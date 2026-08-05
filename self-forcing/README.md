@@ -94,9 +94,10 @@ MAX_GAIN=1.0
 
 ## 第二步：生成视频
 
-该脚本只读取第一步生成的参数，不会采集 trace，也不会重新拟合：
+`MODE=tempokv` 读取第一步生成的参数，不会采集 trace，也不会重新拟合：
 
 ```bash
+MODE=tempokv \
 MODEL_REPO=/path/to/self-forcing-model-repo \
 CHECKPOINT=/models/self_forcing_dmd.pt \
 WAN_MODEL_DIR=/models/Wan2.1-T2V-1.3B \
@@ -110,12 +111,41 @@ FRAMES=27 \
 bash self-forcing/generate.sh
 ```
 
+`MODE=bf16` 运行不量化的基线，不需要 `CONFIG` 和 `PARAM_DIR`：
+
+```bash
+MODE=bf16 \
+MODEL_REPO=/path/to/self-forcing-model-repo \
+CHECKPOINT=/models/self_forcing_dmd.pt \
+WAN_MODEL_DIR=/models/Wan2.1-T2V-1.3B \
+PROMPTS=/data/generation_prompts.txt \
+OUTPUT_DIR=runs/self_forcing_bf16 \
+CUDA_VISIBLE_DEVICES=0 \
+NUM_GPUS=1 \
+FRAMES=27 \
+bash self-forcing/generate.sh
+```
+
 输出为：
 
 ```text
 runs/self_forcing_int2/videos/*.mp4
 runs/self_forcing_int2/pipeline_report.json
 ```
+
+`pipeline_report.json` 会记录外层总耗时、每个 GPU 的推理耗时，以及所有 GPU
+中的最高已分配显存和最高保留显存。TempoKV 与 BF16 使用同一套统计方式，可以
+直接比较。
+
+```text
+performance.launcher_seconds
+performance.max_worker_seconds
+performance.peak_allocated_gib
+performance.peak_reserved_gib
+performance.ranks[]
+```
+
+TempoKV 和 BF16 应使用不同的 `OUTPUT_DIR`，避免视频及报告互相覆盖。
 
 `FRAMES` 至少为 27。更短的运行不会触发 Self-Forcing 的旧 cache span 压缩，
 入口会直接拒绝。

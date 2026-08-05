@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate Self-Forcing videos with existing TempoKV parameters."""
+"""Generate Self-Forcing videos with TempoKV or native bf16 KV caches."""
 
 from __future__ import annotations
 
@@ -13,6 +13,7 @@ import subprocess
 import sys
 import time
 from typing import Sequence
+from uuid import uuid4
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SOURCE_ROOT = PROJECT_ROOT / "src"
@@ -32,11 +33,14 @@ EXPECTED_COORDINATE_SYSTEM = "pre_rope_normalized"
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Generate Self-Forcing videos with fitted TempoKV parameters."
+        description="Generate Self-Forcing videos with TempoKV or bf16 KV caches."
     )
-    parser.add_argument("--config", type=Path, required=True)
-    parser.add_argument("--k-params", type=Path, required=True)
-    parser.add_argument("--v-params", type=Path, required=True)
+    parser.add_argument(
+        "--mode", choices=("tempokv", "bf16"), default="tempokv"
+    )
+    parser.add_argument("--config", type=Path)
+    parser.add_argument("--k-params", type=Path)
+    parser.add_argument("--v-params", type=Path)
     parser.add_argument("--model-repo", type=Path, required=True)
     parser.add_argument("--model-config", type=Path)
     parser.add_argument("--checkpoint", type=Path, required=True)
@@ -118,6 +122,8 @@ def _generation_command(
         "--standalone",
         f"--nproc_per_node={args.num_gpus}",
         str(Path(__file__).with_name("worker.py")),
+        "--mode",
+        args.mode,
         "--model-repo",
         str(paths["model_repo"]),
         "--",
@@ -148,11 +154,78 @@ def _generation_command(
     return command
 
 
+def _load_worker_metrics(
+    metrics_dir: Path, expected_ranks: int
+) -> dict[str, object]:
+    rank_metrics: list[dict[str, object]] = []
+    for expected_rank in range(expected_ranks):
+        path = metrics_dir / f"rank-{expected_rank}.json"
+        if not path.is_file():
+            raise RuntimeError(f"missing metrics for rank {expected_rank}: {path}")
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError) as error:
+            raise RuntimeError(
+                f"invalid metrics for rank {expected_rank}: {path}"
+            ) from error
+        if not isinstance(payload, dict):
+            raise RuntimeError(f"metrics for rank {expected_rank} must be an object")
+        required = {
+            "rank",
+            "wall_seconds",
+            "peak_allocated_bytes",
+            "peak_reserved_bytes",
+            "gpu_name",
+        }
+        missing = sorted(required.difference(payload))
+        if missing:
+            raise RuntimeError(
+                f"metrics for rank {expected_rank} are missing: {', '.join(missing)}"
+            )
+        if payload["rank"] != expected_rank:
+            raise RuntimeError(
+                f"metrics rank mismatch in {path}: expected {expected_rank}"
+            )
+        try:
+            wall_seconds = float(payload["wall_seconds"])
+            peak_allocated = int(payload["peak_allocated_bytes"])
+            peak_reserved = int(payload["peak_reserved_bytes"])
+        except (TypeError, ValueError) as error:
+            raise RuntimeError(
+                f"metrics for rank {expected_rank} contain invalid numbers"
+            ) from error
+        if wall_seconds < 0 or peak_allocated < 0 or peak_reserved < 0:
+            raise RuntimeError(
+                f"metrics for rank {expected_rank} must not be negative"
+            )
+        rank_metrics.append(
+            {
+                **payload,
+                "wall_seconds": wall_seconds,
+                "peak_allocated_bytes": peak_allocated,
+                "peak_reserved_bytes": peak_reserved,
+            }
+        )
+    peak_allocated_bytes = max(
+        metric["peak_allocated_bytes"] for metric in rank_metrics
+    )
+    peak_reserved_bytes = max(
+        metric["peak_reserved_bytes"] for metric in rank_metrics
+    )
+    return {
+        "max_worker_seconds": max(
+            metric["wall_seconds"] for metric in rank_metrics
+        ),
+        "peak_allocated_bytes": peak_allocated_bytes,
+        "peak_reserved_bytes": peak_reserved_bytes,
+        "peak_allocated_gib": peak_allocated_bytes / (1024**3),
+        "peak_reserved_gib": peak_reserved_bytes / (1024**3),
+        "ranks": rank_metrics,
+    }
+
+
 def run(args: argparse.Namespace) -> dict[str, object]:
     inputs = {
-        "config": args.config.expanduser().resolve(),
-        "k_params": args.k_params.expanduser().resolve(),
-        "v_params": args.v_params.expanduser().resolve(),
         "model_repo": args.model_repo.expanduser().resolve(),
         "checkpoint": args.checkpoint.expanduser().resolve(),
         "prompts": args.prompts.expanduser().resolve(),
@@ -174,16 +247,33 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         "runtime_config": args.output_dir.expanduser().resolve()
         / "runtime_config.json",
     }
+    if args.mode == "tempokv":
+        missing_arguments = [
+            name
+            for name, value in (
+                ("--config", args.config),
+                ("--k-params", args.k_params),
+                ("--v-params", args.v_params),
+            )
+            if value is None
+        ]
+        if missing_arguments:
+            raise ValueError(
+                f"mode=tempokv requires {', '.join(missing_arguments)}"
+            )
+        paths.update(
+            {
+                "config": args.config.expanduser().resolve(),
+                "k_params": args.k_params.expanduser().resolve(),
+                "v_params": args.v_params.expanduser().resolve(),
+            }
+        )
     if paths["run"] == Path(paths["run"].anchor):
         raise ValueError("output-dir must not be the filesystem root")
-    for name in (
-        "config",
-        "k_params",
-        "v_params",
-        "checkpoint",
-        "prompts",
-        "model_config",
-    ):
+    required_files = ["checkpoint", "prompts", "model_config"]
+    if args.mode == "tempokv":
+        required_files.extend(("config", "k_params", "v_params"))
+    for name in required_files:
         if not paths[name].is_file():
             raise ValueError(f"{name} file does not exist: {paths[name]}")
     if not paths["model_repo"].is_dir():
@@ -192,66 +282,87 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         if not (paths["model_repo"] / relative).is_file():
             raise ValueError(f"model repository is missing: {relative}")
 
-    config = _load_config(paths["config"])
-    if config.stride != 1560:
-        raise ValueError("Self-Forcing requires stride=1560")
-    if 128 % config.group_size:
-        raise ValueError("Self-Forcing group_size must divide 128")
-    if config.reconstruction_dtype != "bfloat16":
-        raise ValueError("Self-Forcing requires reconstruction_dtype=bfloat16")
-    if args.frames < 27:
-        raise ValueError("Self-Forcing needs at least 27 latent frames to use TempoKV")
     if args.samples < 1:
         raise ValueError("samples must be positive")
     if args.num_gpus < 1:
         raise ValueError("num-gpus must be positive")
-    parameters = _validate_parameters(
-        paths["k_params"], paths["v_params"], config
-    )
+    config = None
+    parameters = None
+    if args.mode == "tempokv":
+        config = _load_config(paths["config"])
+        if config.stride != 1560:
+            raise ValueError("Self-Forcing requires stride=1560")
+        if 128 % config.group_size:
+            raise ValueError("Self-Forcing group_size must divide 128")
+        if config.reconstruction_dtype != "bfloat16":
+            raise ValueError("Self-Forcing requires reconstruction_dtype=bfloat16")
+        if args.frames < 27:
+            raise ValueError(
+                "Self-Forcing needs at least 27 latent frames to use TempoKV"
+            )
+        parameters = _validate_parameters(
+            paths["k_params"], paths["v_params"], config
+        )
 
     generation_command = _generation_command(args, paths)
     report: dict[str, object] = {
         "status": "dry_run" if args.dry_run else "running",
+        "mode": args.mode,
         "created_at": datetime.now(timezone.utc).isoformat(),
-        "parameters": parameters,
         "generation_command": generation_command,
         "output_dir": str(paths["run"]),
-        "runtime_config": str(paths["runtime_config"]),
     }
+    if args.mode == "tempokv":
+        report["parameters"] = parameters
+        report["runtime_config"] = str(paths["runtime_config"])
     if args.dry_run:
         print(json.dumps(report, indent=2, ensure_ascii=False))
         return report
 
     paths["run"].mkdir(parents=True, exist_ok=True)
-    runtime_payload = asdict(config)
-    if not args.allow_triton_fallback:
-        runtime_payload["use_triton"] = True
-        runtime_payload["strict_triton"] = True
-    paths["runtime_config"].write_text(
-        json.dumps(runtime_payload, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
     environment = os.environ.copy()
-    environment.update(
-        {
-            "TEMPOKV_CONFIG_PATH": str(paths["runtime_config"]),
-            "TEMPOKV_K_PARAMS_PATH": str(paths["k_params"]),
-            "TEMPOKV_V_PARAMS_PATH": str(paths["v_params"]),
-        }
-    )
-    if args.triton_cache is not None:
-        environment["TEMPOKV_TRITON_CACHE"] = str(
-            args.triton_cache.expanduser().resolve()
+    if args.mode == "tempokv":
+        runtime_payload = asdict(config)
+        if not args.allow_triton_fallback:
+            runtime_payload["use_triton"] = True
+            runtime_payload["strict_triton"] = True
+        paths["runtime_config"].write_text(
+            json.dumps(runtime_payload, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
         )
+        environment.update(
+            {
+                "TEMPOKV_CONFIG_PATH": str(paths["runtime_config"]),
+                "TEMPOKV_K_PARAMS_PATH": str(paths["k_params"]),
+                "TEMPOKV_V_PARAMS_PATH": str(paths["v_params"]),
+            }
+        )
+        if args.triton_cache is not None:
+            environment["TEMPOKV_TRITON_CACHE"] = str(
+                args.triton_cache.expanduser().resolve()
+            )
+    else:
+        for name in tuple(environment):
+            if name.startswith("TEMPOKV_"):
+                environment.pop(name)
     paths["videos"].mkdir(parents=True, exist_ok=True)
+    metrics_dir = paths["run"] / "metrics" / uuid4().hex
+    metrics_dir.mkdir(parents=True)
+    environment["SELF_FORCING_METRICS_DIR"] = str(metrics_dir)
     started = time.perf_counter()
-    subprocess.run(
+    completed = subprocess.run(
         generation_command,
         cwd=paths["model_repo"],
         env=environment,
-        check=True,
+        check=False,
     )
     generation_seconds = time.perf_counter() - started
+    performance = _load_worker_metrics(metrics_dir, args.num_gpus)
+    performance["launcher_seconds"] = generation_seconds
+    if completed.returncode:
+        raise subprocess.CalledProcessError(
+            completed.returncode, generation_command
+        )
     videos = sorted(paths["videos"].rglob("*.mp4"))
     if not videos or any(path.stat().st_size == 0 for path in videos):
         raise RuntimeError("Self-Forcing completed without a non-empty MP4")
@@ -259,6 +370,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         {
             "status": "complete",
             "generation_seconds": generation_seconds,
+            "performance": performance,
             "videos": [str(path) for path in videos],
         }
     )

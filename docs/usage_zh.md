@@ -274,6 +274,7 @@ bash self-forcing/prepare.sh
 之后只读取已有参数生成视频，可以更换 prompt 并重复运行：
 
 ```bash
+MODE=tempokv \
 MODEL_REPO=/path/to/self-forcing-model-repo \
 CHECKPOINT=/models/self_forcing_dmd.pt \
 WAN_MODEL_DIR=/models/Wan2.1-T2V-1.3B \
@@ -283,6 +284,10 @@ OUTPUT_DIR=runs/self_forcing_int2 \
 CONFIG=configs/int2.json \
 bash self-forcing/generate.sh
 ```
+
+设置 `MODE=bf16` 可以运行不量化的对照生成；该模式不需要 `CONFIG` 和
+`PARAM_DIR`。两种模式都会在 `pipeline_report.json` 中保存总耗时、每个 GPU
+的耗时和最高显存占用。
 
 两个入口都会检查 `stride=1560`、30 层、12 heads、head dimension 128 和 pre-RoPE normalized K。生成长度还会检查是否真正触发 TempoKV。
 

@@ -73,6 +73,7 @@ bash self-forcing/prepare.sh
 Generate videos any number of times from the fitted parameters:
 
 ```bash
+MODE=tempokv \
 MODEL_REPO=/path/to/self-forcing-model-repo \
 CHECKPOINT=/models/self_forcing_dmd.pt \
 WAN_MODEL_DIR=/models/Wan2.1-T2V-1.3B \
@@ -82,6 +83,10 @@ OUTPUT_DIR=runs/self_forcing_int2 \
 CONFIG=configs/int2.json \
 bash self-forcing/generate.sh
 ```
+
+Set `MODE=bf16` to run the same Self-Forcing generation without KV
+quantization. BF16 mode does not need `CONFIG` or `PARAM_DIR`. Both modes write
+wall-clock latency and peak GPU memory to `pipeline_report.json`.
 
 See [self-forcing/README.md](self-forcing/README.md) for the trace contract,
 model requirements, PSNR/SSIM/LPIPS, and VBench commands.
