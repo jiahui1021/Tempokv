@@ -128,20 +128,20 @@ def predict_cross_kv(source: torch.Tensor, parameters: CrossKVParameters) -> tor
     bias = parameters.bias.to(source.device)
     if source.shape[1] != weight.shape[0] or source.shape[-1] != weight.shape[-1]:
         raise ValueError("CrossKV parameters do not match cache heads/head dimension")
-    with _ieee_matmul(source.device):
+    with _tf32_matmul(source.device):
         prediction = torch.matmul(source.float(), weight)
     return prediction + bias[None, :, None, :]
 
 
 @contextmanager
-def _ieee_matmul(device: torch.device):
-    """Match the fixed IEEE policy used by the accelerated decoder."""
+def _tf32_matmul(device: torch.device):
+    """Allow TF32 for CrossKV matmul, matching the Triton decoder precision."""
     if device.type != "cuda":
         yield
         return
     backend = torch.backends.cuda.matmul
     previous = backend.allow_tf32
-    backend.allow_tf32 = False
+    backend.allow_tf32 = True
     try:
         yield
     finally:
@@ -568,26 +568,42 @@ class TempoKVCodec:
             raise ValueError("K and V parameters use different coordinate systems")
         self._temporal_by_device: dict[str, TemporalParameters] = {}
         self._cross_by_device: dict[str, CrossKVParameters] = {}
+        # Per (device, layer) caches so every packed span shares the same
+        # single-layer parameter object instead of building a fresh copy.
+        self._temporal_layer_cache: dict[tuple[str, int], TemporalParameters] = {}
+        self._cross_layer_cache: dict[tuple[str, int], CrossKVParameters] = {}
 
     def _temporal_for_layer(
         self, device: torch.device, layer: int
     ) -> TemporalParameters:
         device_key = str(device)
+        cache_key = (device_key, layer)
+        cached = self._temporal_layer_cache.get(cache_key)
+        if cached is not None:
+            return cached
         parameters = self._temporal_by_device.get(device_key)
         if parameters is None:
             parameters = self.temporal.to(device)
             self._temporal_by_device[device_key] = parameters
-        return parameters.for_layer(layer) if parameters.layered else parameters
+        selected = parameters.for_layer(layer) if parameters.layered else parameters
+        self._temporal_layer_cache[cache_key] = selected
+        return selected
 
     def _cross_for_layer(
         self, device: torch.device, layer: int
     ) -> CrossKVParameters:
         device_key = str(device)
+        cache_key = (device_key, layer)
+        cached = self._cross_layer_cache.get(cache_key)
+        if cached is not None:
+            return cached
         parameters = self._cross_by_device.get(device_key)
         if parameters is None:
             parameters = self.cross_kv.to(device)
             self._cross_by_device[device_key] = parameters
-        return parameters.for_layer(layer) if parameters.layered else parameters
+        selected = parameters.for_layer(layer) if parameters.layered else parameters
+        self._cross_layer_cache[cache_key] = selected
+        return selected
 
     def encode_key(
         self,

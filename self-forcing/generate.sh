@@ -1,5 +1,42 @@
 #!/usr/bin/env bash
-
+#
+# generate.sh — 读取已拟合参数，生成 Self-Forcing 视频
+#
+# 不采集 trace、不重新拟合，只使用 PARAM_DIR 下的参数。更换 PROMPTS /
+# OUTPUT_DIR 后可以重复运行。
+#
+# 两种模式：
+#   MODE=tempokv  使用 TempoKV 量化参数（默认），需要 CONFIG + PARAM_DIR
+#   MODE=bf16     不量化的对照基线，不需要 CONFIG / PARAM_DIR
+#
+# 用法（所有参数都用环境变量传入）：
+#   MODE=tempokv \
+#   MODEL_REPO=/path/to/model-repo \
+#   CHECKPOINT=/models/self_forcing_dmd.pt \
+#   WAN_MODEL_DIR=/models/Wan2.1-T2V-1.3B \
+#   PROMPTS=assets/generation_prompts.txt \
+#   PARAM_DIR=parameters \
+#   OUTPUT_DIR=results/self_forcing \
+#   CONFIG=configs/int2.json \
+#   FRAMES=717 \
+#   bash self-forcing/generate.sh
+#
+# 必需变量：
+#   MODEL_REPO    Self-Forcing 模型仓库目录
+#   CHECKPOINT    Self-Forcing 模型权重
+#   WAN_MODEL_DIR Wan 模型目录
+#   PROMPTS       prompt 列表
+#   CONFIG        codec 配置 JSON（仅 MODE=tempokv）
+#
+# 常用可选变量：
+#   PARAM_DIR       TempoKV 参数目录（默认 parameters/，相对仓库根目录）
+#   OUTPUT_DIR      结果输出目录（默认 results/$MODEL_TYPE/<量化标签>）
+#   FRAMES          最终视频帧数（默认 27；tempokv 至少 27 个 latent 帧≈105 视频帧）
+#   NUM_SAMPLES     每条 prompt 采样数（默认 1）
+#   SEED            随机种子（默认 0）
+#   START_INDEX / END_INDEX  prompt 序号范围（默认 0 .. -1 全部）
+#   NUM_GPUS        torchrun 使用的 GPU 数（默认 1）
+#
 set -euo pipefail
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
@@ -7,129 +44,158 @@ project_root="$(cd -- "$script_dir/.." && pwd -P)"
 python_bin="${PYTHON_BIN:-python3}"
 mode="${MODE:-tempokv}"
 
-require_env() {
-  local name="$1"
-  if [[ -z "${!name:-}" ]]; then
-    printf 'Error: %s must be set.\n' "$name" >&2
-    exit 2
-  fi
+# ---------- 工具函数 ----------
+
+die() {
+  printf 'Error: %s\n' "$*" >&2
+  exit 2
 }
 
-# Build a short quantization label for the results subdirectory, e.g.
-# kh3-cross-int2 for history_length=3, CrossKV predictor, INT2 residuals.
+require_env() {
+  local name
+  for name in "$@"; do
+    if [[ -z "${!name:-}" ]]; then
+      die "缺少必需变量 $name（请用环境变量传入）"
+    fi
+  done
+}
+
+# 相对路径统一按“仓库根目录”解析，保证从任何目录运行行为一致
+resolve_path() {
+  local value="$1"
+  case "$value" in
+    /*) printf '%s\n' "$value" ;;
+    *)  realpath -m -- "$project_root/$value" ;;
+  esac
+}
+
+check_flag() {
+  local name="$1" value="${!1:-0}"
+  [[ "$value" == "0" || "$value" == "1" ]] || die "$name 必须是 0 或 1（当前值：$value）"
+}
+
+check_int() {
+  local name="$1" min="$2" value="${!1:-}"
+  if [[ "$value" =~ ^-?[0-9]+$ ]] && (( value >= min )); then
+    return 0
+  fi
+  die "$name 必须是整数且 >= $min（当前值：$value）"
+}
+
+# 生成一个短量化标签，用于默认输出目录，例如 kh3-cross-int2
 _quant_config_slug() {
   if [[ "$mode" == "bf16" ]]; then
     printf 'bf16'
     return 0
   fi
-  local k_bits v_bits history
-  k_bits=$("$python_bin" - "$CONFIG" <<'PY'
-import json, sys
-cfg = json.load(open(sys.argv[1]))
-print(cfg.get("k_bits", 0))
+  "$python_bin" - "$(resolve_path "$CONFIG")" "$param_dir/k_temporal.npz" <<'PY'
+import json
+import sys
+
+import numpy as np
+
+try:
+    k_bits = json.load(open(sys.argv[1])).get("k_bits", 0)
+    history = int(np.load(sys.argv[2])["history_length"].item())
+    print(f"kh{history}-cross-int{k_bits}")
+except Exception:
+    print("unknown")
 PY
-  )
-  v_bits=$("$python_bin" - "$CONFIG" <<'PY'
-import json, sys
-cfg = json.load(open(sys.argv[1]))
-print(cfg.get("v_bits", 0))
-PY
-  )
-  history=$("$python_bin" - "$param_dir/k_temporal.npz" <<'PY'
-import numpy as np, sys
-k = np.load(sys.argv[1])
-print(int(np.asarray(k["history_length"]).item()))
-PY
-  )
-  printf 'kh%s-cross-int%s' "$history" "$k_bits"
 }
 
-if [[ "$mode" != "tempokv" && "$mode" != "bf16" ]]; then
-  printf 'Error: MODE must be tempokv or bf16.\n' >&2
-  exit 2
-fi
+# ---------- 模式与必需变量 ----------
 
-for name in MODEL_REPO CHECKPOINT WAN_MODEL_DIR PROMPTS; do
-  require_env "$name"
-done
+case "$mode" in
+  tempokv) ;;
+  bf16) ;;
+  *) die "MODE 必须是 tempokv 或 bf16（当前值：$mode）" ;;
+esac
+
+require_env MODEL_REPO CHECKPOINT WAN_MODEL_DIR PROMPTS
 if [[ "$mode" == "tempokv" ]]; then
-  for name in CONFIG; do
-    require_env "$name"
-  done
+  require_env CONFIG
 fi
 
-for flag_name in DRY_RUN ALLOW_TRITON_FALLBACK SKIP_EXISTING; do
-  flag_value="${!flag_name:-0}"
-  if [[ "$flag_value" != "0" && "$flag_value" != "1" ]]; then
-    printf 'Error: %s must be 0 or 1.\n' "$flag_name" >&2
-    exit 2
-  fi
-done
+# ---------- 目录 ----------
+
+param_dir="$(resolve_path "${PARAM_DIR:-parameters}")"
+
 model_type="${MODEL_TYPE:-self_forcing}"
-case "$model_type" in
-  */) model_type="${model_type%/}" ;;
-esac
-param_dir="${PARAM_DIR:-$project_root/parameters}"
-case "$param_dir" in
-  /*) ;;
-  *) param_dir="$(realpath -m -- "$param_dir")" ;;
-esac
-output_dir="${OUTPUT_DIR:-$project_root/results/$model_type/$(_quant_config_slug)}"
-case "$output_dir" in
-  /*) ;;
-  *) output_dir="$(realpath -m -- "$output_dir")" ;;
-esac
+model_type="${model_type%/}"
+output_dir="$(resolve_path "${OUTPUT_DIR:-$project_root/results/$model_type/$(_quant_config_slug)}")"
 if [[ "$output_dir" == "/" ]]; then
-  printf 'Error: OUTPUT_DIR must not be the filesystem root.\n' >&2
-  exit 2
+  die "OUTPUT_DIR 不能是文件系统根目录"
 fi
 
-command=(
+# ---------- 生成参数 ----------
+
+FRAMES="${FRAMES:-27}"
+NUM_SAMPLES="${NUM_SAMPLES:-1}"
+SEED="${SEED:-0}"
+START_INDEX="${START_INDEX:-0}"
+END_INDEX="${END_INDEX:--1}"
+NUM_GPUS="${NUM_GPUS:-1}"
+DRY_RUN="${DRY_RUN:-0}"
+ALLOW_TRITON_FALLBACK="${ALLOW_TRITON_FALLBACK:-0}"
+SKIP_EXISTING="${SKIP_EXISTING:-0}"
+
+check_flag DRY_RUN
+check_flag ALLOW_TRITON_FALLBACK
+check_flag SKIP_EXISTING
+check_int FRAMES 1
+check_int NUM_SAMPLES 1
+check_int SEED 0
+check_int START_INDEX 0
+check_int END_INDEX -1
+check_int NUM_GPUS 1
+
+latent_frames=$(( (FRAMES + 3) / 4 ))
+if [[ "$mode" == "tempokv" && "$latent_frames" -lt 27 ]]; then
+  die "tempokv 模式至少需要 27 个 latent 帧（约 105 个视频帧）才能触发量化，当前 FRAMES=$FRAMES"
+fi
+
+# ---------- 组装命令 ----------
+
+generate_command=(
   "$python_bin" "$script_dir/generate.py"
   --mode "$mode"
-  --model-repo "$MODEL_REPO"
-  --checkpoint "$CHECKPOINT"
-  --prompts "$PROMPTS"
+  --model-repo "$(resolve_path "$MODEL_REPO")"
+  --checkpoint "$(resolve_path "$CHECKPOINT")"
+  --prompts "$(resolve_path "$PROMPTS")"
   --output-dir "$output_dir"
-  --frames "${FRAMES:-27}"
-  --samples "${NUM_SAMPLES:-1}"
-  --seed "${SEED:-0}"
-  --start-index "${START_INDEX:-0}"
-  --end-index "${END_INDEX:--1}"
-  --num-gpus "${NUM_GPUS:-1}"
+  --frames "$FRAMES"
+  --samples "$NUM_SAMPLES"
+  --seed "$SEED"
+  --start-index "$START_INDEX"
+  --end-index "$END_INDEX"
+  --num-gpus "$NUM_GPUS"
 )
-
 if [[ "$mode" == "tempokv" ]]; then
-  command+=(
-    --config "$CONFIG"
+  generate_command+=(
+    --config "$(resolve_path "$CONFIG")"
     --k-params "$param_dir/k_temporal.npz"
     --v-params "$param_dir/v_cross_kv.npz"
   )
 fi
 
-if [[ -n "${MODEL_CONFIG:-}" ]]; then
-  command+=(--model-config "$MODEL_CONFIG")
-fi
-if [[ -n "${LOCAL_ATTN_SIZE:-}" ]]; then
-  command+=(--local-attn-size "$LOCAL_ATTN_SIZE")
-fi
-if [[ -n "${TRITON_CACHE:-}" ]]; then
-  command+=(--triton-cache "$TRITON_CACHE")
-fi
-if [[ "${ALLOW_TRITON_FALLBACK:-0}" == "1" ]]; then
-  command+=(--allow-triton-fallback)
-fi
-if [[ "${SKIP_EXISTING:-0}" == "1" ]]; then
-  command+=(--skip-existing)
-fi
-if [[ "${DRY_RUN:-0}" == "1" ]]; then
-  command+=(--dry-run)
-fi
+[[ -n "${MODEL_CONFIG:-}" ]] && generate_command+=(--model-config "$(resolve_path "$MODEL_CONFIG")")
+[[ -n "${LOCAL_ATTN_SIZE:-}" ]] && generate_command+=(--local-attn-size "$LOCAL_ATTN_SIZE")
+[[ -n "${TRITON_CACHE:-}" ]] && generate_command+=(--triton-cache "$(resolve_path "$TRITON_CACHE")")
+[[ "$ALLOW_TRITON_FALLBACK" == "1" ]] && generate_command+=(--allow-triton-fallback)
+[[ "$SKIP_EXISTING" == "1" ]] && generate_command+=(--skip-existing)
+[[ "$DRY_RUN" == "1" ]] && generate_command+=(--dry-run)
 
-export FORCING_WAN_MODEL_DIR="$WAN_MODEL_DIR"
-if [[ "${DRY_RUN:-0}" == "1" ]]; then
-  "${command[@]}"
+export FORCING_WAN_MODEL_DIR="$(resolve_path "$WAN_MODEL_DIR")"
+
+if [[ "$DRY_RUN" == "1" ]]; then
+  printf '[generate] 干跑模式：打印最终命令，不执行\n'
+  printf '  $'
+  printf ' %q' "${generate_command[@]}"
+  printf '\n'
+  "${generate_command[@]}"
   exit 0
 fi
+
 mkdir -p -- "$output_dir"
-"${command[@]}" 2>&1 | tee "$output_dir/generate.log"
+printf '[generate] 输出目录：%s\n' "$output_dir"
+"${generate_command[@]}" 2>&1 | tee "$output_dir/generate.log"

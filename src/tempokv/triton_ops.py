@@ -417,7 +417,7 @@ def _cross_kv_residual_decode_kernel(
         other=0.0,
     ).to(tl.float32)
     prediction = tl.dot(
-        source, weight, out_dtype=tl.float32, input_precision="ieee"
+        source, weight, out_dtype=tl.float32, input_precision="tf32"
     )
     bias = tl.load(
         bias_ptr + head * width + channel, mask=channel < width, other=0.0
@@ -579,7 +579,7 @@ def _cross_kv_persistent_decode_kernel(
             other=0.0,
         ).to(tl.float32)
         prediction = tl.dot(
-            source, weight, out_dtype=tl.float32, input_precision="ieee"
+            source, weight, out_dtype=tl.float32, input_precision="tf32"
         ) + bias[None, :]
         output_offset = _strided_bhsd_offsets(
             batch_head,

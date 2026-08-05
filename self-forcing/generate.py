@@ -28,6 +28,11 @@ REQUIRED_MODEL_FILES = (
 )
 EXPECTED_LAYER_IDS = tuple(range(30))
 EXPECTED_COORDINATE_SYSTEM = "pre_rope_normalized"
+VIDEO_FRAMES_PER_LATENT = 4
+
+
+def latent_frames_for(video_frames: int) -> int:
+    return (video_frames + VIDEO_FRAMES_PER_LATENT - 1) // VIDEO_FRAMES_PER_LATENT
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -45,7 +50,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--prompts", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--frames", type=int, default=27)
+    parser.add_argument(
+        "--frames",
+        type=int,
+        default=717,
+        help="final video frame count; converted to latent frames internally (1 latent = 4 video frames)",
+    )
     parser.add_argument("--samples", type=int, default=1)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--start-index", type=int, default=0)
@@ -117,6 +127,7 @@ def _validate_parameters(
 def _generation_command(
     args: argparse.Namespace, paths: dict[str, Path]
 ) -> list[str]:
+    latent_frames = latent_frames_for(args.frames)
     command = [
         "torchrun",
         "--standalone",
@@ -136,7 +147,7 @@ def _generation_command(
         "--output_folder",
         str(paths["videos"]),
         "--num_output_frames",
-        str(args.frames),
+        str(latent_frames),
         "--num_samples",
         str(args.samples),
         "--seed",
@@ -237,6 +248,31 @@ def _load_worker_metrics(
     }
 
 
+def _end_to_end_latency(videos_dir: Path) -> float | None:
+    """Read Self-Forcing's authoritative per-video timing from summary.json.
+
+    `videos[i].total_seconds` covers generation + video save and excludes
+    model loading, checkpoint loading, and Triton compilation, so it is the
+    meaningful end-to-end generation latency.
+    """
+    summary_path = videos_dir / "summary.json"
+    if not summary_path.is_file():
+        return None
+    try:
+        payload = json.loads(summary_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
+    candidates: list[float] = []
+    for rank in payload.get("rank_summaries") or []:
+        for video in rank.get("videos") or []:
+            total = video.get("total_seconds")
+            if isinstance(total, (int, float)) and total > 0:
+                candidates.append(float(total))
+    if not candidates:
+        return None
+    return float(sum(candidates) / len(candidates))
+
+
 def run(args: argparse.Namespace) -> dict[str, object]:
     inputs = {
         "model_repo": args.model_repo.expanduser().resolve(),
@@ -309,9 +345,10 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             raise ValueError("Self-Forcing group_size must divide 128")
         if config.reconstruction_dtype != "bfloat16":
             raise ValueError("Self-Forcing requires reconstruction_dtype=bfloat16")
-        if args.frames < 27:
+        if latent_frames_for(args.frames) < 27:
             raise ValueError(
-                "Self-Forcing needs at least 27 latent frames to use TempoKV"
+                "Self-Forcing needs at least 108 video frames (27 latent frames) "
+                "to use TempoKV"
             )
         parameters = _validate_parameters(
             paths["k_params"], paths["v_params"], config
@@ -348,7 +385,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                 "TEMPOKV_CONFIG_PATH": str(paths["runtime_config"]),
                 "TEMPOKV_K_PARAMS_PATH": str(paths["k_params"]),
                 "TEMPOKV_V_PARAMS_PATH": str(paths["v_params"]),
-                "TEMPOKV_NUM_FRAMES": str(args.frames),
+                "TEMPOKV_NUM_FRAMES": str(latent_frames_for(args.frames)),
             }
         )
         if args.triton_cache is not None:
@@ -372,7 +409,6 @@ def run(args: argparse.Namespace) -> dict[str, object]:
     )
     generation_seconds = time.perf_counter() - started
     performance = _load_worker_metrics(metrics_dir, args.num_gpus)
-    performance["launcher_seconds"] = generation_seconds
     if completed.returncode:
         raise subprocess.CalledProcessError(
             completed.returncode, generation_command
@@ -399,6 +435,9 @@ def run(args: argparse.Namespace) -> dict[str, object]:
     videos = sorted(paths["videos"].rglob("*.mp4"))
     if not videos or any(path.stat().st_size == 0 for path in videos):
         raise RuntimeError("Self-Forcing completed without a non-empty MP4")
+    end_to_end = _end_to_end_latency(paths["videos"])
+    if end_to_end is not None:
+        generation_seconds = end_to_end
     report.update(
         {
             "status": "complete",
