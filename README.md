@@ -1,6 +1,6 @@
 # TempoKV
 
-[中文使用指南](assets/usage_zh.md) · [INT2 配置](configs/int2.json) · [INT4 配置](configs/int4.json)
+[中文使用指南](assets/usage_zh.md) 
 
 TempoKV fits, quantizes, and reconstructs attention KV caches. The repository
 provides the codec, a plain PyTorch reference decoder, and optional Triton CUDA
