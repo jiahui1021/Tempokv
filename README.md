@@ -18,14 +18,14 @@ the first model adapter and its fit-to-video entry point.
 ## Installation
 
 ```bash
-pip install -e ".[test]"
+pip install -e .
 ```
 
 For the GPU decoder, install a Triton version compatible with the installed
 PyTorch and CUDA runtime:
 
 ```bash
-pip install -e ".[cuda,test]"
+pip install -e ".[cuda]"
 ```
 
 ## Script quickstart
@@ -216,14 +216,8 @@ from tempokv import configure_triton_cache
 configure_triton_cache("/fast/local/cache")
 ```
 
-## Validation
+## Runtime validation
 
-```bash
-pytest
-```
-
-CPU tests cover fitting, parameter files, all supported bit widths, both
-residual modes, warm-up prediction, partial final units, and exact agreement
-between encoder reconstruction and the reference decoder. CUDA tests compare
-the Triton and PyTorch decoders when a compatible NVIDIA environment is
-available.
+Use the 27-frame, one-prompt Self-Forcing check before a full generation run.
+It verifies video output, peak GPU memory, latency, and both accelerated cache
+paths. See [self-forcing/README.md](self-forcing/README.md#a100-快速验收).

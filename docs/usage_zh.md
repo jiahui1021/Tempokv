@@ -7,13 +7,13 @@ TempoKV 负责对注意力层的 K/V cache 做参数拟合、量化和重建。�
 CPU 或 PyTorch 参考路径：
 
 ```bash
-pip install -e ".[test]"
+pip install -e .
 ```
 
 使用 NVIDIA GPU 上的 Triton 解码器：
 
 ```bash
-pip install -e ".[cuda,test]"
+pip install -e ".[cuda]"
 ```
 
 仓库提供两份配置：
@@ -340,8 +340,6 @@ python scripts/generate.py exported_cache.npz reconstructed_cuda \
 
 ## 9. 最小检查
 
-```bash
-pytest
-```
-
-上线前至少确认：JSON 可构造 `CodecConfig`；`group_size` 整除 `D`；参数和配置的 `stride` 一致；层号能在 `layer_ids` 中找到；decode dtype 与 `reconstruction_dtype` 一致；CUDA 性能测试中没有意外回退到 PyTorch。
+上线前运行 `self-forcing/README.md` 中的 27 帧、单条 prompt 快速验收。
+生成入口会检查配置、参数、视频输出、峰值显存、耗时，以及 K/V 两条 CUDA
+加速路径；任一关键路径未启用都会直接报错。

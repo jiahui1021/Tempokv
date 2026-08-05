@@ -16,7 +16,6 @@ dependencies = [
 
 [project.optional-dependencies]
 cuda = ["triton>=2.2"]
-test = ["pytest>=8"]
 metrics = [
   "lpips>=0.1.4",
   "opencv-python>=4.8",
@@ -25,7 +24,3 @@ metrics = [
 
 [tool.setuptools.packages.find]
 where = ["src"]
-
-[tool.pytest.ini_options]
-testpaths = ["tests"]
-addopts = "-q"

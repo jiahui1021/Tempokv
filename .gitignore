@@ -1,12 +1,40 @@
+# Python caches and local environments
 __pycache__/
 *.py[cod]
 .pytest_cache/
 .ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
 .venv/
+
+# Local verification files
+/tests/
+
+# Build and packaging output
 build/
 dist/
 *.egg-info/
+
+# Generated traces, parameters, and model files
+/parameters/
+/results/
+/runs/
+/outputs/
+/traces/
 *.npz
+*.npy
 *.pt
 *.pth
 *.safetensors
+
+# Runtime caches and logs
+/triton_cache/
+*.log
+*.tmp
+
+# Editor, operating-system, and network-filesystem files
+.DS_Store
+.idea/
+.vscode/
+.nfs*
