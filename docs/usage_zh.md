@@ -265,7 +265,7 @@ Self-Forcing 的适配、启动命令、trace 格式和视频评测统一放在 
 TRACE_RUNNER=/path/to/self-forcing-trace-runner.sh \
 CHECKPOINT=/models/self_forcing_dmd.pt \
 WAN_MODEL_DIR=/models/Wan2.1-T2V-1.3B \
-PROMPTS=/data/fit_prompts.txt \
+PROMPTS=assets/fit_prompts.txt \
 WORK_DIR=runs/self_forcing_prepare \
 CONFIG=configs/int2.json \
 bash self-forcing/prepare.sh
@@ -278,9 +278,9 @@ MODE=tempokv \
 MODEL_REPO=/path/to/self-forcing-model-repo \
 CHECKPOINT=/models/self_forcing_dmd.pt \
 WAN_MODEL_DIR=/models/Wan2.1-T2V-1.3B \
-PROMPTS=/data/generation_prompts.txt \
-PARAM_DIR=runs/self_forcing_prepare/parameters \
-OUTPUT_DIR=runs/self_forcing_int2 \
+PROMPTS=assets/generation_prompts.txt \
+PARAM_DIR=parameters \
+OUTPUT_DIR=results/self_forcing \
 CONFIG=configs/int2.json \
 bash self-forcing/generate.sh
 ```

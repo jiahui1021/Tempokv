@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib
 from pathlib import Path
+from types import SimpleNamespace
 import sys
 import time
 from typing import Any, Callable
@@ -58,6 +59,7 @@ def install(model_repo: str | Path) -> type:
     class TempoKVCausalInferencePipeline(base):
         def __init__(self, *args: Any, **kwargs: Any) -> None:
             super().__init__(*args, **kwargs)
+            self.codec_shape = SimpleNamespace(num_heads=12, head_dim=128)
             self.tempokv_codec = load_codec_from_env()
             config = self.tempokv_codec.config
             if config.stride != self.frame_seq_length:

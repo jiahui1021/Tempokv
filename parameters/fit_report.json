@@ -1,0 +1,98 @@
+{
+  "artifacts": {
+    "k_temporal": "k_temporal.npz",
+    "v_cross_kv": "v_cross_kv.npz"
+  },
+  "codec_config": {
+    "anchor_bits": 4,
+    "group_size": 64,
+    "k_bits": 2,
+    "reconstruction_dtype": "bfloat16",
+    "residual_mode": "asymmetric",
+    "scale_dtype": "bfloat16",
+    "strict_triton": false,
+    "stride": 1560,
+    "use_triton": true,
+    "v_bits": 2
+  },
+  "created_at": "2026-08-05T08:50:26.395025+00:00",
+  "fit": {
+    "coordinate_system": "pre_rope_normalized",
+    "cross_ridge": 0.1,
+    "history_length": 3,
+    "iterations": 2,
+    "max_gain": 1.0,
+    "temporal_ridge": 0.1
+  },
+  "input": {
+    "keys_dtype": "float32",
+    "layer_ids": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29
+    ],
+    "shape": [
+      30,
+      128,
+      24,
+      12,
+      128
+    ],
+    "values_dtype": "float32"
+  },
+  "parameters": {
+    "cross_bias_shape": [
+      30,
+      12,
+      128
+    ],
+    "cross_weight_shape": [
+      30,
+      12,
+      128,
+      128
+    ],
+    "temporal_bias_shape": [
+      30,
+      3,
+      12,
+      128
+    ],
+    "temporal_weight_shape": [
+      30,
+      3,
+      3,
+      12,
+      128
+    ]
+  },
+  "status": "fit_complete",
+  "trace": "/mnt/cpfs/epic-user/hujiahui-20260612/Tempokv/runs/self_forcing_prepare/trace/self_forcing_trace.npz"
+}

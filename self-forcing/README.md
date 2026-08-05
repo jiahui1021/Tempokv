@@ -48,10 +48,9 @@ python self-forcing/prepare_trace.py \
 TRACE_RUNNER=/path/to/self-forcing-trace-runner.sh \
 CHECKPOINT=/models/self_forcing_dmd.pt \
 WAN_MODEL_DIR=/models/Wan2.1-T2V-1.3B \
-PROMPTS=/data/fit_prompts.txt \
+PROMPTS=assets/fit_prompts.txt \
 WORK_DIR=runs/self_forcing_prepare \
 CONFIG=configs/int2.json \
-CUDA_VISIBLE_DEVICES=0 \
 NUM_GPUS=1 \
 bash self-forcing/prepare.sh
 ```
@@ -59,12 +58,15 @@ bash self-forcing/prepare.sh
 输出为：
 
 ```text
-runs/self_forcing_prepare/raw_trace/
-runs/self_forcing_prepare/trace/self_forcing_trace.npz
-runs/self_forcing_prepare/parameters/k_temporal.npz
-runs/self_forcing_prepare/parameters/v_cross_kv.npz
-runs/self_forcing_prepare/parameters/fit_report.json
+runs/self_forcing_prepare/raw_trace/          trace 采集中间产物
+parameters/self_forcing_trace.npz
+parameters/k_temporal.npz
+parameters/v_cross_kv.npz
+parameters/fit_report.json
 ```
+
+`prepare.sh` 默认把采集的 trace 和拟合参数都写到独立的 `parameters/` 目录
+（可用 `PARAM_DIR` 覆盖），`WORK_DIR` 只保留 trace 采集中间产物。
 
 采集固定使用未量化 K/V。默认生成 51 帧、每帧抽取 8 个 token，采集全部
 30 层和全部 head。可以用环境变量调整：
@@ -101,11 +103,10 @@ MODE=tempokv \
 MODEL_REPO=/path/to/self-forcing-model-repo \
 CHECKPOINT=/models/self_forcing_dmd.pt \
 WAN_MODEL_DIR=/models/Wan2.1-T2V-1.3B \
-PROMPTS=/data/generation_prompts.txt \
-PARAM_DIR=runs/self_forcing_prepare/parameters \
-OUTPUT_DIR=runs/self_forcing_int2 \
+PROMPTS=assets/generation_prompts.txt \
+PARAM_DIR=parameters \
+OUTPUT_DIR=results/self_forcing \
 CONFIG=configs/int2.json \
-CUDA_VISIBLE_DEVICES=0 \
 NUM_GPUS=1 \
 FRAMES=27 \
 bash self-forcing/generate.sh
@@ -118,9 +119,8 @@ MODE=bf16 \
 MODEL_REPO=/path/to/self-forcing-model-repo \
 CHECKPOINT=/models/self_forcing_dmd.pt \
 WAN_MODEL_DIR=/models/Wan2.1-T2V-1.3B \
-PROMPTS=/data/generation_prompts.txt \
-OUTPUT_DIR=runs/self_forcing_bf16 \
-CUDA_VISIBLE_DEVICES=0 \
+PROMPTS=assets/generation_prompts.txt \
+OUTPUT_DIR=results/self_forcing_bf16 \
 NUM_GPUS=1 \
 FRAMES=27 \
 bash self-forcing/generate.sh
@@ -129,8 +129,8 @@ bash self-forcing/generate.sh
 输出为：
 
 ```text
-runs/self_forcing_int2/videos/*.mp4
-runs/self_forcing_int2/pipeline_report.json
+results/self_forcing/videos/*.mp4
+results/self_forcing/pipeline_report.json
 ```
 
 `pipeline_report.json` 会记录外层总耗时、每个 GPU 的推理耗时，以及所有 GPU
@@ -167,17 +167,17 @@ pip install -e ".[metrics]"
 ```bash
 python scripts/evaluate_quality.py \
   /data/reference_videos \
-  runs/self_forcing_int2/videos \
+  results/self_forcing/videos \
   --device cuda \
-  --output runs/self_forcing_int2/quality.json
+  --output results/self_forcing/quality.json
 ```
 
 运行 VBench：
 
 ```bash
 python scripts/evaluate_vbench.py \
-  runs/self_forcing_int2/videos \
-  --output-dir runs/self_forcing_int2/vbench \
+  results/self_forcing/videos \
+  --output-dir results/self_forcing/vbench \
   --prompt-file /data/video_prompts.json \
   --device cuda
 ```

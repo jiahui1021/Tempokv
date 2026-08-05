@@ -13,7 +13,6 @@ import subprocess
 import sys
 import time
 from typing import Sequence
-from uuid import uuid4
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SOURCE_ROOT = PROJECT_ROOT / "src"
@@ -52,6 +51,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--start-index", type=int, default=0)
     parser.add_argument("--end-index", type=int, default=-1)
     parser.add_argument("--num-gpus", type=int, default=1)
+    parser.add_argument("--local-attn-size", type=int, default=180)
     parser.add_argument("--triton-cache", type=Path)
     parser.add_argument(
         "--allow-triton-fallback",
@@ -146,6 +146,9 @@ def _generation_command(
         "--end_index",
         str(args.end_index),
         "--save_with_index",
+        "--use_ema",
+        "--local_attn_size",
+        str(args.local_attn_size),
         "--quant_type",
         "none",
     ]
@@ -346,8 +349,8 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             if name.startswith("TEMPOKV_"):
                 environment.pop(name)
     paths["videos"].mkdir(parents=True, exist_ok=True)
-    metrics_dir = paths["run"] / "metrics" / uuid4().hex
-    metrics_dir.mkdir(parents=True)
+    metrics_dir = paths["run"] / "metrics"
+    metrics_dir.mkdir(parents=True, exist_ok=True)
     environment["SELF_FORCING_METRICS_DIR"] = str(metrics_dir)
     started = time.perf_counter()
     completed = subprocess.run(

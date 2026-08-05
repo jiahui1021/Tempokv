@@ -30,10 +30,18 @@ if [[ "$dry_run" != "0" && "$dry_run" != "1" ]]; then
   exit 2
 fi
 
+case "$WORK_DIR" in
+  /*) ;;
+  *) WORK_DIR="$(realpath -m -- "$WORK_DIR")" ;;
+esac
 raw_trace_dir="$WORK_DIR/raw_trace/traces"
 trace_output_dir="$WORK_DIR/raw_trace/output"
-trace_file="$WORK_DIR/trace/self_forcing_trace.npz"
-param_dir="${PARAM_DIR:-$WORK_DIR/parameters}"
+param_dir="${PARAM_DIR:-$project_root/parameters}"
+case "$param_dir" in
+  /*) ;;
+  *) param_dir="$(realpath -m -- "$param_dir")" ;;
+esac
+trace_file="$param_dir/self_forcing_trace.npz"
 start_index="${START_INDEX:-0}"
 end_index="${END_INDEX:-8}"
 trace_frames="${TRACE_FRAMES:-51}"
