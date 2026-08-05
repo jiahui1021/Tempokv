@@ -2,7 +2,6 @@
 """Validate a video directory and run the official VBench Python package."""
 
 from __future__ import annotations
-
 import argparse
 import importlib
 import json

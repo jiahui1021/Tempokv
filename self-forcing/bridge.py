@@ -7,7 +7,6 @@ from types import SimpleNamespace
 import sys
 import time
 from typing import Any, Callable
-
 import torch
 
 from tempokv.codec import PackedTensor, TempoKVCodec, decode_tensor

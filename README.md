@@ -1,6 +1,6 @@
 # TempoKV
 
-[中文使用指南](docs/usage_zh.md) · [INT2 配置](configs/int2.json) · [INT4 配置](configs/int4.json)
+[中文使用指南](assets/usage_zh.md) · [INT2 配置](configs/int2.json) · [INT4 配置](configs/int4.json)
 
 TempoKV is a compact implementation of predictive residual quantization for
 attention KV caches. It keeps the three pieces needed by the runtime:
@@ -52,44 +52,21 @@ python scripts/generate.py exported_cache.npz reconstructed_int2 \
 ```
 
 This second command only round-trips exported cache tensors; it does not run a
-model or generate images or video. See the [Chinese usage guide](docs/usage_zh.md)
+model or generate images or video. See the [Chinese usage guide](assets/usage_zh.md)
 for trace preparation, tuning, CUDA/Triton behavior, and real-model integration.
 
 ## Self-Forcing video pipeline
 
-Self-Forcing uses two shell scripts. Run preparation once to collect a clean
-trace and fit parameters:
+Self-Forcing uses two shell scripts. `self-forcing/prepare.sh` collects a clean
+trace and fits parameters once; `self-forcing/generate.sh` then generates
+videos from those parameters any number of times. All settings are passed as
+environment variables. Set `MODE=tempokv` (default) for TempoKV quantization or
+`MODE=bf16` for an unquantized baseline; both modes write wall-clock latency
+and peak GPU memory to `pipeline_report.json`.
 
-```bash
-TRACE_RUNNER=/path/to/self-forcing-trace-runner.sh \
-CHECKPOINT=/models/self_forcing_dmd.pt \
-WAN_MODEL_DIR=/models/Wan2.1-T2V-1.3B \
-PROMPTS=assets/fit_prompts.txt \
-WORK_DIR=runs/self_forcing_prepare \
-CONFIG=configs/int2.json \
-bash self-forcing/prepare.sh
-```
-
-Generate videos any number of times from the fitted parameters:
-
-```bash
-MODE=tempokv \
-MODEL_REPO=/path/to/self-forcing-model-repo \
-CHECKPOINT=/models/self_forcing_dmd.pt \
-WAN_MODEL_DIR=/models/Wan2.1-T2V-1.3B \
-PROMPTS=assets/generation_prompts.txt \
-PARAM_DIR=parameters \
-OUTPUT_DIR=results/self_forcing \
-CONFIG=configs/int2.json \
-bash self-forcing/generate.sh
-```
-
-Set `MODE=bf16` to run the same Self-Forcing generation without KV
-quantization. BF16 mode does not need `CONFIG` or `PARAM_DIR`. Both modes write
-wall-clock latency and peak GPU memory to `pipeline_report.json`.
-
-See [self-forcing/README.md](self-forcing/README.md) for the trace contract,
-model requirements, PSNR/SSIM/LPIPS, and VBench commands.
+See [self-forcing/README.md](self-forcing/README.md) for the commands, trace
+contract, model requirements, and quality metrics, or the
+[Chinese guide](assets/usage_zh.md) for a condensed walkthrough.
 
 ## Runtime
 

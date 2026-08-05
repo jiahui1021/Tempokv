@@ -1,6 +1,9 @@
 # TempoKV 中文使用指南
 
-TempoKV 负责对注意力层的 K/V cache 做参数拟合、量化和重建。仓库提供 codec、PyTorch 参考解码器、可选的 Triton CUDA 解码器
+TempoKV 负责对注意力层的 K/V cache 做参数拟合、量化和重建。仓库提供 codec、
+PyTorch 参考解码器、可选的 Triton CUDA 解码器。完整英文文档见
+[README](../README.md)，Self-Forcing 详细说明见
+[self-forcing/README.md](../self-forcing/README.md)。
 
 ## 1. 安装与配置
 
@@ -9,6 +12,7 @@ CPU 或 PyTorch 参考路径：
 ```bash
 pip install -e .
 ```
+
 
 使用 NVIDIA GPU 上的 Triton 解码器：
 
@@ -52,8 +56,8 @@ FRAMES=717 \
 bash self-forcing/generate.sh
 ```
 
+设置 `MODE=bf16` 可以运行不量化的对照生成；该模式不需要 `CONFIG` 和
+`PARAM_DIR`。`pipeline_report.json` 中保存总耗时、每个 GPU 的耗时和最高显存占用。
 
-设置 `MODE=bf16` 可以运行不量化的对照生成；该模式不需要 `CONFIG` 和`PARAM_DIR`。
- `pipeline_report.json` 中保存总耗时、每个 GPU的耗时和最高显存占用。
-
-两个入口都会检查 `stride=1560`、30 层、12 heads、head dimension 128 和 pre-RoPE normalized K。生成长度还会检查是否真正触发 TempoKV。
+两个入口都会检查 `stride=1560`、30 层、12 heads、head dimension 128 和
+pre-RoPE normalized K。生成长度还会检查是否真正触发 TempoKV。

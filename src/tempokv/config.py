@@ -3,7 +3,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 
-
 @dataclass(frozen=True, slots=True)
 class CodecConfig:
     """Runtime quantization settings shared by the K and V codecs."""
