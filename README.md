@@ -2,199 +2,65 @@
 
 [中文使用指南](assets/usage_zh.md) · [INT2 配置](configs/int2.json) · [INT4 配置](configs/int4.json)
 
-TempoKV is a compact implementation of predictive residual quantization for
-attention KV caches. It keeps the three pieces needed by the runtime:
-
-- K is predicted from multiple reconstructed history units, with separate
-  warm-up parameters for one, two, and three available histories.
-- V is predicted from the reconstructed K of the same unit with a per-head
-  CrossKV affine projection.
-- Only the prediction residual is quantized after the first anchor unit.
-
-The package includes parameter fitting, a plain PyTorch reference decoder, and
-fused Triton decoders for NVIDIA GPUs. The `self-forcing/` directory contains
-the first model adapter and its fit-to-video entry point.
+TempoKV fits, quantizes, and reconstructs attention KV caches. The repository
+provides the codec, a plain PyTorch reference decoder, and optional Triton CUDA
+decoders. See the [Chinese usage guide](assets/usage_zh.md) for details, and
+[self-forcing/README.md](self-forcing/README.md) for the Self-Forcing model
+adapter.
 
 ## Installation
+
+CPU or PyTorch reference path:
 
 ```bash
 pip install -e .
 ```
 
-For the GPU decoder, install a Triton version compatible with the installed
-PyTorch and CUDA runtime:
+NVIDIA GPU Triton decoders:
 
 ```bash
 pip install -e ".[cuda]"
 ```
 
-## Script quickstart
+Two codec configs are provided:
 
-Fit parameters from a clean `.npz` trace containing `keys`, `values`, and an
-optional `layer_ids` array. Clean traces use `[L,...,T,H,D]`:
+- `configs/int2.json`: INT2 K/V residuals with an INT4 first anchor unit.
+- `configs/int4.json`: INT4 K/V residuals and INT4 first anchor unit.
 
-```bash
-python scripts/fit_params.py clean_kv_trace.npz \
-  --config configs/int2.json \
-  --output-dir fit_output \
-  --history-length 3
-```
+## Self-Forcing pipeline
 
-Quantize and reconstruct an exported cache whose `keys` and `values` use
-`[B,H,S,D]` or `[L,B,H,S,D]`:
+Two shell scripts. All settings are passed as environment variables. Run
+preparation once to collect a clean trace and fit parameters:
 
 ```bash
-python scripts/generate.py exported_cache.npz reconstructed_int2 \
-  --config configs/int2.json \
-  --k-params fit_output/k_temporal.npz \
-  --v-params fit_output/v_cross_kv.npz \
-  --device cpu --no-triton
+TRACE_RUNNER=/path/to/self-forcing-trace-runner.sh \
+CHECKPOINT=/models/self_forcing_dmd.pt \
+WAN_MODEL_DIR=/models/Wan2.1-T2V-1.3B \
+PROMPTS=assets/fit_prompts.txt \
+WORK_DIR=runs/self_forcing_prepare \
+CONFIG=configs/int2.json \
+bash self-forcing/prepare.sh
 ```
 
-This second command only round-trips exported cache tensors; it does not run a
-model or generate images or video. See the [Chinese usage guide](assets/usage_zh.md)
-for trace preparation, tuning, CUDA/Triton behavior, and real-model integration.
+Generate videos from the fitted parameters, repeatable with different prompts:
 
-## Self-Forcing video pipeline
-
-Self-Forcing uses two shell scripts. `self-forcing/prepare.sh` collects a clean
-trace and fits parameters once; `self-forcing/generate.sh` then generates
-videos from those parameters any number of times. All settings are passed as
-environment variables. Set `MODE=tempokv` (default) for TempoKV quantization or
-`MODE=bf16` for an unquantized baseline; both modes write wall-clock latency
-and peak GPU memory to `pipeline_report.json`.
-
-See [self-forcing/README.md](self-forcing/README.md) for the commands, trace
-contract, model requirements, and quality metrics, or the
-[Chinese guide](assets/usage_zh.md) for a condensed walkthrough.
-
-## Runtime
-
-```python
-import torch
-
-from tempokv import (
-    CodecConfig,
-    CrossKVParameters,
-    TempoKVCodec,
-    TemporalParameters,
-)
-
-k_parameters = TemporalParameters.load("k_temporal.npz")
-v_parameters = CrossKVParameters.load("v_cross_kv.npz")
-
-codec = TempoKVCodec(
-    k_parameters,
-    v_parameters,
-    CodecConfig(
-        k_bits=2,
-        v_bits=2,
-        anchor_bits=4,
-        group_size=64,
-        stride=1560,
-        residual_mode="asymmetric",
-        reconstruction_dtype="bfloat16",
-        use_triton=True,
-        strict_triton=True,
-    ),
-)
-
-packed = codec.encode(key_cache, value_cache, layer=layer_index)
-key_rebuilt, value_rebuilt = codec.decode(
-    packed, output_dtype=torch.bfloat16
-)
+```bash
+MODE=tempokv \
+MODEL_REPO=/path/to/self-forcing-model-repo \
+CHECKPOINT=/models/self_forcing_dmd.pt \
+WAN_MODEL_DIR=/models/Wan2.1-T2V-1.3B \
+PROMPTS=assets/generation_prompts.txt \
+PARAM_DIR=parameters \
+OUTPUT_DIR=results/self_forcing \
+CONFIG=configs/int2.json \
+FRAMES=717 \
+bash self-forcing/generate.sh
 ```
 
-The order and reconstruction dtype are part of the format: K is encoded and
-reconstructed first, then V uses that exact reconstructed K. Decoding follows
-the same order. Missing or
-mismatched parameters or dtypes raise an error instead of silently changing
-the closed loop.
+Set `MODE=bf16` for an unquantized baseline; that mode does not need `CONFIG`
+or `PARAM_DIR`. `pipeline_report.json` records total wall-clock time, per-GPU
+latency, and peak GPU memory.
 
-## Parameter fitting
-
-The closed-loop fitting entry point starts from clean traces, repeatedly
-reconstructs K with the target quantizer, and fits V from the final
-reconstructed K:
-
-```python
-from tempokv import fit_predictors
-
-k_parameters, v_parameters = fit_predictors(
-    clean_k,
-    clean_v,
-    config=config,
-    history_length=3,
-    iterations=2,
-    temporal_ridge=0.1,
-    cross_ridge=0.1,
-)
-```
-
-Clean traces use `[L, ..., T, H, D]`. The low-level fitting functions can also
-operate directly on prepared tensors:
-
-```python
-from tempokv import fit_cross_kv, fit_temporal
-
-k_parameters = fit_temporal(
-    reconstructed_k,
-    clean_k,
-    history_length=3,
-    shared=False,
-    ridge=0.1,
-    max_gain=1.0,
-    stride=1560,
-)
-
-v_parameters = fit_cross_kv(
-    reconstructed_k_by_layer,
-    clean_v_by_layer,
-    ridge=0.1,
-    stride=1560,
-)
-```
-
-Temporal fitting expects `[..., T, H, D]`; `T` is the unit or frame order.
-CrossKV fitting expects `[L, ..., H, D]`; `L` is the layer axis and the middle
-dimensions are pooled observations. Fit K from decoder-visible reconstructed
-history, then fit V from the same reconstructed K used by the runtime.
-
-Temporal parameters support three sharing levels:
-
-- `[P,P,D]`: shared across layers and heads;
-- `[P,P,H,D]`: separate heads, shared across layers;
-- `[L,P,P,H,D]`: separate layers and heads.
-
-CrossKV parameters use `[L,H,D,D]` weights and `[L,H,D]` bias. Both parameter
-types use numerical-only `.npz` files loaded with pickle disabled.
-
-## Quantization format
-
-- Supported stored widths: INT2, INT4, and INT8.
-- INT2 and INT4 values are packed into bytes.
-- The anchor is symmetrically quantized.
-- Residuals support symmetric quantization and asymmetric zero-point
-  quantization. The latter is the default.
-- Scale storage supports `float32`, `float16`, and `bfloat16`.
-
-## GPU decoder
-
-The Triton path fuses prediction, residual unpacking, scaling, and cache
-reconstruction. It contains dedicated temporal and CrossKV kernels, plus
-persistent variants that decode several regular units per launch. Unsupported
-layouts fall back to PyTorch unless `strict_triton=True`.
-
-For multi-process jobs, isolate the compilation cache before the first decode:
-
-```python
-from tempokv import configure_triton_cache
-
-configure_triton_cache("/fast/local/cache")
-```
-
-## Runtime validation
-
-Use the 27-frame, one-prompt Self-Forcing check before a full generation run.
-It verifies video output, peak GPU memory, latency, and both accelerated cache
-paths. See [self-forcing/README.md](self-forcing/README.md#a100-快速验收).
+Both entry points validate `stride=1560`, 30 layers, 12 heads, head dimension
+128, and pre-RoPE normalized K. Generation also checks that TempoKV is actually
+triggered.
