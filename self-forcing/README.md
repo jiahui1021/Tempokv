@@ -142,15 +142,56 @@ performance.launcher_seconds
 performance.max_worker_seconds
 performance.peak_allocated_gib
 performance.peak_reserved_gib
+performance.decode_routes
 performance.ranks[]
 ```
 
+`decode_routes` 记录实际调用的 CUDA 路径。严格模式下，TempoKV 生成必须同时
+出现 `temporal_persistent_direct` 和 `cross_kv_persistent_direct`；缺少任意一项
+都会报错，防止在不知情的情况下使用慢速路径。
+
 TempoKV 和 BF16 应使用不同的 `OUTPUT_DIR`，避免视频及报告互相覆盖。
+
+`LOCAL_ATTN_SIZE` 默认是 180。比较 TempoKV 与 BF16 时，两次运行必须使用相同
+的 `FRAMES`、`LOCAL_ATTN_SIZE`、prompt、seed 和 GPU 数量。
 
 `FRAMES` 至少为 27。更短的运行不会触发 Self-Forcing 的旧 cache span 压缩，
 入口会直接拒绝。
 
 生成阶段默认强制使用 Triton 严格模式，底层算子不可用时会直接报错。功能调试时可以设置 `ALLOW_TRITON_FALLBACK=1`，此时使用 JSON 中的 `use_triton` 和 `strict_triton` 设置。
+
+### A100 快速验收
+
+27 帧、单条 prompt 的运行会触发首次量化，也足以检查两条直接 CUDA 路径。
+使用与正式生成相同的模型、参数和配置，只把输出目录换成独立目录：
+
+```bash
+MODE=tempokv \
+MODEL_REPO=/path/to/self-forcing-model-repo \
+CHECKPOINT=/models/self_forcing_dmd.pt \
+WAN_MODEL_DIR=/models/Wan2.1-T2V-1.3B \
+PROMPTS=assets/generation_prompts.txt \
+PARAM_DIR=parameters \
+OUTPUT_DIR=results/self_forcing_smoke \
+CONFIG=configs/int2.json \
+TRITON_CACHE=/tmp/tempokv-triton \
+NUM_GPUS=1 \
+FRAMES=27 \
+START_INDEX=0 \
+END_INDEX=1 \
+bash self-forcing/generate.sh
+```
+
+查看耗时、峰值显存和实际 CUDA 路径：
+
+```bash
+jq '.performance | {
+  max_worker_seconds,
+  peak_allocated_gib,
+  peak_reserved_gib,
+  decode_routes
+}' results/self_forcing_smoke/pipeline_report.json
+```
 
 无 GPU 时，可以在上述任一组完整命令中额外设置 `DRY_RUN=1`，只检查输入和最终命令，不执行采集、拟合或生成。
 

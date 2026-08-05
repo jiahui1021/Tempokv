@@ -25,13 +25,43 @@ def _record(route: str) -> None:
     _ROUTE_COUNTS[route] = _ROUTE_COUNTS.get(route, 0) + 1
 
 
+def _route_name(route: str, direct_output: bool) -> str:
+    return f"{route}_direct" if direct_output else route
+
+
+@triton.jit
+def _strided_bhsd_offsets(
+    batch_head,
+    token,
+    channel,
+    heads: tl.constexpr,
+    stride_b,
+    stride_h,
+    stride_s,
+    stride_d,
+):
+    batch = batch_head // heads
+    head = batch_head - batch * heads
+    return (
+        batch.to(tl.int64) * stride_b
+        + head.to(tl.int64) * stride_h
+        + token[:, None].to(tl.int64) * stride_s
+        + channel[None, :].to(tl.int64) * stride_d
+    )
+
+
 @triton.jit
 def _anchor_decode_kernel(
     quant_ptr,
     scale_ptr,
     output_ptr,
+    output_stride_b,
+    output_stride_h,
+    output_stride_s,
+    output_stride_d,
     sequence: tl.constexpr,
     unit_length: tl.constexpr,
+    heads: tl.constexpr,
     width: tl.constexpr,
     packed_width: tl.constexpr,
     scale_width: tl.constexpr,
@@ -71,10 +101,15 @@ def _anchor_decode_kernel(
     )
     scale = tl.load(scale_ptr + scale_offset, mask=valid, other=1.0).to(tl.float32)
     value = (unsigned - ((1 << (bits - 1)) - 1)).to(tl.float32) * scale
-    output_offset = (
-        batch_head * sequence * width
-        + token[:, None] * width
-        + channel[None, :]
+    output_offset = _strided_bhsd_offsets(
+        batch_head,
+        token,
+        channel,
+        heads,
+        output_stride_b,
+        output_stride_h,
+        output_stride_s,
+        output_stride_d,
     )
     tl.store(output_ptr + output_offset, value, mask=valid)
 
@@ -87,6 +122,10 @@ def _temporal_residual_decode_kernel(
     weight_ptr,
     bias_ptr,
     output_ptr,
+    output_stride_b,
+    output_stride_h,
+    output_stride_s,
+    output_stride_d,
     sequence: tl.constexpr,
     residual_sequence: tl.constexpr,
     heads: tl.constexpr,
@@ -113,10 +152,15 @@ def _temporal_residual_decode_kernel(
     prediction = tl.zeros((block_s, block_d), tl.float32)
     for lag in tl.static_range(0, order):
         previous_token = current_start - (lag + 1) * stride + token
-        previous_offset = (
-            batch_head * sequence * width
-            + previous_token[:, None] * width
-            + channel[None, :]
+        previous_offset = _strided_bhsd_offsets(
+            batch_head,
+            previous_token,
+            channel,
+            heads,
+            output_stride_b,
+            output_stride_h,
+            output_stride_s,
+            output_stride_d,
         )
         previous = tl.load(output_ptr + previous_offset, mask=valid, other=0.0).to(tl.float32)
         if per_head:
@@ -165,10 +209,15 @@ def _temporal_residual_decode_kernel(
     else:
         residual = (unsigned - ((1 << (bits - 1)) - 1)).to(tl.float32) * scale
     output_token = current_start + token
-    output_offset = (
-        batch_head * sequence * width
-        + output_token[:, None] * width
-        + channel[None, :]
+    output_offset = _strided_bhsd_offsets(
+        batch_head,
+        output_token,
+        channel,
+        heads,
+        output_stride_b,
+        output_stride_h,
+        output_stride_s,
+        output_stride_d,
     )
     tl.store(output_ptr + output_offset, prediction + residual, mask=valid)
 
@@ -181,6 +230,10 @@ def _temporal_persistent_decode_kernel(
     weight_ptr,
     bias_ptr,
     output_ptr,
+    output_stride_b,
+    output_stride_h,
+    output_stride_s,
+    output_stride_d,
     sequence: tl.constexpr,
     residual_sequence: tl.constexpr,
     heads: tl.constexpr,
@@ -256,10 +309,15 @@ def _temporal_persistent_decode_kernel(
         for lag in tl.static_range(0, history_length):
             if lag < order:
                 previous_token = (unit_index - lag - 1) * stride + token
-                previous_offset = (
-                    batch_head * sequence * width
-                    + previous_token[:, None] * width
-                    + channel[None, :]
+                previous_offset = _strided_bhsd_offsets(
+                    batch_head,
+                    previous_token,
+                    channel,
+                    heads,
+                    output_stride_b,
+                    output_stride_h,
+                    output_stride_s,
+                    output_stride_d,
                 )
                 previous = tl.load(
                     output_ptr + previous_offset, mask=valid, other=0.0
@@ -280,10 +338,15 @@ def _temporal_persistent_decode_kernel(
                 )
                 prediction += previous * coefficient[None, :]
         current = (prediction + residual).to(tl.bfloat16).to(tl.float32)
-        output_offset = (
-            batch_head * sequence * width
-            + current_token[:, None] * width
-            + channel[None, :]
+        output_offset = _strided_bhsd_offsets(
+            batch_head,
+            current_token,
+            channel,
+            heads,
+            output_stride_b,
+            output_stride_h,
+            output_stride_s,
+            output_stride_d,
         )
         tl.store(output_ptr + output_offset, current, mask=valid)
 
@@ -297,6 +360,14 @@ def _cross_kv_residual_decode_kernel(
     weight_ptr,
     bias_ptr,
     output_ptr,
+    source_stride_b,
+    source_stride_h,
+    source_stride_s,
+    source_stride_d,
+    output_stride_b,
+    output_stride_h,
+    output_stride_s,
+    output_stride_d,
     sequence: tl.constexpr,
     residual_sequence: tl.constexpr,
     heads: tl.constexpr,
@@ -320,10 +391,15 @@ def _cross_kv_residual_decode_kernel(
     input_channel = tl.arange(0, block_k)
     valid = (token[:, None] < unit_length) & (channel[None, :] < width)
     source_token = current_start + token
-    source_offset = (
-        batch_head * sequence * width
-        + source_token[:, None] * width
-        + input_channel[None, :]
+    source_offset = _strided_bhsd_offsets(
+        batch_head,
+        source_token,
+        input_channel,
+        heads,
+        source_stride_b,
+        source_stride_h,
+        source_stride_s,
+        source_stride_d,
     )
     source = tl.load(
         source_ptr + source_offset,
@@ -380,10 +456,15 @@ def _cross_kv_residual_decode_kernel(
         residual = (unsigned.to(tl.float32) - zero) * scale
     else:
         residual = (unsigned - ((1 << (bits - 1)) - 1)).to(tl.float32) * scale
-    output_offset = (
-        batch_head * sequence * width
-        + source_token[:, None] * width
-        + channel[None, :]
+    output_offset = _strided_bhsd_offsets(
+        batch_head,
+        source_token,
+        channel,
+        heads,
+        output_stride_b,
+        output_stride_h,
+        output_stride_s,
+        output_stride_d,
     )
     tl.store(output_ptr + output_offset, prediction + residual, mask=valid)
 
@@ -397,6 +478,14 @@ def _cross_kv_persistent_decode_kernel(
     weight_ptr,
     bias_ptr,
     output_ptr,
+    source_stride_b,
+    source_stride_h,
+    source_stride_s,
+    source_stride_d,
+    output_stride_b,
+    output_stride_h,
+    output_stride_s,
+    output_stride_d,
     sequence: tl.constexpr,
     residual_sequence: tl.constexpr,
     heads: tl.constexpr,
@@ -464,10 +553,15 @@ def _cross_kv_persistent_decode_kernel(
             residual = (unsigned.to(tl.float32) - zero) * scale
         else:
             residual = (unsigned - ((1 << (bits - 1)) - 1)).to(tl.float32) * scale
-        source_offset = (
-            batch_head * sequence * width
-            + current_token[:, None] * width
-            + input_channel[None, :]
+        source_offset = _strided_bhsd_offsets(
+            batch_head,
+            current_token,
+            input_channel,
+            heads,
+            source_stride_b,
+            source_stride_h,
+            source_stride_s,
+            source_stride_d,
         )
         source = tl.load(
             source_ptr + source_offset,
@@ -487,10 +581,15 @@ def _cross_kv_persistent_decode_kernel(
         prediction = tl.dot(
             source, weight, out_dtype=tl.float32, input_precision="ieee"
         ) + bias[None, :]
-        output_offset = (
-            batch_head * sequence * width
-            + current_token[:, None] * width
-            + channel[None, :]
+        output_offset = _strided_bhsd_offsets(
+            batch_head,
+            current_token,
+            channel,
+            heads,
+            output_stride_b,
+            output_stride_h,
+            output_stride_s,
+            output_stride_d,
         )
         tl.store(output_ptr + output_offset, prediction + residual, mask=valid)
 
@@ -516,11 +615,42 @@ def _supported(packed: "PackedTensor", source: torch.Tensor | None) -> bool:
     return packed.temporal is not None
 
 
+def _prepare_output(
+    packed: "PackedTensor",
+    output_dtype: torch.dtype,
+    output_tensor: torch.Tensor | None,
+) -> tuple[torch.Tensor, bool] | None:
+    batch, heads, sequence, width = packed.shape
+    device = packed.anchor_quant.device
+    if output_tensor is None:
+        return (
+            torch.empty(packed.shape, device=device, dtype=output_dtype),
+            False,
+        )
+    if (
+        not output_tensor.is_cuda
+        or output_tensor.device != device
+        or output_tensor.dtype != output_dtype
+        or tuple(output_tensor.shape) != (batch, sequence, heads, width)
+        or not output_tensor.is_contiguous()
+    ):
+        return None
+    return output_tensor, True
+
+
+def _logical_bhsd_output(
+    output: torch.Tensor,
+    output_bshd: bool,
+) -> torch.Tensor:
+    return output.permute(0, 2, 1, 3) if output_bshd else output
+
+
 def decode(
     packed: "PackedTensor",
     *,
     source: torch.Tensor | None,
     output_dtype: torch.dtype,
+    output_tensor: torch.Tensor | None = None,
 ) -> torch.Tensor | None:
     """Fused GPU prediction and residual decode for TempoKV's two runtime routes."""
     if not _supported(packed, source):
@@ -530,8 +660,18 @@ def decode(
     block_s = 16
     block_d = max(16, min(128, triton.next_power_of_2(width)))
     scale_width = width // packed.group_size
-    output = torch.empty(packed.shape, device=packed.anchor_quant.device, dtype=output_dtype)
-    output_flat = output.view(batch_heads, sequence, width)
+    prepared_output = _prepare_output(packed, output_dtype, output_tensor)
+    if prepared_output is None:
+        return None
+    output, output_bshd = prepared_output
+    if output_bshd:
+        output_stride_b, output_stride_s, output_stride_h, output_stride_d = (
+            output.stride()
+        )
+    else:
+        output_stride_b, output_stride_h, output_stride_s, output_stride_d = (
+            output.stride()
+        )
     anchor_length = packed.unit_lengths[0]
     anchor_packed_width = width if packed.anchor_bits == 8 else width // (8 // packed.anchor_bits)
     anchor_grid = (
@@ -542,9 +682,14 @@ def decode(
     _anchor_decode_kernel[anchor_grid](
         packed.anchor_quant.contiguous().view(batch_heads, anchor_length, anchor_packed_width),
         packed.anchor_scale.contiguous().view(batch_heads, anchor_length, scale_width),
-        output_flat,
+        output,
+        output_stride_b,
+        output_stride_h,
+        output_stride_s,
+        output_stride_d,
         sequence,
         anchor_length,
+        heads,
         width,
         anchor_packed_width,
         scale_width,
@@ -554,8 +699,8 @@ def decode(
         block_d,
     )
     if packed.residual_quant is None:
-        _record("anchor")
-        return output
+        _record(_route_name("anchor", output_bshd))
+        return _logical_bhsd_output(output, output_bshd)
     assert packed.residual_scale is not None
     residual_sequence = int(packed.residual_quant.shape[2])
     residual_packed_width = width if packed.bits == 8 else width // (8 // packed.bits)
@@ -593,7 +738,11 @@ def decode(
                     zero,
                     parameters.history_weights.contiguous(),
                     parameters.history_bias.contiguous(),
-                    output_flat,
+                    output,
+                    output_stride_b,
+                    output_stride_h,
+                    output_stride_s,
+                    output_stride_d,
                     sequence,
                     residual_sequence,
                     heads,
@@ -611,8 +760,8 @@ def decode(
                     block_s,
                     block_d,
                 )
-            _record("temporal_persistent")
-            return output
+            _record(_route_name("temporal_persistent", output_bshd))
+            return _logical_bhsd_output(output, output_bshd)
         for unit_index, unit_length in enumerate(packed.unit_lengths[1:], start=1):
             order = min(unit_index, parameters.history_length)
             weights = parameters.history_weights[order - 1, :order].contiguous()
@@ -628,7 +777,11 @@ def decode(
                 zero,
                 weights,
                 bias,
-                output_flat,
+                output,
+                output_stride_b,
+                output_stride_h,
+                output_stride_s,
+                output_stride_d,
                 sequence,
                 residual_sequence,
                 heads,
@@ -649,17 +802,20 @@ def decode(
             )
             current_start += unit_length
             residual_start += unit_length
-        _record("temporal")
-        return output
+        _record(_route_name("temporal", output_bshd))
+        return _logical_bhsd_output(output, output_bshd)
 
     assert source is not None and packed.cross_kv is not None
     parameters = packed.cross_kv.to(output.device)
     if parameters.layered:
         return None
-    source_flat = source.contiguous().view(batch_heads, sequence, width)
+    source_stride_b, source_stride_h, source_stride_s, source_stride_d = (
+        source.stride()
+    )
     weight = parameters.weight.contiguous()
     bias = parameters.bias.contiguous()
     block_k = max(16, triton.next_power_of_2(width))
+    cross_block_d = 32 if width >= 128 else block_d
     if (
         output_dtype == torch.bfloat16
         and source.dtype == torch.bfloat16
@@ -669,7 +825,7 @@ def decode(
         grid = (
             batch_heads,
             _ceil_div(packed.stride, block_s),
-            _ceil_div(width, block_d),
+            _ceil_div(width, cross_block_d),
         )
         for start_unit in range(1, len(packed.unit_lengths), 8):
             chunk_units = min(8, len(packed.unit_lengths) - start_unit)
@@ -677,10 +833,18 @@ def decode(
                 quant,
                 scale,
                 zero,
-                source_flat,
+                source,
                 weight,
                 bias,
-                output_flat,
+                output,
+                source_stride_b,
+                source_stride_h,
+                source_stride_s,
+                source_stride_d,
+                output_stride_b,
+                output_stride_h,
+                output_stride_s,
+                output_stride_d,
                 sequence,
                 residual_sequence,
                 heads,
@@ -694,25 +858,33 @@ def decode(
                 packed.group_size,
                 asymmetric,
                 block_s,
-                block_d,
+                cross_block_d,
                 block_k,
             )
-        _record("cross_kv_persistent")
-        return output
+        _record(_route_name("cross_kv_persistent", output_bshd))
+        return _logical_bhsd_output(output, output_bshd)
     for unit_length in packed.unit_lengths[1:]:
         grid = (
             batch_heads,
             _ceil_div(unit_length, block_s),
-            _ceil_div(width, block_d),
+            _ceil_div(width, cross_block_d),
         )
         _cross_kv_residual_decode_kernel[grid](
             quant,
             scale,
             zero,
-            source_flat,
+            source,
             weight,
             bias,
-            output_flat,
+            output,
+            source_stride_b,
+            source_stride_h,
+            source_stride_s,
+            source_stride_d,
+            output_stride_b,
+            output_stride_h,
+            output_stride_s,
+            output_stride_d,
             sequence,
             residual_sequence,
             heads,
@@ -726,10 +898,10 @@ def decode(
             packed.group_size,
             asymmetric,
             block_s,
-            block_d,
+            cross_block_d,
             block_k,
         )
         current_start += unit_length
         residual_start += unit_length
-    _record("cross_kv")
-    return output
+    _record(_route_name("cross_kv", output_bshd))
+    return _logical_bhsd_output(output, output_bshd)

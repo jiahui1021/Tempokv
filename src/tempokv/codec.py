@@ -201,12 +201,18 @@ def _encode(
     source: torch.Tensor | None,
     bits: int,
     config: CodecConfig,
+    reuse_input_for_reconstruction: bool = False,
 ) -> tuple[PackedTensor, torch.Tensor]:
     _validate_input(value, config)
     batch, heads, sequence, width = map(int, value.shape)
     stride = min(config.stride, sequence)
     scale_dtype = _dtype(config.scale_dtype)
     reconstruction_dtype = _dtype(config.reconstruction_dtype)
+    if reuse_input_for_reconstruction and value.dtype != reconstruction_dtype:
+        raise ValueError(
+            "in-place reconstruction requires input dtype to match "
+            f"{reconstruction_dtype}, got {value.dtype}"
+        )
     if predictor_kind == "temporal":
         if temporal is None:
             raise ValueError("K encoding requires temporal parameters")
@@ -218,6 +224,8 @@ def _encode(
             raise ValueError("V encoding requires CrossKV parameters and reconstructed K")
         if tuple(source.shape) != tuple(value.shape):
             raise ValueError("reconstructed K and V must have the same shape")
+        if source.device != value.device:
+            raise ValueError("reconstructed K and V must be on the same device")
         if source.dtype != reconstruction_dtype:
             raise ValueError(
                 "reconstructed K dtype must match config.reconstruction_dtype "
@@ -239,14 +247,53 @@ def _encode(
         width,
         torch.float32,
     ).to(reconstruction_dtype)
-    reconstruction = torch.empty(
-        value.shape, device=value.device, dtype=reconstruction_dtype
+    reconstruction = (
+        value
+        if reuse_input_for_reconstruction
+        else torch.empty(value.shape, device=value.device, dtype=reconstruction_dtype)
     )
     reconstruction[:, :, :stride] = anchor_rebuilt
     history = [anchor_rebuilt]
-    residual_quant: list[torch.Tensor] = []
-    residual_scale: list[torch.Tensor] = []
-    residual_zero_point: list[torch.Tensor] = []
+    residual_sequence = sequence - stride
+    packed_width = width if bits == 8 else width // (8 // bits)
+    scale_width = width // config.group_size
+    residual_quant = (
+        torch.empty(
+            batch,
+            heads,
+            residual_sequence,
+            packed_width,
+            device=value.device,
+            dtype=torch.uint8,
+        )
+        if residual_sequence
+        else None
+    )
+    residual_scale = (
+        torch.empty(
+            batch,
+            heads,
+            residual_sequence,
+            scale_width,
+            device=value.device,
+            dtype=scale_dtype,
+        )
+        if residual_sequence
+        else None
+    )
+    residual_zero_point = (
+        torch.empty(
+            batch,
+            heads,
+            residual_sequence,
+            scale_width,
+            device=value.device,
+            dtype=torch.uint8,
+        )
+        if residual_sequence and config.residual_mode == "asymmetric"
+        else None
+    )
+    residual_offset = 0
     unit_lengths = [stride]
 
     offset = stride
@@ -275,10 +322,14 @@ def _encode(
         if predictor_kind == "temporal":
             assert temporal is not None
             history = [rebuilt, *history[: temporal.history_length - 1]]
-        residual_quant.append(quant)
-        residual_scale.append(scale)
+        residual_end = residual_offset + unit_length
+        assert residual_quant is not None and residual_scale is not None
+        residual_quant[:, :, residual_offset:residual_end].copy_(quant)
+        residual_scale[:, :, residual_offset:residual_end].copy_(scale)
         if zero_point is not None:
-            residual_zero_point.append(zero_point)
+            assert residual_zero_point is not None
+            residual_zero_point[:, :, residual_offset:residual_end].copy_(zero_point)
+        residual_offset = residual_end
         unit_lengths.append(unit_length)
         offset += unit_length
 
@@ -294,11 +345,9 @@ def _encode(
         unit_lengths=tuple(unit_lengths),
         anchor_quant=anchor_quant,
         anchor_scale=anchor_scale,
-        residual_quant=torch.cat(residual_quant, dim=2) if residual_quant else None,
-        residual_scale=torch.cat(residual_scale, dim=2) if residual_scale else None,
-        residual_zero_point=(
-            torch.cat(residual_zero_point, dim=2) if residual_zero_point else None
-        ),
+        residual_quant=residual_quant,
+        residual_scale=residual_scale,
+        residual_zero_point=residual_zero_point,
         temporal=temporal,
         cross_kv=cross_kv,
     )
@@ -309,6 +358,8 @@ def encode_temporal(
     key: torch.Tensor,
     parameters: TemporalParameters,
     config: CodecConfig | None = None,
+    *,
+    reuse_input_for_reconstruction: bool = False,
 ) -> tuple[PackedTensor, torch.Tensor]:
     """Encode K and return both packed data and its closed-loop reconstruction."""
     resolved = config or CodecConfig()
@@ -320,6 +371,7 @@ def encode_temporal(
         source=None,
         bits=resolved.k_bits,
         config=resolved,
+        reuse_input_for_reconstruction=reuse_input_for_reconstruction,
     )
 
 
@@ -328,6 +380,8 @@ def encode_cross_kv(
     reconstructed_key: torch.Tensor,
     parameters: CrossKVParameters,
     config: CodecConfig | None = None,
+    *,
+    reuse_input_for_reconstruction: bool = False,
 ) -> tuple[PackedTensor, torch.Tensor]:
     """Encode V from reconstructed K and return its closed-loop reconstruction."""
     resolved = config or CodecConfig()
@@ -339,6 +393,7 @@ def encode_cross_kv(
         source=reconstructed_key,
         bits=resolved.v_bits,
         config=resolved,
+        reuse_input_for_reconstruction=reuse_input_for_reconstruction,
     )
 
 
@@ -347,6 +402,7 @@ def decode_tensor(
     *,
     source: torch.Tensor | None = None,
     output_dtype: torch.dtype | None = None,
+    output_tensor: torch.Tensor | None = None,
     use_triton: bool = True,
     strict_triton: bool = False,
 ) -> torch.Tensor:
@@ -359,6 +415,22 @@ def decode_tensor(
             "decode dtype must match the closed-loop reconstruction dtype "
             f"{stored_dtype}, got {output_dtype}"
         )
+    if output_tensor is not None:
+        batch, heads, sequence, width = packed.shape
+        expected_shape = (batch, sequence, heads, width)
+        if tuple(output_tensor.shape) != expected_shape:
+            raise ValueError(
+                "direct decode output must use [B,S,H,D] shape "
+                f"{expected_shape}, got {tuple(output_tensor.shape)}"
+            )
+        if output_tensor.device != packed.anchor_quant.device:
+            raise ValueError("direct decode output must be on the packed tensor device")
+        if output_tensor.dtype != output_dtype:
+            raise ValueError(
+                f"direct decode output must use {output_dtype}, got {output_tensor.dtype}"
+            )
+        if not output_tensor.is_contiguous():
+            raise ValueError("direct decode output must be contiguous BSHD")
     if packed.predictor_kind == "cross_kv":
         if source is None:
             raise ValueError("CrossKV decoding requires reconstructed K")
@@ -375,7 +447,12 @@ def decode_tensor(
         try:
             from .triton_ops import decode as decode_triton
 
-            accelerated = decode_triton(packed, source=source, output_dtype=output_dtype)
+            accelerated = decode_triton(
+                packed,
+                source=source,
+                output_dtype=output_dtype,
+                output_tensor=output_tensor,
+            )
             if accelerated is not None:
                 return accelerated
             if strict_triton:
@@ -391,7 +468,15 @@ def decode_tensor(
 
     _, _, sequence, width = packed.shape
     anchor_length = packed.unit_lengths[0]
-    output = torch.empty(packed.shape, device=packed.anchor_quant.device, dtype=output_dtype)
+    output = (
+        output_tensor.permute(0, 2, 1, 3)
+        if output_tensor is not None
+        else torch.empty(
+            packed.shape,
+            device=packed.anchor_quant.device,
+            dtype=output_dtype,
+        )
+    )
     anchor = dequantize_symmetric(
         packed.anchor_quant,
         packed.anchor_scale,
@@ -484,6 +569,61 @@ class TempoKVCodec:
         self._temporal_by_device: dict[str, TemporalParameters] = {}
         self._cross_by_device: dict[str, CrossKVParameters] = {}
 
+    def _temporal_for_layer(
+        self, device: torch.device, layer: int
+    ) -> TemporalParameters:
+        device_key = str(device)
+        parameters = self._temporal_by_device.get(device_key)
+        if parameters is None:
+            parameters = self.temporal.to(device)
+            self._temporal_by_device[device_key] = parameters
+        return parameters.for_layer(layer) if parameters.layered else parameters
+
+    def _cross_for_layer(
+        self, device: torch.device, layer: int
+    ) -> CrossKVParameters:
+        device_key = str(device)
+        parameters = self._cross_by_device.get(device_key)
+        if parameters is None:
+            parameters = self.cross_kv.to(device)
+            self._cross_by_device[device_key] = parameters
+        return parameters.for_layer(layer) if parameters.layered else parameters
+
+    def encode_key(
+        self,
+        key: torch.Tensor,
+        *,
+        layer: int = 0,
+        reuse_input: bool = False,
+    ) -> tuple[PackedTensor, torch.Tensor]:
+        """Encode one K cache, optionally reusing its input for reconstruction."""
+        temporal = self._temporal_for_layer(key.device, layer)
+        return encode_temporal(
+            key,
+            temporal,
+            self.config,
+            reuse_input_for_reconstruction=reuse_input,
+        )
+
+    def encode_value(
+        self,
+        value: torch.Tensor,
+        reconstructed_key: torch.Tensor,
+        *,
+        layer: int = 0,
+        reuse_input: bool = False,
+    ) -> PackedTensor:
+        """Encode one V cache from reconstructed K without retaining V output."""
+        cross = self._cross_for_layer(value.device, layer)
+        packed, _ = encode_cross_kv(
+            value,
+            reconstructed_key,
+            cross,
+            self.config,
+            reuse_input_for_reconstruction=reuse_input,
+        )
+        return packed
+
     def encode(
         self, key: torch.Tensor, value: torch.Tensor, *, layer: int = 0
     ) -> PackedKV:
@@ -491,19 +631,8 @@ class TempoKVCodec:
             raise ValueError("K and V must have the same shape")
         if key.device != value.device:
             raise ValueError("K and V must be on the same device")
-        device_key = str(key.device)
-        temporal_all = self._temporal_by_device.get(device_key)
-        if temporal_all is None:
-            temporal_all = self.temporal.to(key.device)
-            self._temporal_by_device[device_key] = temporal_all
-        cross_all = self._cross_by_device.get(device_key)
-        if cross_all is None:
-            cross_all = self.cross_kv.to(key.device)
-            self._cross_by_device[device_key] = cross_all
-        cross = cross_all.for_layer(layer) if cross_all.layered else cross_all
-        temporal = temporal_all.for_layer(layer) if temporal_all.layered else temporal_all
-        key_state, key_rebuilt = encode_temporal(key, temporal, self.config)
-        value_state, _ = encode_cross_kv(value, key_rebuilt, cross, self.config)
+        key_state, key_rebuilt = self.encode_key(key, layer=layer)
+        value_state = self.encode_value(value, key_rebuilt, layer=layer)
         return PackedKV(key_state, value_state)
 
     def decode(

@@ -18,6 +18,7 @@ def _write_metrics(
     peak_allocated_bytes: int,
     peak_reserved_bytes: int,
     gpu_name: str,
+    decode_routes: dict[str, int],
 ) -> None:
     metrics_dir.mkdir(parents=True, exist_ok=True)
     path = metrics_dir / f"rank-{rank}.json"
@@ -28,6 +29,7 @@ def _write_metrics(
         "peak_allocated_bytes": peak_allocated_bytes,
         "peak_reserved_bytes": peak_reserved_bytes,
         "gpu_name": gpu_name,
+        "decode_routes": decode_routes,
     }
     temporary.write_text(
         json.dumps(payload, indent=2, sort_keys=True) + "\n",
@@ -113,6 +115,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                 peak_reserved_bytes = torch.cuda.max_memory_reserved(cuda_device)
             except Exception:
                 pass
+        decode_routes: dict[str, int] = {}
+        if args.mode == "tempokv":
+            try:
+                from tempokv.triton_ops import route_report
+
+                decode_routes = route_report()
+            except Exception:
+                pass
         if metrics_dir is not None:
             try:
                 _write_metrics(
@@ -122,6 +132,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     peak_allocated_bytes=peak_allocated_bytes,
                     peak_reserved_bytes=peak_reserved_bytes,
                     gpu_name=gpu_name,
+                    decode_routes=decode_routes,
                 )
             except OSError:
                 pass

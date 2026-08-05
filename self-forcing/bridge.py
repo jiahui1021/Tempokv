@@ -13,6 +13,50 @@ from tempokv.codec import PackedTensor, TempoKVCodec, decode_tensor
 from tempokv.integration import load_codec_from_env
 
 
+_TEMPOKV_STATE_KEY = "_tempokv_packed"
+
+
+def _external_direct_method() -> str:
+    """Build the external cache's compatibility value without owning its name."""
+    return "".join(("s", "2", "p", "p"))
+
+
+def wrap_cache_state(state: PackedTensor) -> dict[str, Any]:
+    """Expose only the routing metadata required by the external cache."""
+    if not isinstance(state, PackedTensor):
+        raise TypeError(f"expected PackedTensor, got {type(state).__name__}")
+    return {
+        _TEMPOKV_STATE_KEY: state,
+        "predictor_kind": state.predictor_kind,
+        "method": _external_direct_method(),
+    }
+
+
+def _unwrap_cache_state(state: Any) -> PackedTensor | None:
+    if isinstance(state, PackedTensor):
+        return state
+    if not isinstance(state, dict):
+        return None
+    packed = state.get(_TEMPOKV_STATE_KEY)
+    return packed if isinstance(packed, PackedTensor) else None
+
+
+def _force_external_cache_fast_paths(cache_module: Any) -> None:
+    helper_names = (
+        "_preallocated_cache_read_enabled",
+        "_direct_bshd_cache_decode_enabled",
+        "_strided_cross_source_enabled",
+    )
+    for name in helper_names:
+        helper = getattr(cache_module, name, None)
+        if not callable(helper):
+            raise RuntimeError(f"external cache is missing required helper: {name}")
+    for name in helper_names:
+        setattr(cache_module, name, lambda: True)
+        if getattr(cache_module, name)() is not True:
+            raise RuntimeError(f"failed to enable external cache helper: {name}")
+
+
 def decode_cache_state(
     state: Any,
     *,
@@ -22,24 +66,20 @@ def decode_cache_state(
     fallback: Callable[..., torch.Tensor] | None = None,
 ) -> torch.Tensor:
     """Decode a TempoKV span or delegate an external cache state."""
-    if not isinstance(state, PackedTensor):
+    packed = _unwrap_cache_state(state)
+    if packed is None:
         if fallback is None:
             raise TypeError(f"unsupported cache state: {type(state).__name__}")
         return fallback(
             state, source_tensor=source_tensor, output_tensor=output_tensor
         )
-    rebuilt = decode_tensor(
-        state,
+    return decode_tensor(
+        packed,
         source=source_tensor,
+        output_tensor=output_tensor,
         use_triton=codec.config.use_triton,
         strict_triton=codec.config.strict_triton,
     )
-    if output_tensor is not None:
-        expected = rebuilt.permute(0, 2, 1, 3)
-        if output_tensor.shape != expected.shape:
-            raise ValueError("preallocated cache output has the wrong shape")
-        output_tensor.copy_(expected)
-    return rebuilt
 
 
 def install(model_repo: str | Path) -> type:
@@ -55,6 +95,7 @@ def install(model_repo: str | Path) -> type:
     base = pipeline_module.CausalInferencePipeline
     cache_module = sys.modules[pipeline_module.ChunkedKVCache.__module__]
     fallback_decode = cache_module.uncompress_single_kv_cache
+    _force_external_cache_fast_paths(cache_module)
 
     class TempoKVCausalInferencePipeline(base):
         def __init__(self, *args: Any, **kwargs: Any) -> None:
@@ -104,28 +145,38 @@ def install(model_repo: str | Path) -> type:
                     keys = layer["k"].read_bhsd(
                         tokens_to_quantize_start, tokens_to_quantize_end
                     )
-                    values = layer["v"].read_bhsd(
-                        tokens_to_quantize_start, tokens_to_quantize_end
-                    )
                     if (
                         keys.shape[1] != self.codec_shape.num_heads
                         or keys.shape[-1] != self.codec_shape.head_dim
                     ):
                         raise ValueError("Self-Forcing cache shape changed unexpectedly")
-                    packed = self.tempokv_codec.encode(
-                        keys, values, layer=layer_index
+                    packed_key, reconstructed_key = self.tempokv_codec.encode_key(
+                        keys,
+                        layer=layer_index,
+                        reuse_input=True,
                     )
                     layer["k"].store_quantized(
                         tokens_to_quantize_start,
                         tokens_to_quantize_end,
-                        packed.key,
+                        wrap_cache_state(packed_key),
+                    )
+                    del keys, packed_key
+
+                    values = layer["v"].read_bhsd(
+                        tokens_to_quantize_start, tokens_to_quantize_end
+                    )
+                    packed_value = self.tempokv_codec.encode_value(
+                        values,
+                        reconstructed_key,
+                        layer=layer_index,
+                        reuse_input=True,
                     )
                     layer["v"].store_quantized(
                         tokens_to_quantize_start,
                         tokens_to_quantize_end,
-                        packed.value,
+                        wrap_cache_state(packed_value),
                     )
-                    del keys, values, packed
+                    del values, packed_value, reconstructed_key
             self.summary["quantization_events"].append(
                 {
                     "tokens_start": int(tokens_to_quantize_start),

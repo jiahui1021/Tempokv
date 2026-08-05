@@ -215,6 +215,15 @@ def _load_worker_metrics(
     peak_reserved_bytes = max(
         metric["peak_reserved_bytes"] for metric in rank_metrics
     )
+    decode_routes: dict[str, int] = {}
+    for metric in rank_metrics:
+        routes = metric.get("decode_routes", {})
+        if not isinstance(routes, dict):
+            raise RuntimeError("worker decode_routes must be an object")
+        for name, count in routes.items():
+            if not isinstance(name, str) or not isinstance(count, int) or count < 0:
+                raise RuntimeError("worker decode_routes contains an invalid entry")
+            decode_routes[name] = decode_routes.get(name, 0) + count
     return {
         "max_worker_seconds": max(
             metric["wall_seconds"] for metric in rank_metrics
@@ -223,6 +232,7 @@ def _load_worker_metrics(
         "peak_reserved_bytes": peak_reserved_bytes,
         "peak_allocated_gib": peak_allocated_bytes / (1024**3),
         "peak_reserved_gib": peak_reserved_bytes / (1024**3),
+        "decode_routes": decode_routes,
         "ranks": rank_metrics,
     }
 
@@ -366,6 +376,25 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         raise subprocess.CalledProcessError(
             completed.returncode, generation_command
         )
+    if (
+        args.mode == "tempokv"
+        and not args.allow_triton_fallback
+        and not args.skip_existing
+    ):
+        required_routes = (
+            "temporal_persistent_direct",
+            "cross_kv_persistent_direct",
+        )
+        missing_routes = [
+            route
+            for route in required_routes
+            if performance["decode_routes"].get(route, 0) <= 0
+        ]
+        if missing_routes:
+            raise RuntimeError(
+                "TempoKV direct decode fast path was not used: "
+                + ", ".join(missing_routes)
+            )
     videos = sorted(paths["videos"].rglob("*.mp4"))
     if not videos or any(path.stat().st_size == 0 for path in videos):
         raise RuntimeError("Self-Forcing completed without a non-empty MP4")
