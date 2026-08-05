@@ -288,7 +288,7 @@ def test_closed_loop_fitting_uses_reconstructed_keys(monkeypatch) -> None:
     # The final Cross fit receives a fresh rollout from the selected temporal
     # parameters, rather than a stale reconstruction from the previous round.
     expected_final = fitting._reconstruct_temporal_trace(keys, temporal, config)
-    torch.testing.assert_close(cross_sources[0], expected_final)
+    torch.testing.assert_close(cross_sources[0], expected_final[..., 1:, :, :])
 
 
 @pytest.mark.parametrize(

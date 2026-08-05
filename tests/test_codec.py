@@ -145,6 +145,35 @@ def test_runtime_rejects_parameter_stride_mismatch() -> None:
         encode_temporal(key, temporal_parameters(stride=8), config(stride=4))
 
 
+def test_codec_rejects_parameter_config_signature_mismatch() -> None:
+    settings = config(stride=4)
+    temporal = TemporalParameters(
+        torch.zeros(1, 1, 8),
+        torch.zeros(1, 8),
+        stride=4,
+        codec_signature=settings.format_signature(),
+    )
+    with pytest.raises(ValueError, match="different codec config"):
+        TempoKVCodec(temporal, cross_parameters(stride=4), config(k_bits=4))
+
+
+def test_codec_rejects_parameters_not_fitted_together() -> None:
+    temporal = TemporalParameters(
+        torch.zeros(1, 1, 8),
+        torch.zeros(1, 8),
+        stride=4,
+        parameter_set_id="k-set",
+    )
+    cross = CrossKVParameters(
+        torch.eye(8).repeat(2, 1, 1),
+        torch.zeros(2, 8),
+        stride=4,
+        parameter_set_id="v-set",
+    )
+    with pytest.raises(ValueError, match="not fitted together"):
+        TempoKVCodec(temporal, cross, config())
+
+
 def test_decode_rejects_different_closed_loop_dtype() -> None:
     key = torch.randn(1, 2, 8, 8)
     packed, _ = encode_temporal(key, temporal_parameters(), config())

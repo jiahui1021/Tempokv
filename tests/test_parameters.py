@@ -41,3 +41,21 @@ def test_explicit_layer_ids_are_used_instead_of_array_position() -> None:
     bias = torch.zeros(2, 2, 4)
     parameters = CrossKVParameters(weight, bias, layer_ids=(7, 19))
     torch.testing.assert_close(parameters.for_layer(19).weight, weight[1])
+
+
+def test_parameter_codec_signature_roundtrip(tmp_path) -> None:
+    signature = "tempokv-codec-v1:test"
+    value = TemporalParameters(
+        torch.zeros(1, 1, 2),
+        torch.zeros(1, 2),
+        stride=4,
+        codec_signature=signature,
+        parameter_set_id="paired",
+        coordinate_system="pre_rope_normalized",
+    )
+    path = tmp_path / "signed.npz"
+    value.save(path)
+    loaded = TemporalParameters.load(path)
+    assert loaded.codec_signature == signature
+    assert loaded.parameter_set_id == "paired"
+    assert loaded.coordinate_system == "pre_rope_normalized"

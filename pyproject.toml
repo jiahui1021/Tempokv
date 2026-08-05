@@ -17,6 +17,11 @@ dependencies = [
 [project.optional-dependencies]
 cuda = ["triton>=2.2"]
 test = ["pytest>=8"]
+metrics = [
+  "lpips>=0.1.4",
+  "opencv-python>=4.8",
+  "scikit-image>=0.22",
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]

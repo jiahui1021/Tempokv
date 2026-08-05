@@ -456,6 +456,31 @@ class TempoKVCodec:
         self.temporal = temporal
         self.cross_kv = cross_kv
         self.config = config or CodecConfig()
+        expected_signature = self.config.format_signature()
+        for name, parameters in (("K", temporal), ("V", cross_kv)):
+            signature = parameters.codec_signature
+            if signature is not None and signature != expected_signature:
+                raise ValueError(
+                    f"{name} parameters were fitted with a different codec config"
+                )
+        if (
+            temporal.codec_signature is not None
+            and cross_kv.codec_signature is not None
+            and temporal.codec_signature != cross_kv.codec_signature
+        ):
+            raise ValueError("K and V parameters use different codec configs")
+        if (
+            temporal.parameter_set_id is not None
+            and cross_kv.parameter_set_id is not None
+            and temporal.parameter_set_id != cross_kv.parameter_set_id
+        ):
+            raise ValueError("K and V parameters were not fitted together")
+        if (
+            temporal.coordinate_system is not None
+            and cross_kv.coordinate_system is not None
+            and temporal.coordinate_system != cross_kv.coordinate_system
+        ):
+            raise ValueError("K and V parameters use different coordinate systems")
         self._temporal_by_device: dict[str, TemporalParameters] = {}
         self._cross_by_device: dict[str, CrossKVParameters] = {}
 

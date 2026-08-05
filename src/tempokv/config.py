@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 
 
 @dataclass(frozen=True, slots=True)
@@ -36,3 +37,19 @@ class CodecConfig:
             raise ValueError(
                 "reconstruction_dtype must be float32, float16, or bfloat16"
             )
+
+    def format_signature(self) -> str:
+        """Return a stable identity for settings used during fitting."""
+        payload = {
+            "anchor_bits": self.anchor_bits,
+            "group_size": self.group_size,
+            "k_bits": self.k_bits,
+            "reconstruction_dtype": self.reconstruction_dtype,
+            "residual_mode": self.residual_mode,
+            "scale_dtype": self.scale_dtype,
+            "stride": self.stride,
+            "v_bits": self.v_bits,
+        }
+        return "tempokv-codec-v1:" + json.dumps(
+            payload, sort_keys=True, separators=(",", ":")
+        )

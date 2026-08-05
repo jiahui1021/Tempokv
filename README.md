@@ -1,5 +1,7 @@
 # TempoKV
 
+[中文使用指南](docs/usage_zh.md) · [INT2 配置](configs/int2.json) · [INT4 配置](configs/int4.json)
+
 TempoKV is a compact implementation of predictive residual quantization for
 attention KV caches. It keeps the three pieces needed by the runtime:
 
@@ -10,8 +12,8 @@ attention KV caches. It keeps the three pieces needed by the runtime:
 - Only the prediction residual is quantized after the first anchor unit.
 
 The package includes parameter fitting, a plain PyTorch reference decoder, and
-fused Triton decoders for NVIDIA GPUs. It does not include model-specific video
-generation code, evaluation pipelines, or unrelated cache codecs.
+fused Triton decoders for NVIDIA GPUs. The `self-forcing/` directory contains
+the first model adapter and its fit-to-video entry point.
 
 ## Installation
 
@@ -25,6 +27,64 @@ PyTorch and CUDA runtime:
 ```bash
 pip install -e ".[cuda,test]"
 ```
+
+## Script quickstart
+
+Fit parameters from a clean `.npz` trace containing `keys`, `values`, and an
+optional `layer_ids` array. Clean traces use `[L,...,T,H,D]`:
+
+```bash
+python scripts/fit_params.py clean_kv_trace.npz \
+  --config configs/int2.json \
+  --output-dir fit_output \
+  --history-length 3
+```
+
+Quantize and reconstruct an exported cache whose `keys` and `values` use
+`[B,H,S,D]` or `[L,B,H,S,D]`:
+
+```bash
+python scripts/generate.py exported_cache.npz reconstructed_int2 \
+  --config configs/int2.json \
+  --k-params fit_output/k_temporal.npz \
+  --v-params fit_output/v_cross_kv.npz \
+  --device cpu --no-triton
+```
+
+This second command only round-trips exported cache tensors; it does not run a
+model or generate images or video. See the [Chinese usage guide](docs/usage_zh.md)
+for trace preparation, tuning, CUDA/Triton behavior, and real-model integration.
+
+## Self-Forcing video pipeline
+
+Self-Forcing uses two shell scripts. Run preparation once to collect a clean
+trace and fit parameters:
+
+```bash
+TRACE_RUNNER=/path/to/self-forcing-trace-runner.sh \
+CHECKPOINT=/models/self_forcing_dmd.pt \
+WAN_MODEL_DIR=/models/Wan2.1-T2V-1.3B \
+PROMPTS=/data/fit_prompts.txt \
+WORK_DIR=runs/self_forcing_prepare \
+CONFIG=configs/int2.json \
+bash self-forcing/prepare.sh
+```
+
+Generate videos any number of times from the fitted parameters:
+
+```bash
+MODEL_REPO=/path/to/self-forcing-model-repo \
+CHECKPOINT=/models/self_forcing_dmd.pt \
+WAN_MODEL_DIR=/models/Wan2.1-T2V-1.3B \
+PROMPTS=/data/generation_prompts.txt \
+PARAM_DIR=runs/self_forcing_prepare/parameters \
+OUTPUT_DIR=runs/self_forcing_int2 \
+CONFIG=configs/int2.json \
+bash self-forcing/generate.sh
+```
+
+See [self-forcing/README.md](self-forcing/README.md) for the trace contract,
+model requirements, PSNR/SSIM/LPIPS, and VBench commands.
 
 ## Runtime
 

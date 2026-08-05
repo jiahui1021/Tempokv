@@ -20,6 +20,9 @@ class TemporalParameters:
     history_bias: torch.Tensor
     stride: int | None = None
     layer_ids: tuple[int, ...] | None = None
+    codec_signature: str | None = None
+    parameter_set_id: str | None = None
+    coordinate_system: str | None = None
 
     def __post_init__(self) -> None:
         weights = _tensor(self.history_weights)
@@ -58,6 +61,12 @@ class TemporalParameters:
         object.__setattr__(self, "history_weights", weights)
         object.__setattr__(self, "history_bias", bias)
         object.__setattr__(self, "layer_ids", layer_ids)
+        if self.codec_signature is not None and not str(self.codec_signature):
+            raise ValueError("codec_signature must be non-empty")
+        if self.parameter_set_id is not None and not str(self.parameter_set_id):
+            raise ValueError("parameter_set_id must be non-empty")
+        if self.coordinate_system is not None and not str(self.coordinate_system):
+            raise ValueError("coordinate_system must be non-empty")
 
     @property
     def history_length(self) -> int:
@@ -82,7 +91,12 @@ class TemporalParameters:
         except ValueError as error:
             raise IndexError(f"layer {layer} is not present in {self.layer_ids}") from error
         return TemporalParameters(
-            self.history_weights[index], self.history_bias[index], self.stride
+            self.history_weights[index],
+            self.history_bias[index],
+            self.stride,
+            codec_signature=self.codec_signature,
+            parameter_set_id=self.parameter_set_id,
+            coordinate_system=self.coordinate_system,
         )
 
     def to(self, device: torch.device | str) -> "TemporalParameters":
@@ -91,6 +105,9 @@ class TemporalParameters:
             self.history_bias.to(device),
             self.stride,
             self.layer_ids,
+            self.codec_signature,
+            self.parameter_set_id,
+            self.coordinate_system,
         )
 
     def save(self, path: str | Path) -> None:
@@ -104,6 +121,9 @@ class TemporalParameters:
             layer_ids=np.asarray(
                 [] if self.layer_ids is None else self.layer_ids, dtype=np.int32
             ),
+            codec_signature=np.asarray(self.codec_signature or ""),
+            parameter_set_id=np.asarray(self.parameter_set_id or ""),
+            coordinate_system=np.asarray(self.coordinate_system or ""),
         )
 
     @classmethod
@@ -118,11 +138,32 @@ class TemporalParameters:
                 if "layer_ids" in data and data["layer_ids"].size
                 else None
             )
+            codec_signature = (
+                str(np.asarray(data["codec_signature"]).item())
+                if "codec_signature" in data
+                and str(np.asarray(data["codec_signature"]).item())
+                else None
+            )
+            parameter_set_id = (
+                str(np.asarray(data["parameter_set_id"]).item())
+                if "parameter_set_id" in data
+                and str(np.asarray(data["parameter_set_id"]).item())
+                else None
+            )
+            coordinate_system = (
+                str(np.asarray(data["coordinate_system"]).item())
+                if "coordinate_system" in data
+                and str(np.asarray(data["coordinate_system"]).item())
+                else None
+            )
             return cls(
                 data["history_weights"],
                 data["history_bias"],
                 None if stride < 0 else stride,
                 layer_ids,
+                codec_signature,
+                parameter_set_id,
+                coordinate_system,
             )
 
 
@@ -134,6 +175,9 @@ class CrossKVParameters:
     bias: torch.Tensor
     stride: int | None = None
     layer_ids: tuple[int, ...] | None = None
+    codec_signature: str | None = None
+    parameter_set_id: str | None = None
+    coordinate_system: str | None = None
 
     def __post_init__(self) -> None:
         weight = _tensor(self.weight)
@@ -158,6 +202,12 @@ class CrossKVParameters:
         object.__setattr__(self, "weight", weight)
         object.__setattr__(self, "bias", bias)
         object.__setattr__(self, "layer_ids", layer_ids)
+        if self.codec_signature is not None and not str(self.codec_signature):
+            raise ValueError("codec_signature must be non-empty")
+        if self.parameter_set_id is not None and not str(self.parameter_set_id):
+            raise ValueError("parameter_set_id must be non-empty")
+        if self.coordinate_system is not None and not str(self.coordinate_system):
+            raise ValueError("coordinate_system must be non-empty")
 
     @property
     def layered(self) -> bool:
@@ -173,11 +223,24 @@ class CrossKVParameters:
             index = self.layer_ids.index(int(layer))
         except ValueError as error:
             raise IndexError(f"layer {layer} is not present in {self.layer_ids}") from error
-        return CrossKVParameters(self.weight[index], self.bias[index], self.stride)
+        return CrossKVParameters(
+            self.weight[index],
+            self.bias[index],
+            self.stride,
+            codec_signature=self.codec_signature,
+            parameter_set_id=self.parameter_set_id,
+            coordinate_system=self.coordinate_system,
+        )
 
     def to(self, device: torch.device | str) -> "CrossKVParameters":
         return CrossKVParameters(
-            self.weight.to(device), self.bias.to(device), self.stride, self.layer_ids
+            self.weight.to(device),
+            self.bias.to(device),
+            self.stride,
+            self.layer_ids,
+            self.codec_signature,
+            self.parameter_set_id,
+            self.coordinate_system,
         )
 
     def save(self, path: str | Path) -> None:
@@ -190,6 +253,9 @@ class CrossKVParameters:
             layer_ids=np.asarray(
                 [] if self.layer_ids is None else self.layer_ids, dtype=np.int32
             ),
+            codec_signature=np.asarray(self.codec_signature or ""),
+            parameter_set_id=np.asarray(self.parameter_set_id or ""),
+            coordinate_system=np.asarray(self.coordinate_system or ""),
         )
 
     @classmethod
@@ -204,11 +270,32 @@ class CrossKVParameters:
                 if "layer_ids" in data and data["layer_ids"].size
                 else None
             )
+            codec_signature = (
+                str(np.asarray(data["codec_signature"]).item())
+                if "codec_signature" in data
+                and str(np.asarray(data["codec_signature"]).item())
+                else None
+            )
+            parameter_set_id = (
+                str(np.asarray(data["parameter_set_id"]).item())
+                if "parameter_set_id" in data
+                and str(np.asarray(data["parameter_set_id"]).item())
+                else None
+            )
+            coordinate_system = (
+                str(np.asarray(data["coordinate_system"]).item())
+                if "coordinate_system" in data
+                and str(np.asarray(data["coordinate_system"]).item())
+                else None
+            )
             return cls(
                 data["weight"],
                 data["bias"],
                 None if stride < 0 else stride,
                 layer_ids,
+                codec_signature,
+                parameter_set_id,
+                coordinate_system,
             )
 
 
