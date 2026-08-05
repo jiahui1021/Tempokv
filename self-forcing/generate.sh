@@ -15,6 +15,35 @@ require_env() {
   fi
 }
 
+# Build a short quantization label for the results subdirectory, e.g.
+# kh3-cross-int2 for history_length=3, CrossKV predictor, INT2 residuals.
+_quant_config_slug() {
+  if [[ "$mode" == "bf16" ]]; then
+    printf 'bf16'
+    return 0
+  fi
+  local k_bits v_bits history
+  k_bits=$("$python_bin" - "$CONFIG" <<'PY'
+import json, sys
+cfg = json.load(open(sys.argv[1]))
+print(cfg.get("k_bits", 0))
+PY
+  )
+  v_bits=$("$python_bin" - "$CONFIG" <<'PY'
+import json, sys
+cfg = json.load(open(sys.argv[1]))
+print(cfg.get("v_bits", 0))
+PY
+  )
+  history=$("$python_bin" - "$param_dir/k_temporal.npz" <<'PY'
+import numpy as np, sys
+k = np.load(sys.argv[1])
+print(int(np.asarray(k["history_length"]).item()))
+PY
+  )
+  printf 'kh%s-cross-int%s' "$history" "$k_bits"
+}
+
 if [[ "$mode" != "tempokv" && "$mode" != "bf16" ]]; then
   printf 'Error: MODE must be tempokv or bf16.\n' >&2
   exit 2
@@ -36,7 +65,16 @@ for flag_name in DRY_RUN ALLOW_TRITON_FALLBACK SKIP_EXISTING; do
     exit 2
   fi
 done
-output_dir="${OUTPUT_DIR:-$project_root/results/self_forcing}"
+model_type="${MODEL_TYPE:-self_forcing}"
+case "$model_type" in
+  */) model_type="${model_type%/}" ;;
+esac
+param_dir="${PARAM_DIR:-$project_root/parameters}"
+case "$param_dir" in
+  /*) ;;
+  *) param_dir="$(realpath -m -- "$param_dir")" ;;
+esac
+output_dir="${OUTPUT_DIR:-$project_root/results/$model_type/$(_quant_config_slug)}"
 case "$output_dir" in
   /*) ;;
   *) output_dir="$(realpath -m -- "$output_dir")" ;;
@@ -45,11 +83,6 @@ if [[ "$output_dir" == "/" ]]; then
   printf 'Error: OUTPUT_DIR must not be the filesystem root.\n' >&2
   exit 2
 fi
-param_dir="${PARAM_DIR:-$project_root/parameters}"
-case "$param_dir" in
-  /*) ;;
-  *) param_dir="$(realpath -m -- "$param_dir")" ;;
-esac
 
 command=(
   "$python_bin" "$script_dir/generate.py"

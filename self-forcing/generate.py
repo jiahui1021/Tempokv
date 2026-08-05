@@ -51,7 +51,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--start-index", type=int, default=0)
     parser.add_argument("--end-index", type=int, default=-1)
     parser.add_argument("--num-gpus", type=int, default=1)
-    parser.add_argument("--local-attn-size", type=int, default=180)
+    parser.add_argument("--local-attn-size", type=int, default=-1)
     parser.add_argument("--triton-cache", type=Path)
     parser.add_argument(
         "--allow-triton-fallback",
@@ -348,6 +348,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                 "TEMPOKV_CONFIG_PATH": str(paths["runtime_config"]),
                 "TEMPOKV_K_PARAMS_PATH": str(paths["k_params"]),
                 "TEMPOKV_V_PARAMS_PATH": str(paths["v_params"]),
+                "TEMPOKV_NUM_FRAMES": str(args.frames),
             }
         )
         if args.triton_cache is not None:

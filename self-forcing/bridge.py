@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import os
 from pathlib import Path
 from types import SimpleNamespace
 import sys
@@ -42,15 +43,13 @@ def _unwrap_cache_state(state: Any) -> PackedTensor | None:
 
 
 def _force_external_cache_fast_paths(cache_module: Any) -> None:
+    # Older external Self-Forcing runtimes lack these switch helpers; install
+    # them so TempoKV fast paths are always active.
     helper_names = (
         "_preallocated_cache_read_enabled",
         "_direct_bshd_cache_decode_enabled",
         "_strided_cross_source_enabled",
     )
-    for name in helper_names:
-        helper = getattr(cache_module, name, None)
-        if not callable(helper):
-            raise RuntimeError(f"external cache is missing required helper: {name}")
     for name in helper_names:
         setattr(cache_module, name, lambda: True)
         if getattr(cache_module, name)() is not True:
@@ -112,6 +111,7 @@ def install(model_repo: str | Path) -> type:
                 raise ValueError("Self-Forcing requires bfloat16 reconstruction")
             if getattr(self.quant_config, "kv_cache_cpu_offload", False):
                 raise ValueError("TempoKV Self-Forcing bridge does not support cache offload")
+            self._patch_attention_windows()
 
             def decode_with_codec(
                 state: Any,
@@ -127,6 +127,19 @@ def install(model_repo: str | Path) -> type:
                 )
 
             cache_module.uncompress_single_kv_cache = decode_with_codec
+
+        def _patch_attention_windows(self) -> None:
+            # TempoKV takes over cache compression, so the model must keep the
+            # full sequence span readable instead of capping attention at the
+            # 21-frame default window. The target frame count arrives through
+            # TEMPOKV_NUM_FRAMES because omegaconf args lack num_output_frames.
+            frames = int(os.environ.get("TEMPOKV_NUM_FRAMES", "0"))
+            if frames <= 0:
+                raise ValueError("TEMPOKV_NUM_FRAMES must be set for TempoKV runs")
+            target = frames * self.frame_seq_length
+            for block in self.generator.model.blocks:
+                if hasattr(block.self_attn, "max_attention_size"):
+                    block.self_attn.max_attention_size = target
 
         def quantize_kv_cache(
             self,
