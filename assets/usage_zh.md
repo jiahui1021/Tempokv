@@ -20,10 +20,17 @@ pip install -e .
 pip install -e ".[cuda]"
 ```
 
-仓库提供两份配置：
+仓库提供两份配置，两者默认都用最近三帧重建 K 预测当前 K，并用当前重建 K
+和最近两帧重建 V 共同预测 V：
 
 - `configs/int2.json`：K/V 残差为 INT2，首个 anchor unit 保持 INT4。
 - `configs/int4.json`：K/V 残差和首个 anchor unit 都为 INT4。
+
+`k_history_length` 用于选择 K 历史长度，可设为 `1` 到 `8`。
+每一帧对应的预测系数由拟合过程自动学习。
+`v_history_length` 用于选择 V 历史长度：
+`2` 使用前两帧，`1` 只使用前一帧，`0` 保留原来的纯 CrossKV 方式。
+修改任一历史长度后都需要重新拟合参数。
 
 ## Self-Forcing 完整生成流程
 流程分成两个 SH 脚本。所有参数都用环境变量传入，第一个脚本运行一次，

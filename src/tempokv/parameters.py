@@ -100,9 +100,15 @@ class TemporalParameters:
         )
 
     def to(self, device: torch.device | str) -> "TemporalParameters":
+        resolved_device = torch.device(device)
+        if (
+            self.history_weights.device == resolved_device
+            and self.history_bias.device == resolved_device
+        ):
+            return self
         return TemporalParameters(
-            self.history_weights.to(device),
-            self.history_bias.to(device),
+            self.history_weights.to(resolved_device),
+            self.history_bias.to(resolved_device),
             self.stride,
             self.layer_ids,
             self.codec_signature,
@@ -156,7 +162,7 @@ class TemporalParameters:
                 and str(np.asarray(data["coordinate_system"]).item())
                 else None
             )
-            return cls(
+            parameters = cls(
                 data["history_weights"],
                 data["history_bias"],
                 None if stride < 0 else stride,
@@ -165,11 +171,20 @@ class TemporalParameters:
                 parameter_set_id,
                 coordinate_system,
             )
+            if "history_length" in data:
+                declared_history_length = int(
+                    np.asarray(data["history_length"]).item()
+                )
+                if declared_history_length != parameters.history_length:
+                    raise ValueError(
+                        "history_length does not match the history_weights array"
+                    )
+            return parameters
 
 
 @dataclass(frozen=True, slots=True)
 class CrossKVParameters:
-    """Per-head K-to-V affine projection parameters."""
+    """Per-head K/current-V-history projection parameters."""
 
     weight: torch.Tensor
     bias: torch.Tensor
@@ -178,6 +193,7 @@ class CrossKVParameters:
     codec_signature: str | None = None
     parameter_set_id: str | None = None
     coordinate_system: str | None = None
+    history_weights: torch.Tensor | np.ndarray | None = None
 
     def __post_init__(self) -> None:
         weight = _tensor(self.weight)
@@ -187,6 +203,49 @@ class CrossKVParameters:
         expected_bias = tuple(weight.shape[:-2]) + (weight.shape[-1],)
         if tuple(bias.shape) != expected_bias:
             raise ValueError(f"bias must have shape {expected_bias}")
+        if self.history_weights is None:
+            if weight.ndim == 3:
+                history_weights = weight.new_empty(
+                    (0, weight.shape[0], weight.shape[-2], weight.shape[-1])
+                )
+            else:
+                history_weights = weight.new_empty(
+                    (
+                        weight.shape[0],
+                        0,
+                        weight.shape[1],
+                        weight.shape[-2],
+                        weight.shape[-1],
+                    )
+                )
+        else:
+            history_weights = _tensor(self.history_weights)
+        if weight.ndim == 3:
+            valid_history = (
+                history_weights.ndim == 4
+                and tuple(history_weights.shape[1:]) == tuple(weight.shape)
+            )
+            history_axis = 0
+        else:
+            valid_history = (
+                history_weights.ndim == 5
+                and history_weights.shape[0] == weight.shape[0]
+                and tuple(history_weights.shape[2:]) == tuple(weight.shape[1:])
+            )
+            history_axis = 1
+        if not valid_history:
+            expected = (
+                f"[P,{weight.shape[0]},{weight.shape[-1]},{weight.shape[-1]}]"
+                if weight.ndim == 3
+                else (
+                    f"[{weight.shape[0]},P,{weight.shape[1]},"
+                    f"{weight.shape[-1]},{weight.shape[-1]}]"
+                )
+            )
+            raise ValueError(f"history_weights must have shape {expected}")
+        history_length = int(history_weights.shape[history_axis])
+        if history_length not in (0, 1, 2):
+            raise ValueError("history_weights must contain 0, 1, or 2 V history maps")
         if self.stride is not None and int(self.stride) <= 0:
             raise ValueError("stride must be positive")
         layer_ids = self.layer_ids
@@ -201,6 +260,7 @@ class CrossKVParameters:
             raise ValueError("layer_ids are only valid for layered CrossKV parameters")
         object.__setattr__(self, "weight", weight)
         object.__setattr__(self, "bias", bias)
+        object.__setattr__(self, "history_weights", history_weights)
         object.__setattr__(self, "layer_ids", layer_ids)
         if self.codec_signature is not None and not str(self.codec_signature):
             raise ValueError("codec_signature must be non-empty")
@@ -212,6 +272,14 @@ class CrossKVParameters:
     @property
     def layered(self) -> bool:
         return self.weight.ndim == 4
+
+    @property
+    def history_length(self) -> int:
+        return int(
+            self.history_weights.shape[1]
+            if self.layered
+            else self.history_weights.shape[0]
+        )
 
     def for_layer(self, layer: int) -> "CrossKVParameters":
         if not self.layered:
@@ -230,17 +298,26 @@ class CrossKVParameters:
             codec_signature=self.codec_signature,
             parameter_set_id=self.parameter_set_id,
             coordinate_system=self.coordinate_system,
+            history_weights=self.history_weights[index],
         )
 
     def to(self, device: torch.device | str) -> "CrossKVParameters":
+        resolved_device = torch.device(device)
+        if (
+            self.weight.device == resolved_device
+            and self.bias.device == resolved_device
+            and self.history_weights.device == resolved_device
+        ):
+            return self
         return CrossKVParameters(
-            self.weight.to(device),
-            self.bias.to(device),
+            self.weight.to(resolved_device),
+            self.bias.to(resolved_device),
             self.stride,
             self.layer_ids,
             self.codec_signature,
             self.parameter_set_id,
             self.coordinate_system,
+            self.history_weights.to(resolved_device),
         )
 
     def save(self, path: str | Path) -> None:
@@ -249,6 +326,8 @@ class CrossKVParameters:
             kind=np.asarray("cross_kv"),
             weight=self.weight.cpu().numpy(),
             bias=self.bias.cpu().numpy(),
+            history_weights=self.history_weights.cpu().numpy(),
+            history_length=np.asarray(self.history_length, dtype=np.int32),
             stride=np.asarray(-1 if self.stride is None else self.stride, dtype=np.int32),
             layer_ids=np.asarray(
                 [] if self.layer_ids is None else self.layer_ids, dtype=np.int32
@@ -288,7 +367,10 @@ class CrossKVParameters:
                 and str(np.asarray(data["coordinate_system"]).item())
                 else None
             )
-            return cls(
+            history_weights = (
+                data["history_weights"] if "history_weights" in data else None
+            )
+            parameters = cls(
                 data["weight"],
                 data["bias"],
                 None if stride < 0 else stride,
@@ -296,7 +378,17 @@ class CrossKVParameters:
                 codec_signature,
                 parameter_set_id,
                 coordinate_system,
+                history_weights,
             )
+            if history_weights is not None and "history_length" in data:
+                declared_history_length = int(
+                    np.asarray(data["history_length"]).item()
+                )
+                if declared_history_length != parameters.history_length:
+                    raise ValueError(
+                        "history_length does not match the history_weights array"
+                    )
+            return parameters
 
 
 def load_parameters(path: str | Path) -> TemporalParameters | CrossKVParameters:

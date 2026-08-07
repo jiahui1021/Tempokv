@@ -108,10 +108,29 @@ def _validate_parameters(
         raise ValueError(
             "Self-Forcing parameters must use pre_rope_normalized coordinates"
         )
-    if tuple(temporal.history_weights.shape[-2:]) != (12, 128):
+    if config.k_history_length is not None:
+        expected_k_history_shape = (
+            30,
+            config.k_history_length,
+            config.k_history_length,
+            12,
+            128,
+        )
+        if tuple(temporal.history_weights.shape) != expected_k_history_shape:
+            raise ValueError(
+                "K history parameters must match 30 layers, the configured history "
+                "length, 12 heads, and dimension 128"
+            )
+    elif tuple(temporal.history_weights.shape[-2:]) != (12, 128):
         raise ValueError("K parameters must contain 12 heads with dimension 128")
     if tuple(cross.weight.shape[-3:]) != (12, 128, 128):
         raise ValueError("V parameters must contain 12 heads with 128x128 weights")
+    expected_v_history_shape = (30, config.v_history_length, 12, 128, 128)
+    if tuple(cross.history_weights.shape) != expected_v_history_shape:
+        raise ValueError(
+            "V history parameters must match 30 layers, the configured history "
+            "length, 12 heads, and 128x128 weights"
+        )
     return {
         "k_params": str(k_path),
         "v_params": str(v_path),
@@ -119,6 +138,8 @@ def _validate_parameters(
         "heads": 12,
         "head_dimension": 128,
         "history_length": temporal.history_length,
+        "k_history_length": temporal.history_length,
+        "v_history_length": cross.history_length,
         "stride": config.stride,
         "coordinate_system": EXPECTED_COORDINATE_SYSTEM,
     }

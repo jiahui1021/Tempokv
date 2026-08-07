@@ -1,14 +1,11 @@
 # Self-Forcing 使用说明
 
-这个目录只放 Self-Forcing 相关代码：
-
 - `prepare.sh`：一次性采集 clean trace 并拟合参数。
 - `generate.sh`：读取已有参数生成视频。
 - `generate.py`：生成脚本使用的内部入口。
 - `worker.py`：在 `torchrun` 进程中加载外部 Self-Forcing。
 - `bridge.py`：把 Self-Forcing 的分段 K/V cache 接到 TempoKV。
 
-Self-Forcing、Wan、VAE、tokenizer 和模型权重继续由外部模型仓库提供，不复制到 TempoKV。
 
 ## Trace 要求
 
@@ -80,14 +77,17 @@ END_INDEX=8
 BASE_SEED=0
 TRACE_FRAMES=51
 TRACE_TOKENS_PER_FRAME=8
-HISTORY_LENGTH=3
 ITERATIONS=2
 TEMPORAL_RIDGE=0.1
 CROSS_RIDGE=0.1
 MAX_GAIN=1.0
 ```
 
-量化位宽、anchor 位宽、分组大小和残差方式在 `CONFIG` 指向的 JSON 中调整。
+量化位宽、anchor 位宽、分组大小、残差方式和 K/V 历史长度都在 `CONFIG`
+指向的 JSON 中调整。`k_history_length` 可设为 `1` 到 `8`，设为 `3` 时使用
+前三帧重建 K，各帧系数由拟合过程自动学习；
+`v_history_length=2` 使用前两帧重建 V，设为 `1` 时只使用前一帧，设为 `0`
+时使用旧的纯 CrossKV 预测。
 这些配置改变后必须重新运行 `prepare.sh`，避免参数和生成配置不匹配。
 
 采集器需要接受以下环境变量：`SELF_FORCING_CHECKPOINT_PATH`、
@@ -159,8 +159,10 @@ performance.ranks[]
 局部滑窗；比较 TempoKV 与 BF16 时，两次运行必须使用相同的 `FRAMES`、
 `LOCAL_ATTN_SIZE`、prompt、seed 和 GPU 数量。
 
-CrossKV 的 128×128 预测矩阵乘在编码和 Triton 解码端都使用 TF32（A100 上比
-IEEE FP32 明显更快），与旧仓库 `S2_CROSS_MATMUL_PRECISION=tf32` 一致。
+K→V 与历史 V 的 128×128 预测矩阵乘在编码和 Triton 解码端都使用 TF32
+（A100 上比 IEEE FP32 明显更快），与旧仓库
+`S2_CROSS_MATMUL_PRECISION=tf32` 一致。历史 V 的计算已融合进同一个 Triton
+解码 kernel；正式生成仍使用 `cross_kv_persistent_direct` 快速路径。
 predictor 参数在 codec 内按 (device, layer) 缓存并全局共享，多个压缩 span
 复用同一份参数，不再为每个 span 复制。
 

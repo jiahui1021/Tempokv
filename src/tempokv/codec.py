@@ -49,6 +49,10 @@ class PackedTensor:
             raise ValueError("group_size must divide the head dimension")
         if sum(self.unit_lengths) != sequence or not self.unit_lengths:
             raise ValueError("unit_lengths must exactly cover the sequence")
+        if any(length <= 0 or length > self.stride for length in self.unit_lengths):
+            raise ValueError("unit lengths must be in [1, stride]")
+        if any(length != self.stride for length in self.unit_lengths[:-1]):
+            raise ValueError("only the final packed unit may be shorter than stride")
         if self.predictor_kind == "temporal" and self.temporal is None:
             raise ValueError("temporal packed state is missing predictor parameters")
         if self.predictor_kind == "cross_kv" and self.cross_kv is None:
@@ -120,16 +124,30 @@ def predict_temporal(
     return prediction + bias[None, None, None, :]
 
 
-def predict_cross_kv(source: torch.Tensor, parameters: CrossKVParameters) -> torch.Tensor:
-    """Apply the per-head K-to-V affine projection."""
+def predict_cross_kv(
+    source: torch.Tensor,
+    parameters: CrossKVParameters,
+    history: list[torch.Tensor] | tuple[torch.Tensor, ...] | None = None,
+) -> torch.Tensor:
+    """Predict V from current reconstructed K and newest-to-oldest V history."""
     if parameters.layered:
         raise ValueError("select one layer before using CrossKV parameters")
+    resolved_history = () if history is None else tuple(history)
+    order = min(len(resolved_history), parameters.history_length)
+    for previous in resolved_history[:order]:
+        if tuple(previous.shape) != tuple(source.shape):
+            raise ValueError("reconstructed K and V history must have the same shape")
+        if previous.device != source.device:
+            raise ValueError("reconstructed K and V history must be on the same device")
     weight = parameters.weight.to(source.device)
     bias = parameters.bias.to(source.device)
     if source.shape[1] != weight.shape[0] or source.shape[-1] != weight.shape[-1]:
         raise ValueError("CrossKV parameters do not match cache heads/head dimension")
     with _tf32_matmul(source.device):
         prediction = torch.matmul(source.float(), weight)
+        for lag, previous in enumerate(resolved_history[:order]):
+            history_weight = parameters.history_weights[lag].to(source.device)
+            prediction.add_(torch.matmul(previous.float(), history_weight))
     return prediction + bias[None, :, None, :]
 
 
@@ -216,6 +234,13 @@ def _encode(
     if predictor_kind == "temporal":
         if temporal is None:
             raise ValueError("K encoding requires temporal parameters")
+        if (
+            config.k_history_length is not None
+            and temporal.history_length != config.k_history_length
+        ):
+            raise ValueError(
+                "temporal K history length does not match config.k_history_length"
+            )
         if temporal.stride is not None and temporal.stride != config.stride:
             raise ValueError("temporal parameters were fitted for a different stride")
         temporal = temporal.to(value.device)
@@ -233,6 +258,10 @@ def _encode(
             )
         if cross_kv.stride is not None and cross_kv.stride != config.stride:
             raise ValueError("CrossKV parameters were fitted for a different stride")
+        if cross_kv.history_length != config.v_history_length:
+            raise ValueError(
+                "CrossKV V history length does not match config.v_history_length"
+            )
         cross_kv = cross_kv.to(value.device)
 
     anchor = value[:, :, :stride]
@@ -308,7 +337,9 @@ def _encode(
         else:
             assert cross_kv is not None and source is not None
             prediction = predict_cross_kv(
-                source[:, :, offset : offset + unit_length], cross_kv
+                source[:, :, offset : offset + unit_length],
+                cross_kv,
+                [item[:, :, :unit_length] for item in history],
             )
         quant, scale, zero_point, residual_rebuilt = _quantize(
             current.float() - prediction,
@@ -322,6 +353,10 @@ def _encode(
         if predictor_kind == "temporal":
             assert temporal is not None
             history = [rebuilt, *history[: temporal.history_length - 1]]
+        else:
+            assert cross_kv is not None
+            if cross_kv.history_length:
+                history = [rebuilt, *history[: cross_kv.history_length - 1]]
         residual_end = residual_offset + unit_length
         assert residual_quant is not None and residual_scale is not None
         residual_quant[:, :, residual_offset:residual_end].copy_(quant)
@@ -383,7 +418,7 @@ def encode_cross_kv(
     *,
     reuse_input_for_reconstruction: bool = False,
 ) -> tuple[PackedTensor, torch.Tensor]:
-    """Encode V from reconstructed K and return its closed-loop reconstruction."""
+    """Encode V from reconstructed K/V history and return its reconstruction."""
     resolved = config or CodecConfig()
     return _encode(
         value,
@@ -502,7 +537,9 @@ def decode_tensor(
             if source is None or packed.cross_kv is None:
                 raise ValueError("CrossKV decoding requires reconstructed K")
             prediction = predict_cross_kv(
-                source[:, :, offset : offset + unit_length], packed.cross_kv
+                source[:, :, offset : offset + unit_length],
+                packed.cross_kv,
+                [item[:, :, :unit_length] for item in history],
             )
         end = residual_offset + unit_length
         zero_point = (
@@ -524,13 +561,20 @@ def decode_tensor(
         if packed.predictor_kind == "temporal":
             assert packed.temporal is not None
             history = [rebuilt, *history[: packed.temporal.history_length - 1]]
+        else:
+            assert packed.cross_kv is not None
+            if packed.cross_kv.history_length:
+                history = [
+                    rebuilt,
+                    *history[: packed.cross_kv.history_length - 1],
+                ]
         offset += unit_length
         residual_offset = end
     return output
 
 
 class TempoKVCodec:
-    """End-to-end K temporal + V CrossKV predictive residual codec."""
+    """End-to-end temporal K and joint K/V-history predictive residual codec."""
 
     def __init__(
         self,
@@ -541,6 +585,17 @@ class TempoKVCodec:
         self.temporal = temporal
         self.cross_kv = cross_kv
         self.config = config or CodecConfig()
+        if (
+            self.config.k_history_length is not None
+            and temporal.history_length != self.config.k_history_length
+        ):
+            raise ValueError(
+                "K parameters and codec config use different K history lengths"
+            )
+        if cross_kv.history_length != self.config.v_history_length:
+            raise ValueError(
+                "V parameters and codec config use different V history lengths"
+            )
         expected_signature = self.config.format_signature()
         for name, parameters in (("K", temporal), ("V", cross_kv)):
             signature = parameters.codec_signature

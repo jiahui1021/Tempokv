@@ -29,7 +29,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--trace", type=Path, help="clean K/V .npz trace")
     parser.add_argument("--config", type=Path, required=True, help="codec JSON")
     parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--history-length", type=int, default=3)
+    parser.add_argument(
+        "--history-length",
+        type=int,
+        help="legacy K history override; prefer k_history_length in the config",
+    )
     parser.add_argument("--iterations", type=int, default=2)
     parser.add_argument("--temporal-ridge", type=float, default=0.1)
     parser.add_argument("--cross-ridge", type=float, default=0.1)
@@ -122,8 +126,6 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             str(config),
             "--output-dir",
             str(parameter_dir),
-            "--history-length",
-            str(args.history_length),
             "--iterations",
             str(args.iterations),
             "--temporal-ridge",
@@ -133,6 +135,8 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             "--max-gain",
             str(args.max_gain),
         ]
+        if args.history_length is not None:
+            fit_command.extend(("--history-length", str(args.history_length)))
 
     report: dict[str, object] = {
         "status": "dry_run" if args.dry_run else "running",

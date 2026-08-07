@@ -31,7 +31,6 @@
 #   TRACE_TOKENS_PER_FRAME  每帧抽取的 token 数（默认 8）
 #   START_INDEX / END_INDEX  prompt 序号范围（默认 0 .. 8）
 #   BASE_SEED      随机种子（默认 0）
-#   HISTORY_LENGTH 时序历史长度（默认 3）
 #   ITERATIONS     拟合迭代次数（默认 2）
 #   TEMPORAL_RIDGE / CROSS_RIDGE / MAX_GAIN  拟合正则与增益（默认 0.1/0.1/1.0）
 #   OVERWRITE      已存在产物时覆盖（0/1，默认 0）
@@ -111,7 +110,6 @@ NUM_GPUS="${NUM_GPUS:-1}"
 BASE_SEED="${BASE_SEED:-0}"
 SKIP_EXISTING="${SKIP_EXISTING:-0}"
 MIN_FREE_VRAM_GB="${MIN_FREE_VRAM_GB:-70}"
-HISTORY_LENGTH="${HISTORY_LENGTH:-3}"
 ITERATIONS="${ITERATIONS:-2}"
 TEMPORAL_RIDGE="${TEMPORAL_RIDGE:-0.1}"
 CROSS_RIDGE="${CROSS_RIDGE:-0.1}"
@@ -128,7 +126,6 @@ check_int TRACE_FRAMES 27
 check_int TRACE_TOKENS_PER_FRAME 1
 check_int NUM_GPUS 1
 check_int BASE_SEED 0
-check_int HISTORY_LENGTH 1
 check_int ITERATIONS 1
 
 # ---------- 组装三条命令 ----------
@@ -167,7 +164,6 @@ fit_command=(
   "$trace_file"
   --config "$(resolve_path "$CONFIG")"
   --output-dir "$param_dir"
-  --history-length "$HISTORY_LENGTH"
   --iterations "$ITERATIONS"
   --temporal-ridge "$TEMPORAL_RIDGE"
   --cross-ridge "$CROSS_RIDGE"

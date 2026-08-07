@@ -82,7 +82,7 @@ check_int() {
   die "$name 必须是整数且 >= $min（当前值：$value）"
 }
 
-# 生成一个短量化标签，用于默认输出目录，例如 kh3-cross-int2
+# 生成一个短量化标签，用于默认输出目录，例如 kh3-vh2-int2
 _quant_config_slug() {
   if [[ "$mode" == "bf16" ]]; then
     printf 'bf16'
@@ -95,9 +95,12 @@ import sys
 import numpy as np
 
 try:
-    k_bits = json.load(open(sys.argv[1])).get("k_bits", 0)
+    config = json.load(open(sys.argv[1]))
+    config = config.get("codec", config)
+    k_bits = config.get("k_bits", 0)
+    v_history = config.get("v_history_length", 0)
     history = int(np.load(sys.argv[2])["history_length"].item())
-    print(f"kh{history}-cross-int{k_bits}")
+    print(f"kh{history}-vh{v_history}-int{k_bits}")
 except Exception:
     print("unknown")
 PY

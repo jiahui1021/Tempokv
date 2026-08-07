@@ -50,6 +50,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--anchor-bits", type=int, choices=(2, 4, 8))
     parser.add_argument("--group-size", type=int)
     parser.add_argument("--stride", type=int)
+    parser.add_argument("--k-history-length", type=int)
+    parser.add_argument("--v-history-length", type=int, choices=(0, 1, 2))
     parser.add_argument(
         "--residual-mode", choices=("symmetric", "asymmetric")
     )
@@ -242,4 +244,3 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
 
 if __name__ == "__main__":
     main()
-

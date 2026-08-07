@@ -30,7 +30,7 @@ CODEC_FIELDS = {field.name for field in fields(CodecConfig)}
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Fit temporal K and CrossKV V parameters from a clean .npz trace."
+        description="Fit temporal K and joint K/V-history predictors from a clean .npz trace."
     )
     parser.add_argument("trace", type=Path, help=".npz file containing keys and values")
     parser.add_argument(
@@ -42,7 +42,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--config", type=Path, help="JSON file containing CodecConfig fields")
     parser.add_argument("--keys-name", default="keys", help="K array name in the trace")
     parser.add_argument("--values-name", default="values", help="V array name in the trace")
-    parser.add_argument("--history-length", type=int, default=3)
+    k_history = parser.add_mutually_exclusive_group()
+    k_history.add_argument("--k-history-length", type=int)
+    k_history.add_argument(
+        "--history-length",
+        type=int,
+        help="legacy K history override; prefer k_history_length in the config",
+    )
     parser.add_argument("--iterations", type=int, default=2)
     parser.add_argument("--temporal-ridge", type=float, default=0.0)
     parser.add_argument("--cross-ridge", type=float, default=0.0)
@@ -58,6 +64,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--anchor-bits", type=int)
     parser.add_argument("--group-size", type=int)
     parser.add_argument("--stride", type=int)
+    parser.add_argument("--v-history-length", type=int, choices=(0, 1, 2))
     parser.add_argument("--residual-mode", choices=("symmetric", "asymmetric"))
     parser.add_argument("--scale-dtype", choices=("float32", "float16", "bfloat16"))
     parser.add_argument(
@@ -158,7 +165,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         keys,
         values,
         config=config,
-        history_length=args.history_length,
+        history_length=(
+            args.history_length
+            if args.history_length is not None
+            else config.k_history_length
+        ),
         iterations=args.iterations,
         temporal_ridge=args.temporal_ridge,
         cross_ridge=args.cross_ridge,
@@ -186,10 +197,13 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         },
         "codec_config": asdict(config),
         "fit": {
-            "history_length": int(args.history_length),
+            # Keep the old report key while exposing the clearer config name.
+            "history_length": temporal.history_length,
+            "k_history_length": temporal.history_length,
             "iterations": int(args.iterations),
             "temporal_ridge": float(args.temporal_ridge),
             "cross_ridge": float(args.cross_ridge),
+            "v_history_length": int(config.v_history_length),
             "max_gain": float(args.max_gain),
             "coordinate_system": args.coordinate_system,
         },
@@ -197,6 +211,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "temporal_weight_shape": list(temporal.history_weights.shape),
             "temporal_bias_shape": list(temporal.history_bias.shape),
             "cross_weight_shape": list(cross.weight.shape),
+            "cross_history_weight_shape": list(cross.history_weights.shape),
             "cross_bias_shape": list(cross.bias.shape),
         },
         "artifacts": {

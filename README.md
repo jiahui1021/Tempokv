@@ -22,10 +22,19 @@ NVIDIA GPU Triton decoders:
 pip install -e ".[cuda]"
 ```
 
-Two codec configs are provided:
+Two codec configs are provided. Both use the three most recent reconstructed K
+frames to predict K, and current reconstructed K plus the two most recent
+reconstructed V frames to predict V:
 
 - `configs/int2.json`: INT2 K/V residuals with an INT4 first anchor unit.
 - `configs/int4.json`: INT4 K/V residuals and INT4 first anchor unit.
+
+`k_history_length` controls how many reconstructed K frames predict the next K
+and accepts values from `1` to `8`; fitting learns a separate coefficient for
+each selected history frame.
+`v_history_length` controls the V predictor: `2` uses the previous two V frames,
+`1` uses only the previous frame, and `0` retains the legacy K-only CrossKV
+predictor. Predictor parameters must be refitted after changing either value.
 
 ## Self-Forcing pipeline
 
