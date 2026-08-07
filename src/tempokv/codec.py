@@ -69,6 +69,24 @@ class PackedTensor:
                 raise ValueError("asymmetric residuals require zero points")
         _dtype(self.reconstruction_dtype)
 
+    def storage_bytes(self) -> int:
+        """On-device bytes actually stored for this packed tensor.
+
+        Counts every quantized component (anchor quant/scale and, when present,
+        residual quant/scale/zero-point).  Predictor parameters are shared and
+        not replicated per span, so they are excluded.
+        """
+        total = self.anchor_quant.numel() * self.anchor_quant.element_size()
+        total += self.anchor_scale.numel() * self.anchor_scale.element_size()
+        for component in (
+            self.residual_quant,
+            self.residual_scale,
+            self.residual_zero_point,
+        ):
+            if component is not None:
+                total += component.numel() * component.element_size()
+        return total
+
 
 @dataclass(slots=True)
 class PackedKV:

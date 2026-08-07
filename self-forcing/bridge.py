@@ -210,6 +210,55 @@ def install(model_repo: str | Path) -> type:
                     "codec": "TempoKV",
                 }
             )
+            self._record_kv_cache_memory()
+
+        def _record_kv_cache_memory(self) -> None:
+            """Aggregate stored K/V bytes across every layer's quantized spans.
+
+            Fills ``self.summary["last_kv_cache_memory"]`` (consumed by the
+            Self-Forcing runtime as ``summary.json -> memory.kv_cache``) with a
+            per-layer breakdown, totals, and the achieved compression rate
+            versus the equivalent BF16 cache.  Predictor parameters are shared
+            across spans and already excluded from ``storage_bytes``.
+            """
+            per_layer: dict[str, dict[str, object]] = {}
+            total_kv_bytes = 0
+            total_bf16_bytes = 0
+            bf16_per_value = 2  # bytes for a bfloat16 element
+
+            for layer_index, layer in enumerate(self.kv_cache1):
+                k_bytes = v_bytes = 0
+                for cache, name in ((layer["k"], "k"), (layer["v"], "v")):
+                    bytes_per_cache = 0
+                    for span in cache.quantized_spans:
+                        packed = _unwrap_cache_state(span.get("quant_data"))
+                        if packed is None:
+                            continue
+                        bytes_per_cache += packed.storage_bytes()
+                        total_bf16_bytes += (
+                            int(torch.tensor(packed.shape).prod().item())
+                            * bf16_per_value
+                        )
+                    if name == "k":
+                        k_bytes = bytes_per_cache
+                    else:
+                        v_bytes = bytes_per_cache
+                total_kv_bytes += k_bytes + v_bytes
+                per_layer[str(layer_index)] = {
+                    "k_bytes": k_bytes,
+                    "v_bytes": v_bytes,
+                    "kv_bytes": k_bytes + v_bytes,
+                }
+
+            self.summary["last_kv_cache_memory"] = {
+                "num_layers": len(self.kv_cache1),
+                "per_layer_kv_bytes": per_layer,
+                "total_kv_cache_bytes": total_kv_bytes,
+                "total_bf16_kv_bytes": total_bf16_bytes,
+                "compression_rate": (
+                    total_bf16_bytes / total_kv_bytes if total_kv_bytes else None
+                ),
+            }
 
     TempoKVCausalInferencePipeline.__name__ = "TempoKVCausalInferencePipeline"
     pipeline_module.CausalInferencePipeline = TempoKVCausalInferencePipeline
