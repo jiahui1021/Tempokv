@@ -37,6 +37,7 @@
 #   NUM_GPUS        torchrun 使用的 GPU 数（默认 1）
 #   K_HISTORY_LENGTH  K 使用的历史帧数（1 到 8；默认读取 CONFIG）
 #   V_HISTORY_LENGTH  V 使用的历史帧数（0 到 2；默认读取 CONFIG）
+#   TEMPOKV_PERSISTENT_UNITS_PER_LAUNCH  单次持续解码帧数（默认 16；范围 1 到 16）
 #
 set -euo pipefail
 

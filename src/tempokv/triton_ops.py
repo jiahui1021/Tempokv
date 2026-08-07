@@ -6,6 +6,8 @@ import torch
 import triton
 import triton.language as tl
 
+from .runtime import persistent_units_per_launch
+
 if TYPE_CHECKING:
     from .codec import PackedTensor
 
@@ -712,6 +714,18 @@ def _cross_kv_history_persistent_decode_kernel(
         mask=channel < width,
         other=0.0,
     ).to(tl.float32)
+    if history_diagonal:
+        history_weight_one = tl.load(
+            history_weight_ptr + head * width + channel,
+            mask=channel < width,
+            other=0.0,
+        ).to(tl.float32)
+        if history_length > 1:
+            history_weight_two = tl.load(
+                history_weight_ptr + (heads + head) * width + channel,
+                mask=channel < width,
+                other=0.0,
+            ).to(tl.float32)
 
     previous_token = (start_unit - 1) * stride + token
     if history_diagonal:
@@ -843,12 +857,6 @@ def _cross_kv_history_persistent_decode_kernel(
         )
 
         if history_diagonal:
-            history_weight_one_offset = head * width + channel
-            history_weight_one = tl.load(
-                history_weight_ptr + history_weight_one_offset,
-                mask=channel < width,
-                other=0.0,
-            ).to(tl.float32)
             prediction += previous_one * history_weight_one[None, :]
         else:
             history_weight_one_offset = (
@@ -871,12 +879,6 @@ def _cross_kv_history_persistent_decode_kernel(
         if history_length > 1:
             if unit_index > 1:
                 if history_diagonal:
-                    history_weight_two_offset = (heads + head) * width + channel
-                    history_weight_two = tl.load(
-                        history_weight_ptr + history_weight_two_offset,
-                        mask=channel < width,
-                        other=0.0,
-                    ).to(tl.float32)
                     prediction += previous_two * history_weight_two[None, :]
                 else:
                     history_weight_two_offset = (
@@ -1055,8 +1057,17 @@ def decode(
                 _ceil_div(packed.stride, block_s),
                 _ceil_div(width, block_d),
             )
-            for start_unit in range(1, len(packed.unit_lengths), 8):
-                chunk_units = min(8, len(packed.unit_lengths) - start_unit)
+            persistent_units = persistent_units_per_launch()
+            # Large K orders create a nested compile-time expansion.  Keep the
+            # original bound unless the production-size order is small.
+            if parameters.history_length > 4:
+                persistent_units = min(persistent_units, 8)
+            for start_unit in range(
+                1, len(packed.unit_lengths), persistent_units
+            ):
+                chunk_units = min(
+                    persistent_units, len(packed.unit_lengths) - start_unit
+                )
                 _temporal_persistent_decode_kernel[grid](
                     quant,
                     scale,
@@ -1157,8 +1168,18 @@ def decode(
             _ceil_div(packed.stride, block_s),
             _ceil_div(width, cross_block_d),
         )
-        for start_unit in range(1, len(packed.unit_lengths), 8):
-            chunk_units = min(8, len(packed.unit_lengths) - start_unit)
+        persistent_units = persistent_units_per_launch()
+        # Full V-history matrices make every recurrent unit substantially
+        # larger and require one program to own all output channels.  Only the
+        # fast diagonal path is allowed to opt into larger launch batches.
+        if parameters.history_length and not parameters.history_diagonal:
+            persistent_units = min(persistent_units, 8)
+        for start_unit in range(
+            1, len(packed.unit_lengths), persistent_units
+        ):
+            chunk_units = min(
+                persistent_units, len(packed.unit_lengths) - start_unit
+            )
             if parameters.history_length:
                 # Diagonal history only depends on the same output channel, so
                 # it keeps the legacy 32-channel tiling and one dense K dot.

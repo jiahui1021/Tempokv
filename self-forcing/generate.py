@@ -19,6 +19,8 @@ SOURCE_ROOT = PROJECT_ROOT / "src"
 if SOURCE_ROOT.is_dir() and str(SOURCE_ROOT) not in sys.path:
     sys.path.insert(0, str(SOURCE_ROOT))
 
+from tempokv.runtime import persistent_units_per_launch  # noqa: E402
+
 REQUIRED_MODEL_FILES = (
     "experiments/Self-Forcing/inference.py",
     "experiments/Self-Forcing/pipeline/__init__.py",
@@ -145,6 +147,19 @@ def _validate_parameters(
                 "30 layers, the configured history length, 12 heads, and dimension "
                 "128; refit v_cross_kv.npz with the current fitter"
             )
+    parameter_tensors = (
+        temporal.history_weights,
+        temporal.history_bias,
+        cross.weight,
+        cross.bias,
+        cross.history_weights,
+    )
+    predictor_parameter_bytes = sum(
+        tensor.numel() * tensor.element_size() for tensor in parameter_tensors
+    )
+    v_history_parameter_bytes = (
+        cross.history_weights.numel() * cross.history_weights.element_size()
+    )
     return {
         "k_params": str(k_path),
         "v_params": str(v_path),
@@ -155,6 +170,10 @@ def _validate_parameters(
         "k_history_length": temporal.history_length,
         "v_history_length": cross.history_length,
         "v_history_mode": cross.history_mode,
+        "predictor_parameter_bytes": predictor_parameter_bytes,
+        "predictor_parameter_mib": predictor_parameter_bytes / (1024**2),
+        "v_history_parameter_bytes": v_history_parameter_bytes,
+        "v_history_parameter_mib": v_history_parameter_bytes / (1024**2),
         "stride": config.stride,
         "coordinate_system": EXPECTED_COORDINATE_SYSTEM,
     }
@@ -411,6 +430,21 @@ def run(args: argparse.Namespace) -> dict[str, object]:
     if args.mode == "tempokv":
         report["parameters"] = parameters
         report["runtime_config"] = str(paths["runtime_config"])
+        requested_persistent_units = persistent_units_per_launch()
+        report["persistent_units_per_launch"] = {
+            "requested": requested_persistent_units,
+            "k": (
+                min(requested_persistent_units, 8)
+                if parameters["k_history_length"] > 4
+                else requested_persistent_units
+            ),
+            "v": (
+                min(requested_persistent_units, 8)
+                if parameters["v_history_length"]
+                and parameters.get("v_history_mode", "dense") != "diagonal"
+                else requested_persistent_units
+            ),
+        }
     if args.dry_run:
         print(json.dumps(report, indent=2, ensure_ascii=False))
         return report

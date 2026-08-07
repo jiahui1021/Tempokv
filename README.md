@@ -88,9 +88,15 @@ bash self-forcing/generate.sh
 for this run. If omitted, both values come from `CONFIG`; the example also
 omits the default mode, parameter directory, and output directory.
 
+The fast K/V history paths decode up to 16 units per launch by default. Override
+this for A/B testing without refitting with
+`TEMPOKV_PERSISTENT_UNITS_PER_LAUNCH=8`. Values from 1 through 16 are accepted.
+Dense V history and K history orders above four are always capped at eight
+because their compile-time expansion is substantially larger.
+
 Set `MODE=bf16` for an unquantized baseline; that mode does not need `CONFIG`
 or `PARAM_DIR`. `pipeline_report.json` records total wall-clock time, per-GPU
-latency, and peak GPU memory.
+latency, peak GPU memory, and the exact predictor-parameter footprint.
 
 Both entry points validate `stride=1560`, 30 layers, 12 heads, head dimension
 128, and pre-RoPE normalized K. Generation also checks that TempoKV is actually

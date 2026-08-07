@@ -191,6 +191,11 @@ IEEE FP32 明显更快），与旧仓库 `S2_CROSS_MATMUL_PRECISION=tf32` 一致
 predictor 参数在 codec 内按 (device, layer) 缓存并全局共享，多个压缩 span
 复用同一份参数，不再为每个 span 复制。
 
+快速 K/V 历史路径默认单次处理 16 帧，减少长缓存的分段解码次数。需要做
+保守对照时可设置 `TEMPOKV_PERSISTENT_UNITS_PER_LAUNCH=8`；允许范围是 1 到 16。
+完整矩阵 V 历史与超过 4 帧的 K 历史会自动限制在 8，避免编译展开过大。
+`pipeline_report.json` 会记录 predictor 参数大小与整次运行的显存峰值。
+
 `decode_routes` 记录实际调用的 CUDA 路径。严格模式下，TempoKV 生成必须同时
 出现 `temporal_persistent_direct` 和 `cross_kv_persistent_direct`；缺少任意一项
 都会报错，防止在不知情的情况下使用慢速路径。

@@ -117,11 +117,17 @@ def predict_temporal(
         if weights.shape[1] != history[0].shape[1]:
             raise ValueError("per-head temporal parameters do not match the cache")
         for index in range(order):
-            prediction.add_(history[index].float() * weights[index][None, :, None, :])
-        return prediction + bias[None, :, None, :]
+            prediction.addcmul_(
+                history[index], weights[index][None, :, None, :]
+            )
+        prediction.add_(bias[None, :, None, :])
+        return prediction
     for index in range(order):
-        prediction.add_(history[index].float() * weights[index][None, None, None, :])
-    return prediction + bias[None, None, None, :]
+        prediction.addcmul_(
+            history[index], weights[index][None, None, None, :]
+        )
+    prediction.add_(bias[None, None, None, :])
+    return prediction
 
 
 def predict_cross_kv(
@@ -148,12 +154,13 @@ def predict_cross_kv(
         for lag, previous in enumerate(resolved_history[:order]):
             history_weight = parameters.history_weights[lag].to(source.device)
             if parameters.history_diagonal:
-                prediction.add_(
-                    previous.float() * history_weight[None, :, None, :]
+                prediction.addcmul_(
+                    previous, history_weight[None, :, None, :]
                 )
             else:
                 prediction.add_(torch.matmul(previous.float(), history_weight))
-    return prediction + bias[None, :, None, :]
+    prediction.add_(bias[None, :, None, :])
+    return prediction
 
 
 @contextmanager
@@ -287,7 +294,10 @@ def _encode(
         else torch.empty(value.shape, device=value.device, dtype=reconstruction_dtype)
     )
     reconstruction[:, :, :stride] = anchor_rebuilt
-    history = [anchor_rebuilt]
+    # Keep history as views into the reconstruction.  Retaining the temporary
+    # rebuilt units would otherwise duplicate up to P full units on the GPU.
+    history = [reconstruction[:, :, :stride]]
+    del anchor_rebuilt
     residual_sequence = sequence - stride
     packed_width = width if bits == 8 else width // (8 // bits)
     scale_width = width // config.group_size
@@ -346,22 +356,29 @@ def _encode(
                 cross_kv,
                 [item[:, :, :unit_length] for item in history],
             )
+        residual_input = torch.empty_like(current, dtype=torch.float32)
+        torch.sub(current, prediction, out=residual_input)
         quant, scale, zero_point, residual_rebuilt = _quantize(
-            current.float() - prediction,
+            residual_input,
             bits=bits,
             group_size=config.group_size,
             mode=config.residual_mode,
             scale_dtype=scale_dtype,
         )
-        rebuilt = (prediction + residual_rebuilt).to(reconstruction_dtype)
+        del residual_input
+        rebuilt = prediction.add_(residual_rebuilt).to(reconstruction_dtype)
         reconstruction[:, :, offset : offset + unit_length] = rebuilt
+        rebuilt_view = reconstruction[:, :, offset : offset + unit_length]
         if predictor_kind == "temporal":
             assert temporal is not None
-            history = [rebuilt, *history[: temporal.history_length - 1]]
+            history = [rebuilt_view, *history[: temporal.history_length - 1]]
         else:
             assert cross_kv is not None
             if cross_kv.history_length:
-                history = [rebuilt, *history[: cross_kv.history_length - 1]]
+                history = [
+                    rebuilt_view,
+                    *history[: cross_kv.history_length - 1],
+                ]
         residual_end = residual_offset + unit_length
         assert residual_quant is not None and residual_scale is not None
         residual_quant[:, :, residual_offset:residual_end].copy_(quant)
@@ -372,6 +389,7 @@ def _encode(
         residual_offset = residual_end
         unit_lengths.append(unit_length)
         offset += unit_length
+        del current, prediction, quant, scale, zero_point, residual_rebuilt, rebuilt
 
     packed = PackedTensor(
         shape=(batch, heads, sequence, width),
@@ -526,10 +544,11 @@ def decode_tensor(
         output_dtype,
     )
     output[:, :, :anchor_length] = anchor
+    del anchor
     if packed.residual_quant is None:
         return output
     assert packed.residual_scale is not None
-    history = [anchor]
+    history = [output[:, :, :anchor_length]]
     offset = anchor_length
     residual_offset = 0
     for unit_length in packed.unit_lengths[1:]:
@@ -561,20 +580,25 @@ def decode_tensor(
             width=width,
             mode=packed.residual_mode,
         )
-        rebuilt = (prediction + residual).to(output_dtype)
+        rebuilt = prediction.add_(residual).to(output_dtype)
         output[:, :, offset : offset + unit_length] = rebuilt
+        rebuilt_view = output[:, :, offset : offset + unit_length]
         if packed.predictor_kind == "temporal":
             assert packed.temporal is not None
-            history = [rebuilt, *history[: packed.temporal.history_length - 1]]
+            history = [
+                rebuilt_view,
+                *history[: packed.temporal.history_length - 1],
+            ]
         else:
             assert packed.cross_kv is not None
             if packed.cross_kv.history_length:
                 history = [
-                    rebuilt,
+                    rebuilt_view,
                     *history[: packed.cross_kv.history_length - 1],
                 ]
         offset += unit_length
         residual_offset = end
+        del prediction, zero_point, residual, rebuilt
     return output
 
 
