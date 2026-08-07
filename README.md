@@ -54,17 +54,20 @@ bash self-forcing/prepare.sh
 Generate videos from the fitted parameters, repeatable with different prompts:
 
 ```bash
-MODE=tempokv \
 MODEL_REPO=/path/to/self-forcing-model-repo \
 CHECKPOINT=/models/self_forcing_dmd.pt \
 WAN_MODEL_DIR=/models/Wan2.1-T2V-1.3B \
 PROMPTS=assets/generation_prompts.txt \
-PARAM_DIR=parameters \
-OUTPUT_DIR=results/self_forcing \
 CONFIG=configs/int2.json \
+K_HISTORY_LENGTH=3 \
+V_HISTORY_LENGTH=2 \
 FRAMES=717 \
 bash self-forcing/generate.sh
 ```
+
+`K_HISTORY_LENGTH` and `V_HISTORY_LENGTH` explicitly select the history used
+for this run. If omitted, both values come from `CONFIG`; the example also
+omits the default mode, parameter directory, and output directory.
 
 Set `MODE=bf16` for an unquantized baseline; that mode does not need `CONFIG`
 or `PARAM_DIR`. `pipeline_report.json` records total wall-clock time, per-GPU

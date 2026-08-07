@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import datetime, timezone
 import json
 import os
@@ -45,6 +45,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--config", type=Path)
     parser.add_argument("--k-params", type=Path)
     parser.add_argument("--v-params", type=Path)
+    parser.add_argument(
+        "--k-history-length",
+        type=int,
+        choices=range(1, 9),
+        help="number of reconstructed K frames used by the predictor",
+    )
+    parser.add_argument(
+        "--v-history-length",
+        type=int,
+        choices=(0, 1, 2),
+        help="number of reconstructed V frames used by the predictor",
+    )
     parser.add_argument("--model-repo", type=Path, required=True)
     parser.add_argument("--model-config", type=Path)
     parser.add_argument("--checkpoint", type=Path, required=True)
@@ -360,6 +372,16 @@ def run(args: argparse.Namespace) -> dict[str, object]:
     parameters = None
     if args.mode == "tempokv":
         config = _load_config(paths["config"])
+        history_overrides = {
+            name: value
+            for name, value in (
+                ("k_history_length", args.k_history_length),
+                ("v_history_length", args.v_history_length),
+            )
+            if value is not None
+        }
+        if history_overrides:
+            config = replace(config, **history_overrides)
         if config.stride != 1560:
             raise ValueError("Self-Forcing requires stride=1560")
         if 128 % config.group_size:

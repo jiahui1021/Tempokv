@@ -10,14 +10,13 @@
 #   MODE=bf16     不量化的对照基线，不需要 CONFIG / PARAM_DIR
 #
 # 用法（所有参数都用环境变量传入）：
-#   MODE=tempokv \
 #   MODEL_REPO=/path/to/model-repo \
 #   CHECKPOINT=/models/self_forcing_dmd.pt \
 #   WAN_MODEL_DIR=/models/Wan2.1-T2V-1.3B \
 #   PROMPTS=assets/generation_prompts.txt \
-#   PARAM_DIR=parameters \
-#   OUTPUT_DIR=results/self_forcing \
 #   CONFIG=configs/int2.json \
+#   K_HISTORY_LENGTH=3 \
+#   V_HISTORY_LENGTH=2 \
 #   FRAMES=717 \
 #   bash self-forcing/generate.sh
 #
@@ -36,6 +35,8 @@
 #   SEED            随机种子（默认 0）
 #   START_INDEX / END_INDEX  prompt 序号范围（默认 0 .. -1 全部）
 #   NUM_GPUS        torchrun 使用的 GPU 数（默认 1）
+#   K_HISTORY_LENGTH  K 使用的历史帧数（1 到 8；默认读取 CONFIG）
+#   V_HISTORY_LENGTH  V 使用的历史帧数（0 到 2；默认读取 CONFIG）
 #
 set -euo pipefail
 
@@ -55,7 +56,7 @@ require_env() {
   local name
   for name in "$@"; do
     if [[ -z "${!name:-}" ]]; then
-      die "缺少必需变量 $name（请用环境变量传入）"
+      die "缺少必需变量 ${name}（请用环境变量传入）"
     fi
   done
 }
@@ -65,7 +66,7 @@ resolve_path() {
   local value="$1"
   case "$value" in
     /*) printf '%s\n' "$value" ;;
-    *)  realpath -m -- "$project_root/$value" ;;
+    *)  printf '%s/%s\n' "${project_root%/}" "${value#./}" ;;
   esac
 }
 
@@ -88,7 +89,8 @@ _quant_config_slug() {
     printf 'bf16'
     return 0
   fi
-  "$python_bin" - "$(resolve_path "$CONFIG")" "$param_dir/k_temporal.npz" <<'PY'
+  "$python_bin" - "$(resolve_path "$CONFIG")" "$param_dir/k_temporal.npz" \
+    "${K_HISTORY_LENGTH:-}" "${V_HISTORY_LENGTH:-}" <<'PY'
 import json
 import sys
 
@@ -98,9 +100,12 @@ try:
     config = json.load(open(sys.argv[1]))
     config = config.get("codec", config)
     k_bits = config.get("k_bits", 0)
-    v_history = config.get("v_history_length", 0)
-    history = int(np.load(sys.argv[2])["history_length"].item())
-    print(f"kh{history}-vh{v_history}-int{k_bits}")
+    fitted_k_history = int(np.load(sys.argv[2])["history_length"].item())
+    k_history = int(sys.argv[3]) if sys.argv[3] else fitted_k_history
+    v_history = (
+        int(sys.argv[4]) if sys.argv[4] else config.get("v_history_length", 0)
+    )
+    print(f"kh{k_history}-vh{v_history}-int{k_bits}")
 except Exception:
     print("unknown")
 PY
@@ -151,6 +156,14 @@ check_int SEED 0
 check_int START_INDEX 0
 check_int END_INDEX -1
 check_int NUM_GPUS 1
+if [[ -n "${K_HISTORY_LENGTH:-}" ]]; then
+  check_int K_HISTORY_LENGTH 1
+  (( K_HISTORY_LENGTH <= 8 )) || die "K_HISTORY_LENGTH 必须 <= 8（当前值：$K_HISTORY_LENGTH）"
+fi
+if [[ -n "${V_HISTORY_LENGTH:-}" ]]; then
+  check_int V_HISTORY_LENGTH 0
+  (( V_HISTORY_LENGTH <= 2 )) || die "V_HISTORY_LENGTH 必须 <= 2（当前值：$V_HISTORY_LENGTH）"
+fi
 
 latent_frames=$(( (FRAMES + 3) / 4 ))
 if [[ "$mode" == "tempokv" && "$latent_frames" -lt 27 ]]; then
@@ -179,6 +192,8 @@ if [[ "$mode" == "tempokv" ]]; then
     --k-params "$param_dir/k_temporal.npz"
     --v-params "$param_dir/v_cross_kv.npz"
   )
+  [[ -n "${K_HISTORY_LENGTH:-}" ]] && generate_command+=(--k-history-length "$K_HISTORY_LENGTH")
+  [[ -n "${V_HISTORY_LENGTH:-}" ]] && generate_command+=(--v-history-length "$V_HISTORY_LENGTH")
 fi
 
 [[ -n "${MODEL_CONFIG:-}" ]] && generate_command+=(--model-config "$(resolve_path "$MODEL_CONFIG")")

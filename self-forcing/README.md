@@ -103,17 +103,20 @@ MAX_GAIN=1.0
 例如生成 717 帧（= 180 latent 帧）的完整视频：
 
 ```bash
-MODE=tempokv \
 MODEL_REPO=/path/to/self-forcing-model-repo \
 CHECKPOINT=/models/self_forcing_dmd.pt \
 WAN_MODEL_DIR=/models/Wan2.1-T2V-1.3B \
 PROMPTS=assets/generation_prompts.txt \
-PARAM_DIR=parameters \
-OUTPUT_DIR=results/self_forcing \
 CONFIG=configs/int2.json \
+K_HISTORY_LENGTH=3 \
+V_HISTORY_LENGTH=2 \
 FRAMES=717 \
 bash self-forcing/generate.sh
 ```
+
+`K_HISTORY_LENGTH` 和 `V_HISTORY_LENGTH` 明确指定本次生成使用的历史帧数；
+省略时读取 `CONFIG`。示例省略了默认的 `MODE=tempokv`、`PARAM_DIR=parameters`
+和输出目录。
 
 > 注意：`MODE=tempokv` 时 `FRAMES` 至少要给到 105 视频帧（27 latent 帧），
 > 否则入口会直接拒绝。`MODE=bf16` 没有这个下限。

@@ -51,17 +51,20 @@ bash self-forcing/prepare.sh
 ### 第二步：读取参数生成视频（可更换 prompt 后重复运行）
 
 ```bash
-MODE=tempokv \
 MODEL_REPO=/path/to/self-forcing-model-repo \
 CHECKPOINT=/models/self_forcing_dmd.pt \
 WAN_MODEL_DIR=/models/Wan2.1-T2V-1.3B \
 PROMPTS=assets/generation_prompts.txt \
-PARAM_DIR=parameters \
-OUTPUT_DIR=results/self_forcing \
 CONFIG=configs/int2.json \
+K_HISTORY_LENGTH=3 \
+V_HISTORY_LENGTH=2 \
 FRAMES=717 \
 bash self-forcing/generate.sh
 ```
+
+`K_HISTORY_LENGTH` 和 `V_HISTORY_LENGTH` 明确指定本次生成使用的历史帧数；
+省略时读取 `CONFIG`。示例省略了默认的 `MODE=tempokv`、`PARAM_DIR=parameters`
+和输出目录。
 
 设置 `MODE=bf16` 可以运行不量化的对照生成；该模式不需要 `CONFIG` 和
 `PARAM_DIR`。`pipeline_report.json` 中保存总耗时、每个 GPU 的耗时和最高显存占用。
