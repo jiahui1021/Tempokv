@@ -137,12 +137,14 @@ def _validate_parameters(
         raise ValueError("K parameters must contain 12 heads with dimension 128")
     if tuple(cross.weight.shape[-3:]) != (12, 128, 128):
         raise ValueError("V parameters must contain 12 heads with 128x128 weights")
-    expected_v_history_shape = (30, config.v_history_length, 12, 128, 128)
-    if tuple(cross.history_weights.shape) != expected_v_history_shape:
-        raise ValueError(
-            "V history parameters must match 30 layers, the configured history "
-            "length, 12 heads, and 128x128 weights"
-        )
+    if config.v_history_length:
+        expected_v_history_shape = (30, config.v_history_length, 12, 128)
+        if tuple(cross.history_weights.shape) != expected_v_history_shape:
+            raise ValueError(
+                "Self-Forcing requires fast diagonal V history parameters matching "
+                "30 layers, the configured history length, 12 heads, and dimension "
+                "128; refit v_cross_kv.npz with the current fitter"
+            )
     return {
         "k_params": str(k_path),
         "v_params": str(v_path),
@@ -152,6 +154,7 @@ def _validate_parameters(
         "history_length": temporal.history_length,
         "k_history_length": temporal.history_length,
         "v_history_length": cross.history_length,
+        "v_history_mode": cross.history_mode,
         "stride": config.stride,
         "coordinate_system": EXPECTED_COORDINATE_SYSTEM,
     }

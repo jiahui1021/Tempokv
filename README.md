@@ -22,7 +22,7 @@ NVIDIA GPU Triton decoders:
 pip install -e ".[cuda]"
 ```
 
-Two codec configs are provided. Both use the three most recent reconstructed K
+Two codec configs are provided. Both use the two most recent reconstructed K
 frames to predict K, and current reconstructed K plus the two most recent
 reconstructed V frames to predict V:
 
@@ -34,7 +34,9 @@ and accepts values from `1` to `8`; fitting learns a separate coefficient for
 each selected history frame.
 `v_history_length` controls the V predictor: `2` uses the previous two V frames,
 `1` uses only the previous frame, and `0` retains the legacy K-only CrossKV
-predictor. Predictor parameters must be refitted after changing either value.
+predictor. V history coefficients are fitted per head and channel, so each lag
+adds only lightweight multiply-adds instead of another full K-to-V projection.
+Predictor parameters must be refitted after changing either value.
 
 ## Self-Forcing pipeline
 
@@ -51,6 +53,23 @@ CONFIG=configs/int2.json \
 bash self-forcing/prepare.sh
 ```
 
+If `parameters/self_forcing_trace.npz` already exists, refit the fast two-frame
+K/V parameters without collecting another trace:
+
+```bash
+python scripts/fit_params.py parameters/self_forcing_trace.npz \
+  --config configs/int2.json \
+  --output-dir parameters \
+  --k-history-length 2 \
+  --v-history-length 2 \
+  --iterations 2 \
+  --temporal-ridge 0.1 \
+  --cross-ridge 0.1 \
+  --max-gain 1.0 \
+  --stride 1560 \
+  --coordinate-system pre_rope_normalized
+```
+
 Generate videos from the fitted parameters, repeatable with different prompts:
 
 ```bash
@@ -59,7 +78,7 @@ CHECKPOINT=/models/self_forcing_dmd.pt \
 WAN_MODEL_DIR=/models/Wan2.1-T2V-1.3B \
 PROMPTS=assets/generation_prompts.txt \
 CONFIG=configs/int2.json \
-K_HISTORY_LENGTH=3 \
+K_HISTORY_LENGTH=2 \
 V_HISTORY_LENGTH=2 \
 FRAMES=717 \
 bash self-forcing/generate.sh

@@ -15,7 +15,7 @@
 #   WAN_MODEL_DIR=/models/Wan2.1-T2V-1.3B \
 #   PROMPTS=assets/generation_prompts.txt \
 #   CONFIG=configs/int2.json \
-#   K_HISTORY_LENGTH=3 \
+#   K_HISTORY_LENGTH=2 \
 #   V_HISTORY_LENGTH=2 \
 #   FRAMES=717 \
 #   bash self-forcing/generate.sh
@@ -83,7 +83,7 @@ check_int() {
   die "$name 必须是整数且 >= $min（当前值：$value）"
 }
 
-# 生成一个短量化标签，用于默认输出目录，例如 kh3-vh2-int2
+# 生成一个短量化标签，用于默认输出目录，例如 kh2-vh2-int2
 _quant_config_slug() {
   if [[ "$mode" == "bf16" ]]; then
     printf 'bf16'

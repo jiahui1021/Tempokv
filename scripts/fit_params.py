@@ -204,6 +204,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "temporal_ridge": float(args.temporal_ridge),
             "cross_ridge": float(args.cross_ridge),
             "v_history_length": int(config.v_history_length),
+            "v_history_mode": cross.history_mode,
             "max_gain": float(args.max_gain),
             "coordinate_system": args.coordinate_system,
         },

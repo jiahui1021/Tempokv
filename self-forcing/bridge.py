@@ -112,6 +112,14 @@ def install(model_repo: str | Path) -> type:
                 )
             if config.reconstruction_dtype != "bfloat16":
                 raise ValueError("Self-Forcing requires bfloat16 reconstruction")
+            if (
+                getattr(config, "v_history_length", 0)
+                and not self.tempokv_codec.cross_kv.history_diagonal
+            ):
+                raise ValueError(
+                    "Self-Forcing requires fast diagonal V history parameters; "
+                    "refit v_cross_kv.npz with the current fitter"
+                )
             if getattr(self.quant_config, "kv_cache_cpu_offload", False):
                 raise ValueError("TempoKV Self-Forcing bridge does not support cache offload")
             self._patch_attention_windows()

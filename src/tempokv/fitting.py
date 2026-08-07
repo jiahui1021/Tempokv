@@ -200,11 +200,12 @@ def fit_cross_kv(
     *,
     reconstructed_values: torch.Tensor | None = None,
     history_length: int = 0,
+    history_mode: str = "dense",
     ridge: float = 0.0,
     stride: int | None = None,
     layer_ids: tuple[int, ...] | None = None,
 ) -> CrossKVParameters:
-    """Fit dense current-K and reconstructed-V-history maps per layer/head.
+    """Fit current-K and reconstructed-V-history maps per layer/head.
 
     With ``history_length=0``, inputs use ``[L,...,H,D]`` and retain the legacy
     ``V = K @ W_K + b`` behavior.  With one or two history terms, inputs use
@@ -212,6 +213,9 @@ def fit_cross_kv(
     ``V_t = K_t @ W_K + sum(V_hat_(t-i) @ W_Vi) + b``.  Missing warm-up lags
     are zero.  ``reconstructed_values`` must supply decoder-visible history;
     callers that intentionally want teacher forcing can pass ``values``.
+    ``history_mode="dense"`` fits a full ``D x D`` map per lag and preserves
+    the legacy API.  ``history_mode="diagonal"`` jointly fits the dense K map
+    with one history coefficient per lag and output channel.
     """
     _check_pair(keys, values, minimum_dimensions=4, layout="[L, ..., H, D]")
     if (
@@ -221,6 +225,11 @@ def fit_cross_kv(
     ):
         raise ValueError("history_length must be 0, 1, or 2")
     history_length = int(history_length)
+    if history_mode not in ("dense", "diagonal"):
+        raise ValueError("history_mode must be 'dense' or 'diagonal'")
+    # A zero-history fit is exactly the legacy K-only regression.  Keep that
+    # fast path even when callers preselect diagonal mode for a later fit.
+    resolved_history_mode = "dense" if history_length == 0 else history_mode
     ridge = _check_scalar("ridge", ridge)
     stride = _check_stride(stride)
     history_trace: torch.Tensor | None = None
@@ -252,7 +261,9 @@ def fit_cross_kv(
     layer_count = int(keys.shape[0])
     head_count = int(keys.shape[-2])
     dim = int(keys.shape[-1])
-    feature_dim = (history_length + 1) * dim
+    feature_dim = dim + history_length * (
+        dim if resolved_history_mode == "dense" else 1
+    )
 
     work_device = keys.device
     compute_dtype = torch.float64
@@ -265,7 +276,7 @@ def fit_cross_kv(
     for layer in range(layer_count):
         # Fit one layer at a time.  Production traces are large, and expanding
         # every layer to float64 together needlessly multiplies peak memory.
-        feature_parts = [feature_keys[layer]]
+        history_parts: list[torch.Tensor] = []
         if history_trace is not None:
             layer_history = history_trace[layer]
             history_layout = torch.zeros_like(layer_history[..., 1:, :, :])
@@ -274,41 +285,141 @@ def fit_cross_kv(
                 aligned[..., lag - 1 :, :, :] = layer_history[
                     ..., : frame_count - lag, :, :
                 ]
-                feature_parts.append(aligned)
-        x = torch.cat(feature_parts, dim=-1).detach().to(
+                history_parts.append(aligned)
+
+        layer_keys = feature_keys[layer].detach().to(
             device=work_device, dtype=compute_dtype
-        ).reshape(-1, head_count, feature_dim).permute(1, 0, 2)
-        del feature_parts
-        if history_trace is not None:
-            del aligned, history_layout, layer_history
+        )
+        history_parts = [
+            part.detach().to(device=work_device, dtype=compute_dtype)
+            for part in history_parts
+        ]
         y = targets[layer].detach().to(device=work_device, dtype=compute_dtype).reshape(
             -1, head_count, dim
         ).permute(1, 0, 2)
 
-        x_mean = x.mean(dim=1)
-        y_mean = y.mean(dim=1)
-        xc = x - x_mean[:, None, :]
-        yc = y - y_mean[:, None, :]
-        gram = torch.matmul(xc.transpose(-2, -1), xc)
-        rhs = torch.matmul(xc.transpose(-2, -1), yc)
-        scale = gram.diagonal(dim1=-2, dim2=-1).sum(dim=-1) / feature_dim
-        penalty = ridge * scale.clamp_min(torch.finfo(compute_dtype).eps)
-        system = gram + penalty[..., None, None] * identity
-        if ridge > 0.0:
-            combined_weight = torch.linalg.solve(system, rhs)
-        else:
-            combined_weight = torch.matmul(
-                torch.linalg.pinv(system, rtol=1e-10), rhs
+        if resolved_history_mode == "dense":
+            x = torch.cat([layer_keys, *history_parts], dim=-1).reshape(
+                -1, head_count, feature_dim
+            ).permute(1, 0, 2)
+            x_mean = x.mean(dim=1)
+            y_mean = y.mean(dim=1)
+            xc = x - x_mean[:, None, :]
+            yc = y - y_mean[:, None, :]
+            gram = torch.matmul(xc.transpose(-2, -1), xc)
+            rhs = torch.matmul(xc.transpose(-2, -1), yc)
+            scale = gram.diagonal(dim1=-2, dim2=-1).sum(dim=-1) / feature_dim
+            penalty = ridge * scale.clamp_min(torch.finfo(compute_dtype).eps)
+            system = gram + penalty[..., None, None] * identity
+            if ridge > 0.0:
+                combined_weight = torch.linalg.solve(system, rhs)
+            else:
+                combined_weight = torch.matmul(
+                    torch.linalg.pinv(system, rtol=1e-10), rhs
+                )
+            bias = y_mean - torch.matmul(
+                x_mean.unsqueeze(-2), combined_weight
+            ).squeeze(-2)
+            weights.append(combined_weight[:, :dim])
+            history_weights.append(
+                combined_weight[:, dim:]
+                .reshape(head_count, history_length, dim, dim)
+                .permute(1, 0, 2, 3)
             )
-        bias = y_mean - torch.matmul(
-            x_mean.unsqueeze(-2), combined_weight
-        ).squeeze(-2)
-        weights.append(combined_weight[:, :dim])
-        history_weights.append(
-            combined_weight[:, dim:]
-            .reshape(head_count, history_length, dim, dim)
-            .permute(1, 0, 2, 3)
+            biases.append(bias)
+            continue
+
+        # Every output channel sees all current-K channels, but only the same
+        # channel from each V-history lag.  Form the small normal-equation
+        # blocks directly to avoid materializing D copies of the K features.
+        key_x = layer_keys.reshape(-1, head_count, dim).permute(1, 0, 2)
+        observation_count = int(key_x.shape[1])
+        if history_parts:
+            history_x = torch.stack(history_parts, dim=-2).reshape(
+                -1, head_count, history_length, dim
+            ).permute(1, 3, 0, 2)
+        else:
+            history_x = key_x.new_empty(head_count, dim, observation_count, 0)
+
+        y_by_output = y.permute(0, 2, 1)
+        key_mean = key_x.mean(dim=1)
+        history_mean = history_x.mean(dim=2)
+        y_mean = y_by_output.mean(dim=2)
+        key_centered = key_x - key_mean[:, None, :]
+        history_centered = history_x - history_mean[:, :, None, :]
+        y_centered = y_by_output - y_mean[:, :, None]
+
+        key_gram = torch.matmul(key_centered.transpose(-2, -1), key_centered)
+        key_rhs = torch.einsum("hni,hon->hoi", key_centered, y_centered)
+        cross_gram = torch.einsum(
+            "hni,honp->hoip", key_centered, history_centered
         )
+        history_gram = torch.einsum(
+            "honp,honq->hopq", history_centered, history_centered
+        )
+        history_rhs = torch.einsum(
+            "honp,hon->hop", history_centered, y_centered
+        )
+
+        # Use one common relative ridge scale per head so the D x D K block
+        # can be factored once and reused for every output channel.  History
+        # energy is averaged over output channels because each channel sees
+        # only its own P history features.
+        key_energy = key_gram.diagonal(dim1=-2, dim2=-1).sum(dim=-1)
+        history_energy = history_gram.diagonal(
+            dim1=-2, dim2=-1
+        ).sum(dim=-1).mean(dim=-1)
+        scale = (key_energy + history_energy) / feature_dim
+        penalty = ridge * scale.clamp_min(torch.finfo(compute_dtype).eps)
+        key_system = key_gram + penalty[:, None, None] * identity[:dim, :dim]
+        history_system = history_gram + (
+            penalty[:, None, None, None]
+            * identity[:history_length, :history_length]
+        )
+
+        # Schur complement: solve the large K block once per head with all
+        # output/history right-hand sides, then solve only P x P systems per
+        # output channel and back-substitute the K weights.
+        key_block_rhs = torch.cat(
+            (
+                key_rhs.permute(0, 2, 1),
+                cross_gram.permute(0, 2, 1, 3).reshape(
+                    head_count, dim, dim * history_length
+                ),
+            ),
+            dim=-1,
+        )
+        if ridge > 0.0:
+            key_block_solution = torch.linalg.solve(key_system, key_block_rhs)
+        else:
+            key_block_solution = torch.matmul(
+                torch.linalg.pinv(key_system, rtol=1e-10), key_block_rhs
+            )
+        inverse_key_rhs = key_block_solution[..., :dim].permute(0, 2, 1)
+        inverse_cross = key_block_solution[..., dim:].reshape(
+            head_count, dim, dim, history_length
+        ).permute(0, 2, 1, 3)
+        schur_system = history_system - torch.einsum(
+            "hoip,hoiq->hopq", cross_gram, inverse_cross
+        )
+        schur_system = 0.5 * (schur_system + schur_system.transpose(-2, -1))
+        schur_rhs = history_rhs - torch.einsum(
+            "hoip,hoi->hop", cross_gram, inverse_key_rhs
+        )
+        fitted_history_weight = _solve(
+            schur_system, schur_rhs, regularized=ridge > 0.0
+        )
+        fitted_key_weight = inverse_key_rhs - torch.einsum(
+            "hoip,hop->hoi", inverse_cross, fitted_history_weight
+        )
+        bias = y_mean - torch.einsum(
+            "hi,hoi->ho", key_mean, fitted_key_weight
+        )
+        bias = bias - torch.einsum(
+            "hop,hop->ho", history_mean, fitted_history_weight
+        )
+        weights.append(fitted_key_weight.transpose(-2, -1))
+        history_weights.append(fitted_history_weight.permute(2, 0, 1))
         biases.append(bias)
 
     weight = torch.stack(weights)
@@ -522,13 +633,19 @@ def _reconstruct_cross_kv_trace(
         )
         order = min(frame, parameters.history_length)
         for lag in range(1, order + 1):
-            prediction.add_(
-                torch.einsum(
-                    "l...hi,lhij->l...hj",
-                    rebuilt[..., frame - lag, :, :].float(),
-                    history_weights[:, lag - 1],
+            if parameters.history_diagonal:
+                prediction.add_(
+                    rebuilt[..., frame - lag, :, :].float()
+                    * history_weights[:, lag - 1].view(broadcast_shape)
                 )
-            )
+            else:
+                prediction.add_(
+                    torch.einsum(
+                        "l...hi,lhij->l...hj",
+                        rebuilt[..., frame - lag, :, :].float(),
+                        history_weights[:, lag - 1],
+                    )
+                )
         prediction.add_(bias)
         residual = clean_values[..., frame, :, :].float() - prediction
         residual_rebuilt = _quantization_roundtrip(
@@ -673,7 +790,6 @@ def fit_predictors(
                 resolved.v_history_length,
                 head_count,
                 dim,
-                dim,
                 device=keys.device,
                 dtype=torch.float32,
             ),
@@ -687,6 +803,7 @@ def fit_predictors(
                 values,
                 reconstructed_values=reconstructed_values,
                 history_length=resolved.v_history_length,
+                history_mode="diagonal",
                 ridge=cross_ridge,
                 stride=resolved.stride,
                 layer_ids=layer_ids,

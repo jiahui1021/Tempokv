@@ -65,6 +65,26 @@ parameters/v_cross_kv.npz
 parameters/fit_report.json
 ```
 
+已有 `parameters/self_forcing_trace.npz` 时，无需重新采集，可以直接生成新的
+快速参数。下面的命令把 K 和 V 都设为使用前两帧：
+
+```bash
+python scripts/fit_params.py parameters/self_forcing_trace.npz \
+  --config configs/int2.json \
+  --output-dir parameters \
+  --k-history-length 2 \
+  --v-history-length 2 \
+  --iterations 2 \
+  --temporal-ridge 0.1 \
+  --cross-ridge 0.1 \
+  --max-gain 1.0 \
+  --stride 1560 \
+  --coordinate-system pre_rope_normalized
+```
+
+这条命令会替换 `parameters/k_temporal.npz` 和
+`parameters/v_cross_kv.npz`。
+
 `prepare.sh` 默认把采集的 trace 和拟合参数都写到独立的 `parameters/` 目录
 （可用 `PARAM_DIR` 覆盖），`WORK_DIR` 只保留 trace 采集中间产物。
 
@@ -84,11 +104,13 @@ MAX_GAIN=1.0
 ```
 
 量化位宽、anchor 位宽、分组大小、残差方式和 K/V 历史长度都在 `CONFIG`
-指向的 JSON 中调整。`k_history_length` 可设为 `1` 到 `8`，设为 `3` 时使用
-前三帧重建 K，各帧系数由拟合过程自动学习；
+指向的 JSON 中调整。`k_history_length` 可设为 `1` 到 `8`，设为 `2` 时使用
+前两帧重建 K，各帧系数由拟合过程自动学习；
 `v_history_length=2` 使用前两帧重建 V，设为 `1` 时只使用前一帧，设为 `0`
 时使用旧的纯 CrossKV 预测。
 这些配置改变后必须重新运行 `prepare.sh`，避免参数和生成配置不匹配。
+当前拟合器会生成快速的逐通道 V 历史系数；旧版完整矩阵历史参数会在生成前
+被拒绝，需要用当前代码重新拟合一次。
 
 采集器需要接受以下环境变量：`SELF_FORCING_CHECKPOINT_PATH`、
 `FORCING_WAN_MODEL_DIR`、`CROSS_KV_TRACE_DIR`、`OUTPUT_FOLDER`、
@@ -108,7 +130,7 @@ CHECKPOINT=/models/self_forcing_dmd.pt \
 WAN_MODEL_DIR=/models/Wan2.1-T2V-1.3B \
 PROMPTS=assets/generation_prompts.txt \
 CONFIG=configs/int2.json \
-K_HISTORY_LENGTH=3 \
+K_HISTORY_LENGTH=2 \
 V_HISTORY_LENGTH=2 \
 FRAMES=717 \
 bash self-forcing/generate.sh
@@ -162,10 +184,10 @@ performance.ranks[]
 局部滑窗；比较 TempoKV 与 BF16 时，两次运行必须使用相同的 `FRAMES`、
 `LOCAL_ATTN_SIZE`、prompt、seed 和 GPU 数量。
 
-K→V 与历史 V 的 128×128 预测矩阵乘在编码和 Triton 解码端都使用 TF32
-（A100 上比 IEEE FP32 明显更快），与旧仓库
-`S2_CROSS_MATMUL_PRECISION=tf32` 一致。历史 V 的计算已融合进同一个 Triton
-解码 kernel；正式生成仍使用 `cross_kv_persistent_direct` 快速路径。
+K→V 的 128×128 预测矩阵乘在编码和 Triton 解码端使用 TF32（A100 上比
+IEEE FP32 明显更快），与旧仓库 `S2_CROSS_MATMUL_PRECISION=tf32` 一致。
+历史 V 使用逐通道拟合的系数，只增加乘加，不再为每帧历史执行一遍完整矩阵
+计算；正式生成仍使用 `cross_kv_persistent_direct` 快速路径。
 predictor 参数在 codec 内按 (device, layer) 缓存并全局共享，多个压缩 span
 复用同一份参数，不再为每个 span 复制。
 

@@ -147,7 +147,12 @@ def predict_cross_kv(
         prediction = torch.matmul(source.float(), weight)
         for lag, previous in enumerate(resolved_history[:order]):
             history_weight = parameters.history_weights[lag].to(source.device)
-            prediction.add_(torch.matmul(previous.float(), history_weight))
+            if parameters.history_diagonal:
+                prediction.add_(
+                    previous.float() * history_weight[None, :, None, :]
+                )
+            else:
+                prediction.add_(torch.matmul(previous.float(), history_weight))
     return prediction + bias[None, :, None, :]
 
 

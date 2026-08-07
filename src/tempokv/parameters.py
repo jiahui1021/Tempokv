@@ -221,20 +221,29 @@ class CrossKVParameters:
         else:
             history_weights = _tensor(self.history_weights)
         if weight.ndim == 3:
-            valid_history = (
+            valid_dense_history = (
                 history_weights.ndim == 4
                 and tuple(history_weights.shape[1:]) == tuple(weight.shape)
             )
+            valid_diagonal_history = (
+                history_weights.ndim == 3
+                and tuple(history_weights.shape[1:]) == tuple(bias.shape)
+            )
             history_axis = 0
         else:
-            valid_history = (
+            valid_dense_history = (
                 history_weights.ndim == 5
                 and history_weights.shape[0] == weight.shape[0]
                 and tuple(history_weights.shape[2:]) == tuple(weight.shape[1:])
             )
+            valid_diagonal_history = (
+                history_weights.ndim == 4
+                and history_weights.shape[0] == weight.shape[0]
+                and tuple(history_weights.shape[2:]) == tuple(bias.shape[1:])
+            )
             history_axis = 1
-        if not valid_history:
-            expected = (
+        if not (valid_dense_history or valid_diagonal_history):
+            expected_dense = (
                 f"[P,{weight.shape[0]},{weight.shape[-1]},{weight.shape[-1]}]"
                 if weight.ndim == 3
                 else (
@@ -242,7 +251,15 @@ class CrossKVParameters:
                     f"{weight.shape[-1]},{weight.shape[-1]}]"
                 )
             )
-            raise ValueError(f"history_weights must have shape {expected}")
+            expected_diagonal = (
+                f"[P,{weight.shape[0]},{weight.shape[-1]}]"
+                if weight.ndim == 3
+                else f"[{weight.shape[0]},P,{weight.shape[1]},{weight.shape[-1]}]"
+            )
+            raise ValueError(
+                "history_weights must have dense shape "
+                f"{expected_dense} or diagonal shape {expected_diagonal}"
+            )
         history_length = int(history_weights.shape[history_axis])
         if history_length not in (0, 1, 2):
             raise ValueError("history_weights must contain 0, 1, or 2 V history maps")
@@ -280,6 +297,17 @@ class CrossKVParameters:
             if self.layered
             else self.history_weights.shape[0]
         )
+
+    @property
+    def history_mode(self) -> str:
+        """Return ``"dense"`` or ``"diagonal"`` for the V history maps."""
+        dense_dimensions = 5 if self.layered else 4
+        return "dense" if self.history_weights.ndim == dense_dimensions else "diagonal"
+
+    @property
+    def history_diagonal(self) -> bool:
+        """Whether V history uses one scalar coefficient per output channel."""
+        return self.history_mode == "diagonal"
 
     def for_layer(self, layer: int) -> "CrossKVParameters":
         if not self.layered:
@@ -328,6 +356,7 @@ class CrossKVParameters:
             bias=self.bias.cpu().numpy(),
             history_weights=self.history_weights.cpu().numpy(),
             history_length=np.asarray(self.history_length, dtype=np.int32),
+            history_mode=np.asarray(self.history_mode),
             stride=np.asarray(-1 if self.stride is None else self.stride, dtype=np.int32),
             layer_ids=np.asarray(
                 [] if self.layer_ids is None else self.layer_ids, dtype=np.int32
@@ -380,6 +409,12 @@ class CrossKVParameters:
                 coordinate_system,
                 history_weights,
             )
+            if "history_mode" in data:
+                declared_history_mode = str(np.asarray(data["history_mode"]).item())
+                if declared_history_mode != parameters.history_mode:
+                    raise ValueError(
+                        "history_mode does not match the history_weights array"
+                    )
             if history_weights is not None and "history_length" in data:
                 declared_history_length = int(
                     np.asarray(data["history_length"]).item()
