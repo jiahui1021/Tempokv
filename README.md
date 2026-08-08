@@ -12,7 +12,10 @@ The LongCat-Video adapter is documented in
 [longcat/README.md](longcat/README.md). It keeps the TempoKV codec unchanged and
 connects it to LongCat's clean pre-RoPE KV cache. The first validation target is
 the single-process, no-offload, no-sink path; Context Parallel, KV CPU offload,
-attention sink spans, and `torch.compile` remain experimental.
+attention sink spans, and `torch.compile` remain experimental. LongCat can be
+run with `MODE=tempokv` for TempoKV KV quantization or `MODE=bf16` for the
+original unquantized BF16 baseline; each rank writes end-to-end timing and peak
+GPU-memory statistics.
 
 ## Installation
 

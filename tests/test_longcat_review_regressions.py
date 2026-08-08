@@ -8,6 +8,7 @@ import numpy as np
 import pytest
 import torch
 
+import longcat.generate as longcat_generate
 from longcat.bridge import (
     LongCatRuntimeSpec,
     LongCatTempoKVBridge,
@@ -214,7 +215,8 @@ def test_bridge_report_proves_tempokv_was_triggered() -> None:
     assert report["decode_tensor_calls"] > 0
 
 
-def test_trace_mode_bypasses_original_longcat_quantizer() -> None:
+@pytest.mark.parametrize("mode", ["trace", "bf16"])
+def test_clean_modes_bypass_original_longcat_quantizer(mode: str) -> None:
     attention_module = SimpleNamespace()
 
     class FakeAttention:
@@ -249,7 +251,7 @@ def test_trace_mode_bypasses_original_longcat_quantizer() -> None:
             del cond_latents, args, kwargs
             return None
 
-    bridge = LongCatTempoKVBridge(None, mode="trace", spec=_spec())
+    bridge = LongCatTempoKVBridge(None, mode=mode, spec=_spec())
     bridge.install(
         dit_module=dit_module,
         attention_module=attention_module,
@@ -263,6 +265,88 @@ def test_trace_mode_bypasses_original_longcat_quantizer() -> None:
 
     assert returned is clean_cache
     assert dit.original_quantize_calls == 0
+    assert bridge.report()["quantization_events"] == []
+
+
+def test_bf16_mode_forces_clean_qvg_quantization() -> None:
+    args = longcat_generate._parser().parse_args(
+        ["--mode", "bf16", "--longcat-repo", "/tmp/qvg"]
+    )
+    assert args.mode == "bf16"
+    forwarded = longcat_generate._external_arguments(
+        ["--quant_type", "naive-int4"], bf16=True
+    )
+    assert forwarded[-2:] == ["--quant_type", "none"]
+
+
+def test_bf16_runner_writes_timing_and_memory_report(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "Quant-VideoGen"
+    runner_root = repo / "experiments" / "LongCat"
+    runner_root.mkdir(parents=True)
+    (runner_root / "run_long_t2v.py").write_text("# fake runner\n", encoding="utf-8")
+    output = tmp_path / "output"
+    calls: dict[str, object] = {}
+
+    class FakeBridge:
+        def attach(self, dit: object, pipeline: object) -> None:
+            calls["attached"] = (dit, pipeline)
+
+        def report(self) -> dict[str, object]:
+            return {"mode": "bf16", "quantization_events": [], "decode_events": []}
+
+    def fake_install(**kwargs: object) -> FakeBridge:
+        calls["install"] = kwargs
+        return FakeBridge()
+
+    runner = SimpleNamespace()
+    runner.get_model_and_pipe = lambda *args, **kwargs: ("dit", "pipeline")
+    runner._parse_args = lambda: SimpleNamespace(output_dir=str(output))
+
+    def fake_generate(args: object) -> None:
+        del args
+        runner.get_model_and_pipe()
+
+    runner.generate = fake_generate
+    monkeypatch.setattr(longcat_generate, "install_longcat_bridge", fake_install)
+    monkeypatch.setattr(
+        longcat_generate.importlib, "import_module", lambda name: runner
+    )
+
+    result = longcat_generate.run(
+        [
+            "--mode",
+            "bf16",
+            "--longcat-repo",
+            str(repo),
+            "--output_dir",
+            str(output),
+        ]
+    )
+
+    assert result == 0
+    install = calls["install"]
+    assert isinstance(install, dict)
+    assert install["mode"] == "bf16"
+    assert "config_path" not in install
+    report = json.loads(
+        (output / "tempokv_bridge_report_rank_00000.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert report["mode"] == "bf16"
+    assert report["end_to_end_seconds"] >= 0
+    assert report["timing"]["model_load_seconds"] >= 0
+    assert "peak_allocated_bytes" in report["gpu_memory"]
+
+
+def test_gpu_memory_report_has_peak_fields() -> None:
+    report = longcat_generate._gpu_memory_report()
+
+    assert "peak_allocated_bytes" in report
+    assert "peak_reserved_bytes" in report
+    json.dumps(report)
 
 
 def test_context_parallel_trace_budget_is_global(tmp_path: Path) -> None:

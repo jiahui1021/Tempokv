@@ -575,8 +575,8 @@ class LongCatTempoKVBridge:
     decode_events: list[dict[str, object]] = field(init=False, default_factory=list)
 
     def __post_init__(self) -> None:
-        if self.mode not in {"tempokv", "trace"}:
-            raise ValueError("LongCat bridge mode must be tempokv or trace")
+        if self.mode not in {"tempokv", "bf16", "trace"}:
+            raise ValueError("LongCat bridge mode must be tempokv, bf16, or trace")
         if self.mode == "tempokv" and self.codec is None:
             raise ValueError("tempokv mode requires a loaded TempoKV codec")
         if (
@@ -787,8 +787,9 @@ class LongCatTempoKVBridge:
         *,
         offload: bool = False,
     ) -> Any:
-        if self.mode == "trace":
-            # Trace collection runs the uncompressed baseline after saving clean KV.
+        if self.mode in {"bf16", "trace"}:
+            # BF16 runs the original uncompressed LongCat attention path.  Trace
+            # collection uses the same clean path after saving the raw cache.
             return kv_cache_dict
         if self.codec is None:
             raise RuntimeError("TempoKV codec is not loaded")

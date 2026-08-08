@@ -23,9 +23,32 @@ python longcat/preflight.py \
   --checkpoint-dir /models/LongCat-Video
 ```
 
-For TempoKV generation, add `--config`, `--k-parameters`, and
+For `tempokv` generation, add `--config`, `--k-parameters`, and
 `--v-parameters`. The command returns exit code `2` and lists missing
 dependencies, checkpoint directories, CUDA, or mismatched stride settings.
+
+## Runtime modes
+
+The launcher supports three modes:
+
+- `MODE=tempokv` uses the TempoKV KV codec and requires `CONFIG`, `K_PARAMS`,
+  and `V_PARAMS`.
+- `MODE=bf16` runs LongCat's original unquantized BF16 KV-cache path. It does
+  not load TempoKV configuration or fitted parameters and forces qvg's
+  `--quant_type none`.
+- `MODE=trace` saves clean KV samples for parameter fitting and then runs the
+  uncompressed path.
+
+The BF16 baseline can be generated without any TempoKV files:
+
+```bash
+MODE=bf16 \
+LONGCAT_REPO=/path/to/qvg/Quant-VideoGen \
+CHECKPOINT_DIR=/models/LongCat-Video \
+INIT_VIDEO_PATH=results/longcat/base/0-0.mp4 \
+OUTPUT_DIR=results/longcat/bf16 \
+bash longcat/generate.sh
+```
 
 The first real-model validation target is intentionally narrow:
 
@@ -116,6 +139,7 @@ is required solely because the runtime spatial partition changed.
 ## Generation
 
 ```bash
+MODE=tempokv \
 LONGCAT_REPO=/path/to/qvg/Quant-VideoGen \
 CHECKPOINT_DIR=/models/LongCat-Video \
 INIT_VIDEO_PATH=results/longcat/base/0-0.mp4 \
@@ -153,10 +177,16 @@ Triton decoder.
 The launcher adds the bridge before model instances are created, then attaches
 it to the loaded DIT and pipeline. Existing LongCat command-line arguments can
 be appended to `generate.sh`. Each rank writes a
-`tempokv_bridge_report_rank_*.json` file containing quantization, decode, and
-storage statistics. It also records `encode_key_calls`, `encode_value_calls`,
-and `decode_tensor_calls`, so the TempoKV path can be checked directly. The
-report separates current, peak, and cumulative cache traffic:
+`tempokv_bridge_report_rank_*.json` file. The report contains
+`timing.end_to_end_seconds` for the complete Python-side run and
+`gpu_memory.peak_allocated_bytes` / `gpu_memory.peak_reserved_bytes` for the
+highest CUDA memory observed by that rank. The same peak values are available
+as the top-level `peak_gpu_allocated_bytes` and `peak_gpu_reserved_bytes`.
+
+TempoKV reports also contain quantization, decode, and storage statistics. They
+record `encode_key_calls`, `encode_value_calls`, and `decode_tensor_calls`, so
+the TempoKV path can be checked directly. The report separates current, peak,
+and cumulative cache traffic:
 `current_compressed_cache_bytes`, `peak_compressed_cache_bytes`, and
 `total_encoded_cache_bytes`, with matching uncompressed baseline fields.
 `compressed_cache_bytes`, `uncompressed_cache_bytes`, and `compression_ratio`
@@ -164,3 +194,7 @@ remain compatibility aliases for peak resident cache memory, never the sum over
 continuation segments. For Context Parallel runs, `stride` records the measured
 runtime value, `configured_stride` records the optional explicit constraint,
 and `trace_strides` records source trace layouts separately.
+
+In BF16 mode, the quantization and decode event lists remain empty while the
+same timing and GPU-memory fields are recorded, making the baseline directly
+comparable with `MODE=tempokv`.

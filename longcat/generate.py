@@ -9,7 +9,10 @@ import json
 import os
 from pathlib import Path
 import sys
+import time
 from typing import Sequence
+
+import torch
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -28,9 +31,14 @@ from longcat.trace import DEFAULT_TRACE_SPATIAL_POSITIONS  # noqa: E402
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Run the external LongCat pipeline with TempoKV or collect clean traces."
+        description=(
+            "Run the external LongCat pipeline with TempoKV, clean BF16, "
+            "or collect clean traces."
+        )
     )
-    parser.add_argument("--mode", choices=("tempokv", "trace"), default="tempokv")
+    parser.add_argument(
+        "--mode", choices=("tempokv", "bf16", "trace"), default="tempokv"
+    )
     parser.add_argument(
         "--longcat-repo",
         type=Path,
@@ -46,7 +54,10 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--trace-dir",
         type=Path,
-        help="directory for clean LongCat layer traces (trace mode or optional with tempokv)",
+        help=(
+            "directory for clean LongCat layer traces "
+            "(trace mode or optional with tempokv/bf16)"
+        ),
     )
     parser.add_argument(
         "--max-trace-spatial-positions",
@@ -84,8 +95,60 @@ def _validate_stage_options(arguments: list[str]) -> None:
         raise ValueError("attn_sink_frames must be non-negative")
 
 
+def _reset_peak_gpu_memory_stats() -> None:
+    """Reset CUDA peak counters after the LongCat device is selected."""
+    if not torch.cuda.is_available():
+        return
+    try:
+        torch.cuda.reset_peak_memory_stats()
+    except (AssertionError, RuntimeError):
+        # The real LongCat runner initializes CUDA before model loading.  Keep
+        # the launcher usable with lightweight mocked runners and CPU checks.
+        return
+
+
+def _gpu_memory_report() -> dict[str, object]:
+    """Return current and peak CUDA memory for this rank's active device."""
+    report: dict[str, object] = {
+        "available": False,
+        "device_index": None,
+        "device_name": None,
+        "current_allocated_bytes": None,
+        "current_reserved_bytes": None,
+        "peak_allocated_bytes": None,
+        "peak_reserved_bytes": None,
+    }
+    if not torch.cuda.is_available():
+        return report
+    try:
+        device_index = int(torch.cuda.current_device())
+        torch.cuda.synchronize(device_index)
+        report.update(
+            {
+                "available": True,
+                "device_index": device_index,
+                "device_name": torch.cuda.get_device_name(device_index),
+                "current_allocated_bytes": int(
+                    torch.cuda.memory_allocated(device_index)
+                ),
+                "current_reserved_bytes": int(
+                    torch.cuda.memory_reserved(device_index)
+                ),
+                "peak_allocated_bytes": int(
+                    torch.cuda.max_memory_allocated(device_index)
+                ),
+                "peak_reserved_bytes": int(
+                    torch.cuda.max_memory_reserved(device_index)
+                ),
+            }
+        )
+    except (AssertionError, RuntimeError) as error:
+        report["error"] = str(error)
+    return report
+
+
 def _external_arguments(
-    arguments: list[str], *, trace: bool = False
+    arguments: list[str], *, trace: bool = False, bf16: bool = False
 ) -> list[str]:
     _validate_stage_options(arguments)
     result = list(arguments)
@@ -98,22 +161,26 @@ def _external_arguments(
         result.extend(("--context_parallel_size", "1"))
     if _option_value(result, "--attn_sink_frames") is None:
         result.extend(("--attn_sink_frames", "0"))
-    if trace:
-        # Parameter fitting must see the clean LongCat cache.  Put this last
-        # so an accidentally forwarded qvg quantizer option cannot alter the
-        # trace run.
+    if trace or bf16:
+        # Both clean modes must use the original BF16 cache.  Put this last so
+        # an accidentally forwarded qvg quantizer option cannot alter the run.
         result.extend(("--quant_type", "none"))
     return result
 
 
 def run(argv: Sequence[str] | None = None) -> int:
+    run_started = time.perf_counter()
     parser = _parser()
     known, external = parser.parse_known_args(argv)
     if known.stride is not None and known.stride <= 0:
         parser.error("--stride must be positive")
     if known.max_trace_spatial_positions <= 0:
         parser.error("--max-trace-spatial-positions must be positive")
-    external = _external_arguments(external, trace=known.mode == "trace")
+    external = _external_arguments(
+        external,
+        trace=known.mode == "trace",
+        bf16=known.mode == "bf16",
+    )
     context_parallel_size = int(_option_value(external, "--context_parallel_size") or "1")
     attention_sink_frames = int(_option_value(external, "--attn_sink_frames") or "0")
     rank = int(os.environ.get("RANK", "0"))
@@ -155,11 +222,26 @@ def run(argv: Sequence[str] | None = None) -> int:
             attention_sink_frames=attention_sink_frames,
             model_repo=known.longcat_repo,
         )
-    else:
+    elif known.mode == "trace":
         bridge = install_longcat_bridge(
             mode="trace",
             trace_dir=trace_dir
             or PROJECT_ROOT / "parameters" / "longcat_raw_trace" / f"rank_{rank:05d}",
+            max_trace_spatial_positions=known.max_trace_spatial_positions,
+            spec=(
+                LongCatRuntimeSpec(stride=known.stride)
+                if known.stride is not None
+                else None
+            ),
+            context_parallel_size=context_parallel_size,
+            context_parallel_rank=context_parallel_rank,
+            attention_sink_frames=attention_sink_frames,
+            model_repo=known.longcat_repo,
+        )
+    else:
+        bridge = install_longcat_bridge(
+            mode="bf16",
+            trace_dir=trace_dir,
             max_trace_spatial_positions=known.max_trace_spatial_positions,
             spec=(
                 LongCatRuntimeSpec(stride=known.stride)
@@ -185,28 +267,58 @@ def run(argv: Sequence[str] | None = None) -> int:
     if str(project_root) not in sys.path:
         sys.path.insert(0, str(project_root))
 
+    _reset_peak_gpu_memory_stats()
     runner = importlib.import_module("run_long_t2v")
+    _reset_peak_gpu_memory_stats()
     original_get_model_and_pipe = runner.get_model_and_pipe
+    model_load_seconds: float | None = None
 
     def get_model_and_pipe(*args, **kwargs):
+        nonlocal model_load_seconds
+        model_started = time.perf_counter()
         dit, pipeline = original_get_model_and_pipe(*args, **kwargs)
+        model_load_seconds = time.perf_counter() - model_started
         bridge.attach(dit, pipeline)
         return dit, pipeline
 
     runner.get_model_and_pipe = get_model_and_pipe
+    original_init_distributed_environment = getattr(
+        runner, "init_distributed_environment", None
+    )
+    if callable(original_init_distributed_environment):
+
+        def init_distributed_environment(*args, **kwargs):
+            result = original_init_distributed_environment(*args, **kwargs)
+            _reset_peak_gpu_memory_stats()
+            return result
+
+        runner.init_distributed_environment = init_distributed_environment
     os.environ.setdefault("TEMPOKV_LONGCAT_MODE", known.mode)
     sys.argv = [str(runner_path), *external]
     external_args = runner._parse_args()
     Path(external_args.output_dir).expanduser().resolve().mkdir(
         parents=True, exist_ok=True
     )
+    runner_started = time.perf_counter()
     runner.generate(external_args)
+    gpu_memory = _gpu_memory_report()
+    completed_at = time.perf_counter()
+    report = bridge.report()
+    report["timing"] = {
+        "end_to_end_seconds": completed_at - run_started,
+        "runner_seconds": completed_at - runner_started,
+        "model_load_seconds": model_load_seconds,
+    }
+    report["end_to_end_seconds"] = completed_at - run_started
+    report["gpu_memory"] = gpu_memory
+    report["peak_gpu_allocated_bytes"] = gpu_memory["peak_allocated_bytes"]
+    report["peak_gpu_reserved_bytes"] = gpu_memory["peak_reserved_bytes"]
     report_path = (
         Path(external_args.output_dir).expanduser().resolve()
         / f"tempokv_bridge_report_rank_{rank:05d}.json"
     )
     report_path.write_text(
-        json.dumps(bridge.report(), indent=2, sort_keys=True) + "\n",
+        json.dumps(report, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
     return 0

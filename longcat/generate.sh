@@ -7,6 +7,14 @@ torchrun_bin="${TORCHRUN_BIN:-torchrun}"
 python_bin="${PYTHON_BIN:-python3}"
 mode="${MODE:-tempokv}"
 
+case "$mode" in
+  tempokv|bf16|trace) ;;
+  *)
+    printf 'Error: MODE must be tempokv, bf16, or trace (got %s)\n' "$mode" >&2
+    exit 2
+    ;;
+esac
+
 require_env() {
   local name
   for name in "$@"; do

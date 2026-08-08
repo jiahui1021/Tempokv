@@ -481,9 +481,11 @@ def run(args: argparse.Namespace) -> dict[str, object]:
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Check LongCat and TempoKV prerequisites without loading the model."
+        description="Check LongCat and optional TempoKV prerequisites without loading the model."
     )
-    parser.add_argument("--mode", choices=("tempokv", "trace"), default="tempokv")
+    parser.add_argument(
+        "--mode", choices=("tempokv", "bf16", "trace"), default="tempokv"
+    )
     parser.add_argument("--longcat-repo", type=Path, required=True)
     parser.add_argument("--checkpoint-dir", type=Path, required=True)
     parser.add_argument("--config", type=Path)
