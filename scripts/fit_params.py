@@ -148,7 +148,6 @@ def _load_trace(
             )
             metadata: dict[str, object] = {}
             for name in (
-                "stride",
                 "temporal_units",
                 "num_layers",
                 "num_heads",
@@ -158,6 +157,32 @@ def _load_trace(
             ):
                 if name in archive:
                     metadata[name] = np.asarray(archive[name]).item()
+            named_trace_stride = (
+                np.asarray(archive["trace_stride"]).item()
+                if "trace_stride" in archive
+                else None
+            )
+            legacy_stride = (
+                np.asarray(archive["stride"]).item()
+                if "stride" in archive
+                else None
+            )
+            if (
+                named_trace_stride is not None
+                and legacy_stride is not None
+                and int(named_trace_stride) != int(legacy_stride)
+            ):
+                raise ValueError("trace contains conflicting trace stride metadata")
+            trace_stride = (
+                named_trace_stride
+                if named_trace_stride is not None
+                else legacy_stride
+            )
+            if trace_stride is not None:
+                trace_stride = int(trace_stride)
+                if trace_stride <= 0:
+                    raise ValueError("trace_stride metadata must be positive")
+                metadata["trace_stride"] = trace_stride
     except OSError as error:
         raise ValueError(f"cannot read trace {path}: {error}") from error
 
@@ -210,11 +235,6 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         keys_name=args.keys_name,
         values_name=args.values_name,
     )
-    trace_stride = trace_metadata.get("stride")
-    if trace_stride is not None and int(trace_stride) != config.stride:
-        raise ValueError(
-            f"trace stride {int(trace_stride)} does not match codec stride {config.stride}"
-        )
     trace_shape_metadata = {
         "num_layers": int(keys.shape[0]),
         "num_heads": int(keys.shape[-2]),
@@ -307,6 +327,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "keys_dtype": str(keys.dtype).removeprefix("torch."),
             "values_dtype": str(values.dtype).removeprefix("torch."),
             "layer_ids": list(temporal.layer_ids or ()),
+            "trace_stride": trace_metadata.get("trace_stride"),
+            "runtime_stride": config.stride,
         },
         "codec_config": asdict(config),
         "fit": {

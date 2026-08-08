@@ -37,6 +37,7 @@ args=(
   --seed "${SEED:-0}"
   --context_parallel_size "${CONTEXT_PARALLEL_SIZE:-1}"
   --attn_sink_frames "${ATTN_SINK_FRAMES:-0}"
+  --max-trace-spatial-positions "${MAX_TRACE_SPATIAL_POSITIONS:-32}"
 )
 if [[ "${OFFLOAD_KV_CACHE:-0}" == "1" ]]; then
   args+=(--offload_kv_cache)

@@ -10,9 +10,9 @@ adapter.
 
 The LongCat-Video adapter is documented in
 [longcat/README.md](longcat/README.md). It keeps the TempoKV codec unchanged and
-connects it to LongCat's clean pre-RoPE KV cache. It supports single-process
-and Context Parallel runs, optional KV CPU offload, and independent attention
-sink spans.
+connects it to LongCat's clean pre-RoPE KV cache. The first validation target is
+the single-process, no-offload, no-sink path; Context Parallel, KV CPU offload,
+attention sink spans, and `torch.compile` remain experimental.
 
 ## Installation
 

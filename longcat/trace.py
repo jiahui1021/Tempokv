@@ -10,6 +10,9 @@ import numpy as np
 import torch
 
 
+DEFAULT_TRACE_SPATIAL_POSITIONS = 32
+
+
 def _spatial_indices(num_positions: int, limit: int) -> np.ndarray:
     if num_positions <= 0:
         raise ValueError("the cache must contain at least one spatial position")
@@ -56,7 +59,7 @@ def _validate_cache(
     kv_cache_dict: Mapping[int, tuple[torch.Tensor, torch.Tensor]],
     *,
     temporal_units: int,
-) -> tuple[list[int], int, int, int, int, np.ndarray]:
+) -> tuple[list[int], int, int, int, int]:
     if temporal_units <= 0:
         raise ValueError("temporal_units must be positive")
     if not kv_cache_dict:
@@ -80,9 +83,6 @@ def _validate_cache(
             f"cache sequence length {sequence} is not divisible by temporal units "
             f"{temporal_units}"
         )
-    stride = sequence // temporal_units
-    indices = _spatial_indices(stride, min(256, stride))
-
     for layer_id in layer_ids[1:]:
         key, value = kv_cache_dict[layer_id]
         if not isinstance(key, torch.Tensor) or not isinstance(value, torch.Tensor):
@@ -90,7 +90,7 @@ def _validate_cache(
         if tuple(key.shape) != (batch, heads, sequence, width) or key.shape != value.shape:
             raise ValueError("all LongCat layers must share one [B,H,S,D] cache layout")
 
-    return layer_ids, batch, heads, sequence, width, indices
+    return layer_ids, batch, heads, sequence, width
 
 
 @dataclass(slots=True)
@@ -102,7 +102,7 @@ class LongCatTraceCollector:
     """
 
     output_dir: Path
-    max_spatial_positions: int = 256
+    max_spatial_positions: int = DEFAULT_TRACE_SPATIAL_POSITIONS
     coordinate_system: str = "pre_rope_normalized"
     cross_source_kind: str = "normalized"
     _event_index: int = 0
@@ -133,7 +133,7 @@ class LongCatTraceCollector:
         temporal_units: int,
         event_name: str | None = None,
     ) -> dict[str, object]:
-        layer_ids, batch, heads, sequence, width, _ = _validate_cache(
+        layer_ids, batch, heads, sequence, width = _validate_cache(
             kv_cache_dict, temporal_units=temporal_units
         )
         stride = sequence // temporal_units
@@ -162,6 +162,9 @@ class LongCatTraceCollector:
                 v=value_sample,
                 layer_index=np.asarray(layer_id, dtype=np.int32),
                 temporal_units=np.asarray(temporal_units, dtype=np.int32),
+                trace_stride=np.asarray(stride, dtype=np.int32),
+                # Compatibility alias for traces written before trace/runtime
+                # stride metadata was separated.
                 stride=np.asarray(stride, dtype=np.int32),
                 spatial_indices=indices,
                 coordinate_system=np.asarray(self.coordinate_system),
@@ -174,7 +177,7 @@ class LongCatTraceCollector:
             "layers": len(layer_ids),
             "shape": [batch, temporal_units, int(indices.size), heads, width],
             "sequence": sequence,
-            "stride": stride,
+            "trace_stride": stride,
             "coordinate_system": self.coordinate_system,
         }
 
@@ -184,7 +187,7 @@ def dump_clean_kv(
     output_dir: str | Path,
     *,
     temporal_units: int,
-    max_spatial_positions: int = 256,
+    max_spatial_positions: int = DEFAULT_TRACE_SPATIAL_POSITIONS,
     event_name: str | None = None,
 ) -> dict[str, object]:
     """Write one LongCat clean-cache event and return its metadata."""

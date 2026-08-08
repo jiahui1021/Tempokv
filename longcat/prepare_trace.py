@@ -62,7 +62,23 @@ def _event(
             layer = int(np.asarray(data["layer_index"]).item())
             key = np.asarray(data["k_pre_rope"])
             value = np.asarray(data["v"])
-            stride = int(_scalar(data, "stride", expected_stride or -1))
+            named_trace_stride = _scalar(data, "trace_stride")
+            legacy_stride = _scalar(data, "stride")
+            if (
+                named_trace_stride is not None
+                and legacy_stride is not None
+                and int(named_trace_stride) != int(legacy_stride)
+            ):
+                raise ValueError(f"{path} contains conflicting trace stride metadata")
+            trace_stride = int(
+                named_trace_stride
+                if named_trace_stride is not None
+                else (
+                    legacy_stride
+                    if legacy_stride is not None
+                    else expected_stride or -1
+                )
+            )
             temporal_units = int(_scalar(data, "temporal_units", key.shape[1]))
             coordinate_system = str(
                 _scalar(data, "coordinate_system", "pre_rope_normalized")
@@ -82,11 +98,12 @@ def _event(
             raise ValueError(
                 f"{path} must contain head dimension {expected_head_dim}, got {width}"
             )
-        if stride <= 0:
-            raise ValueError(f"{path} contains an invalid stride {stride}")
-        if expected_stride is not None and stride != expected_stride:
+        if trace_stride <= 0:
+            raise ValueError(f"{path} contains an invalid trace stride {trace_stride}")
+        if expected_stride is not None and trace_stride != expected_stride:
             raise ValueError(
-                f"{path} was collected with stride {stride}, expected {expected_stride}"
+                f"{path} was collected with trace stride {trace_stride}, "
+                f"expected {expected_stride}"
             )
         if coordinate_system != "pre_rope_normalized":
             raise ValueError(
@@ -101,7 +118,7 @@ def _event(
             expected_tail = tail
             metadata = {
                 "temporal_units": frames,
-                "stride": stride,
+                "trace_stride": trace_stride,
                 "num_heads": heads,
                 "head_dim": width,
                 "coordinate_system": coordinate_system,
@@ -167,7 +184,10 @@ def convert_trace_root(
         keys=keys,
         values=values,
         layer_ids=np.arange(layers, dtype=np.int32),
-        stride=np.asarray(event_metadata["stride"], dtype=np.int32),
+        trace_stride=np.asarray(event_metadata["trace_stride"], dtype=np.int32),
+        # Compatibility alias for older fitting tools. It describes the trace
+        # layout and is intentionally independent of the runtime codec stride.
+        stride=np.asarray(event_metadata["trace_stride"], dtype=np.int32),
         temporal_units=np.asarray(frames, dtype=np.int32),
         num_layers=np.asarray(layers, dtype=np.int32),
         num_heads=np.asarray(heads, dtype=np.int32),
@@ -181,7 +201,7 @@ def convert_trace_root(
         "output": str(output),
         "events": len(key_events),
         "shape": list(keys.shape),
-        "stride": int(event_metadata["stride"]),
+        "trace_stride": int(event_metadata["trace_stride"]),
         "coordinate_system": "pre_rope_normalized",
     }
     print(json.dumps(report, indent=2, ensure_ascii=False))
@@ -197,7 +217,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--expected-layers", type=int, default=LONGCAT_NUM_LAYERS)
     parser.add_argument("--expected-heads", type=int, default=LONGCAT_NUM_HEADS)
     parser.add_argument("--expected-head-dim", type=int, default=LONGCAT_HEAD_DIM)
-    parser.add_argument("--stride", type=int, default=LONGCAT_STRIDE)
+    parser.add_argument(
+        "--trace-stride",
+        "--stride",
+        dest="trace_stride",
+        type=int,
+        default=LONGCAT_STRIDE,
+        help="expected spatial stride recorded by the source trace",
+    )
     parser.add_argument(
         "--allow-dynamic-shape",
         action="store_true",
@@ -211,7 +238,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             expected_layers=None if args.allow_dynamic_shape else args.expected_layers,
             expected_heads=None if args.allow_dynamic_shape else args.expected_heads,
             expected_head_dim=None if args.allow_dynamic_shape else args.expected_head_dim,
-            expected_stride=args.stride,
+            expected_stride=args.trace_stride,
         )
     except (OSError, ValueError) as error:
         parser.error(str(error))

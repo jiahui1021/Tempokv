@@ -23,6 +23,7 @@ from longcat.bridge import (  # noqa: E402
     LongCatRuntimeSpec,
     install_longcat_bridge,
 )
+from longcat.trace import DEFAULT_TRACE_SPATIAL_POSITIONS  # noqa: E402
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -47,7 +48,12 @@ def _parser() -> argparse.ArgumentParser:
         type=Path,
         help="directory for clean LongCat layer traces (trace mode or optional with tempokv)",
     )
-    parser.add_argument("--max-trace-spatial-positions", type=int, default=256)
+    parser.add_argument(
+        "--max-trace-spatial-positions",
+        type=int,
+        default=DEFAULT_TRACE_SPATIAL_POSITIONS,
+        help="global spatial sample budget shared by all Context Parallel ranks",
+    )
     parser.add_argument(
         "--stride",
         type=int,
@@ -105,11 +111,23 @@ def run(argv: Sequence[str] | None = None) -> int:
     known, external = parser.parse_known_args(argv)
     if known.stride is not None and known.stride <= 0:
         parser.error("--stride must be positive")
+    if known.max_trace_spatial_positions <= 0:
+        parser.error("--max-trace-spatial-positions must be positive")
     external = _external_arguments(external, trace=known.mode == "trace")
     context_parallel_size = int(_option_value(external, "--context_parallel_size") or "1")
     attention_sink_frames = int(_option_value(external, "--attn_sink_frames") or "0")
     rank = int(os.environ.get("RANK", "0"))
+    if rank < 0:
+        parser.error("RANK must be non-negative")
+    context_parallel_rank = rank % context_parallel_size
     trace_dir = known.trace_dir
+    if (
+        (known.mode == "trace" or trace_dir is not None)
+        and known.max_trace_spatial_positions < context_parallel_size
+    ):
+        parser.error(
+            "--max-trace-spatial-positions must be at least context_parallel_size"
+        )
     if trace_dir is not None:
         # Every CP rank sees a different spatial shard.  Keep the shards in
         # separate directories so event creation remains race-free; the trace
@@ -133,6 +151,7 @@ def run(argv: Sequence[str] | None = None) -> int:
                 else None
             ),
             context_parallel_size=context_parallel_size,
+            context_parallel_rank=context_parallel_rank,
             attention_sink_frames=attention_sink_frames,
             model_repo=known.longcat_repo,
         )
@@ -148,6 +167,7 @@ def run(argv: Sequence[str] | None = None) -> int:
                 else None
             ),
             context_parallel_size=context_parallel_size,
+            context_parallel_rank=context_parallel_rank,
             attention_sink_frames=attention_sink_frames,
             model_repo=known.longcat_repo,
         )

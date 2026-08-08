@@ -17,7 +17,11 @@ from .bridge import (
     move_packed_tensor,
     validate_cache_layout,
 )
-from .trace import LongCatTraceCollector, dump_clean_kv
+from .trace import (
+    DEFAULT_TRACE_SPATIAL_POSITIONS,
+    LongCatTraceCollector,
+    dump_clean_kv,
+)
 
 __all__ = [
     "LONGCAT_COORDINATE_SYSTEM",
@@ -25,6 +29,7 @@ __all__ = [
     "LONGCAT_NUM_HEADS",
     "LONGCAT_NUM_LAYERS",
     "LONGCAT_STRIDE",
+    "DEFAULT_TRACE_SPATIAL_POSITIONS",
     "PackedTensorSpanSet",
     "LongCatRuntimeSpec",
     "LongCatTempoKVBridge",

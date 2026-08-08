@@ -61,6 +61,8 @@ if [[ "$mode" == "tempokv" ]]; then
   )
 fi
 [[ -n "${TRACE_DIR:-}" ]] && args+=(--trace-dir "$(resolve_path "$TRACE_DIR")")
+[[ -n "${MAX_TRACE_SPATIAL_POSITIONS:-}" ]] && \
+  args+=(--max-trace-spatial-positions "$MAX_TRACE_SPATIAL_POSITIONS")
 
 if [[ "${PREFLIGHT:-1}" != "0" ]]; then
   preflight_args=(

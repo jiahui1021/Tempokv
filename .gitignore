@@ -9,7 +9,8 @@ htmlcov/
 .venv/
 
 # Local verification files
-/tests/
+/tests/*
+!/tests/test_longcat_review_regressions.py
 
 # Build and packaging output
 build/

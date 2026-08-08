@@ -22,7 +22,7 @@ import torch
 from tempokv.codec import PackedTensor, TempoKVCodec, decode_tensor
 from tempokv.integration import load_codec
 
-from .trace import LongCatTraceCollector
+from .trace import DEFAULT_TRACE_SPATIAL_POSITIONS, LongCatTraceCollector
 
 
 LONGCAT_NUM_LAYERS = 48
@@ -317,6 +317,11 @@ def encode_kv_cache(
         spec=spec,
     )
     first_key, _ = _layer_pair(kv_cache_dict, 0)
+    uncompressed_cache_bytes = sum(
+        int(key.numel() * key.element_size() + value.numel() * value.element_size())
+        for layer_id in sorted(kv_cache_dict)
+        for key, value in (_layer_pair(kv_cache_dict, int(layer_id)),)
+    )
     encoded: dict[int, tuple[PackedState, PackedState]] = {}
     target_device = None if encode_device is None else torch.device(encode_device)
     timing_device = target_device or first_key.device
@@ -351,17 +356,6 @@ def encode_kv_cache(
         packed.storage_bytes()
         for pair in encoded.values()
         for packed in pair
-    )
-    reference_key, reference_value = _layer_pair(kv_cache_dict, 0)
-    if reference_key.element_size() != reference_value.element_size():
-        raise ValueError("LongCat K/V cache dtypes must use the same element size")
-    uncompressed_cache_bytes = (
-        int(layout["batch"])
-        * int(layout["num_heads"])
-        * int(layout["sequence"])
-        * int(layout["head_dim"])
-        * 2
-        * reference_key.element_size()
     )
     reconstruction_element_size = _RECONSTRUCTION_ELEMENT_SIZE[
         codec.config.reconstruction_dtype
@@ -567,12 +561,14 @@ class LongCatTempoKVBridge:
     codec: TempoKVCodec | None
     mode: str = "tempokv"
     trace_dir: Path | None = None
-    max_trace_spatial_positions: int = 256
+    max_trace_spatial_positions: int = DEFAULT_TRACE_SPATIAL_POSITIONS
     spec: LongCatRuntimeSpec = field(default_factory=LongCatRuntimeSpec)
     context_parallel_size: int = 1
+    context_parallel_rank: int = 0
     attention_sink_frames: int = 0
     auto_context_parallel_stride: bool = True
     trace_collector: LongCatTraceCollector | None = field(init=False, default=None)
+    local_trace_spatial_positions: int = field(init=False, default=0)
     _installed: bool = field(init=False, default=False)
     trace_events: list[dict[str, object]] = field(init=False, default_factory=list)
     quantization_events: list[dict[str, object]] = field(init=False, default_factory=list)
@@ -583,8 +579,26 @@ class LongCatTempoKVBridge:
             raise ValueError("LongCat bridge mode must be tempokv or trace")
         if self.mode == "tempokv" and self.codec is None:
             raise ValueError("tempokv mode requires a loaded TempoKV codec")
-        if self.context_parallel_size <= 0:
+        if (
+            isinstance(self.context_parallel_size, bool)
+            or not isinstance(self.context_parallel_size, int)
+            or self.context_parallel_size <= 0
+        ):
             raise ValueError("context_parallel_size must be positive")
+        if (
+            isinstance(self.context_parallel_rank, bool)
+            or not isinstance(self.context_parallel_rank, int)
+            or not 0 <= self.context_parallel_rank < self.context_parallel_size
+        ):
+            raise ValueError(
+                "context_parallel_rank must be in [0, context_parallel_size)"
+            )
+        if (
+            isinstance(self.max_trace_spatial_positions, bool)
+            or not isinstance(self.max_trace_spatial_positions, int)
+            or self.max_trace_spatial_positions <= 0
+        ):
+            raise ValueError("max_trace_spatial_positions must be positive")
         if self.attention_sink_frames < 0:
             raise ValueError("attention_sink_frames must be non-negative")
         if (
@@ -594,9 +608,19 @@ class LongCatTempoKVBridge:
         ):
             self.spec = replace(self.spec, stride=None)
         if self.trace_dir is not None:
+            if self.max_trace_spatial_positions < self.context_parallel_size:
+                raise ValueError(
+                    "global trace spatial budget must be at least context_parallel_size"
+                )
+            local_budget, remainder = divmod(
+                self.max_trace_spatial_positions, self.context_parallel_size
+            )
+            if self.context_parallel_rank < remainder:
+                local_budget += 1
+            self.local_trace_spatial_positions = local_budget
             self.trace_collector = LongCatTraceCollector(
                 Path(self.trace_dir),
-                max_spatial_positions=self.max_trace_spatial_positions,
+                max_spatial_positions=self.local_trace_spatial_positions,
             )
 
     def validate_model(self, dit: Any) -> None:
@@ -860,9 +884,23 @@ class LongCatTempoKVBridge:
                 int(parameter.numel() * parameter.element_size())
                 for parameter in parameters
             )
-        compressed_cache_bytes = sum(
+        compressed_event_bytes = [
             int(event.get("storage_bytes", 0)) for event in self.quantization_events
+        ]
+        uncompressed_event_bytes = [
+            int(event.get("uncompressed_cache_bytes", 0))
+            for event in self.quantization_events
+        ]
+        current_compressed_cache_bytes = (
+            compressed_event_bytes[-1] if compressed_event_bytes else 0
         )
+        peak_compressed_cache_bytes = max(compressed_event_bytes, default=0)
+        total_encoded_cache_bytes = sum(compressed_event_bytes)
+        current_uncompressed_cache_bytes = (
+            uncompressed_event_bytes[-1] if uncompressed_event_bytes else 0
+        )
+        peak_uncompressed_cache_bytes = max(uncompressed_event_bytes, default=0)
+        total_uncompressed_cache_bytes = sum(uncompressed_event_bytes)
         encode_key_calls = sum(
             int(event.get("encode_key_calls", 0))
             for event in self.quantization_events
@@ -874,10 +912,6 @@ class LongCatTempoKVBridge:
         decode_tensor_calls = sum(
             int(event.get("decode_tensor_calls", 0)) for event in self.decode_events
         )
-        uncompressed_cache_bytes = sum(
-            int(event.get("uncompressed_cache_bytes", 0))
-            for event in self.quantization_events
-        )
         temporary_reconstruction_bytes = max(
             (
                 int(event.get("temporary_reconstruction_bytes", 0))
@@ -885,38 +919,67 @@ class LongCatTempoKVBridge:
             ),
             default=0,
         )
-        observed_strides = sorted(
+        observed_runtime_strides = sorted(
             {
                 int(event["stride"])
-                for event in (*self.trace_events, *self.quantization_events)
+                for event in self.quantization_events
                 if event.get("stride") is not None
             }
         )
+        observed_trace_strides = sorted(
+            {
+                int(event.get("trace_stride", event.get("stride")))
+                for event in self.trace_events
+                if event.get("trace_stride", event.get("stride")) is not None
+            }
+        )
         reported_stride = (
-            observed_strides[0]
-            if len(observed_strides) == 1
-            else self.spec.stride
+            observed_runtime_strides[0]
+            if len(observed_runtime_strides) == 1
+            else (self.spec.stride if self.mode == "tempokv" else None)
         )
         return {
             "mode": self.mode,
             "context_parallel_size": self.context_parallel_size,
+            "context_parallel_rank": self.context_parallel_rank,
             "attention_sink_frames": self.attention_sink_frames,
             "num_layers": self.spec.num_layers,
             "num_heads": self.spec.num_heads,
             "head_dim": self.spec.head_dim,
             "stride": reported_stride,
             "configured_stride": self.spec.stride,
-            "runtime_strides": observed_strides,
+            "runtime_strides": observed_runtime_strides,
+            "trace_strides": observed_trace_strides,
             "coordinate_system": self.spec.coordinate_system,
+            "global_trace_spatial_positions": self.max_trace_spatial_positions,
+            "local_trace_spatial_positions": self.local_trace_spatial_positions,
             "predictor_parameter_bytes": predictor_parameter_bytes,
             "encode_key_calls": encode_key_calls,
             "encode_value_calls": encode_value_calls,
             "decode_tensor_calls": decode_tensor_calls,
-            "compressed_cache_bytes": compressed_cache_bytes,
-            "uncompressed_cache_bytes": uncompressed_cache_bytes,
+            "current_compressed_cache_bytes": current_compressed_cache_bytes,
+            "peak_compressed_cache_bytes": peak_compressed_cache_bytes,
+            "total_encoded_cache_bytes": total_encoded_cache_bytes,
+            "current_uncompressed_cache_bytes": current_uncompressed_cache_bytes,
+            "peak_uncompressed_cache_bytes": peak_uncompressed_cache_bytes,
+            "total_uncompressed_cache_bytes": total_uncompressed_cache_bytes,
+            # Compatibility aliases now describe peak resident cache memory,
+            # never cumulative encode traffic across continuation segments.
+            "compressed_cache_bytes": peak_compressed_cache_bytes,
+            "uncompressed_cache_bytes": peak_uncompressed_cache_bytes,
             "compression_ratio": (
-                float(uncompressed_cache_bytes / compressed_cache_bytes)
-                if compressed_cache_bytes
+                float(
+                    peak_uncompressed_cache_bytes / peak_compressed_cache_bytes
+                )
+                if peak_compressed_cache_bytes
+                else None
+            ),
+            "current_compression_ratio": (
+                float(
+                    current_uncompressed_cache_bytes
+                    / current_compressed_cache_bytes
+                )
+                if current_compressed_cache_bytes
                 else None
             ),
             "temporary_reconstruction_bytes": temporary_reconstruction_bytes,
@@ -965,8 +1028,6 @@ class LongCatTempoKVBridge:
             ) -> Any:
                 bridge = getattr(instance, "_tempokv_bridge", None)
                 if bridge is None:
-                    return original_quantize(instance, kv_cache_dict, offload_kv_cache)
-                if bridge.mode == "trace":
                     return original_quantize(instance, kv_cache_dict, offload_kv_cache)
                 return bridge.quantize(
                     instance, kv_cache_dict, offload=bool(offload_kv_cache)
@@ -1059,9 +1120,10 @@ def install_longcat_bridge(
     codec: TempoKVCodec | None = None,
     mode: str = "tempokv",
     trace_dir: str | Path | None = None,
-    max_trace_spatial_positions: int = 256,
+    max_trace_spatial_positions: int = DEFAULT_TRACE_SPATIAL_POSITIONS,
     spec: LongCatRuntimeSpec | None = None,
     context_parallel_size: int = 1,
+    context_parallel_rank: int = 0,
     attention_sink_frames: int = 0,
     model_repo: str | Path | None = None,
     **modules: Any,
@@ -1089,6 +1151,7 @@ def install_longcat_bridge(
         max_trace_spatial_positions=max_trace_spatial_positions,
         spec=resolved_spec,
         context_parallel_size=context_parallel_size,
+        context_parallel_rank=context_parallel_rank,
         attention_sink_frames=attention_sink_frames,
         auto_context_parallel_stride=spec is None,
     )
