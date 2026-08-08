@@ -18,6 +18,9 @@ dist/
 
 # Generated traces, parameters, and model files
 /parameters/
+/parameters_kh3_vh1/
+/parameters_kh3_vh1_dedicated_gpu/
+/parameters_backup_kh2vh2/
 /results/
 /runs/
 /outputs/
