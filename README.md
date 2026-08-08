@@ -22,30 +22,31 @@ NVIDIA GPU Triton decoders:
 pip install -e ".[cuda]"
 ```
 
-Two codec configs are provided. Both use two reconstructed K frames and two
-reconstructed V frames at generation time. Their fitted parameter files support
-up to three K frames and two V frames:
+Two codec configs are provided. Each config's `k_history_length` and
+`v_history_length` select the exact number of reconstructed history frames used
+at generation time, and the same values drive the parameter fit:
 
 - `configs/int2.json`: INT2 K/V residuals with an INT4 first anchor unit.
 - `configs/int4.json`: INT4 K/V residuals and INT4 first anchor unit.
 
 `k_history_length` controls how many reconstructed K frames predict the next K
-and accepts values from `1` through `k_max_history_length`.
+and accepts values from `1` through `8`.
 `v_history_length` controls the V predictor: `2` uses the previous two V frames,
 `1` uses only the previous frame, and `0` retains the legacy K-only CrossKV
-predictor. K history frames share one coefficient set, and V history frames
-share one per-head/channel coefficient set. Active history frames are averaged
-before applying those coefficients. This avoids extra full K-to-V projections
-and keeps the predictor parameter footprint independent of the active length.
+predictor.
 
-`k_max_history_length` and `v_max_history_length` are fitting limits. Fit once at
-the maximum values, then change `k_history_length` and `v_history_length` for
-generation without refitting, as long as they do not exceed those limits.
+Different history configurations need their own fitted parameter files. Because
+fitting is accelerated on GPU and takes only ~2 seconds per config (see below),
+the recommended workflow is to fit one dedicated parameter set for every
+`k_history_length` / `v_history_length` combination you intend to run.
 
 ## Self-Forcing pipeline
 
-Two shell scripts. All settings are passed as environment variables. Run
-preparation once to collect a clean trace and fit parameters:
+Three shell scripts. All settings are passed as environment variables.
+
+**Step 1 — collect and merge a clean trace (once).** Collecting runs model
+inference and takes about 10-15 minutes; every subsequent generation reuses the
+same `self_forcing_trace.npz`:
 
 ```bash
 TRACE_RUNNER=/path/to/self-forcing-trace-runner.sh \
@@ -53,29 +54,38 @@ CHECKPOINT=/models/self_forcing_dmd.pt \
 WAN_MODEL_DIR=/models/Wan2.1-T2V-1.3B \
 PROMPTS=assets/fit_prompts.txt \
 WORK_DIR=runs/self_forcing_prepare \
-CONFIG=configs/int2.json \
-bash self-forcing/prepare.sh
+bash self-forcing/collect_trace.sh
 ```
 
-If `parameters/self_forcing_trace.npz` already exists, fit one reusable K/V
-parameter set without collecting another trace:
+To collect without the wrapper, call the external trace runner directly, then
+merge with `prepare_trace.py`:
 
 ```bash
-python scripts/fit_params.py parameters/self_forcing_trace.npz \
-  --config configs/int2.json \
-  --output-dir parameters \
-  --k-max-history-length 3 \
-  --v-max-history-length 2 \
-  --iterations 2 \
-  --temporal-ridge 0.1 \
-  --cross-ridge 0.1 \
-  --max-gain 1.0 \
-  --device cuda \
-  --stride 1560 \
-  --coordinate-system pre_rope_normalized
+SELF_FORCING_CHECKPOINT_PATH=/models/self_forcing_dmd.pt \
+FORCING_WAN_MODEL_DIR=/models/Wan2.1-T2V-1.3B \
+PROMPTS_PATH=assets/fit_prompts.txt \
+CROSS_KV_TRACE_DIR=runs/self_forcing_prepare/raw_trace/traces \
+OUTPUT_FOLDER=runs/self_forcing_prepare/raw_trace/output \
+bash /path/to/self-forcing-trace-runner.sh
+
+python self-forcing/prepare_trace.py \
+  runs/self_forcing_prepare/raw_trace/traces \
+  parameters/self_forcing_trace.npz
 ```
 
-Generate videos from the fitted parameters, repeatable with different prompts:
+**Step 2 — fit parameters.** Fit a dedicated parameter set for the exact
+`k_history_length` / `v_history_length` you plan to run (takes about 1.5 seconds
+on GPU):
+
+```bash
+CONFIG=configs/int2.json \
+K_HISTORY_LENGTH=2 \
+V_HISTORY_LENGTH=2 \
+OUTPUT_DIR=parameters/self_forcing/kh2-vh2-int2 \
+bash self-forcing/fit_params.sh
+```
+
+**Step 3 — generate videos.** `PARAM_DIR` points at step 2's output:
 
 ```bash
 MODEL_REPO=/path/to/self-forcing-model-repo \
@@ -83,6 +93,7 @@ CHECKPOINT=/models/self_forcing_dmd.pt \
 WAN_MODEL_DIR=/models/Wan2.1-T2V-1.3B \
 PROMPTS=assets/generation_prompts.txt \
 CONFIG=configs/int2.json \
+PARAM_DIR=parameters/self_forcing/kh2-vh2-int2 \
 K_HISTORY_LENGTH=2 \
 V_HISTORY_LENGTH=2 \
 FRAMES=717 \
@@ -90,12 +101,18 @@ bash self-forcing/generate.sh
 ```
 
 `K_HISTORY_LENGTH=2` and `V_HISTORY_LENGTH=2` explicitly select the history used
-for this run. The same fitted files can also run with K set to `1` or `3`, and V
-set to `0` or `1`. If omitted, both active values come from `CONFIG`.
+for this run; they must match the fitted `k_history_length` /
+`v_history_length` of the parameter files in `PARAM_DIR`, otherwise parameter
+shape validation fails. If omitted, both active values come from `CONFIG`.
 
-Fitting uses CUDA automatically when it is available. `--device cuda` makes
-that choice explicit; use `--device cpu` for a CPU-only fit. CUDA fitting uses
-float32 equations and processes regression statistics one layer at a time.
+`K_HISTORY_LENGTH` / `V_HISTORY_LENGTH` fall back to the config values when
+omitted. The remaining fit options have sensible defaults and are usually left
+as is: `FIT_DEVICE=auto` uses CUDA when available (float32 fitting),
+`ITERATIONS` defaults to 2, `MAX_GAIN` to 1.0, and stride is fixed at 1560
+(to match the trace). On an A100, fitting one dedicated config from the
+128-prompt trace takes about 1.5 seconds of fit time (roughly 10-20 seconds
+wall-clock including trace loading), versus roughly 14 minutes for the same fit
+on CPU with float64 equations.
 
 The fast K/V history paths decode up to 16 units per launch by default. Override
 this for A/B testing without refitting with

@@ -13,7 +13,6 @@ CPU 或 PyTorch 参考路径：
 pip install -e .
 ```
 
-
 使用 NVIDIA GPU 上的 Triton 解码器：
 
 ```bash
@@ -26,22 +25,21 @@ pip install -e ".[cuda]"
 - `configs/int2.json`：K/V 残差为 INT2，首个 anchor unit 保持 INT4。
 - `configs/int4.json`：K/V 残差和首个 anchor unit 都为 INT4。
 
-`k_history_length` 用于选择 K 历史长度，可设为 `1` 到
-`k_max_history_length`。
+`k_history_length` 用于选择 K 历史长度，可设为 `1` 到 `8`。
 `v_history_length` 用于选择 V 历史长度：
-`2` 使用前两帧，`1` 只使用前一帧，`0` 保留原来的纯 CrossKV 方式。
-K 的各帧共用一套系数，V 的各帧也共用一套按 head 和通道拟合的系数。
-使用多帧时先求平均，因此切换历史长度不会让预测项随帧数成倍放大，也不会
-重复执行完整的 K→V 矩阵计算。
 
-`k_max_history_length` 和 `v_max_history_length` 决定拟合支持的最大长度。
-按最大长度拟合一次后，生成时可以在范围内自由修改 K/V 历史长度，无需重新拟合。
+`2` 使用前两帧，`1` 只使用前一帧，`0` 保留原来的纯 CrossKV 方式。
+
+不同的历史长度配置需要各自对应的拟合参数。由于 GPU 拟合只需约 2 秒，
+推荐做法是：每个要运行的 `k_history_length` / `v_history_length` 组合，分别拟合一套专属参数。
 
 ## Self-Forcing 完整生成流程
-流程分成两个 SH 脚本。所有参数都用环境变量传入，第一个脚本运行一次，
-第二个脚本可以更换 prompt 后重复运行。
 
-### 第一步：采集 clean trace 和拟合参数（只需运行一次）
+### 第一步：采集 + 合并 clean trace（一次性）
+
+采集需要跑模型推理，约 10-15 分钟。`collect_trace.sh` 采集并合并 clean
+trace，产出拟合输入 `self_forcing_trace.npz`；之后生成任意视频都复用同一个
+`self_forcing_trace.npz`，无需重新采集。
 
 ```bash
 TRACE_RUNNER=/path/to/self-forcing-trace-runner.sh \
@@ -49,14 +47,44 @@ CHECKPOINT=/models/self_forcing_dmd.pt \
 WAN_MODEL_DIR=/models/Wan2.1-T2V-1.3B \
 PROMPTS=assets/fit_prompts.txt \
 WORK_DIR=runs/self_forcing_prepare \
-CONFIG=configs/int2.json \
-bash self-forcing/prepare.sh
+bash self-forcing/collect_trace.sh
 ```
 
-拟合默认使用 `FIT_DEVICE=auto`，检测到 CUDA 时自动使用 GPU。需要强制使用
-GPU 时设置 `FIT_DEVICE=cuda`；GPU 拟合采用 float32，并按层累计回归统计量。
+已有 raw trace 时，也可以不用 `collect_trace.sh`，直接调用外部采集入口再
+手动合并：
 
-### 第二步：读取参数生成视频（可更换 prompt 后重复运行）
+```bash
+SELF_FORCING_CHECKPOINT_PATH=/models/self_forcing_dmd.pt \
+FORCING_WAN_MODEL_DIR=/models/Wan2.1-T2V-1.3B \
+PROMPTS_PATH=assets/fit_prompts.txt \
+CROSS_KV_TRACE_DIR=runs/self_forcing_prepare/raw_trace/traces \
+OUTPUT_FOLDER=runs/self_forcing_prepare/raw_trace/output \
+bash /path/to/self-forcing-trace-runner.sh
+
+python self-forcing/prepare_trace.py \
+  runs/self_forcing_prepare/raw_trace/traces \
+  parameters/self_forcing_trace.npz
+```
+
+### 第二步：拟合参数
+
+每次生成前先拟合参数（GPU 只需约 1.5 秒）。每个
+`k_history_length` / `v_history_length` 配置拟合一套专属参数，用
+`K_HISTORY_LENGTH` 和 `V_HISTORY_LENGTH` 显式指定，用不同 `OUTPUT_DIR`
+区分，且生成时的 `K_HISTORY_LENGTH` / `V_HISTORY_LENGTH` 必须与拟合值一致
+
+```bash
+CONFIG=configs/int2.json \
+K_HISTORY_LENGTH=3 \
+V_HISTORY_LENGTH=1 \
+OUTPUT_DIR=parameters/self_forcing/kh2-vh2-int2 \
+bash self-forcing/fit_params.sh
+```
+
+### 第三步：生成视频
+
+生成时 `PARAM_DIR` 指向第二步的 `OUTPUT_DIR`，`K_HISTORY_LENGTH` /
+`V_HISTORY_LENGTH` 必须与拟合值一致：
 
 ```bash
 MODEL_REPO=/path/to/self-forcing-model-repo \
@@ -64,18 +92,16 @@ CHECKPOINT=/models/self_forcing_dmd.pt \
 WAN_MODEL_DIR=/models/Wan2.1-T2V-1.3B \
 PROMPTS=assets/generation_prompts.txt \
 CONFIG=configs/int2.json \
-K_HISTORY_LENGTH=2 \
-V_HISTORY_LENGTH=2 \
+PARAM_DIR=parameters/self_forcing/kh2-vh2-int2 \
+K_HISTORY_LENGTH=3 \
+V_HISTORY_LENGTH=1 \
 FRAMES=717 \
 bash self-forcing/generate.sh
 ```
 
 `K_HISTORY_LENGTH` 和 `V_HISTORY_LENGTH` 明确指定本次生成使用的历史帧数；
-省略时读取 `CONFIG`。示例省略了默认的 `MODE=tempokv`、`PARAM_DIR=parameters`
-和输出目录。
+省略时读取 `CONFIG`。示例省略了默认的 `MODE=tempokv` 和输出目录。
 
 设置 `MODE=bf16` 可以运行不量化的对照生成；该模式不需要 `CONFIG` 和
 `PARAM_DIR`。`pipeline_report.json` 中保存总耗时、每个 GPU 的耗时和最高显存占用。
-
-两个入口都会检查 `stride=1560`、30 层、12 heads、head dimension 128 和
-pre-RoPE normalized K。生成长度还会检查是否真正触发 TempoKV。
+、

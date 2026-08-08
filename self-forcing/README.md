@@ -1,7 +1,13 @@
 # Self-Forcing 使用说明
 
-- `prepare.sh`：一次性采集 clean trace 并拟合参数。
+完整流程分三个脚本，依次执行：
+
+- `collect_trace.sh`：采集 clean trace 并合并成拟合输入 `self_forcing_trace.npz`（只需运行一次）。
+- `fit_params.sh`：从 trace 拟合 TempoKV 参数。
 - `generate.sh`：读取已有参数生成视频。
+
+其他文件：
+
 - `generate.py`：生成脚本使用的内部入口。
 - `worker.py`：在 `torchrun` 进程中加载外部 Self-Forcing。
 - `bridge.py`：把 Self-Forcing 的分段 K/V cache 接到 TempoKV。
@@ -28,7 +34,7 @@ cross_source_kind    normalized
 
 这样 `F` 才是拟合使用的时间轴。
 
-`prepare.sh` 会自动执行转换。已有 raw trace 时也可以单独转换：
+`collect_trace.sh` 会自动执行转换。已有 raw trace 时也可以单独转换：
 
 ```bash
 python self-forcing/prepare_trace.py \
@@ -36,12 +42,13 @@ python self-forcing/prepare_trace.py \
   /data/self_forcing_trace.npz
 ```
 
-## 第一步：采集 trace 并拟合参数
+## 第一步：采集 + 合并 trace（只需运行一次）
 
-这一阶段只需要运行一次。`TRACE_RUNNER` 指向外部 Self-Forcing 仓库中
-能够采集 clean CrossKV trace 的 SH 入口；它需要支持本节列出的环境变量。
-
-所有参数都用环境变量传入。完整示例：
+`collect_trace.sh` 调用外部 `TRACE_RUNNER` 采集 clean trace，再用
+`prepare_trace.py` 合并成拟合输入 `self_forcing_trace.npz`。`TRACE_RUNNER`
+指向外部 Self-Forcing 仓库中能够采集 clean CrossKV trace 的 SH 入口；它需要
+支持本节列出的环境变量。采集需要跑模型推理，约 10-15 分钟，之后生成任意
+视频都复用同一个 `self_forcing_trace.npz`。
 
 ```bash
 TRACE_RUNNER=/path/to/self-forcing-trace-runner.sh \
@@ -49,48 +56,31 @@ CHECKPOINT=/models/self_forcing_dmd.pt \
 WAN_MODEL_DIR=/models/Wan2.1-T2V-1.3B \
 PROMPTS=assets/fit_prompts.txt \
 WORK_DIR=runs/self_forcing_prepare \
-CONFIG=configs/int2.json \
-bash self-forcing/prepare.sh
+bash self-forcing/collect_trace.sh
 ```
-
-全部可配置变量见 `prepare.sh` 头部注释。
 
 输出为：
 
 ```text
 runs/self_forcing_prepare/raw_trace/          trace 采集中间产物
-parameters/self_forcing_trace.npz
-parameters/k_temporal.npz
-parameters/v_cross_kv.npz
-parameters/fit_report.json
+parameters/self_forcing_trace.npz             （可用 TRACE_FILE 覆盖）
 ```
 
-已有 `parameters/self_forcing_trace.npz` 时，无需重新采集，可以直接拟合一套
-可复用参数。下面的参数支持 K 最多 3 帧、V 最多 2 帧：
+全部可配置变量见 `collect_trace.sh` 头部注释。已有 raw trace 时，也可以不
+用 `collect_trace.sh`，直接调用外部采集入口再手动合并：
 
 ```bash
-python scripts/fit_params.py parameters/self_forcing_trace.npz \
-  --config configs/int2.json \
-  --output-dir parameters \
-  --k-max-history-length 3 \
-  --v-max-history-length 2 \
-  --iterations 2 \
-  --temporal-ridge 0.1 \
-  --cross-ridge 0.1 \
-  --max-gain 1.0 \
-  --device cuda \
-  --stride 1560 \
-  --coordinate-system pre_rope_normalized
+SELF_FORCING_CHECKPOINT_PATH=/models/self_forcing_dmd.pt \
+FORCING_WAN_MODEL_DIR=/models/Wan2.1-T2V-1.3B \
+PROMPTS_PATH=assets/fit_prompts.txt \
+CROSS_KV_TRACE_DIR=runs/self_forcing_prepare/raw_trace/traces \
+OUTPUT_FOLDER=runs/self_forcing_prepare/raw_trace/output \
+bash /path/to/self-forcing-trace-runner.sh
+
+python self-forcing/prepare_trace.py \
+  runs/self_forcing_prepare/raw_trace/traces \
+  parameters/self_forcing_trace.npz
 ```
-
-这条命令会替换 `parameters/k_temporal.npz` 和
-`parameters/v_cross_kv.npz`。
-拟合默认使用 `--device auto`，检测到 CUDA 时自动在 GPU 上运行；上面的
-`--device cuda` 会在 CUDA 不可用时直接报错。GPU 拟合按层累计统计量，避免
-为每个输出通道展开一份完整特征。
-
-`prepare.sh` 默认把采集的 trace 和拟合参数都写到独立的 `parameters/` 目录
-（可用 `PARAM_DIR` 覆盖），`WORK_DIR` 只保留 trace 采集中间产物。
 
 采集固定使用未量化 K/V。默认生成 51 帧、每帧抽取 8 个 token，采集全部
 30 层和全部 head。可以用环境变量调整：
@@ -108,14 +98,15 @@ MAX_GAIN=1.0
 ```
 
 量化位宽、anchor 位宽、分组大小、残差方式和 K/V 历史长度都在 `CONFIG`
-指向的 JSON 中调整。`k_max_history_length` 和 `v_max_history_length` 决定拟合
-支持的最大长度；`k_history_length` 和 `v_history_length` 决定本次生成实际使用
-多少帧。K 的所有历史帧共用一套系数，V 的所有历史帧也共用一套系数。
-`k_history_length=2` 使用前两帧重建 K；
+指向的 JSON 中调整。`k_history_length` 决定本次生成使用前几帧重建 K；
 `v_history_length=2` 使用前两帧重建 V，设为 `1` 时只使用前一帧，设为 `0`
 时使用旧的纯 CrossKV 预测。
-生成使用的长度不超过拟合最大值时，可以直接修改，无需重新运行 `prepare.sh`。
-改变最大值、量化设置或 stride 后需要重新拟合。
+
+不同历史长度配置需要各自的拟合参数：每个 `k_history_length` /
+`v_history_length` 组合都应拟合一套专属参数，生成时 `PARAM_DIR` 指向对应
+参数目录，且 `K_HISTORY_LENGTH` / `V_HISTORY_LENGTH` 必须与拟合值一致。
+GPU 拟合单个配置约 2 秒（CPU float64 约 14 分钟），因此按配置分别拟合的
+成本可以忽略。改变量化设置或 stride 后需要重新拟合。
 当前拟合器会生成快速的逐通道 V 历史系数；旧版完整矩阵历史参数会在生成前
 被拒绝，需要用当前代码重新拟合一次。
 
@@ -126,10 +117,40 @@ MAX_GAIN=1.0
 `TRACE_TOKENS_PER_FRAME`、`TRACE_CAPTURE_HIDDEN`、
 `TRACE_CAPTURE_ATTENTION` 和 `TRACE_QUANT_TYPE`。
 
-## 第二步：生成视频
+## 第二步：拟合参数
 
-`MODE=tempokv` 读取第一步生成的参数，不会采集 trace，也不会重新拟合。
-例如生成 717 帧（= 180 latent 帧）的完整视频：
+每次生成前先拟合参数（GPU 只需约 1.5 秒）。每个 `k_history_length` /
+`v_history_length` 配置拟合一套专属参数，用 `K_HISTORY_LENGTH` /
+`V_HISTORY_LENGTH` 显式指定，用不同 `OUTPUT_DIR` 区分，且生成时的
+`K_HISTORY_LENGTH` / `V_HISTORY_LENGTH` 必须与拟合值一致（下面示例为
+kh=2、vh=2，与 CONFIG 默认一致）：
+
+```bash
+TRACE_FILE=parameters/self_forcing_trace.npz \
+CONFIG=configs/int2.json \
+K_HISTORY_LENGTH=2 \
+V_HISTORY_LENGTH=2 \
+OUTPUT_DIR=parameters/self_forcing/kh2-vh2-int2 \
+bash self-forcing/fit_params.sh
+```
+
+`TRACE_FILE` 默认就是 `parameters/self_forcing_trace.npz`（第一步的输出），
+可以省略。`K_HISTORY_LENGTH` / `V_HISTORY_LENGTH` 省略时读取 `CONFIG` 里的
+`k_history_length` / `v_history_length`。其余拟合参数（迭代次数、max-gain、
+stride、设备）都有合理默认值，一般无需改动：`FIT_DEVICE=auto` 检测到 CUDA
+时自动在 GPU 上运行（float32），`ITERATIONS=2`、`MAX_GAIN=1.0`，stride 固定
+1560（与 trace 一致）。GPU 拟合按层累计统计量，避免为每个输出通道展开一份
+完整特征。输出为：
+
+```text
+parameters/self_forcing/kh2-vh2-int2/k_temporal.npz
+parameters/self_forcing/kh2-vh2-int2/v_cross_kv.npz
+```
+
+## 第三步：生成视频
+
+生成时 `PARAM_DIR` 指向第二步的 `OUTPUT_DIR`，`K_HISTORY_LENGTH` /
+`V_HISTORY_LENGTH` 必须与拟合值一致（下面示例为 717 帧）：
 
 ```bash
 MODEL_REPO=/path/to/self-forcing-model-repo \
@@ -137,6 +158,7 @@ CHECKPOINT=/models/self_forcing_dmd.pt \
 WAN_MODEL_DIR=/models/Wan2.1-T2V-1.3B \
 PROMPTS=assets/generation_prompts.txt \
 CONFIG=configs/int2.json \
+PARAM_DIR=parameters/self_forcing/kh2-vh2-int2 \
 K_HISTORY_LENGTH=2 \
 V_HISTORY_LENGTH=2 \
 FRAMES=717 \
@@ -144,8 +166,7 @@ bash self-forcing/generate.sh
 ```
 
 `K_HISTORY_LENGTH` 和 `V_HISTORY_LENGTH` 明确指定本次生成使用的历史帧数；
-同一份参数也可改成 K=`1`/`3` 或 V=`0`/`1`。省略时读取 `CONFIG`。
-示例省略了默认的 `MODE=tempokv`、`PARAM_DIR=parameters` 和输出目录。
+省略时读取 `CONFIG`。示例省略了默认的 `MODE=tempokv` 和输出目录。
 
 > 注意：`MODE=tempokv` 时 `FRAMES` 至少要给到 105 视频帧（27 latent 帧），
 > 否则入口会直接拒绝。`MODE=bf16` 没有这个下限。
