@@ -142,6 +142,7 @@ def _temporal_residual_decode_kernel(
     bits: tl.constexpr,
     group_size: tl.constexpr,
     per_head: tl.constexpr,
+    history_shared: tl.constexpr,
     asymmetric: tl.constexpr,
     block_s: tl.constexpr,
     block_d: tl.constexpr,
@@ -152,6 +153,12 @@ def _temporal_residual_decode_kernel(
     channel = tl.program_id(2) * block_d + tl.arange(0, block_d)
     valid = (token[:, None] < unit_length) & (channel[None, :] < width)
     prediction = tl.zeros((block_s, block_d), tl.float32)
+    if history_shared:
+        shared_weight = tl.load(
+            weight_ptr + head * width + channel,
+            mask=channel < width,
+            other=0.0,
+        ).to(tl.float32)
     for lag in tl.static_range(0, order):
         previous_token = current_start - (lag + 1) * stride + token
         previous_offset = _strided_bhsd_offsets(
@@ -165,13 +172,21 @@ def _temporal_residual_decode_kernel(
             output_stride_d,
         )
         previous = tl.load(output_ptr + previous_offset, mask=valid, other=0.0).to(tl.float32)
-        if per_head:
-            weight_offset = (lag * heads + head) * width + channel
+        if history_shared:
+            prediction += previous
         else:
-            weight_offset = lag * width + channel
-        weight = tl.load(weight_ptr + weight_offset, mask=channel < width, other=0.0)
-        prediction += previous * weight[None, :]
-    if per_head:
+            if per_head:
+                weight_offset = (lag * heads + head) * width + channel
+            else:
+                weight_offset = lag * width + channel
+            weight = tl.load(
+                weight_ptr + weight_offset, mask=channel < width, other=0.0
+            )
+            prediction += previous * weight[None, :]
+    if history_shared:
+        prediction *= shared_weight[None, :] / order
+        bias_offset = head * width + channel
+    elif per_head:
         bias_offset = head * width + channel
     else:
         bias_offset = channel
@@ -249,6 +264,7 @@ def _temporal_persistent_decode_kernel(
     bits: tl.constexpr,
     group_size: tl.constexpr,
     per_head: tl.constexpr,
+    history_shared: tl.constexpr,
     asymmetric: tl.constexpr,
     block_s: tl.constexpr,
     block_d: tl.constexpr,
@@ -258,6 +274,17 @@ def _temporal_persistent_decode_kernel(
     head = batch_head % heads
     token = tl.program_id(1) * block_s + tl.arange(0, block_s)
     channel = tl.program_id(2) * block_d + tl.arange(0, block_d)
+    if history_shared:
+        shared_weight = tl.load(
+            weight_ptr + head * width + channel,
+            mask=channel < width,
+            other=0.0,
+        ).to(tl.float32)
+        shared_bias = tl.load(
+            bias_ptr + head * width + channel,
+            mask=channel < width,
+            other=0.0,
+        ).to(tl.float32)
     for chunk_index in tl.static_range(0, chunk_units):
         unit_index = start_unit + chunk_index
         current_token = unit_index * stride + token
@@ -303,12 +330,20 @@ def _temporal_persistent_decode_kernel(
         order = unit_index
         if order > history_length:
             order = history_length
-        if per_head:
+        if history_shared:
+            prediction = tl.zeros((block_s, block_d), tl.float32)
+        elif per_head:
             bias_offset = ((order - 1) * heads + head) * width + channel
+            bias = tl.load(bias_ptr + bias_offset, mask=channel < width, other=0.0)
+            prediction = bias[None, :] + tl.zeros(
+                (block_s, block_d), tl.float32
+            )
         else:
             bias_offset = (order - 1) * width + channel
-        bias = tl.load(bias_ptr + bias_offset, mask=channel < width, other=0.0)
-        prediction = bias[None, :] + tl.zeros((block_s, block_d), tl.float32)
+            bias = tl.load(bias_ptr + bias_offset, mask=channel < width, other=0.0)
+            prediction = bias[None, :] + tl.zeros(
+                (block_s, block_d), tl.float32
+            )
         for lag in tl.static_range(0, history_length):
             if lag < order:
                 previous_token = (unit_index - lag - 1) * stride + token
@@ -325,21 +360,31 @@ def _temporal_persistent_decode_kernel(
                 previous = tl.load(
                     output_ptr + previous_offset, mask=valid, other=0.0
                 ).to(tl.float32)
-                if per_head:
-                    weight_offset = (
-                        (((order - 1) * history_length + lag) * heads + head) * width
-                        + channel
-                    )
+                if history_shared:
+                    prediction += previous
                 else:
-                    weight_offset = (
-                        ((order - 1) * history_length + lag) * width + channel
+                    if per_head:
+                        weight_offset = (
+                            (((order - 1) * history_length + lag) * heads + head)
+                            * width
+                            + channel
+                        )
+                    else:
+                        weight_offset = (
+                            ((order - 1) * history_length + lag) * width
+                            + channel
+                        )
+                    coefficient = tl.load(
+                        weight_ptr + weight_offset,
+                        mask=channel < width,
+                        other=0.0,
                     )
-                coefficient = tl.load(
-                    weight_ptr + weight_offset,
-                    mask=channel < width,
-                    other=0.0,
-                )
-                prediction += previous * coefficient[None, :]
+                    prediction += previous * coefficient[None, :]
+        if history_shared:
+            prediction = (
+                prediction * (shared_weight[None, :] / order)
+                + shared_bias[None, :]
+            )
         current = (prediction + residual).to(tl.bfloat16).to(tl.float32)
         output_offset = _strided_bhsd_offsets(
             batch_head,
@@ -385,6 +430,7 @@ def _cross_kv_residual_decode_kernel(
     history_length: tl.constexpr,
     history_order: tl.constexpr,
     history_diagonal: tl.constexpr,
+    history_shared: tl.constexpr,
     bits: tl.constexpr,
     group_size: tl.constexpr,
     asymmetric: tl.constexpr,
@@ -427,10 +473,35 @@ def _cross_kv_residual_decode_kernel(
     prediction = tl.dot(
         source, weight, out_dtype=tl.float32, input_precision="tf32"
     )
+    if history_shared and history_length > 0:
+        shared_history_weight = tl.load(
+            history_weight_ptr + head * width + channel,
+            mask=channel < width,
+            other=0.0,
+        ).to(tl.float32)
     for lag in tl.static_range(0, history_length):
         if lag < history_order:
             previous_token = current_start - (lag + 1) * stride + token
-            if history_diagonal:
+            if history_shared:
+                previous_offset = _strided_bhsd_offsets(
+                    batch_head,
+                    previous_token,
+                    channel,
+                    heads,
+                    output_stride_b,
+                    output_stride_h,
+                    output_stride_s,
+                    output_stride_d,
+                )
+                previous = tl.load(
+                    output_ptr + previous_offset,
+                    mask=valid,
+                    other=0.0,
+                ).to(tl.float32)
+                prediction += previous * (
+                    shared_history_weight[None, :] / history_order
+                )
+            elif history_diagonal:
                 previous_offset = _strided_bhsd_offsets(
                     batch_head,
                     previous_token,
@@ -694,6 +765,7 @@ def _cross_kv_history_persistent_decode_kernel(
     stride: tl.constexpr,
     history_length: tl.constexpr,
     history_diagonal: tl.constexpr,
+    history_shared: tl.constexpr,
     start_unit: tl.constexpr,
     chunk_units: tl.constexpr,
     bits: tl.constexpr,
@@ -720,7 +792,7 @@ def _cross_kv_history_persistent_decode_kernel(
             mask=channel < width,
             other=0.0,
         ).to(tl.float32)
-        if history_length > 1:
+        if history_length > 1 and not history_shared:
             history_weight_two = tl.load(
                 history_weight_ptr + (heads + head) * width + channel,
                 mask=channel < width,
@@ -856,7 +928,20 @@ def _cross_kv_history_persistent_decode_kernel(
             source, weight, out_dtype=tl.float32, input_precision="tf32"
         )
 
-        if history_diagonal:
+        if history_shared:
+            history_order = 1
+            if history_length > 1:
+                if unit_index > 1:
+                    history_order = 2
+            prediction += previous_one * (
+                history_weight_one[None, :] / history_order
+            )
+            if history_length > 1:
+                if unit_index > 1:
+                    prediction += previous_two * (
+                        history_weight_one[None, :] / history_order
+                    )
+        elif history_diagonal:
             prediction += previous_one * history_weight_one[None, :]
         else:
             history_weight_one_offset = (
@@ -876,7 +961,7 @@ def _cross_kv_history_persistent_decode_kernel(
                 out_dtype=tl.float32,
                 input_precision="tf32",
             )
-        if history_length > 1:
+        if history_length > 1 and not history_shared:
             if unit_index > 1:
                 if history_diagonal:
                     prediction += previous_two * history_weight_two[None, :]
@@ -1092,6 +1177,7 @@ def decode(
                     packed.bits,
                     packed.group_size,
                     parameters.per_head,
+                    parameters.shared_history,
                     asymmetric,
                     block_s,
                     block_d,
@@ -1100,8 +1186,12 @@ def decode(
             return _logical_bhsd_output(output, output_bshd)
         for unit_index, unit_length in enumerate(packed.unit_lengths[1:], start=1):
             order = min(unit_index, parameters.history_length)
-            weights = parameters.history_weights[order - 1, :order].contiguous()
-            bias = parameters.history_bias[order - 1].contiguous()
+            if parameters.shared_history:
+                weights = parameters.history_weights.contiguous()
+                bias = parameters.history_bias.contiguous()
+            else:
+                weights = parameters.history_weights[order - 1, :order].contiguous()
+                bias = parameters.history_bias[order - 1].contiguous()
             grid = (
                 batch_heads,
                 _ceil_div(unit_length, block_s),
@@ -1132,6 +1222,7 @@ def decode(
                 packed.bits,
                 packed.group_size,
                 parameters.per_head,
+                parameters.shared_history,
                 asymmetric,
                 block_s,
                 block_d,
@@ -1219,6 +1310,7 @@ def decode(
                     packed.stride,
                     parameters.history_length,
                     parameters.history_diagonal,
+                    parameters.shared_history,
                     start_unit,
                     chunk_units,
                     packed.bits,
@@ -1300,6 +1392,7 @@ def decode(
             parameters.history_length,
             history_order,
             parameters.history_diagonal,
+            parameters.shared_history,
             packed.bits,
             packed.group_size,
             asymmetric,

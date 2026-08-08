@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Literal
 import warnings
 
@@ -128,6 +128,16 @@ def predict_temporal(
     if parameters.layered:
         raise ValueError("select one layer before using temporal parameters")
     order = min(len(history), parameters.history_length)
+    if parameters.shared_history:
+        prediction = torch.zeros_like(history[0], dtype=torch.float32)
+        for previous in history[:order]:
+            prediction.add_(previous)
+        prediction.mul_(
+            parameters.history_weights.to(history[0].device)[None, :, None, :]
+            / order
+        )
+        prediction.add_(parameters.history_bias.to(history[0].device)[None, :, None, :])
+        return prediction
     weights = parameters.history_weights[order - 1, :order].to(history[0].device)
     bias = parameters.history_bias[order - 1].to(history[0].device)
     prediction = torch.zeros_like(history[0], dtype=torch.float32)
@@ -169,14 +179,24 @@ def predict_cross_kv(
         raise ValueError("CrossKV parameters do not match cache heads/head dimension")
     with _tf32_matmul(source.device):
         prediction = torch.matmul(source.float(), weight)
-        for lag, previous in enumerate(resolved_history[:order]):
-            history_weight = parameters.history_weights[lag].to(source.device)
-            if parameters.history_diagonal:
+        if parameters.shared_history and order:
+            history_weight = parameters.history_weights.to(source.device)
+            scale = 1.0 / order
+            for previous in resolved_history[:order]:
                 prediction.addcmul_(
-                    previous, history_weight[None, :, None, :]
+                    previous,
+                    history_weight[None, :, None, :],
+                    value=scale,
                 )
-            else:
-                prediction.add_(torch.matmul(previous.float(), history_weight))
+        else:
+            for lag, previous in enumerate(resolved_history[:order]):
+                history_weight = parameters.history_weights[lag].to(source.device)
+                if parameters.history_diagonal:
+                    prediction.addcmul_(
+                        previous, history_weight[None, :, None, :]
+                    )
+                else:
+                    prediction.add_(torch.matmul(previous.float(), history_weight))
     prediction.add_(bias[None, :, None, :])
     return prediction
 
@@ -264,13 +284,7 @@ def _encode(
     if predictor_kind == "temporal":
         if temporal is None:
             raise ValueError("K encoding requires temporal parameters")
-        if (
-            config.k_history_length is not None
-            and temporal.history_length != config.k_history_length
-        ):
-            raise ValueError(
-                "temporal K history length does not match config.k_history_length"
-            )
+        temporal = temporal.with_history_length(config.k_history_length)
         if temporal.stride is not None and temporal.stride != config.stride:
             raise ValueError("temporal parameters were fitted for a different stride")
         temporal = temporal.to(value.device)
@@ -288,10 +302,7 @@ def _encode(
             )
         if cross_kv.stride is not None and cross_kv.stride != config.stride:
             raise ValueError("CrossKV parameters were fitted for a different stride")
-        if cross_kv.history_length != config.v_history_length:
-            raise ValueError(
-                "CrossKV V history length does not match config.v_history_length"
-            )
+        cross_kv = cross_kv.with_history_length(config.v_history_length)
         cross_kv = cross_kv.to(value.device)
 
     anchor = value[:, :, :stride]
@@ -629,43 +640,71 @@ class TempoKVCodec:
         cross_kv: CrossKVParameters,
         config: CodecConfig | None = None,
     ) -> None:
-        self.temporal = temporal
-        self.cross_kv = cross_kv
         self.config = config or CodecConfig()
-        if (
-            self.config.k_history_length is not None
-            and temporal.history_length != self.config.k_history_length
+        if temporal.shared_history != cross_kv.shared_history:
+            raise ValueError("K and V parameters must use the same history sharing mode")
+        if temporal.shared_history:
+            if (
+                self.config.k_max_history_length is not None
+                and temporal.max_history_length != self.config.k_max_history_length
+            ):
+                raise ValueError(
+                    "K parameters do not match config.k_max_history_length"
+                )
+            if (
+                self.config.v_max_history_length is not None
+                and cross_kv.max_history_length != self.config.v_max_history_length
+            ):
+                raise ValueError(
+                    "V parameters do not match config.v_max_history_length"
+                )
+            # The maxima describe the fitted parameter set, not the active
+            # runtime choice.  Fill omitted maxima from the files so callers
+            # only need to override k_history_length/v_history_length.
+            self.config = replace(
+                self.config,
+                k_max_history_length=temporal.max_history_length,
+                v_max_history_length=cross_kv.max_history_length,
+            )
+        elif (
+            self.config.k_max_history_length is not None
+            or self.config.v_max_history_length is not None
         ):
             raise ValueError(
-                "K parameters and codec config use different K history lengths"
+                "history maxima require shared K and V parameter files; refit "
+                "the predictors with the current config"
             )
-        if cross_kv.history_length != self.config.v_history_length:
-            raise ValueError(
-                "V parameters and codec config use different V history lengths"
-            )
-        expected_signature = self.config.format_signature()
-        for name, parameters in (("K", temporal), ("V", cross_kv)):
+        temporal = temporal.with_history_length(self.config.k_history_length)
+        cross_kv = cross_kv.with_history_length(self.config.v_history_length)
+        self.temporal = temporal
+        self.cross_kv = cross_kv
+        expected_signature = (
+            self.config.shared_format_signature()
+            if temporal.shared_history
+            else self.config.format_signature()
+        )
+        for name, parameters in (("K", self.temporal), ("V", self.cross_kv)):
             signature = parameters.codec_signature
             if signature is not None and signature != expected_signature:
                 raise ValueError(
                     f"{name} parameters were fitted with a different codec config"
                 )
         if (
-            temporal.codec_signature is not None
-            and cross_kv.codec_signature is not None
-            and temporal.codec_signature != cross_kv.codec_signature
+            self.temporal.codec_signature is not None
+            and self.cross_kv.codec_signature is not None
+            and self.temporal.codec_signature != self.cross_kv.codec_signature
         ):
             raise ValueError("K and V parameters use different codec configs")
         if (
-            temporal.parameter_set_id is not None
-            and cross_kv.parameter_set_id is not None
-            and temporal.parameter_set_id != cross_kv.parameter_set_id
+            self.temporal.parameter_set_id is not None
+            and self.cross_kv.parameter_set_id is not None
+            and self.temporal.parameter_set_id != self.cross_kv.parameter_set_id
         ):
             raise ValueError("K and V parameters were not fitted together")
         if (
-            temporal.coordinate_system is not None
-            and cross_kv.coordinate_system is not None
-            and temporal.coordinate_system != cross_kv.coordinate_system
+            self.temporal.coordinate_system is not None
+            and self.cross_kv.coordinate_system is not None
+            and self.temporal.coordinate_system != self.cross_kv.coordinate_system
         ):
             raise ValueError("K and V parameters use different coordinate systems")
         self._temporal_by_device: dict[str, TemporalParameters] = {}

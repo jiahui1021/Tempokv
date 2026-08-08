@@ -9,6 +9,7 @@ import sys
 from dataclasses import asdict, fields
 from datetime import datetime, timezone
 from pathlib import Path
+import time
 from typing import Any, Sequence
 
 import numpy as np
@@ -49,10 +50,20 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         help="legacy K history override; prefer k_history_length in the config",
     )
+    parser.add_argument(
+        "--k-max-history-length",
+        type=int,
+        help="fit one shared K parameter set usable from 1 through this length",
+    )
     parser.add_argument("--iterations", type=int, default=2)
     parser.add_argument("--temporal-ridge", type=float, default=0.0)
     parser.add_argument("--cross-ridge", type=float, default=0.0)
     parser.add_argument("--max-gain", type=float, default=1.0)
+    parser.add_argument(
+        "--device",
+        default="auto",
+        help="fitting device: auto, cpu, cuda, or cuda:N (default: auto)",
+    )
     parser.add_argument(
         "--coordinate-system",
         default="unspecified",
@@ -65,6 +76,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--group-size", type=int)
     parser.add_argument("--stride", type=int)
     parser.add_argument("--v-history-length", type=int, choices=(0, 1, 2))
+    parser.add_argument(
+        "--v-max-history-length",
+        type=int,
+        choices=(0, 1, 2),
+        help="fit one shared V parameter set usable from 0 through this length",
+    )
     parser.add_argument("--residual-mode", choices=("symmetric", "asymmetric"))
     parser.add_argument("--scale-dtype", choices=("float32", "float16", "bfloat16"))
     parser.add_argument(
@@ -154,6 +171,26 @@ def _load_trace(
     return keys, values, layer_ids
 
 
+def _fit_device(name: str) -> torch.device:
+    if name == "auto":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    try:
+        device = torch.device(name)
+    except (RuntimeError, TypeError) as error:
+        raise ValueError("fit device must be auto, cpu, cuda, or cuda:N") from error
+    if device.type not in ("cpu", "cuda"):
+        raise ValueError("fit device must be auto, cpu, cuda, or cuda:N")
+    if device.type == "cuda" and not torch.cuda.is_available():
+        raise ValueError("CUDA fitting was requested but CUDA is unavailable")
+    if (
+        device.type == "cuda"
+        and device.index is not None
+        and not 0 <= device.index < torch.cuda.device_count()
+    ):
+        raise ValueError(f"CUDA device index is unavailable: {device.index}")
+    return device
+
+
 def run(args: argparse.Namespace) -> dict[str, Any]:
     config = _codec_config(args)
     keys, values, layer_ids = _load_trace(
@@ -161,6 +198,18 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         keys_name=args.keys_name,
         values_name=args.values_name,
     )
+    device = _fit_device(args.device)
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
+    fit_started = time.perf_counter()
+    if device.type == "cuda":
+        # Avoid carrying float64 trace storage onto the GPU.  All CUDA fitting
+        # equations and closed-loop reconstruction use float32 inputs.
+        keys = keys.to(device=device, dtype=torch.float32)
+        values = values.to(device=device, dtype=torch.float32)
+    else:
+        keys = keys.to(device=device)
+        values = values.to(device=device)
     temporal, cross = fit_predictors(
         keys,
         values,
@@ -168,7 +217,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         history_length=(
             args.history_length
             if args.history_length is not None
-            else config.k_history_length
+            else (
+                config.k_max_history_length
+                if config.k_max_history_length is not None
+                else config.k_history_length
+            )
         ),
         iterations=args.iterations,
         temporal_ridge=args.temporal_ridge,
@@ -177,12 +230,30 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         layer_ids=layer_ids,
         coordinate_system=args.coordinate_system,
     )
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+        peak_fit_allocated = int(torch.cuda.max_memory_allocated(device))
+        peak_fit_reserved = int(torch.cuda.max_memory_reserved(device))
+    else:
+        peak_fit_allocated = None
+        peak_fit_reserved = None
+    fit_seconds = time.perf_counter() - fit_started
 
     output_dir = args.output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     temporal_path = output_dir / "k_temporal.npz"
     cross_path = output_dir / "v_cross_kv.npz"
     report_path = output_dir / "fit_report.json"
+    parameter_tensors = (
+        temporal.history_weights,
+        temporal.history_bias,
+        cross.weight,
+        cross.history_weights,
+        cross.bias,
+    )
+    parameter_bytes = sum(
+        tensor.numel() * tensor.element_size() for tensor in parameter_tensors
+    )
     temporal.save(temporal_path)
     cross.save(cross_path)
     report = {
@@ -198,15 +269,29 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "codec_config": asdict(config),
         "fit": {
             # Keep the old report key while exposing the clearer config name.
-            "history_length": temporal.history_length,
-            "k_history_length": temporal.history_length,
+            "history_length": temporal.max_history_length,
+            "k_history_length": temporal.with_history_length(
+                config.k_history_length
+            ).history_length,
+            "k_max_history_length": temporal.max_history_length,
+            "k_history_mode": temporal.history_mode,
             "iterations": int(args.iterations),
             "temporal_ridge": float(args.temporal_ridge),
             "cross_ridge": float(args.cross_ridge),
-            "v_history_length": int(config.v_history_length),
+            "v_history_length": cross.with_history_length(
+                config.v_history_length
+            ).history_length,
+            "v_max_history_length": cross.max_history_length,
             "v_history_mode": cross.history_mode,
             "max_gain": float(args.max_gain),
             "coordinate_system": args.coordinate_system,
+            "device": str(device),
+            "compute_dtype": "float32" if device.type == "cuda" else "float64",
+            "seconds": fit_seconds,
+            # Keep the original name as an alias for allocated memory.
+            "peak_gpu_bytes": peak_fit_allocated,
+            "peak_gpu_allocated_bytes": peak_fit_allocated,
+            "peak_gpu_reserved_bytes": peak_fit_reserved,
         },
         "parameters": {
             "temporal_weight_shape": list(temporal.history_weights.shape),
@@ -214,6 +299,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "cross_weight_shape": list(cross.weight.shape),
             "cross_history_weight_shape": list(cross.history_weights.shape),
             "cross_bias_shape": list(cross.bias.shape),
+            "bytes": parameter_bytes,
+            "mib": parameter_bytes / (1024**2),
         },
         "artifacts": {
             "k_temporal": temporal_path.name,

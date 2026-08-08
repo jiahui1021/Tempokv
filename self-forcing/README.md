@@ -65,25 +65,29 @@ parameters/v_cross_kv.npz
 parameters/fit_report.json
 ```
 
-已有 `parameters/self_forcing_trace.npz` 时，无需重新采集，可以直接生成新的
-快速参数。下面的命令把 K 和 V 都设为使用前两帧：
+已有 `parameters/self_forcing_trace.npz` 时，无需重新采集，可以直接拟合一套
+可复用参数。下面的参数支持 K 最多 3 帧、V 最多 2 帧：
 
 ```bash
 python scripts/fit_params.py parameters/self_forcing_trace.npz \
   --config configs/int2.json \
   --output-dir parameters \
-  --k-history-length 2 \
-  --v-history-length 2 \
+  --k-max-history-length 3 \
+  --v-max-history-length 2 \
   --iterations 2 \
   --temporal-ridge 0.1 \
   --cross-ridge 0.1 \
   --max-gain 1.0 \
+  --device cuda \
   --stride 1560 \
   --coordinate-system pre_rope_normalized
 ```
 
 这条命令会替换 `parameters/k_temporal.npz` 和
 `parameters/v_cross_kv.npz`。
+拟合默认使用 `--device auto`，检测到 CUDA 时自动在 GPU 上运行；上面的
+`--device cuda` 会在 CUDA 不可用时直接报错。GPU 拟合按层累计统计量，避免
+为每个输出通道展开一份完整特征。
 
 `prepare.sh` 默认把采集的 trace 和拟合参数都写到独立的 `parameters/` 目录
 （可用 `PARAM_DIR` 覆盖），`WORK_DIR` 只保留 trace 采集中间产物。
@@ -104,11 +108,14 @@ MAX_GAIN=1.0
 ```
 
 量化位宽、anchor 位宽、分组大小、残差方式和 K/V 历史长度都在 `CONFIG`
-指向的 JSON 中调整。`k_history_length` 可设为 `1` 到 `8`，设为 `2` 时使用
-前两帧重建 K，各帧系数由拟合过程自动学习；
+指向的 JSON 中调整。`k_max_history_length` 和 `v_max_history_length` 决定拟合
+支持的最大长度；`k_history_length` 和 `v_history_length` 决定本次生成实际使用
+多少帧。K 的所有历史帧共用一套系数，V 的所有历史帧也共用一套系数。
+`k_history_length=2` 使用前两帧重建 K；
 `v_history_length=2` 使用前两帧重建 V，设为 `1` 时只使用前一帧，设为 `0`
 时使用旧的纯 CrossKV 预测。
-这些配置改变后必须重新运行 `prepare.sh`，避免参数和生成配置不匹配。
+生成使用的长度不超过拟合最大值时，可以直接修改，无需重新运行 `prepare.sh`。
+改变最大值、量化设置或 stride 后需要重新拟合。
 当前拟合器会生成快速的逐通道 V 历史系数；旧版完整矩阵历史参数会在生成前
 被拒绝，需要用当前代码重新拟合一次。
 
@@ -137,8 +144,8 @@ bash self-forcing/generate.sh
 ```
 
 `K_HISTORY_LENGTH` 和 `V_HISTORY_LENGTH` 明确指定本次生成使用的历史帧数；
-省略时读取 `CONFIG`。示例省略了默认的 `MODE=tempokv`、`PARAM_DIR=parameters`
-和输出目录。
+同一份参数也可改成 K=`1`/`3` 或 V=`0`/`1`。省略时读取 `CONFIG`。
+示例省略了默认的 `MODE=tempokv`、`PARAM_DIR=parameters` 和输出目录。
 
 > 注意：`MODE=tempokv` 时 `FRAMES` 至少要给到 105 视频帧（27 latent 帧），
 > 否则入口会直接拒绝。`MODE=bf16` 没有这个下限。
@@ -186,8 +193,8 @@ performance.ranks[]
 
 K→V 的 128×128 预测矩阵乘在编码和 Triton 解码端使用 TF32（A100 上比
 IEEE FP32 明显更快），与旧仓库 `S2_CROSS_MATMUL_PRECISION=tf32` 一致。
-历史 V 使用逐通道拟合的系数，只增加乘加，不再为每帧历史执行一遍完整矩阵
-计算；正式生成仍使用 `cross_kv_persistent_direct` 快速路径。
+历史 K/V 分别共用一套逐通道系数。多帧历史只增加求和与乘加，不再为每帧
+历史执行一遍完整矩阵计算；正式生成仍使用快速解码路径。
 predictor 参数在 codec 内按 (device, layer) 缓存并全局共享，多个压缩 span
 复用同一份参数，不再为每个 span 复制。
 

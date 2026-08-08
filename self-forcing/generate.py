@@ -108,7 +108,7 @@ def _validate_parameters(
 
     temporal = TemporalParameters.load(k_path)
     cross = CrossKVParameters.load(v_path)
-    TempoKVCodec(temporal, cross, config)
+    codec = TempoKVCodec(temporal, cross, config)
     if temporal.layer_ids != EXPECTED_LAYER_IDS:
         raise ValueError("K parameters must contain layers 0 through 29")
     if cross.layer_ids != EXPECTED_LAYER_IDS:
@@ -122,7 +122,13 @@ def _validate_parameters(
         raise ValueError(
             "Self-Forcing parameters must use pre_rope_normalized coordinates"
         )
-    if config.k_history_length is not None:
+    if temporal.shared_history:
+        if tuple(temporal.history_weights.shape) != (30, 12, 128):
+            raise ValueError(
+                "shared K parameters must contain one coefficient for each of "
+                "30 layers, 12 heads, and 128 channels"
+            )
+    elif config.k_history_length is not None:
         expected_k_history_shape = (
             30,
             config.k_history_length,
@@ -139,7 +145,13 @@ def _validate_parameters(
         raise ValueError("K parameters must contain 12 heads with dimension 128")
     if tuple(cross.weight.shape[-3:]) != (12, 128, 128):
         raise ValueError("V parameters must contain 12 heads with 128x128 weights")
-    if config.v_history_length:
+    if cross.shared_history:
+        if tuple(cross.history_weights.shape) != (30, 12, 128):
+            raise ValueError(
+                "shared V history parameters must contain one coefficient for "
+                "each of 30 layers, 12 heads, and 128 channels"
+            )
+    elif config.v_history_length:
         expected_v_history_shape = (30, config.v_history_length, 12, 128)
         if tuple(cross.history_weights.shape) != expected_v_history_shape:
             raise ValueError(
@@ -166,10 +178,14 @@ def _validate_parameters(
         "layers": 30,
         "heads": 12,
         "head_dimension": 128,
-        "history_length": temporal.history_length,
-        "k_history_length": temporal.history_length,
-        "v_history_length": cross.history_length,
+        "history_length": codec.temporal.history_length,
+        "k_history_length": codec.temporal.history_length,
+        "k_max_history_length": temporal.max_history_length,
+        "k_history_mode": temporal.history_mode,
+        "v_history_length": codec.cross_kv.history_length,
+        "v_max_history_length": cross.max_history_length,
         "v_history_mode": cross.history_mode,
+        "v_history_diagonal": cross.history_diagonal,
         "predictor_parameter_bytes": predictor_parameter_bytes,
         "predictor_parameter_mib": predictor_parameter_bytes / (1024**2),
         "v_history_parameter_bytes": v_history_parameter_bytes,
@@ -441,7 +457,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             "v": (
                 min(requested_persistent_units, 8)
                 if parameters["v_history_length"]
-                and parameters.get("v_history_mode", "dense") != "diagonal"
+                and not parameters.get("v_history_diagonal", False)
                 else requested_persistent_units
             ),
         }

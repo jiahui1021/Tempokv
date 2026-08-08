@@ -22,21 +22,25 @@ NVIDIA GPU Triton decoders:
 pip install -e ".[cuda]"
 ```
 
-Two codec configs are provided. Both use the two most recent reconstructed K
-frames to predict K, and current reconstructed K plus the two most recent
-reconstructed V frames to predict V:
+Two codec configs are provided. Both use two reconstructed K frames and two
+reconstructed V frames at generation time. Their fitted parameter files support
+up to three K frames and two V frames:
 
 - `configs/int2.json`: INT2 K/V residuals with an INT4 first anchor unit.
 - `configs/int4.json`: INT4 K/V residuals and INT4 first anchor unit.
 
 `k_history_length` controls how many reconstructed K frames predict the next K
-and accepts values from `1` to `8`; fitting learns a separate coefficient for
-each selected history frame.
+and accepts values from `1` through `k_max_history_length`.
 `v_history_length` controls the V predictor: `2` uses the previous two V frames,
 `1` uses only the previous frame, and `0` retains the legacy K-only CrossKV
-predictor. V history coefficients are fitted per head and channel, so each lag
-adds only lightweight multiply-adds instead of another full K-to-V projection.
-Predictor parameters must be refitted after changing either value.
+predictor. K history frames share one coefficient set, and V history frames
+share one per-head/channel coefficient set. Active history frames are averaged
+before applying those coefficients. This avoids extra full K-to-V projections
+and keeps the predictor parameter footprint independent of the active length.
+
+`k_max_history_length` and `v_max_history_length` are fitting limits. Fit once at
+the maximum values, then change `k_history_length` and `v_history_length` for
+generation without refitting, as long as they do not exceed those limits.
 
 ## Self-Forcing pipeline
 
@@ -53,19 +57,20 @@ CONFIG=configs/int2.json \
 bash self-forcing/prepare.sh
 ```
 
-If `parameters/self_forcing_trace.npz` already exists, refit the fast two-frame
-K/V parameters without collecting another trace:
+If `parameters/self_forcing_trace.npz` already exists, fit one reusable K/V
+parameter set without collecting another trace:
 
 ```bash
 python scripts/fit_params.py parameters/self_forcing_trace.npz \
   --config configs/int2.json \
   --output-dir parameters \
-  --k-history-length 2 \
-  --v-history-length 2 \
+  --k-max-history-length 3 \
+  --v-max-history-length 2 \
   --iterations 2 \
   --temporal-ridge 0.1 \
   --cross-ridge 0.1 \
   --max-gain 1.0 \
+  --device cuda \
   --stride 1560 \
   --coordinate-system pre_rope_normalized
 ```
@@ -84,9 +89,13 @@ FRAMES=717 \
 bash self-forcing/generate.sh
 ```
 
-`K_HISTORY_LENGTH` and `V_HISTORY_LENGTH` explicitly select the history used
-for this run. If omitted, both values come from `CONFIG`; the example also
-omits the default mode, parameter directory, and output directory.
+`K_HISTORY_LENGTH=2` and `V_HISTORY_LENGTH=2` explicitly select the history used
+for this run. The same fitted files can also run with K set to `1` or `3`, and V
+set to `0` or `1`. If omitted, both active values come from `CONFIG`.
+
+Fitting uses CUDA automatically when it is available. `--device cuda` makes
+that choice explicit; use `--device cpu` for a CPU-only fit. CUDA fitting uses
+float32 equations and processes regression statistics one layer at a time.
 
 The fast K/V history paths decode up to 16 units per launch by default. Override
 this for A/B testing without refitting with

@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 
+
 @dataclass(frozen=True, slots=True)
 class CodecConfig:
     """Runtime quantization settings shared by the K and V codecs."""
@@ -21,6 +22,9 @@ class CodecConfig:
     v_history_length: int = 0
     # None keeps legacy parameter-driven K history selection.
     k_history_length: int | None = None
+    # Shared parameter files can serve any active length up to these maxima.
+    k_max_history_length: int | None = None
+    v_max_history_length: int | None = None
 
     def __post_init__(self) -> None:
         for name in ("k_bits", "v_bits", "anchor_bits"):
@@ -44,6 +48,49 @@ class CodecConfig:
             or int(self.k_history_length) > 8
         ):
             raise ValueError("k_history_length must be an integer from 1 to 8 or null")
+        if (
+            self.k_max_history_length is not None
+            or self.v_max_history_length is not None
+        ):
+            object.__setattr__(
+                self,
+                "k_max_history_length",
+                self.k_max_history_length
+                if self.k_max_history_length is not None
+                else self.k_history_length or 3,
+            )
+            object.__setattr__(
+                self,
+                "v_max_history_length",
+                self.v_max_history_length
+                if self.v_max_history_length is not None
+                else self.v_history_length,
+            )
+        if self.k_max_history_length is not None and (
+            isinstance(self.k_max_history_length, bool)
+            or int(self.k_max_history_length) != self.k_max_history_length
+            or not 1 <= int(self.k_max_history_length) <= 8
+        ):
+            raise ValueError(
+                "k_max_history_length must be an integer from 1 to 8 or null"
+            )
+        if self.v_max_history_length is not None and (
+            isinstance(self.v_max_history_length, bool)
+            or int(self.v_max_history_length) != self.v_max_history_length
+            or int(self.v_max_history_length) not in (0, 1, 2)
+        ):
+            raise ValueError("v_max_history_length must be 0, 1, 2, or null")
+        if (
+            self.k_history_length is not None
+            and self.k_max_history_length is not None
+            and self.k_history_length > self.k_max_history_length
+        ):
+            raise ValueError("k_history_length must not exceed k_max_history_length")
+        if (
+            self.v_max_history_length is not None
+            and self.v_history_length > self.v_max_history_length
+        ):
+            raise ValueError("v_history_length must not exceed v_max_history_length")
         if self.residual_mode not in {"symmetric", "asymmetric"}:
             raise ValueError("residual_mode must be symmetric or asymmetric")
         supported_dtypes = {"float32", "float16", "bfloat16"}
@@ -78,5 +125,23 @@ class CodecConfig:
             # Preserve the exact signature used by legacy CrossKV-only files.
             version = "v1"
         return f"tempokv-codec-{version}:" + json.dumps(
+            payload, sort_keys=True, separators=(",", ":")
+        )
+
+    def shared_format_signature(self) -> str:
+        """Identity for parameters reusable across active history lengths."""
+        payload = {
+            "anchor_bits": self.anchor_bits,
+            "group_size": self.group_size,
+            "k_bits": self.k_bits,
+            "k_max_history_length": self.k_max_history_length,
+            "reconstruction_dtype": self.reconstruction_dtype,
+            "residual_mode": self.residual_mode,
+            "scale_dtype": self.scale_dtype,
+            "stride": self.stride,
+            "v_bits": self.v_bits,
+            "v_max_history_length": self.v_max_history_length,
+        }
+        return "tempokv-codec-v4:" + json.dumps(
             payload, sort_keys=True, separators=(",", ":")
         )

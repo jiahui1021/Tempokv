@@ -32,6 +32,8 @@
 #   START_INDEX / END_INDEX  prompt 序号范围（默认 0 .. 8）
 #   BASE_SEED      随机种子（默认 0）
 #   ITERATIONS     拟合迭代次数（默认 2）
+#   K_MAX_HISTORY_LENGTH / V_MAX_HISTORY_LENGTH  参数支持的最大历史帧数（默认读取 CONFIG）
+#   FIT_DEVICE     拟合设备（默认 auto，有 CUDA 时自动使用 GPU）
 #   TEMPORAL_RIDGE / CROSS_RIDGE / MAX_GAIN  拟合正则与增益（默认 0.1/0.1/1.0）
 #   OVERWRITE      已存在产物时覆盖（0/1，默认 0）
 #   SKIP_EXISTING  采集时跳过已存在的 trace（0/1，默认 0）
@@ -65,7 +67,7 @@ resolve_path() {
   local value="$1"
   case "$value" in
     /*) printf '%s\n' "$value" ;;
-    *)  realpath -m -- "$project_root/$value" ;;
+    *)  printf '%s/%s\n' "${project_root%/}" "${value#./}" ;;
   esac
 }
 
@@ -87,6 +89,7 @@ check_int() {
 require_env TRACE_RUNNER CHECKPOINT WAN_MODEL_DIR PROMPTS WORK_DIR CONFIG
 
 trace_runner="$(resolve_path "$TRACE_RUNNER")"
+config_path="$(resolve_path "$CONFIG")"
 
 # ---------- 目录 ----------
 
@@ -114,6 +117,7 @@ ITERATIONS="${ITERATIONS:-2}"
 TEMPORAL_RIDGE="${TEMPORAL_RIDGE:-0.1}"
 CROSS_RIDGE="${CROSS_RIDGE:-0.1}"
 MAX_GAIN="${MAX_GAIN:-1.0}"
+FIT_DEVICE="${FIT_DEVICE:-auto}"
 OVERWRITE="${OVERWRITE:-0}"
 DRY_RUN="${DRY_RUN:-0}"
 
@@ -127,6 +131,14 @@ check_int TRACE_TOKENS_PER_FRAME 1
 check_int NUM_GPUS 1
 check_int BASE_SEED 0
 check_int ITERATIONS 1
+if [[ -n "${K_MAX_HISTORY_LENGTH:-}" ]]; then
+  check_int K_MAX_HISTORY_LENGTH 1
+  (( K_MAX_HISTORY_LENGTH <= 8 )) || die "K_MAX_HISTORY_LENGTH 必须 <= 8（当前值：$K_MAX_HISTORY_LENGTH）"
+fi
+if [[ -n "${V_MAX_HISTORY_LENGTH:-}" ]]; then
+  check_int V_MAX_HISTORY_LENGTH 0
+  (( V_MAX_HISTORY_LENGTH <= 2 )) || die "V_MAX_HISTORY_LENGTH 必须 <= 2（当前值：$V_MAX_HISTORY_LENGTH）"
+fi
 
 # ---------- 组装三条命令 ----------
 
@@ -162,15 +174,18 @@ merge_command=(
 fit_command=(
   "$python_bin" "$project_root/scripts/fit_params.py"
   "$trace_file"
-  --config "$(resolve_path "$CONFIG")"
+  --config "$config_path"
   --output-dir "$param_dir"
   --iterations "$ITERATIONS"
   --temporal-ridge "$TEMPORAL_RIDGE"
   --cross-ridge "$CROSS_RIDGE"
   --max-gain "$MAX_GAIN"
+  --device "$FIT_DEVICE"
   --stride 1560
   --coordinate-system pre_rope_normalized
 )
+[[ -n "${K_MAX_HISTORY_LENGTH:-}" ]] && fit_command+=(--k-max-history-length "$K_MAX_HISTORY_LENGTH")
+[[ -n "${V_MAX_HISTORY_LENGTH:-}" ]] && fit_command+=(--v-max-history-length "$V_MAX_HISTORY_LENGTH")
 
 print_command() {
   printf '  $'
@@ -188,7 +203,7 @@ fi
 
 # 干跑模式不检查文件存在，便于先预览命令；真实执行前再校验
 [[ -f "$trace_runner" ]] || die "TRACE_RUNNER 不存在：$trace_runner"
-[[ -f "$CONFIG" ]] || die "CONFIG 不存在：$CONFIG"
+[[ -f "$config_path" ]] || die "CONFIG 不存在：$config_path"
 
 # 防止意外覆盖已有参数
 existing=""

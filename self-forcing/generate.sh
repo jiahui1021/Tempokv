@@ -90,21 +90,18 @@ _quant_config_slug() {
     printf 'bf16'
     return 0
   fi
-  "$python_bin" - "$(resolve_path "$CONFIG")" "$param_dir/k_temporal.npz" \
+  "$python_bin" - "$(resolve_path "$CONFIG")" \
     "${K_HISTORY_LENGTH:-}" "${V_HISTORY_LENGTH:-}" <<'PY'
 import json
 import sys
-
-import numpy as np
 
 try:
     config = json.load(open(sys.argv[1]))
     config = config.get("codec", config)
     k_bits = config.get("k_bits", 0)
-    fitted_k_history = int(np.load(sys.argv[2])["history_length"].item())
-    k_history = int(sys.argv[3]) if sys.argv[3] else fitted_k_history
+    k_history = int(sys.argv[2]) if sys.argv[2] else config.get("k_history_length", 3)
     v_history = (
-        int(sys.argv[4]) if sys.argv[4] else config.get("v_history_length", 0)
+        int(sys.argv[3]) if sys.argv[3] else config.get("v_history_length", 0)
     )
     print(f"kh{k_history}-vh{v_history}-int{k_bits}")
 except Exception:

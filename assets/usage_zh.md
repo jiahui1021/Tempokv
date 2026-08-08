@@ -26,13 +26,16 @@ pip install -e ".[cuda]"
 - `configs/int2.json`：K/V 残差为 INT2，首个 anchor unit 保持 INT4。
 - `configs/int4.json`：K/V 残差和首个 anchor unit 都为 INT4。
 
-`k_history_length` 用于选择 K 历史长度，可设为 `1` 到 `8`。
-每一帧对应的预测系数由拟合过程自动学习。
+`k_history_length` 用于选择 K 历史长度，可设为 `1` 到
+`k_max_history_length`。
 `v_history_length` 用于选择 V 历史长度：
 `2` 使用前两帧，`1` 只使用前一帧，`0` 保留原来的纯 CrossKV 方式。
-V 历史系数按 head 和通道拟合，只增加轻量乘加，不会为每一帧历史重复执行
-完整的 K→V 矩阵计算。
-修改任一历史长度后都需要重新拟合参数。
+K 的各帧共用一套系数，V 的各帧也共用一套按 head 和通道拟合的系数。
+使用多帧时先求平均，因此切换历史长度不会让预测项随帧数成倍放大，也不会
+重复执行完整的 K→V 矩阵计算。
+
+`k_max_history_length` 和 `v_max_history_length` 决定拟合支持的最大长度。
+按最大长度拟合一次后，生成时可以在范围内自由修改 K/V 历史长度，无需重新拟合。
 
 ## Self-Forcing 完整生成流程
 流程分成两个 SH 脚本。所有参数都用环境变量传入，第一个脚本运行一次，
@@ -49,6 +52,9 @@ WORK_DIR=runs/self_forcing_prepare \
 CONFIG=configs/int2.json \
 bash self-forcing/prepare.sh
 ```
+
+拟合默认使用 `FIT_DEVICE=auto`，检测到 CUDA 时自动使用 GPU。需要强制使用
+GPU 时设置 `FIT_DEVICE=cuda`；GPU 拟合采用 float32，并按层累计回归统计量。
 
 ### 第二步：读取参数生成视频（可更换 prompt 后重复运行）
 
