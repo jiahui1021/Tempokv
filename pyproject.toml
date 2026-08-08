@@ -22,5 +22,6 @@ metrics = [
   "scikit-image>=0.22",
 ]
 
-[tool.setuptools.packages.find]
-where = ["src"]
+[tool.setuptools]
+packages = ["tempokv", "longcat"]
+package-dir = {tempokv = "src/tempokv", longcat = "longcat"}

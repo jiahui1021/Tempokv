@@ -135,7 +135,7 @@ def _load_trace(
     *,
     keys_name: str,
     values_name: str,
-) -> tuple[torch.Tensor, torch.Tensor, tuple[int, ...] | None]:
+) -> tuple[torch.Tensor, torch.Tensor, tuple[int, ...] | None, dict[str, object]]:
     try:
         with np.load(path, allow_pickle=False) as archive:
             missing = [name for name in (keys_name, values_name) if name not in archive]
@@ -146,6 +146,18 @@ def _load_trace(
             layer_ids_array = (
                 np.array(archive["layer_ids"], copy=True) if "layer_ids" in archive else None
             )
+            metadata: dict[str, object] = {}
+            for name in (
+                "stride",
+                "temporal_units",
+                "num_layers",
+                "num_heads",
+                "head_dim",
+                "coordinate_system",
+                "cross_source_kind",
+            ):
+                if name in archive:
+                    metadata[name] = np.asarray(archive[name]).item()
     except OSError as error:
         raise ValueError(f"cannot read trace {path}: {error}") from error
 
@@ -168,7 +180,7 @@ def _load_trace(
         layer_ids = tuple(int(item) for item in layer_ids_array)
         if len(set(layer_ids)) != len(layer_ids):
             raise ValueError("layer_ids must be unique")
-    return keys, values, layer_ids
+    return keys, values, layer_ids, metadata
 
 
 def _fit_device(name: str) -> torch.device:
@@ -193,11 +205,41 @@ def _fit_device(name: str) -> torch.device:
 
 def run(args: argparse.Namespace) -> dict[str, Any]:
     config = _codec_config(args)
-    keys, values, layer_ids = _load_trace(
+    keys, values, layer_ids, trace_metadata = _load_trace(
         args.trace,
         keys_name=args.keys_name,
         values_name=args.values_name,
     )
+    trace_stride = trace_metadata.get("stride")
+    if trace_stride is not None and int(trace_stride) != config.stride:
+        raise ValueError(
+            f"trace stride {int(trace_stride)} does not match codec stride {config.stride}"
+        )
+    trace_shape_metadata = {
+        "num_layers": int(keys.shape[0]),
+        "num_heads": int(keys.shape[-2]),
+        "head_dim": int(keys.shape[-1]),
+        "temporal_units": int(keys.shape[-3]),
+    }
+    for name, actual in trace_shape_metadata.items():
+        recorded = trace_metadata.get(name)
+        if recorded is not None and int(recorded) != actual:
+            raise ValueError(
+                f"trace {name} metadata is {int(recorded)}, but the array has {actual}"
+            )
+    trace_coordinate_system = trace_metadata.get("coordinate_system")
+    coordinate_system = args.coordinate_system
+    if trace_coordinate_system is not None:
+        trace_coordinate_system = str(trace_coordinate_system)
+        if coordinate_system == "unspecified":
+            coordinate_system = trace_coordinate_system
+        elif coordinate_system != trace_coordinate_system:
+            raise ValueError(
+                f"trace coordinate system {trace_coordinate_system!r} does not match "
+                f"requested {coordinate_system!r}"
+            )
+    if trace_metadata.get("cross_source_kind") not in (None, "normalized"):
+        raise ValueError("trace CrossKV source must be normalized for TempoKV")
     device = _fit_device(args.device)
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
@@ -228,7 +270,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         cross_ridge=args.cross_ridge,
         max_gain=args.max_gain,
         layer_ids=layer_ids,
-        coordinate_system=args.coordinate_system,
+        coordinate_system=coordinate_system,
     )
     if device.type == "cuda":
         torch.cuda.synchronize(device)
@@ -284,7 +326,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "v_max_history_length": cross.max_history_length,
             "v_history_mode": cross.history_mode,
             "max_gain": float(args.max_gain),
-            "coordinate_system": args.coordinate_system,
+            "coordinate_system": coordinate_system,
+            "trace_metadata": trace_metadata,
             "device": str(device),
             "compute_dtype": "float32" if device.type == "cuda" else "float64",
             "seconds": fit_seconds,

@@ -8,6 +8,12 @@ decoders. See the [Chinese usage guide](assets/usage_zh.md) for details, and
 [self-forcing/README.md](self-forcing/README.md) for the Self-Forcing model
 adapter.
 
+The LongCat-Video adapter is documented in
+[longcat/README.md](longcat/README.md). It keeps the TempoKV codec unchanged and
+connects it to LongCat's clean pre-RoPE KV cache. It supports single-process
+and Context Parallel runs, optional KV CPU offload, and independent attention
+sink spans.
+
 ## Installation
 
 CPU or PyTorch reference path:
