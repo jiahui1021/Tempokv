@@ -1,138 +1,152 @@
 # TempoKV
 
-[中文使用指南](assets/usage_zh.md) 
+TempoKV 使用时间预测与 CrossKV 预测压缩视频生成模型的 KV cache。仓库包含
+PyTorch 参考实现、可选 Triton 算子、参数拟合工具，以及 Self-Forcing 和
+LongCat 的模型接入。
 
-TempoKV fits, quantizes, and reconstructs attention KV caches. The repository
-provides the codec, a plain PyTorch reference decoder, and optional Triton CUDA
-decoders. See the [Chinese usage guide](assets/usage_zh.md) for details, and
-[self-forcing/README.md](self-forcing/README.md) for the Self-Forcing model
-adapter.
+## 目录
 
-The LongCat-Video adapter is documented in
-[longcat/README.md](longcat/README.md). It keeps the TempoKV codec unchanged and
-connects it to LongCat's clean pre-RoPE KV cache. The first validation target is
-the single-process, no-offload, no-sink path; Context Parallel, KV CPU offload,
-attention sink spans, and `torch.compile` remain experimental. LongCat can be
-run with `MODE=tempokv` for TempoKV KV quantization or `MODE=bf16` for the
-original unquantized BF16 baseline; each rank writes end-to-end timing and peak
-GPU-memory statistics.
+```text
+Tempokv/
+├── experiments/
+│   ├── Self-Forcing/          Self-Forcing 模型与推理代码
+│   └── LongCat/               LongCat 模型接入代码
+├── src/tempokv/               TempoKV 核心算法、参数格式与 Triton 算子
+├── scripts/
+│   ├── Self-Forcing/          Self-Forcing 采集、拟合与生成入口
+│   ├── LongCat/               LongCat 采集、拟合与生成入口
+│   ├── common/                多模型共用的参数拟合入口
+│   ├── evaluation/            视频质量评测
+│   └── tools/                 通用分析与流水线工具
+├── data/
+│   ├── self-forcing/
+│   │   ├── trace/             raw trace 与合并后的 clean trace
+│   │   └── params/            按参数方案分组的拟合参数
+│   └── longcat/
+│       ├── trace/
+│       └── params/
+├── configs/                   TempoKV 配置
+├── results/                   生成视频、报告与评测结果
+└── tests/
+```
 
-## Installation
+目录职责固定：
 
-CPU or PyTorch reference path:
+- `experiments/` 只保存模型侧代码。
+- `src/tempokv/` 只保存 TempoKV 自己的算法和算子。
+- `scripts/` 只保存最终调用入口与通用工具。
+- `data/` 保存可重复使用的 trace 和拟合参数。
+- `results/` 保存每次运行产生的视频与报告。
+
+## 安装
+
+PyTorch 参考实现：
 
 ```bash
 pip install -e .
 ```
 
-NVIDIA GPU Triton decoders:
+NVIDIA GPU Triton 解码：
 
 ```bash
 pip install -e ".[cuda]"
 ```
 
-Two codec configs are provided. Each config's `k_history_length` and
-`v_history_length` select the exact number of reconstructed history frames used
-at generation time, and the same values drive the parameter fit:
+仓库提供 `configs/int2.json` 和 `configs/int4.json`。每一种
+`k_history_length`、`v_history_length` 与位宽组合都需要一套对应的拟合参数。
 
-- `configs/int2.json`: INT2 K/V residuals with an INT4 first anchor unit.
-- `configs/int4.json`: INT4 K/V residuals and INT4 first anchor unit.
+## Self-Forcing
 
-`k_history_length` controls how many reconstructed K frames predict the next K
-and accepts values from `1` through `8`.
-`v_history_length` controls the V predictor: `2` uses the previous two V frames,
-`1` uses only the previous frame, and `0` retains the legacy K-only CrossKV
-predictor.
+Self-Forcing 的 BF16、clean trace 和 TempoKV 使用同一份本地模型代码：
+`experiments/Self-Forcing/inference.py`。不需要 `MODEL_REPO`、`TRACE_RUNNER`
+或 QVG 仓库。`CHECKPOINT` 与 `WAN_MODEL_DIR` 只负责指定本机模型权重。
 
-Different history configurations need their own fitted parameter files. Because
-fitting is accelerated on GPU and takes only ~2 seconds per config (see below),
-the recommended workflow is to fit one dedicated parameter set for every
-`k_history_length` / `v_history_length` combination you intend to run.
-
-## Self-Forcing pipeline
-
-Three shell scripts. All settings are passed as environment variables.
-
-**Step 1 — collect and merge a clean trace (once).** Collecting runs model
-inference and takes about 10-15 minutes; every subsequent generation reuses the
-same `self_forcing_trace.npz`:
+### 1. 采集并合并 clean trace
 
 ```bash
-TRACE_RUNNER=/path/to/self-forcing-trace-runner.sh \
 CHECKPOINT=/models/self_forcing_dmd.pt \
 WAN_MODEL_DIR=/models/Wan2.1-T2V-1.3B \
 PROMPTS=assets/fit_prompts.txt \
-WORK_DIR=runs/self_forcing_prepare \
-bash self-forcing/collect_trace.sh
+bash scripts/Self-Forcing/collect_trace.sh
 ```
 
-To collect without the wrapper, call the external trace runner directly, then
-merge with `prepare_trace.py`:
+默认输出：
+
+```text
+data/self-forcing/trace/raw/
+data/self-forcing/trace/output/
+data/self-forcing/trace/clean_trace.npz
+```
+
+已有 raw trace 时只执行合并：
 
 ```bash
-SELF_FORCING_CHECKPOINT_PATH=/models/self_forcing_dmd.pt \
-FORCING_WAN_MODEL_DIR=/models/Wan2.1-T2V-1.3B \
-PROMPTS_PATH=assets/fit_prompts.txt \
-CROSS_KV_TRACE_DIR=runs/self_forcing_prepare/raw_trace/traces \
-OUTPUT_FOLDER=runs/self_forcing_prepare/raw_trace/output \
-bash /path/to/self-forcing-trace-runner.sh
-
-python self-forcing/prepare_trace.py \
-  runs/self_forcing_prepare/raw_trace/traces \
-  parameters/self_forcing_trace.npz
+python experiments/Self-Forcing/tempokv_adapter/prepare_trace.py \
+  data/self-forcing/trace/raw \
+  data/self-forcing/trace/clean_trace.npz
 ```
 
-**Step 2 — fit parameters.** Fit a dedicated parameter set for the exact
-`k_history_length` / `v_history_length` you plan to run (takes about 1.5 seconds
-on GPU):
+### 2. 拟合一套参数
 
 ```bash
 CONFIG=configs/int2.json \
 K_HISTORY_LENGTH=2 \
 V_HISTORY_LENGTH=2 \
-OUTPUT_DIR=parameters/self_forcing/kh2-vh2-int2 \
-bash self-forcing/fit_params.sh
+bash scripts/Self-Forcing/fit_params.sh
 ```
 
-**Step 3 — generate videos.** `PARAM_DIR` points at step 2's output:
+默认输出：
+
+```text
+data/self-forcing/params/kh2-vh2-int2/k_temporal.npz
+data/self-forcing/params/kh2-vh2-int2/v_cross_kv.npz
+```
+
+### 3. 使用 TempoKV 生成
 
 ```bash
-MODEL_REPO=/path/to/self-forcing-model-repo \
 CHECKPOINT=/models/self_forcing_dmd.pt \
 WAN_MODEL_DIR=/models/Wan2.1-T2V-1.3B \
 PROMPTS=assets/generation_prompts.txt \
 CONFIG=configs/int2.json \
-PARAM_DIR=parameters/self_forcing/kh2-vh2-int2 \
 K_HISTORY_LENGTH=2 \
 V_HISTORY_LENGTH=2 \
 FRAMES=717 \
-bash self-forcing/generate.sh
+bash scripts/Self-Forcing/run_tempokv.sh
 ```
 
-`K_HISTORY_LENGTH=2` and `V_HISTORY_LENGTH=2` explicitly select the history used
-for this run; they must match the fitted `k_history_length` /
-`v_history_length` of the parameter files in `PARAM_DIR`, otherwise parameter
-shape validation fails. If omitted, both active values come from `CONFIG`.
+脚本会按配置自动选择 `data/self-forcing/params/<参数方案>/`。也可以用
+`PARAM_DIR` 指定其他参数目录。
 
-`K_HISTORY_LENGTH` / `V_HISTORY_LENGTH` fall back to the config values when
-omitted. The remaining fit options have sensible defaults and are usually left
-as is: `FIT_DEVICE=auto` uses CUDA when available (float32 fitting),
-`ITERATIONS` defaults to 2, `MAX_GAIN` to 1.0, and stride is fixed at 1560
-(to match the trace). On an A100, fitting one dedicated config from the
-128-prompt trace takes about 1.5 seconds of fit time (roughly 10-20 seconds
-wall-clock including trace loading), versus roughly 14 minutes for the same fit
-on CPU with float64 equations.
+### 4. 生成 BF16 对照
 
-The fast K/V history paths decode up to 16 units per launch by default. Override
-this for A/B testing without refitting with
-`TEMPOKV_PERSISTENT_UNITS_PER_LAUNCH=8`. Values from 1 through 16 are accepted.
-Dense V history and K history orders above four are always capped at eight
-because their compile-time expansion is substantially larger.
+```bash
+CHECKPOINT=/models/self_forcing_dmd.pt \
+WAN_MODEL_DIR=/models/Wan2.1-T2V-1.3B \
+PROMPTS=assets/generation_prompts.txt \
+FRAMES=81 \
+bash scripts/Self-Forcing/run_bf16.sh
+```
 
-Set `MODE=bf16` for an unquantized baseline; that mode does not need `CONFIG`
-or `PARAM_DIR`. `pipeline_report.json` records total wall-clock time, per-GPU
-latency, peak GPU memory, and the exact predictor-parameter footprint.
+BF16 不读取 TempoKV 配置或参数。两种生成方式都会在 `results/` 中写入视频、
+耗时和显存报告。
 
-Both entry points validate `stride=1560`, 30 layers, 12 heads, head dimension
-128, and pre-RoPE normalized K. Generation also checks that TempoKV is actually
-triggered.
+完整变量说明见 [Self-Forcing 使用说明](scripts/Self-Forcing/README.md)。
+
+## LongCat
+
+LongCat 的模型接入代码位于 `experiments/LongCat/longcat/`，最终入口位于
+`scripts/LongCat/`。现有 LongCat 接入仍使用 `LONGCAT_REPO` 指向已安装的
+LongCat 模型运行环境；它与 Self-Forcing 的本地运行方式互不混用。
+
+## 评测
+
+```bash
+pip install -e ".[metrics]"
+
+python scripts/evaluation/evaluate_quality.py \
+  /data/reference_videos \
+  results/self-forcing/videos \
+  --device cuda \
+  --output results/self-forcing/quality.json
+```

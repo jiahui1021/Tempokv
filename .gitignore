@@ -11,6 +11,7 @@ htmlcov/
 # Local verification files
 /tests/*
 !/tests/test_longcat_review_regressions.py
+!/tests/test_self_forcing_trace_flow.py
 
 # Build and packaging output
 build/
@@ -18,6 +19,8 @@ dist/
 *.egg-info/
 
 # Generated traces, parameters, and model files
+/data/*
+!/data/README.md
 /parameters/
 /parameters_kh3_vh1/
 /parameters_kh3_vh1_dedicated_gpu/

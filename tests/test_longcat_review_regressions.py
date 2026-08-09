@@ -24,8 +24,8 @@ from tempokv import (
     encode_cross_kv,
 )
 from tempokv.parameters import load_parameters
-from scripts.fit_params import build_parser as build_fit_parser
-from scripts.fit_params import run as run_fit
+from scripts.common.fit_params import build_parser as build_fit_parser
+from scripts.common.fit_params import run as run_fit
 
 
 def _codec() -> TempoKVCodec:

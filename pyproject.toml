@@ -24,7 +24,7 @@ metrics = [
 
 [tool.setuptools]
 packages = ["tempokv", "longcat"]
-package-dir = {tempokv = "src/tempokv", longcat = "longcat"}
+package-dir = {tempokv = "src/tempokv", longcat = "experiments/LongCat/longcat"}
 
 [tool.pytest.ini_options]
-pythonpath = ["src"]
+pythonpath = ["src", "experiments/LongCat"]
