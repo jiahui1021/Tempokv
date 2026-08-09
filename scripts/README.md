@@ -3,6 +3,7 @@
 ```text
 scripts/
 ├── Self-Forcing/   Self-Forcing trace, fit, BF16, and TempoKV commands
+├── Causal-Forcing/ Causal Forcing download, trace, fit, BF16, and TempoKV commands
 ├── LongCat/        LongCat trace, fit, and generation commands
 ├── common/         shared parameter fitting command
 ├── evaluation/     video quality and VBench evaluation

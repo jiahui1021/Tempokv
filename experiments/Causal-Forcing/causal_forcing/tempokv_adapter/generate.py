@@ -1,0 +1,594 @@
+#!/usr/bin/env python3
+"""Generate Causal Forcing videos with TempoKV or native bf16 KV caches.
+
+Validation happens before the model is loaded: a parameter set fitted for a
+different codec config, a different coordinate system, or a different layer
+count is rejected up front rather than producing a plausible-looking video from
+mismatched predictors.  After the run, the TempoKV report is checked for actual
+codec activity so a misconfigured run cannot pass as a TempoKV result.
+"""
+
+from __future__ import annotations
+
+import argparse
+from dataclasses import asdict, replace
+from datetime import datetime, timezone
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import time
+from typing import Sequence
+
+PROJECT_ROOT = Path(__file__).resolve().parents[4]
+SOURCE_ROOT = PROJECT_ROOT / "src"
+if SOURCE_ROOT.is_dir() and str(SOURCE_ROOT) not in sys.path:
+    sys.path.insert(0, str(SOURCE_ROOT))
+
+RUNTIME_ROOT = PROJECT_ROOT / "experiments" / "Causal-Forcing"
+REQUIRED_RUNTIME_FILES = (
+    "inference.py",
+    "causal_forcing/kv_cache.py",
+    "causal_forcing/pipeline/__init__.py",
+    "causal_forcing/pipeline/causal_inference.py",
+    "causal_forcing/utils/wan_wrapper.py",
+    "causal_forcing/wan/modules/causal_model.py",
+)
+EXPECTED_COORDINATE_SYSTEM = "pre_rope_normalized"
+VIDEO_FRAMES_PER_LATENT = 4
+
+
+def latent_frames_for(video_frames: int, num_frame_per_block: int) -> int:
+    """Convert a video frame count to whole latent blocks.
+
+    Wan latents cover four video frames each, and the first latent is shared by
+    the first frame only, hence the ``+3``.
+    """
+    if video_frames < 1:
+        raise ValueError("video frame count must be positive")
+    if num_frame_per_block < 1:
+        raise ValueError("num-frame-per-block must be positive")
+    shifted = video_frames + VIDEO_FRAMES_PER_LATENT - 1
+    period = VIDEO_FRAMES_PER_LATENT * num_frame_per_block
+    if shifted % period:
+        raise ValueError(
+            f"FRAMES must map exactly to {num_frame_per_block}-frame latent "
+            f"blocks; valid values satisfy (FRAMES + 3) % {period} == 0"
+        )
+    return shifted // VIDEO_FRAMES_PER_LATENT
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Generate Causal Forcing videos with TempoKV or bf16 KV caches."
+    )
+    parser.add_argument("--mode", choices=("tempokv", "bf16", "trace"), default="tempokv")
+    parser.add_argument("--config", type=Path, help="TempoKV codec config JSON")
+    parser.add_argument("--k-params", type=Path)
+    parser.add_argument("--v-params", type=Path)
+    parser.add_argument("--k-history-length", type=int, choices=range(1, 9))
+    parser.add_argument("--v-history-length", type=int, choices=(0, 1, 2))
+    parser.add_argument(
+        "--model-config",
+        type=Path,
+        help="Causal Forcing YAML; defaults to the bundled chunkwise config",
+    )
+    parser.add_argument("--checkpoint", type=Path, required=True)
+    parser.add_argument("--model-root", type=Path, required=True)
+    parser.add_argument("--prompts", type=Path, required=True)
+    parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--trace-dir", type=Path, help="required when --mode trace")
+    parser.add_argument(
+        "--frames",
+        type=int,
+        default=81,
+        help="final video frame count; 1 latent frame = 4 video frames",
+    )
+    parser.add_argument(
+        "--num-frame-per-block",
+        type=int,
+        default=3,
+        help="3 for chunkwise Causal Forcing, 1 for framewise",
+    )
+    parser.add_argument(
+        "--span-frames",
+        type=int,
+        help="latent frames per TempoKV span; one anchor is emitted per span",
+    )
+    parser.add_argument("--samples", type=int, default=1)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--start-index", type=int, default=0)
+    parser.add_argument("--end-index", type=int, default=-1)
+    parser.add_argument("--num-gpus", type=int, default=1)
+    parser.add_argument("--local-attn-size", type=int, default=-1)
+    parser.add_argument("--triton-cache", type=Path)
+    parser.add_argument(
+        "--allow-triton-fallback",
+        action="store_true",
+        help="use the config's Triton flags instead of enforcing strict acceleration",
+    )
+    parser.add_argument("--skip-existing", action="store_true")
+    parser.add_argument("--dry-run", action="store_true")
+    return parser
+
+
+def _load_config(path: Path):
+    from tempokv.config import CodecConfig
+
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError("codec config must be a JSON object")
+    if "codec" in payload:
+        if len(payload) != 1 or not isinstance(payload["codec"], dict):
+            raise ValueError("'codec' must be the only top-level config object")
+        payload = payload["codec"]
+    return CodecConfig(**payload)
+
+
+def _validate_parameters(k_path: Path, v_path: Path, config) -> dict[str, object]:
+    from tempokv.codec import TempoKVCodec
+    from tempokv.parameters import CrossKVParameters, TemporalParameters
+
+    temporal = TemporalParameters.load(k_path)
+    cross = CrossKVParameters.load(v_path)
+    if temporal.shared_history != cross.shared_history:
+        raise ValueError(
+            "Causal Forcing K and V parameters must use the same history mode"
+        )
+    signature_config = config
+    if temporal.shared_history:
+        signature_config = replace(
+            config,
+            k_max_history_length=(
+                config.k_max_history_length
+                if config.k_max_history_length is not None
+                else temporal.max_history_length
+            ),
+            v_max_history_length=(
+                config.v_max_history_length
+                if config.v_max_history_length is not None
+                else cross.max_history_length
+            ),
+        )
+    expected_signature = (
+        signature_config.shared_format_signature()
+        if temporal.shared_history
+        else signature_config.format_signature()
+    )
+    if (
+        temporal.codec_signature != expected_signature
+        or cross.codec_signature != expected_signature
+    ):
+        raise ValueError(
+            "Causal Forcing parameters were not fitted with the current codec config"
+        )
+    if (
+        not temporal.parameter_set_id
+        or not cross.parameter_set_id
+        or temporal.parameter_set_id != cross.parameter_set_id
+    ):
+        raise ValueError(
+            "Causal Forcing K/V parameters must share a current parameter_set_id"
+        )
+    if temporal.layer_ids != cross.layer_ids:
+        raise ValueError("Causal Forcing K and V parameters cover different layers")
+    if temporal.stride != config.stride or cross.stride != config.stride:
+        raise ValueError("parameter stride does not match the codec config")
+    if (
+        temporal.coordinate_system != EXPECTED_COORDINATE_SYSTEM
+        or cross.coordinate_system != EXPECTED_COORDINATE_SYSTEM
+    ):
+        raise ValueError(
+            "Causal Forcing parameters must use pre_rope_normalized coordinates; "
+            "Self-Forcing parameters are not reusable because the checkpoint and "
+            "cache distribution differ"
+        )
+    codec = TempoKVCodec(temporal, cross, config)
+    heads, head_dim = tuple(int(item) for item in cross.weight.shape[-3:-1])
+    parameter_tensors = (
+        temporal.history_weights,
+        temporal.history_bias,
+        cross.weight,
+        cross.bias,
+        cross.history_weights,
+    )
+    predictor_parameter_bytes = sum(
+        tensor.numel() * tensor.element_size()
+        for tensor in parameter_tensors
+        if tensor is not None
+    )
+    return {
+        "k_params": str(k_path),
+        "v_params": str(v_path),
+        "layers": len(temporal.layer_ids),
+        "heads": heads,
+        "head_dimension": head_dim,
+        "k_history_length": codec.temporal.history_length,
+        "v_history_length": codec.cross_kv.history_length,
+        "v_history_diagonal": cross.history_diagonal,
+        "predictor_parameter_bytes": predictor_parameter_bytes,
+        "stride": config.stride,
+        "coordinate_system": EXPECTED_COORDINATE_SYSTEM,
+    }
+
+
+def _generation_command(
+    args: argparse.Namespace, paths: dict[str, Path], latent_frames: int
+) -> list[str]:
+    command = [
+        sys.executable,
+        "-m",
+        "torch.distributed.run",
+        "--standalone",
+        f"--nproc_per_node={args.num_gpus}",
+        str(Path(__file__).with_name("worker.py")),
+        "--mode",
+        args.mode,
+        "--",
+        "--config_path",
+        str(paths["model_config"]),
+        "--checkpoint_path",
+        str(paths["checkpoint"]),
+        "--model_root",
+        str(paths["model_root"]),
+        "--data_path",
+        str(paths["prompts"]),
+        "--output_folder",
+        str(paths["videos"]),
+        "--num_output_frames",
+        str(latent_frames),
+        "--num_samples",
+        str(args.samples),
+        "--seed",
+        str(args.seed),
+        "--start_index",
+        str(args.start_index),
+        "--end_index",
+        str(args.end_index),
+        "--save_with_index",
+        "--use_ema",
+        "--local_attn_size",
+        str(args.local_attn_size),
+    ]
+    if args.skip_existing:
+        command.append("--skip_existing")
+    return command
+
+
+def _load_worker_metrics(metrics_dir: Path, expected_ranks: int) -> dict[str, object]:
+    rank_metrics: list[dict[str, object]] = []
+    for expected_rank in range(expected_ranks):
+        path = metrics_dir / f"rank-{expected_rank}.json"
+        if not path.is_file():
+            raise RuntimeError(f"missing metrics for rank {expected_rank}: {path}")
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict) or payload.get("rank") != expected_rank:
+            raise RuntimeError(f"invalid metrics for rank {expected_rank}: {path}")
+        rank_metrics.append(payload)
+    decode_routes: dict[str, int] = {}
+    for metric in rank_metrics:
+        for name, count in (metric.get("decode_routes") or {}).items():
+            decode_routes[name] = decode_routes.get(name, 0) + int(count)
+    peak_allocated = max(int(m["peak_allocated_bytes"]) for m in rank_metrics)
+    peak_reserved = max(int(m["peak_reserved_bytes"]) for m in rank_metrics)
+    return {
+        "max_worker_seconds": max(float(m["wall_seconds"]) for m in rank_metrics),
+        "peak_allocated_bytes": peak_allocated,
+        "peak_reserved_bytes": peak_reserved,
+        "peak_allocated_gib": peak_allocated / (1024**3),
+        "peak_reserved_gib": peak_reserved / (1024**3),
+        "decode_routes": decode_routes,
+        "ranks": rank_metrics,
+    }
+
+
+def _rank_summaries(videos_dir: Path) -> list[dict[str, object]]:
+    summary_path = videos_dir / "summary.json"
+    if not summary_path.is_file():
+        raise RuntimeError("Causal Forcing did not write the current run summary")
+    payload = json.loads(summary_path.read_text(encoding="utf-8"))
+    return [rank for rank in payload.get("rank_summaries") or [] if isinstance(rank, dict)]
+
+
+def _merge_tempokv_reports(ranks: list[dict[str, object]]) -> dict[str, object]:
+    """Combine per-rank reports.
+
+    Counters and encoded volume add across ranks; peaks are the worst single
+    rank, since ranks do not hold their caches at the same instant on different
+    devices. Latency is reported as the slowest rank.
+    """
+    reports = [rank.get("tempokv_report") for rank in ranks]
+    reports = [report for report in reports if isinstance(report, dict)]
+    if not reports:
+        raise RuntimeError(
+            "TempoKV run produced no report; the bridge was not installed"
+        )
+    summed = (
+        "encode_key_calls",
+        "encode_value_calls",
+        "decode_tensor_calls",
+        "finalized_frames",
+        "ephemeral_writes",
+        "cache_evictions",
+        "cache_resets",
+        "total_encoded_cache_bytes",
+        "total_uncompressed_cache_bytes",
+        "current_compressed_cache_bytes",
+        "current_uncompressed_cache_bytes",
+    )
+    maxed = (
+        "peak_compressed_cache_bytes",
+        "peak_uncompressed_cache_bytes",
+        "encode_ms",
+        "decode_ms",
+        "attention_ms",
+        "generation_ms",
+    )
+    merged: dict[str, object] = {
+        name: reports[0].get(name)
+        for name in ("model", "kv_mode", "num_layers", "num_heads", "head_dim", "stride")
+    }
+    for name in summed:
+        merged[name] = sum(int(report.get(name) or 0) for report in reports)
+    for name in maxed:
+        merged[name] = max(float(report.get(name) or 0) for report in reports)
+    merged["predictor_parameter_bytes"] = max(
+        int(report.get("predictor_parameter_bytes") or 0) for report in reports
+    )
+    compressed = int(merged["current_compressed_cache_bytes"])
+    merged["compression_ratio"] = (
+        int(merged["current_uncompressed_cache_bytes"]) / compressed
+        if compressed
+        else None
+    )
+    merged["ranks"] = len(reports)
+    return merged
+
+
+def _require_tempokv_activity(report: dict[str, object]) -> None:
+    empty = [
+        name
+        for name in (
+            "encode_key_calls",
+            "encode_value_calls",
+            "decode_tensor_calls",
+            "finalized_frames",
+        )
+        if int(report.get(name) or 0) <= 0
+    ]
+    if empty:
+        raise RuntimeError(
+            "TempoKV generation did not exercise the codec: "
+            + ", ".join(f"{name}=0" for name in empty)
+        )
+
+
+def run(args: argparse.Namespace) -> dict[str, object]:
+    model_config = args.model_config
+    if model_config is None:
+        model_config = RUNTIME_ROOT / "configs" / "causal_forcing_dmd_chunkwise.yaml"
+    output_dir = args.output_dir.expanduser().resolve()
+    paths = {
+        "checkpoint": args.checkpoint.expanduser().resolve(),
+        "model_root": args.model_root.expanduser().resolve(),
+        "prompts": args.prompts.expanduser().resolve(),
+        "model_config": model_config.expanduser().resolve(),
+        "run": output_dir,
+        "videos": output_dir / "videos",
+        "runtime_config": output_dir / "runtime_config.json",
+    }
+    if args.mode == "tempokv":
+        missing = [
+            name
+            for name, value in (
+                ("--config", args.config),
+                ("--k-params", args.k_params),
+                ("--v-params", args.v_params),
+            )
+            if value is None
+        ]
+        if missing:
+            raise ValueError(f"mode=tempokv requires {', '.join(missing)}")
+        paths.update(
+            {
+                "config": args.config.expanduser().resolve(),
+                "k_params": args.k_params.expanduser().resolve(),
+                "v_params": args.v_params.expanduser().resolve(),
+            }
+        )
+    if args.mode == "trace" and args.trace_dir is None:
+        raise ValueError("mode=trace requires --trace-dir")
+    if paths["run"] == Path(paths["run"].anchor):
+        raise ValueError("output-dir must not be the filesystem root")
+
+    required_files = ["checkpoint", "prompts", "model_config"]
+    if args.mode == "tempokv":
+        required_files.extend(("config", "k_params", "v_params"))
+    for name in required_files:
+        if not paths[name].is_file():
+            raise ValueError(f"{name} file does not exist: {paths[name]}")
+    if not paths["model_root"].is_dir():
+        raise ValueError(f"model-root directory does not exist: {paths['model_root']}")
+    for relative in REQUIRED_RUNTIME_FILES:
+        if not (RUNTIME_ROOT / relative).is_file():
+            raise ValueError(f"bundled Causal Forcing runtime is missing: {relative}")
+
+    if args.samples < 1:
+        raise ValueError("samples must be positive")
+    if args.num_gpus < 1:
+        raise ValueError("num-gpus must be positive")
+    if args.local_attn_size == 0 or args.local_attn_size < -1:
+        raise ValueError("local-attn-size must be -1 or a positive integer")
+    latent_frames = latent_frames_for(args.frames, args.num_frame_per_block)
+    if args.local_attn_size != -1 and args.local_attn_size < latent_frames:
+        raise ValueError(
+            "local-attn-size must cover the complete generated latent sequence "
+            f"({latent_frames} frames) so BF16 and TempoKV use identical "
+            "Causal Forcing attention semantics"
+        )
+
+    config = None
+    parameters = None
+    span_frames = args.span_frames
+    if args.mode == "tempokv":
+        config = _load_config(paths["config"])
+        overrides = {
+            name: value
+            for name, value in (
+                ("k_history_length", args.k_history_length),
+                ("v_history_length", args.v_history_length),
+            )
+            if value is not None
+        }
+        if overrides:
+            config = replace(config, **overrides)
+        if 128 % config.group_size:
+            raise ValueError("Causal Forcing group_size must divide the head dimension")
+        if config.reconstruction_dtype != "bfloat16":
+            raise ValueError("Causal Forcing requires reconstruction_dtype=bfloat16")
+        if span_frames is None:
+            from causal_forcing.tempokv_adapter.bridge import DEFAULT_SPAN_FRAMES
+
+            span_frames = DEFAULT_SPAN_FRAMES
+        if span_frames < 2:
+            raise ValueError("span-frames must be at least 2")
+        if span_frames % args.num_frame_per_block:
+            raise ValueError(
+                f"span-frames ({span_frames}) must be a whole number of "
+                f"{args.num_frame_per_block}-frame blocks"
+            )
+        if latent_frames < span_frames:
+            raise ValueError(
+                f"generating {latent_frames} latent frames never fills a "
+                f"{span_frames}-frame TempoKV span; lower --span-frames or "
+                "raise --frames"
+            )
+        parameters = _validate_parameters(paths["k_params"], paths["v_params"], config)
+
+    generation_command = _generation_command(args, paths, latent_frames)
+    report: dict[str, object] = {
+        "status": "dry_run" if args.dry_run else "running",
+        "mode": args.mode,
+        "model": "causal_forcing",
+        "generation_mode": (
+            "framewise" if args.num_frame_per_block == 1 else "chunkwise"
+        ),
+        "num_frame_per_block": args.num_frame_per_block,
+        "latent_frames": latent_frames,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "generation_command": generation_command,
+        "output_dir": str(paths["run"]),
+    }
+    if args.mode == "tempokv":
+        report["parameters"] = parameters
+        report["span_frames"] = span_frames
+    if args.dry_run:
+        print(json.dumps(report, indent=2, ensure_ascii=False))
+        return report
+
+    paths["run"].mkdir(parents=True, exist_ok=True)
+    environment = os.environ.copy()
+    for name in tuple(environment):
+        if name.startswith("TEMPOKV_"):
+            environment.pop(name)
+    if args.mode == "tempokv":
+        runtime_payload = asdict(config)
+        if not args.allow_triton_fallback:
+            runtime_payload["use_triton"] = True
+            runtime_payload["strict_triton"] = True
+        paths["runtime_config"].write_text(
+            json.dumps(runtime_payload, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        environment.update(
+            {
+                "TEMPOKV_CONFIG_PATH": str(paths["runtime_config"]),
+                "TEMPOKV_K_PARAMS_PATH": str(paths["k_params"]),
+                "TEMPOKV_V_PARAMS_PATH": str(paths["v_params"]),
+                "TEMPOKV_SPAN_FRAMES": str(span_frames),
+                "TEMPOKV_MODEL_NAME": f"causal_forcing_{report['generation_mode']}",
+            }
+        )
+        if args.triton_cache is not None:
+            environment["TEMPOKV_TRITON_CACHE"] = str(
+                args.triton_cache.expanduser().resolve()
+            )
+    elif args.mode == "trace":
+        environment["TEMPOKV_TRACE_DIR"] = str(
+            args.trace_dir.expanduser().resolve()
+        )
+
+    paths["videos"].mkdir(parents=True, exist_ok=True)
+    metrics_dir = paths["run"] / "metrics"
+    metrics_dir.mkdir(parents=True, exist_ok=True)
+    for rank in range(args.num_gpus):
+        (metrics_dir / f"rank-{rank}.json").unlink(missing_ok=True)
+    environment["CAUSAL_FORCING_METRICS_DIR"] = str(metrics_dir)
+
+    started = time.perf_counter()
+    completed = subprocess.run(
+        generation_command, cwd=RUNTIME_ROOT, env=environment, check=False
+    )
+    generation_seconds = time.perf_counter() - started
+    if completed.returncode:
+        raise subprocess.CalledProcessError(completed.returncode, generation_command)
+
+    performance = _load_worker_metrics(metrics_dir, args.num_gpus)
+    report.update(
+        {
+            "status": "complete",
+            "generation_seconds": generation_seconds,
+            "performance": performance,
+        }
+    )
+    if args.mode == "trace":
+        report["trace_dir"] = environment["TEMPOKV_TRACE_DIR"]
+    else:
+        ranks = _rank_summaries(paths["videos"])
+        videos = [
+            entry["path"]
+            for rank in ranks
+            for entry in rank.get("videos") or []
+            if isinstance(entry, dict) and isinstance(entry.get("path"), str)
+        ]
+        for path in videos:
+            resolved = Path(path)
+            if not resolved.is_file() or resolved.stat().st_size == 0:
+                raise RuntimeError(f"Causal Forcing video is missing or empty: {path}")
+        report["videos"] = videos
+        if args.mode == "tempokv":
+            tempokv_report = _merge_tempokv_reports(ranks)
+            _require_tempokv_activity(tempokv_report)
+            report["tempokv"] = tempokv_report
+            (paths["run"] / "tempokv_report.json").write_text(
+                json.dumps(tempokv_report, indent=2, ensure_ascii=False) + "\n",
+                encoding="utf-8",
+            )
+
+    (paths["run"] / "pipeline_report.json").write_text(
+        json.dumps(report, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+    )
+    print(json.dumps(report, indent=2, ensure_ascii=False))
+    return report
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        run(args)
+    except (
+        json.JSONDecodeError,
+        OSError,
+        RuntimeError,
+        subprocess.CalledProcessError,
+        TypeError,
+        ValueError,
+    ) as error:
+        parser.error(str(error))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

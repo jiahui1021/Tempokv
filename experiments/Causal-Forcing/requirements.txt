@@ -1,0 +1,23 @@
+# Causal Forcing 推理依赖。也可以直接安装 extras：
+#   pip install -e ".[cuda,causal-forcing]"
+#
+# Causal Forcing 使用 torch.nn.attention.flex_attention 与 torch.compile，
+# PyTorch 版本需要固定并验证。
+accelerate>=1.1.1
+av==13.1.0
+diffusers==0.31.0
+easydict>=1.13
+einops>=0.8.0
+ftfy>=6.2.0
+imageio>=2.34
+omegaconf>=2.3.0
+Pillow>=10.0
+regex>=2024.0
+safetensors>=0.4
+scipy>=1.10
+sentencepiece>=0.2.0
+tokenizers>=0.20.3
+torch>=2.5.0
+torchvision>=0.20.0
+tqdm>=4.66
+transformers>=4.49.0

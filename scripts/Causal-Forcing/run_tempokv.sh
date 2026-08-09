@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Causal Forcing generation with TempoKV cache compression.
+set -euo pipefail
+
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+MODE=tempokv exec bash "$script_dir/generate.sh" "$@"

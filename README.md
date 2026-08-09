@@ -1,8 +1,8 @@
 # TempoKV
 
 TempoKV 使用时间预测与 CrossKV 预测压缩视频生成模型的 KV cache。仓库包含
-PyTorch 参考实现、可选 Triton 算子、参数拟合工具，以及 Self-Forcing 和
-LongCat 的模型接入。
+PyTorch 参考实现、可选 Triton 算子、参数拟合工具，以及 Self-Forcing、
+Causal Forcing 和 LongCat 的模型接入。
 
 ## 目录
 
@@ -10,10 +10,13 @@ LongCat 的模型接入。
 Tempokv/
 ├── experiments/
 │   ├── Self-Forcing/          Self-Forcing 模型与推理代码
+│   ├── Causal-Forcing/        Causal Forcing 模型与推理代码
 │   └── LongCat/               LongCat 模型接入代码
 ├── src/tempokv/               TempoKV 核心算法、参数格式与 Triton 算子
+│   └── runtime/               因果视频模型共用的 KV cache、RoPE、流式编码与指标
 ├── scripts/
 │   ├── Self-Forcing/          Self-Forcing 采集、拟合与生成入口
+│   ├── Causal-Forcing/        Causal Forcing 下载、采集、拟合与生成入口
 │   ├── LongCat/               LongCat 采集、拟合与生成入口
 │   ├── common/                多模型共用的参数拟合入口
 │   ├── evaluation/            视频质量评测
@@ -22,6 +25,9 @@ Tempokv/
 │   ├── self-forcing/
 │   │   ├── trace/             raw trace 与合并后的 clean trace
 │   │   └── params/            按参数方案分组的拟合参数
+│   ├── causal-forcing/
+│   │   ├── trace/<模式>/
+│   │   └── params/<模式>/
 │   └── longcat/
 │       ├── trace/
 │       └── params/
@@ -32,7 +38,8 @@ Tempokv/
 目录职责固定：
 
 - `experiments/` 只保存模型侧代码。
-- `src/tempokv/` 只保存 TempoKV 自己的算法和算子。
+- `src/tempokv/` 只保存 TempoKV 自己的算法和算子；`src/tempokv/runtime/` 保存
+  Self-Forcing 与 Causal Forcing 共用的因果 KV cache 运行时。
 - `scripts/` 只保存最终调用入口与通用工具。
 - `data/` 保存可重复使用的 trace 和拟合参数。
 - `results/` 保存每次运行产生的视频与报告。
@@ -55,6 +62,12 @@ Self-Forcing 推理环境：
 
 ```bash
 pip install -e ".[cuda,self-forcing]"
+```
+
+Causal Forcing 推理环境：
+
+```bash
+pip install -e ".[cuda,causal-forcing]"
 ```
 
 如果还需要 Self-Forcing 训练工具，再安装：
@@ -153,6 +166,56 @@ BF16 不读取 TempoKV 配置或参数。BF16 与 TempoKV 默认都生成 717 �
 中写入视频、耗时和显存报告。
 
 完整变量说明见 [Self-Forcing 使用说明](scripts/Self-Forcing/README.md)。
+
+## Causal Forcing
+
+Causal Forcing 的模型、pipeline、VAE、scheduler 和 TempoKV 接入代码都位于
+`experiments/Causal-Forcing/`，入口位于 `scripts/Causal-Forcing/`。不需要 clone
+外部 `thu-ml/Causal-Forcing`，不需要外部 `PYTHONPATH`，权重由 `MODEL_ROOT` 与
+`CHECKPOINT` 指定。
+
+下载权重：
+
+```bash
+bash scripts/Causal-Forcing/download_models.sh
+```
+
+BF16 基线：
+
+```bash
+CHECKPOINT=checkpoints/causal_forcing/chunkwise/causal_forcing.pt \
+MODEL_ROOT=checkpoints/causal_forcing/wan2.1-t2v-1.3b \
+PROMPTS=assets/generation_prompts.txt \
+bash scripts/Causal-Forcing/run_bf16.sh
+```
+
+采集 clean trace 并拟合 INT4：
+
+```bash
+CHECKPOINT=checkpoints/causal_forcing/chunkwise/causal_forcing.pt \
+MODEL_ROOT=checkpoints/causal_forcing/wan2.1-t2v-1.3b \
+PROMPTS=assets/fit_prompts.txt \
+bash scripts/Causal-Forcing/collect_trace.sh
+
+CONFIG=configs/causal_forcing_int4.json \
+bash scripts/Causal-Forcing/fit_params.sh
+```
+
+TempoKV 生成：
+
+```bash
+CHECKPOINT=checkpoints/causal_forcing/chunkwise/causal_forcing.pt \
+MODEL_ROOT=checkpoints/causal_forcing/wan2.1-t2v-1.3b \
+PROMPTS=assets/generation_prompts.txt \
+CONFIG=configs/causal_forcing_int4.json \
+bash scripts/Causal-Forcing/run_tempokv.sh
+```
+
+`GENERATION_MODE=framewise` 切换到 frame-wise 模型，trace、参数和结果分开存放。
+Causal Forcing 与 Self-Forcing 的 30 层 / 12 头 / D=128 / stride=1560 完全相同，
+但 checkpoint 与 cache 分布不同，**参数不能互相复用**，必须各自采 trace 各自拟合。
+
+完整变量说明见 [Causal Forcing 使用说明](scripts/Causal-Forcing/README.md)。
 
 ## LongCat
 

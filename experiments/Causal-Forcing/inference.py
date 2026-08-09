@@ -1,0 +1,385 @@
+"""Causal Forcing inference entry point for BF16, trace, and TempoKV runs.
+
+The KV mode is selected by the caller before this script runs: the TempoKV or
+trace bridge, if any, has already replaced ``CausalInferencePipeline``. This
+script itself only loads the model, generates, and writes the run summary.
+
+Every path is explicit. There is no ``wan_models/`` relative lookup, no
+``PYTHONPATH`` pointing at an external Causal-Forcing checkout, and no
+dependence on the working directory.
+"""
+
+import argparse
+import json
+import os
+from pathlib import Path
+import sys
+import time
+
+import torch
+import torch.distributed as dist
+from einops import rearrange
+from omegaconf import OmegaConf
+from torch.utils.data import DataLoader, SequentialSampler, Subset
+from torchvision import transforms
+from torchvision.io import write_video
+
+_RUNTIME_ROOT = Path(__file__).resolve().parent
+if str(_RUNTIME_ROOT) not in sys.path:
+    sys.path.insert(0, str(_RUNTIME_ROOT))
+_SOURCE_ROOT = _RUNTIME_ROOT.parents[1] / "src"
+if _SOURCE_ROOT.is_dir() and str(_SOURCE_ROOT) not in sys.path:
+    sys.path.insert(0, str(_SOURCE_ROOT))
+
+from causal_forcing.pipeline import (  # noqa: E402
+    CausalDiffusionInferencePipeline,
+    CausalInferencePipeline,
+)
+from causal_forcing.utils.dataset import TextDataset, TextImagePairDataset  # noqa: E402
+from causal_forcing.utils.misc import set_seed  # noqa: E402
+from causal_forcing.demo_utils.memory import (  # noqa: E402
+    DynamicSwapInstaller,
+    get_cuda_free_memory_gb,
+)
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--config_path", type=str, required=True, help="Causal Forcing config")
+parser.add_argument("--checkpoint_path", type=str, help="Causal Forcing checkpoint")
+parser.add_argument(
+    "--model_root",
+    type=str,
+    required=True,
+    help="Wan2.1-T2V-1.3B directory holding the VAE, T5 encoder, and model config",
+)
+parser.add_argument("--data_path", type=str, required=True, help="Prompt file or I2V directory")
+parser.add_argument("--extended_prompt_path", type=str, help="Optional extended prompts")
+parser.add_argument("--output_folder", type=str, required=True)
+parser.add_argument("--num_output_frames", type=int, default=21, help="Latent frames to generate")
+parser.add_argument("--i2v", action="store_true", help="Image-to-video instead of text-to-video")
+parser.add_argument("--use_ema", action="store_true")
+parser.add_argument("--seed", type=int, default=0)
+parser.add_argument("--num_samples", type=int, default=1)
+parser.add_argument("--save_with_index", action="store_true")
+parser.add_argument("--start_index", type=int, default=0)
+parser.add_argument("--end_index", type=int, default=-1)
+parser.add_argument("--local_attn_size", type=int, default=-1)
+parser.add_argument("--skip_existing", action="store_true")
+parser.add_argument("--skip_video_save", action="store_true", help=argparse.SUPPRESS)
+args = parser.parse_args()
+
+if "LOCAL_RANK" in os.environ:
+    local_rank = int(os.environ["LOCAL_RANK"])
+    torch.cuda.set_device(local_rank)
+    device = torch.device(f"cuda:{local_rank}")
+    try:
+        dist.init_process_group(backend="nccl", device_id=device)
+    except TypeError:
+        dist.init_process_group(backend="nccl")
+    global_rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    set_seed(args.seed + global_rank)
+else:
+    device = torch.device("cuda")
+    local_rank = 0
+    global_rank = 0
+    world_size = 1
+    set_seed(args.seed)
+
+print(f"Free VRAM {get_cuda_free_memory_gb(device)} GB")
+low_memory = get_cuda_free_memory_gb(device) < 40
+
+torch.set_grad_enabled(False)
+
+config = OmegaConf.load(args.config_path)
+default_config = OmegaConf.load(_RUNTIME_ROOT / "configs" / "default_config.yaml")
+config = OmegaConf.merge(default_config, config)
+config.model_root = str(Path(args.model_root).expanduser().resolve())
+if "model_kwargs" not in config:
+    config.model_kwargs = {}
+config.model_kwargs.local_attn_size = args.local_attn_size
+
+if hasattr(config, "denoising_step_list"):
+    pipeline = CausalInferencePipeline(config, device=device)
+else:
+    pipeline = CausalDiffusionInferencePipeline(config, device=device)
+
+if args.checkpoint_path:
+    state_dict = torch.load(args.checkpoint_path, map_location="cpu")
+    key = "generator_ema" if args.use_ema else "generator"
+    generator_state = state_dict[key]
+    try:
+        pipeline.generator.load_state_dict(generator_state)
+    except RuntimeError:
+        # Checkpoints saved under FSDP carry a wrapper prefix on every key.
+        unwrapped = {
+            name.replace("model._fsdp_wrapped_module.", "model.", 1)
+            if name.startswith("model._fsdp_wrapped_module.")
+            else name: tensor
+            for name, tensor in generator_state.items()
+        }
+        pipeline.generator.load_state_dict(unwrapped, strict=False)
+
+pipeline = pipeline.to(dtype=torch.bfloat16)
+if low_memory:
+    DynamicSwapInstaller.install_model(pipeline.text_encoder, device=device)
+else:
+    pipeline.text_encoder.to(device=device)
+pipeline.generator.to(device=device)
+pipeline.vae.to(device=device)
+
+if args.i2v:
+    assert not dist.is_initialized(), "I2V does not support distributed inference yet"
+    transform = transforms.Compose(
+        [
+            transforms.Resize((480, 832)),
+            transforms.ToTensor(),
+            transforms.Normalize([0.5], [0.5]),
+        ]
+    )
+    dataset = TextImagePairDataset(args.data_path, transform=transform)
+else:
+    dataset = TextDataset(
+        prompt_path=args.data_path, extended_prompt_path=args.extended_prompt_path
+    )
+
+full_num_prompts = len(dataset)
+end_index = full_num_prompts if args.end_index < 0 else min(args.end_index, full_num_prompts)
+if args.start_index < 0 or args.start_index > end_index:
+    raise ValueError("invalid prompt range")
+selected_indices = list(range(args.start_index, end_index))
+
+
+def _output_path(prompt: str, idx: int, seed_idx: int) -> str:
+    if args.save_with_index:
+        return os.path.join(args.output_folder, f"{idx}_{seed_idx}.mp4")
+    return os.path.join(args.output_folder, f"{prompt[:100]}-{seed_idx}.mp4")
+
+
+def _is_valid_video(path: str) -> bool:
+    return os.path.isfile(path) and os.path.getsize(path) > 0
+
+
+def _write_video_checked(path: str, frames: torch.Tensor, fps: int) -> None:
+    stem, suffix = os.path.splitext(path)
+    temporary = f"{stem}.tmp-{os.getpid()}{suffix or '.mp4'}"
+    try:
+        write_video(temporary, frames, fps=fps)
+        if not _is_valid_video(temporary):
+            raise RuntimeError(f"video encoder produced an empty file: {temporary}")
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+pre_skipped_summaries = []
+pre_skipped_batches = []
+if args.skip_existing and args.save_with_index:
+    pending_indices = []
+    for idx in selected_indices:
+        expected = [
+            _output_path("", idx, seed_idx) for seed_idx in range(args.num_samples)
+        ]
+        if expected and all(_is_valid_video(path) for path in expected):
+            for seed_idx, output_path in enumerate(expected):
+                pre_skipped_summaries.append(
+                    {
+                        "prompt_index": int(idx),
+                        "sample_index": seed_idx,
+                        "noise_seed": int(args.seed) + idx * 1_000_003,
+                        "path": output_path,
+                        "skipped": True,
+                        "generation_seconds": None,
+                        "total_seconds": None,
+                    }
+                )
+            pre_skipped_batches.append(
+                {
+                    "prompt_index": int(idx),
+                    "requested_samples": int(args.num_samples),
+                    "generated_samples": 0,
+                    "skipped_samples": int(args.num_samples),
+                    "generation_seconds": None,
+                    "video_save_seconds": None,
+                    "total_seconds": None,
+                    "timing_scope": "prompt_batch",
+                }
+            )
+        else:
+            pending_indices.append(idx)
+    selected_indices = pending_indices
+
+dataset = Subset(dataset, selected_indices)
+num_prompts = len(dataset)
+if dist.is_initialized():
+    prompts_per_rank = num_prompts // world_size
+    remainder = num_prompts % world_size
+    # LOCAL_RANK selects the device on each node; prompt ownership must use the
+    # global rank so multi-node runs do not repeat the same prompts per node.
+    rank_start = global_rank * prompts_per_rank + min(global_rank, remainder)
+    rank_end = rank_start + prompts_per_rank + (1 if global_rank < remainder else 0)
+    dataset = Subset(dataset, range(rank_start, rank_end))
+print(
+    f"Rank {global_rank}/{world_size} (local {local_rank}): "
+    f"total={full_num_prompts}, selected={num_prompts}, assigned={len(dataset)}",
+    flush=True,
+)
+
+dataloader = DataLoader(
+    dataset, batch_size=1, sampler=SequentialSampler(dataset), num_workers=0
+)
+
+if global_rank == 0:
+    os.makedirs(args.output_folder, exist_ok=True)
+if dist.is_initialized():
+    try:
+        dist.barrier(device_ids=[local_rank])
+    except TypeError:
+        dist.barrier()
+
+# Timing and memory exclude checkpoint and model loading so BF16, trace, and
+# TempoKV runs are measured at the same boundary.
+torch.cuda.reset_peak_memory_stats(device)
+generation_run_start = time.perf_counter()
+video_summaries = list(pre_skipped_summaries) if global_rank == 0 else []
+batch_summaries = list(pre_skipped_batches) if global_rank == 0 else []
+
+for batch_data in dataloader:
+    idx = batch_data["idx"].item()
+    video_total_start = time.perf_counter()
+    batch = batch_data[0] if isinstance(batch_data, list) else batch_data
+
+    prompt_seed = int(args.seed) + int(idx) * 1_000_003
+    set_seed(prompt_seed)
+
+    if args.i2v:
+        prompt = batch["prompts"][0]
+        prompts = [prompt] * args.num_samples
+        image = (
+            batch["image"]
+            .squeeze(0)
+            .unsqueeze(0)
+            .unsqueeze(2)
+            .to(device=device, dtype=torch.bfloat16)
+        )
+        initial_latent = pipeline.vae.encode_to_latent(image).to(
+            device=device, dtype=torch.bfloat16
+        )
+        initial_latent = initial_latent.repeat(args.num_samples, 1, 1, 1, 1)
+        sampled_noise = torch.randn(
+            [args.num_samples, args.num_output_frames - 1, 16, 60, 104],
+            device=device,
+            dtype=torch.bfloat16,
+        )
+    else:
+        prompt = batch["prompts"][0]
+        extended_prompt = (
+            batch["extended_prompts"][0] if "extended_prompts" in batch else None
+        )
+        prompts = [extended_prompt or prompt] * args.num_samples
+        initial_latent = None
+        sampled_noise = torch.randn(
+            [args.num_samples, args.num_output_frames, 16, 60, 104],
+            device=device,
+            dtype=torch.bfloat16,
+        )
+
+    generation_start = time.perf_counter()
+    video, latents = pipeline.inference(
+        noise=sampled_noise,
+        text_prompts=prompts,
+        return_latents=True,
+        initial_latent=initial_latent,
+        low_memory=low_memory,
+    )
+    torch.cuda.synchronize(device)
+    generation_seconds = time.perf_counter() - generation_start
+
+    if args.skip_video_save:
+        pipeline.vae.model.clear_cache()
+        del video, latents, sampled_noise, initial_latent
+        continue
+
+    frames = 255.0 * rearrange(video, "b t c h w -> b t h w c").cpu()
+    pipeline.vae.model.clear_cache()
+
+    batch_video_start = len(video_summaries)
+    save_batch_start = time.perf_counter()
+    for seed_idx in range(args.num_samples):
+        output_path = _output_path(prompt, idx, seed_idx)
+        save_start = time.perf_counter()
+        _write_video_checked(output_path, frames[seed_idx], fps=16)
+        video_summaries.append(
+            {
+                "prompt_index": int(idx),
+                "sample_index": seed_idx,
+                "noise_seed": prompt_seed,
+                "path": output_path,
+                "skipped": False,
+                "generation_seconds": generation_seconds,
+                "save_seconds": time.perf_counter() - save_start,
+                "total_seconds": None,
+            }
+        )
+    batch_video_save_seconds = time.perf_counter() - save_batch_start
+    batch_total_seconds = time.perf_counter() - video_total_start
+    generation_seconds_per_sample = generation_seconds / args.num_samples
+    throughput = (
+        args.num_samples / batch_total_seconds if batch_total_seconds > 0 else None
+    )
+    for entry in video_summaries[batch_video_start:]:
+        entry["batch_generation_seconds"] = generation_seconds
+        entry["batch_video_save_seconds"] = batch_video_save_seconds
+        entry["batch_total_seconds"] = batch_total_seconds
+        entry["generation_seconds_per_sample"] = generation_seconds_per_sample
+        entry["throughput_samples_per_second"] = throughput
+        entry["total_seconds"] = batch_total_seconds
+    batch_summaries.append(
+        {
+            "prompt_index": int(idx),
+            "requested_samples": int(args.num_samples),
+            "generated_samples": int(args.num_samples),
+            "skipped_samples": 0,
+            "generation_seconds": generation_seconds,
+            "video_save_seconds": batch_video_save_seconds,
+            "total_seconds": batch_total_seconds,
+            "generation_seconds_per_sample": generation_seconds_per_sample,
+            "throughput_samples_per_second": throughput,
+            "timing_scope": "prompt_batch",
+        }
+    )
+    del video, latents, frames, sampled_noise, initial_latent
+
+generation_wall_seconds = time.perf_counter() - generation_run_start
+
+tempokv_report = getattr(pipeline, "tempokv_report", None)
+if tempokv_report is not None:
+    report_path = os.path.join(
+        args.output_folder, f"tempokv_report.rank-{global_rank}.json"
+    )
+    with open(report_path, "w", encoding="utf-8") as handle:
+        json.dump(tempokv_report.to_dict(), handle, indent=2, ensure_ascii=False)
+        handle.write("\n")
+
+rank_summary = {
+    "rank": int(global_rank),
+    "local_rank": int(local_rank),
+    "world_size": int(world_size),
+    "generation_wall_seconds": generation_wall_seconds,
+    "batches": batch_summaries,
+    "videos": video_summaries,
+    "tempokv_report": tempokv_report.to_dict() if tempokv_report is not None else None,
+}
+if dist.is_initialized():
+    gathered = [None] * world_size if global_rank == 0 else None
+    dist.gather_object(rank_summary, gathered, dst=0)
+    rank_summaries = gathered if global_rank == 0 else None
+else:
+    rank_summaries = [rank_summary]
+if global_rank == 0:
+    summary_path = os.path.join(args.output_folder, "summary.json")
+    temporary_summary = f"{summary_path}.tmp-{os.getpid()}"
+    with open(temporary_summary, "w", encoding="utf-8") as handle:
+        json.dump({"rank_summaries": rank_summaries}, handle, indent=2, ensure_ascii=False)
+        handle.write("\n")
+    os.replace(temporary_summary, summary_path)

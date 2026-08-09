@@ -16,6 +16,14 @@ import torch.nn as nn
 import torch
 import math
 import torch.distributed as dist
+from pathlib import Path
+import sys
+
+# TempoKV is normally installed (`pip install -e .`); fall back to the checkout
+# so the bundled runtime also imports from a bare clone.
+_SOURCE_ROOT = Path(__file__).resolve().parents[4] / "src"
+if _SOURCE_ROOT.is_dir() and str(_SOURCE_ROOT) not in sys.path:
+    sys.path.insert(0, str(_SOURCE_ROOT))
 
 # wan 1.3B model has a weird channel / head configurations and require max-autotune to work with flexattention
 # see https://github.com/pytorch/pytorch/issues/133254
@@ -68,60 +76,13 @@ def causal_rope_apply(x, grid_sizes, freqs, start_frame=0):
     return torch.stack(output).type_as(x)
 
 
-def causal_rope_apply_long_input(x, grid_sizes, freqs, start_frame=0):
-    """Apply RoPE to a complete pre-RoPE cache using absolute frame positions."""
-    n, c = x.size(2), x.size(3) // 2
-    temporal, height, width = freqs.split(
-        [c - 2 * (c // 3), c // 3, c // 3], dim=1
-    )
-    result = torch.empty_like(x)
-    for batch_index, (model_block_frames, h, w) in enumerate(
-        grid_sizes.tolist()
-    ):
-        tokens_per_frame = h * w
-        if x.shape[1] % tokens_per_frame:
-            raise ValueError("cached sequence is not frame aligned")
-        frames = x.shape[1] // tokens_per_frame
-        if start_frame + frames > temporal.shape[0]:
-            raise ValueError(
-                f"RoPE table supports {temporal.shape[0]} frames, requested "
-                f"[{start_frame}, {start_frame + frames})"
-            )
-        # Keep the full BF16 result, but create float32/complex temporaries
-        # only for one model block at a time. This matches the original QVG
-        # long-input path and avoids a full-history float32 copy.
-        block_frames = max(1, int(model_block_frames))
-        for relative_frame in range(0, frames, block_frames):
-            current_frames = min(block_frames, frames - relative_frame)
-            token_start = relative_frame * tokens_per_frame
-            token_end = token_start + current_frames * tokens_per_frame
-            complex_x = torch.view_as_complex(
-                x[batch_index, token_start:token_end]
-                .to(torch.float32)
-                .reshape(token_end - token_start, n, -1, 2)
-            )
-            absolute_frame = start_frame + relative_frame
-            multipliers = torch.cat(
-                [
-                    temporal[absolute_frame:absolute_frame + current_frames]
-                    .view(current_frames, 1, 1, -1)
-                    .expand(current_frames, h, w, -1),
-                    height[:h]
-                    .view(1, h, 1, -1)
-                    .expand(current_frames, h, w, -1),
-                    width[:w]
-                    .view(1, 1, w, -1)
-                    .expand(current_frames, h, w, -1),
-                ],
-                dim=-1,
-            ).reshape(token_end - token_start, 1, -1).to(
-                dtype=complex_x.dtype
-            )
-            rotated = torch.view_as_real(complex_x * multipliers).flatten(2)
-            result[batch_index, token_start:token_end].copy_(
-                rotated.to(dtype=x.dtype)
-            )
-    return result
+# Read-time RoPE for the pre-RoPE cache is shared with Causal Forcing; see
+# tempokv.runtime.rope for the span-aware form used once eviction can leave a
+# gap between the sink and the recent window.
+from tempokv.runtime.rope import (  # noqa: E402
+    apply_rope_by_span,
+    causal_rope_apply_long_input,
+)
 
 
 class CausalWanSelfAttention(nn.Module):

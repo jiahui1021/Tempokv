@@ -58,6 +58,28 @@ longcat = [
   "transformers==4.41.0",
   "triton>=3.0",
 ]
+causal-forcing = [
+  "accelerate>=1.1.1",
+  "av==13.1.0",
+  "diffusers==0.31.0",
+  "easydict>=1.13",
+  "einops>=0.8.0",
+  "ftfy>=6.2.0",
+  "imageio>=2.34",
+  "omegaconf>=2.3.0",
+  "Pillow>=10.0",
+  "regex>=2024.0",
+  "safetensors>=0.4",
+  "scipy>=1.10",
+  "sentencepiece>=0.2.0",
+  "tokenizers>=0.20.3",
+  # Causal Forcing compiles torch.nn.attention.flex_attention; 2.5 is the
+  # oldest release where the compiled path is stable for Wan2.1-1.3B.
+  "torch>=2.5.0",
+  "torchvision>=0.20.0",
+  "tqdm>=4.66",
+  "transformers>=4.49.0",
+]
 metrics = [
   "lpips>=0.1.4",
   "opencv-python>=4.8",
@@ -65,9 +87,9 @@ metrics = [
 ]
 
 [tool.setuptools.packages.find]
-where = ["src", "experiments/LongCat"]
-include = ["tempokv*", "longcat*", "longcat_video*"]
+where = ["src", "experiments/LongCat", "experiments/Causal-Forcing"]
+include = ["tempokv*", "longcat*", "longcat_video*", "causal_forcing*"]
 namespaces = true
 
 [tool.pytest.ini_options]
-pythonpath = ["src", "experiments/LongCat"]
+pythonpath = ["src", "experiments/LongCat", "experiments/Causal-Forcing"]
