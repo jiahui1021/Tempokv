@@ -28,7 +28,9 @@
 #   PARAM_DIR        参数目录（默认 data/causal-forcing/params/<模式>/<参数方案>）
 #   OUTPUT_DIR       结果输出目录（默认 results/causal_forcing/<模式>/<量化标签>）
 #   FRAMES           最终视频帧数（默认 81）
-#   SPAN_FRAMES      每个 TempoKV span 的 latent 帧数（默认 24）
+#   SPAN_FRAMES      每个 TempoKV span 的 latent 帧数（默认 12）
+#                    需满足 latent_frames >= SPAN_FRAMES + num_frame_per_block，
+#                    否则 span 直到最后一个 block 才打包，没有任何一次注意力读过它
 #   NUM_SAMPLES      每条 prompt 采样数（默认 1）
 #   SEED             随机种子（默认 0）
 #   START_INDEX / END_INDEX  prompt 序号范围（默认 0 .. -1 全部）

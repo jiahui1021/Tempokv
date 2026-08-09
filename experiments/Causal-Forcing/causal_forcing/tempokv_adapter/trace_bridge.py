@@ -5,10 +5,11 @@ Only the state TempoKV will actually compress is sampled: the normalized
 The four noisy denoising passes per block are never traced — fitting on them
 would match the predictor to a distribution the long-term cache never holds.
 
-Which pass counts as clean is not inferred from a timestep.  The projection
-hooks overwrite a scratch buffer on every forward, and the pipeline's own
-``finalize_kv_cache`` announcement is what promotes the buffer into the trace.
-By construction that is the clean refresh, exactly once per block.
+Which pass counts as clean is not inferred from a timestep: the pipeline
+announces it with ``note_clean_refresh`` before the forward, and confirms the
+frame range with ``finalize_kv_cache`` afterwards.  Sampling only that pass also
+avoids four fifths of the device-to-host traffic, since the four noisy
+denoising passes per block would otherwise be copied out and thrown away.
 """
 
 from __future__ import annotations
@@ -142,6 +143,7 @@ def install(runtime_root: str | Path | None = None) -> type:
             blocks = self.generator.model.blocks
             output_root.mkdir(parents=True, exist_ok=True)
             self._trace_event_index = 0
+            self._capturing = False
             self._latest: dict[int, dict[str, np.ndarray]] = {}
             self._latest_token_indices: np.ndarray | None = None
             self._sequence: dict[int, dict[str, list[np.ndarray]]] = {}
@@ -165,6 +167,8 @@ def install(runtime_root: str | Path | None = None) -> type:
                 output: torch.Tensor,
             ) -> None:
                 del module, args
+                if not self._capturing:
+                    return
                 sampled, token_indices = _sample_projection(
                     output,
                     frame_seq_length=self.frame_seq_length,
@@ -185,8 +189,17 @@ def install(runtime_root: str | Path | None = None) -> type:
         def reset_kv_cache_state(self) -> None:
             self._reset_sequence()
 
+        def note_clean_refresh(self) -> None:
+            self._capturing = True
+
         def finalize_kv_cache(self, start_frame: int, num_frames: int) -> None:
             super().finalize_kv_cache(start_frame, num_frames)
+            if not self._capturing:
+                raise RuntimeError(
+                    "Causal Forcing finalized a block without announcing a "
+                    "clean refresh first; the trace would be empty"
+                )
+            self._capturing = False
             self._commit(start_frame, num_frames)
 
         def inference(self, *args: Any, **kwargs: Any) -> Any:
@@ -323,6 +336,7 @@ def install(runtime_root: str | Path | None = None) -> type:
                 raise
 
         def _reset_sequence(self) -> None:
+            self._capturing = False
             self._latest = {}
             self._latest_token_indices = None
             self._sequence = {}

@@ -57,7 +57,7 @@ INT2 只需要换 `configs/causal_forcing_int2.json` 与对应的参数目录。
 | `CONFIG` | codec 配置 JSON | TempoKV 模式必填 |
 | `GENERATION_MODE` | `chunkwise` 或 `framewise` | `chunkwise` |
 | `FRAMES` | 最终视频帧数 | `81` |
-| `SPAN_FRAMES` | 每个 TempoKV span 的 latent 帧数 | `24` |
+| `SPAN_FRAMES` | 每个 TempoKV span 的 latent 帧数 | `12` |
 | `LOCAL_ATTN_SIZE` | 局部注意力窗口 | `-1` |
 | `NUM_GPUS` | torchrun GPU 数 | `1` |
 | `DRY_RUN` | 只打印命令不执行 | `0` |
@@ -93,6 +93,34 @@ results/causal_forcing/<模式>/<量化标签>/
 
 TempoKV 生成结束后 `tempokv_report.json` 至少包含 `encode_key_calls`、
 `encode_value_calls`、`decode_tensor_calls`、`finalized_frames`、
-`ephemeral_writes`、resident / peak / total 三组 cache 字节数，以及 encode 与
-decode 的分项耗时。任何一个计数为 0 都会让本次运行直接失败——视频正常生成但其实
-没走 TempoKV 是必须暴露的错误。
+`ephemeral_writes`，以及 `encode_ms` / `decode_ms` / `generation_ms`。任何一个
+计数为 0 都会让本次运行直接失败——视频正常生成但其实没走 TempoKV 是必须暴露的错误。
+
+报告只写真正测过的量。attention 单独耗时**不在报告里**：逐层计时需要 device
+sync，会扭曲被测对象本身；需要时用 `generation_ms - encode_ms - decode_ms` 估算。
+逐 prompt 的墙钟时间在同目录的 `videos/summary.json`。
+
+内存有两套数字，不要混用：
+
+- `current_compressed_cache_bytes` / `peak_compressed_cache_bytes` 只统计已经打包
+  的 span，`compression_ratio` 用的是同一份 cache state 的压缩前后字节数；
+- `resident_bf16_bytes` / `resident_total_bytes` / `peak_resident_total_bytes`
+  还包含**已 finalize 但尚未攒满一个 span 的 BF16 帧**。这些帧真实占显存，所以
+  报告显存峰值时要用 `peak_resident_total_bytes`，只报压缩后的字节会低估实际占用。
+
+多 GPU 时所有 cache 字节都是**单卡口径**（`byte_scope: per_device`），取最差的一张
+卡——那才是需要装进一块 GPU 的数字。只有调用计数和 `total_*_cache_bytes`
+（整个运行的累计编码量）是跨卡求和的。
+
+## SPAN_FRAMES 怎么选
+
+一个 span 只有一个 anchor，span 越大压缩越好，但 span 必须**在生成结束前就攒满并
+被后续 block 读回**，否则打包发生在最后一次 forward 之后，没有任何一次注意力读过
+压缩 cache。因此要求：
+
+```text
+latent_frames >= SPAN_FRAMES + num_frame_per_block
+```
+
+`FRAMES=81` 对应 21 个 latent 帧，chunkwise 下 `SPAN_FRAMES` 最大 18，默认 12。
+不满足时 `generate.py` 会在加载模型之前报错，而不是跑完再失败。

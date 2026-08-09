@@ -196,6 +196,7 @@ class CausalInferencePipeline(torch.nn.Module):
                 assert (num_input_frames - 1) % self.num_frame_per_block == 0
                 num_input_blocks = (num_input_frames - 1) // self.num_frame_per_block
                 output[:, :1] = initial_latent[:, :1]
+                self.note_clean_refresh()
                 self.generator(
                     noisy_image_or_video=initial_latent[:, :1],
                     conditional_dict=conditional_dict,
@@ -215,6 +216,7 @@ class CausalInferencePipeline(torch.nn.Module):
                 current_ref_latents = \
                     initial_latent[:, current_start_frame:current_start_frame + self.num_frame_per_block]
                 output[:, current_start_frame:current_start_frame + self.num_frame_per_block] = current_ref_latents
+                self.note_clean_refresh()
                 self.generator(
                     noisy_image_or_video=current_ref_latents,
                     conditional_dict=conditional_dict,
@@ -306,6 +308,7 @@ class CausalInferencePipeline(torch.nn.Module):
             # Step 3.3: rerun with timestep zero to update KV cache using clean context
             context_timestep = torch.ones_like(timestep) * self.args.context_noise
 
+            self.note_clean_refresh()
             self.generator(
                 noisy_image_or_video=denoised_pred,
                 conditional_dict=conditional_dict,
@@ -378,6 +381,14 @@ class CausalInferencePipeline(torch.nn.Module):
     def note_ephemeral_block(self, num_writes: int) -> None:
         """Announce noisy denoising writes that must not become history."""
         del num_writes
+
+    def note_clean_refresh(self) -> None:
+        """Announce that the next forward writes clean, keepable K/V.
+
+        Trace collection uses this to sample only the clean pass. Without it a
+        collector would have to guess from the timestep, or sample every pass
+        and discard four fifths of the transfers.
+        """
 
     def finalize_kv_cache(self, start_frame: int, num_frames: int) -> None:
         """Announce that ``num_frames`` of clean state are now historical.

@@ -215,6 +215,14 @@ bash scripts/Causal-Forcing/run_tempokv.sh
 Causal Forcing 与 Self-Forcing 的 30 层 / 12 头 / D=128 / stride=1560 完全相同，
 但 checkpoint 与 cache 分布不同，**参数不能互相复用**，必须各自采 trace 各自拟合。
 
+### 已接入范围
+
+已接入的是**标准 Causal Forcing 推理**（chunk-wise 与 frame-wise）的 BF16、
+trace、INT4/INT2 全流程。上游的 Rolling Forcing / long-video 扩展
+（`long_video/`）**尚未接入**，rolling eviction 与 sink 保留也未实现：cache 已经
+保存绝对帧位置和独立的 predictor span，为这些功能留了口子，但在实现之前
+`sink_size > 0` 与局部注意力窗口同时使用会直接报错，而不是给出与上游不同的结果。
+
 完整变量说明见 [Causal Forcing 使用说明](scripts/Causal-Forcing/README.md)。
 
 ## LongCat

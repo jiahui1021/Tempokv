@@ -49,16 +49,25 @@ class TempoKVRuntimeReport:
 
     predictor_parameter_bytes: int = 0
 
+    # Only latencies this runtime actually measures live here. Attention time
+    # is deliberately absent: timing it per layer needs device syncs that
+    # distort the thing being measured, and it is recoverable as
+    # `generation_ms` minus `encode_ms` and `decode_ms`. Per-prompt wall time
+    # lives in the runtime's own `summary.json`.
     encode_ms: float = 0.0
     decode_ms: float = 0.0
-    attention_ms: float = 0.0
     generation_ms: float = 0.0
-    first_chunk_ms: float | None = None
 
     total_encoded_cache_bytes: int = 0
     total_uncompressed_cache_bytes: int = 0
     peak_compressed_cache_bytes: int = 0
     peak_uncompressed_cache_bytes: int = 0
+
+    # Dense frames that are finalized but not packed yet, plus the block being
+    # denoised. Tracked apart from the packed spans because both are resident
+    # at the same time and a peak-memory figure needs their sum.
+    resident_bf16_bytes: int = 0
+    peak_resident_total_bytes: int = 0
 
     _resident: dict[Any, _SpanBytes] = field(default_factory=dict, repr=False)
 
@@ -73,17 +82,34 @@ class TempoKVRuntimeReport:
         self._resident[key] = _SpanBytes(compressed_bytes, uncompressed_bytes)
         self.total_encoded_cache_bytes += compressed_bytes
         self.total_uncompressed_cache_bytes += uncompressed_bytes
-        self._refresh_peaks()
+        self._refresh_span_peaks()
 
     def drop_span(self, key: Any) -> None:
         if self._resident.pop(key, None) is not None:
             self.cache_evictions += 1
 
+    def observe_resident_bf16_bytes(self, resident_bytes: int) -> None:
+        """Record the dense part of the cache that is currently allocated.
+
+        This is the only thing that moves the resident peak.  Packing a span
+        frees dense chunks and installs compressed bytes in their place, so
+        raising the peak from inside :meth:`record_span` would add the new
+        compressed span on top of a dense figure that the same operation had
+        just invalidated — and a peak, once raised, cannot be corrected down.
+        """
+        if resident_bytes < 0:
+            raise ValueError("resident byte counts must not be negative")
+        self.resident_bf16_bytes = int(resident_bytes)
+        self.peak_resident_total_bytes = max(
+            self.peak_resident_total_bytes, self.resident_total_bytes
+        )
+
     def reset_cache(self) -> None:
         self._resident.clear()
+        self.resident_bf16_bytes = 0
         self.cache_resets += 1
 
-    def _refresh_peaks(self) -> None:
+    def _refresh_span_peaks(self) -> None:
         self.peak_compressed_cache_bytes = max(
             self.peak_compressed_cache_bytes, self.current_compressed_cache_bytes
         )
@@ -99,6 +125,11 @@ class TempoKVRuntimeReport:
     @property
     def current_uncompressed_cache_bytes(self) -> int:
         return sum(span.uncompressed for span in self._resident.values())
+
+    @property
+    def resident_total_bytes(self) -> int:
+        """Everything the KV cache actually holds: packed spans plus BF16."""
+        return self.current_compressed_cache_bytes + self.resident_bf16_bytes
 
     @property
     def compression_ratio(self) -> float | None:
@@ -156,6 +187,9 @@ class TempoKVRuntimeReport:
             "cache_resets": self.cache_resets,
             "current_compressed_cache_bytes": self.current_compressed_cache_bytes,
             "peak_compressed_cache_bytes": self.peak_compressed_cache_bytes,
+            "resident_bf16_bytes": self.resident_bf16_bytes,
+            "resident_total_bytes": self.resident_total_bytes,
+            "peak_resident_total_bytes": self.peak_resident_total_bytes,
             "total_encoded_cache_bytes": self.total_encoded_cache_bytes,
             "current_uncompressed_cache_bytes": (
                 self.current_uncompressed_cache_bytes
@@ -166,9 +200,7 @@ class TempoKVRuntimeReport:
             "predictor_parameter_bytes": self.predictor_parameter_bytes,
             "encode_ms": self.encode_ms,
             "decode_ms": self.decode_ms,
-            "attention_ms": self.attention_ms,
             "generation_ms": self.generation_ms,
-            "first_chunk_ms": self.first_chunk_ms,
         }
 
 

@@ -43,16 +43,20 @@ def _rotate_frames(
             f"RoPE table supports {temporal.shape[0]} frames, requested "
             f"[{absolute_start_frame}, {absolute_start_frame + num_frames})"
         )
-    # Keep the full BF16 result, but create float32/complex temporaries only
-    # for one model block at a time. This avoids a float32 copy of the whole
-    # history on long rollouts.
+    # Rotate in complex128, matching upstream `causal_rope_apply`: the RoPE
+    # table is built in float64 and downcasting it to complex64 here would make
+    # a handful of bf16 keys per frame differ from the reference
+    # implementation, which an autoregressive rollout then feeds back into
+    # itself. Temporaries stay bounded by processing one model block at a time
+    # rather than the whole history, so for Wan2.1-1.3B this costs about
+    # 114 MiB transiently per layer call instead of 57 MiB.
     for relative_frame in range(0, num_frames, block_frames):
         current_frames = min(block_frames, num_frames - relative_frame)
         block_start = token_start + relative_frame * tokens_per_frame
         block_end = block_start + current_frames * tokens_per_frame
         complex_x = torch.view_as_complex(
             x[batch_index, block_start:block_end]
-            .to(torch.float32)
+            .to(torch.float64)
             .reshape(block_end - block_start, heads, -1, 2)
         )
         absolute_frame = absolute_start_frame + relative_frame

@@ -32,7 +32,12 @@ _TEMPOKV_STATE_KEY = "_tempokv_packed"
 # Frames packed into one TempoKV span. One anchor is emitted per span and every
 # other frame in it is predicted from reconstructed history, so a larger span
 # means better compression; the most recent (< span) frames stay BF16.
-DEFAULT_SPAN_FRAMES = 24
+#
+# The default has to leave room for the packed span to actually be *read*: the
+# 81-frame default rollout is 21 latent frames, so a 24-frame span would never
+# complete, and even a 21-frame span would only pack after the last forward
+# pass — producing a video that never decoded a single compressed key.
+DEFAULT_SPAN_FRAMES = 12
 
 
 def wrap_cache_state(state: PackedTensor) -> dict[str, Any]:

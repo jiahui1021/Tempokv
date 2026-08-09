@@ -448,6 +448,20 @@ class ChunkedKVCache:
             self.chunk_state[chunk_index] = ChunkState.QUANTIZED
             self._span_by_chunk[chunk_index] = span
 
+    def bf16_resident_bytes(self) -> int:
+        """Bytes held by dense chunks that are not covered by a packed span.
+
+        These are the frames that have been finalized but not yet packed, plus
+        the block currently being denoised.  They occupy real device memory, so
+        a peak-KV-memory figure that only counts packed spans understates what
+        the run actually needed.
+        """
+        total = 0
+        for chunk in self.chunks:
+            if chunk is not None:
+                total += chunk.numel() * chunk.element_size()
+        return total
+
     def clear(self) -> None:
         self.chunks = [None] * self.max_num_chunks
         self.chunk_state = [ChunkState.EMPTY] * self.max_num_chunks

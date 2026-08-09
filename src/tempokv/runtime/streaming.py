@@ -126,6 +126,10 @@ class StreamingTempoKVEncoder:
             raise ValueError("finalize needs at least one frame")
         self._finalized_frame += int(num_frames)
         self.report.finalized_frames += int(num_frames)
+        # Measure before packing as well: the moment just before a span is
+        # compressed is when the cache holds the most dense frames, and that is
+        # the peak a memory claim has to survive.
+        self._observe_resident(caches)
         if not flush:
             return 0
         return self.flush(caches)
@@ -144,7 +148,18 @@ class StreamingTempoKVEncoder:
             self._encode_span(caches, self._span_start_frame, length)
             self._span_start_frame += length
             packed_frames += length
+        if packed_frames:
+            self._observe_resident(caches)
         return packed_frames
+
+    def _observe_resident(self, caches: Sequence[Mapping[str, Any]]) -> None:
+        self.report.observe_resident_bf16_bytes(
+            sum(
+                layer[role].bf16_resident_bytes()
+                for layer in caches
+                for role in ("k", "v")
+            )
+        )
 
     # -- encoding --------------------------------------------------------
 

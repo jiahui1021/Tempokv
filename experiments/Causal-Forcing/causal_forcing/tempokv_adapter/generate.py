@@ -294,9 +294,14 @@ def _rank_summaries(videos_dir: Path) -> list[dict[str, object]]:
 def _merge_tempokv_reports(ranks: list[dict[str, object]]) -> dict[str, object]:
     """Combine per-rank reports.
 
-    Counters and encoded volume add across ranks; peaks are the worst single
-    rank, since ranks do not hold their caches at the same instant on different
-    devices. Latency is reported as the slowest rank.
+    Every rank holds its own KV cache on its own device, so **all cache-state
+    byte figures are per-device**: they are the worst single rank, which is the
+    number that has to fit on one GPU.  Mixing a summed "current" with a maxed
+    "peak" in the same JSON would produce a report whose current exceeds its
+    peak, and multiplying by the rank count would describe a device that does
+    not exist.  Only genuinely additive quantities are summed: call counts,
+    finalized frames, and the cumulative encoded volume over the whole run.
+    Latency is reported as the slowest rank.
     """
     reports = [rank.get("tempokv_report") for rank in ranks]
     reports = [report for report in reports if isinstance(report, dict)]
@@ -312,36 +317,44 @@ def _merge_tempokv_reports(ranks: list[dict[str, object]]) -> dict[str, object]:
         "ephemeral_writes",
         "cache_evictions",
         "cache_resets",
+        # Cumulative volume over the run, not a state: these do add up.
         "total_encoded_cache_bytes",
         "total_uncompressed_cache_bytes",
+    )
+    per_device = (
         "current_compressed_cache_bytes",
         "current_uncompressed_cache_bytes",
-    )
-    maxed = (
         "peak_compressed_cache_bytes",
         "peak_uncompressed_cache_bytes",
-        "encode_ms",
-        "decode_ms",
-        "attention_ms",
-        "generation_ms",
+        "resident_bf16_bytes",
+        "resident_total_bytes",
+        "peak_resident_total_bytes",
     )
+    slowest = ("encode_ms", "decode_ms", "generation_ms")
     merged: dict[str, object] = {
         name: reports[0].get(name)
         for name in ("model", "kv_mode", "num_layers", "num_heads", "head_dim", "stride")
     }
     for name in summed:
         merged[name] = sum(int(report.get(name) or 0) for report in reports)
-    for name in maxed:
+    for name in per_device:
+        merged[name] = max(int(report.get(name) or 0) for report in reports)
+    for name in slowest:
         merged[name] = max(float(report.get(name) or 0) for report in reports)
     merged["predictor_parameter_bytes"] = max(
         int(report.get("predictor_parameter_bytes") or 0) for report in reports
     )
-    compressed = int(merged["current_compressed_cache_bytes"])
-    merged["compression_ratio"] = (
-        int(merged["current_uncompressed_cache_bytes"]) / compressed
-        if compressed
-        else None
-    )
+    # Each rank's ratio compares one coherent cache state against itself, so
+    # take the worst rather than dividing two independently-maxed figures that
+    # may have come from different ranks.
+    ratios = [
+        int(report.get("current_uncompressed_cache_bytes") or 0)
+        / int(report["current_compressed_cache_bytes"])
+        for report in reports
+        if int(report.get("current_compressed_cache_bytes") or 0)
+    ]
+    merged["compression_ratio"] = min(ratios) if ratios else None
+    merged["byte_scope"] = "per_device"
     merged["ranks"] = len(reports)
     return merged
 
@@ -458,11 +471,17 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                 f"span-frames ({span_frames}) must be a whole number of "
                 f"{args.num_frame_per_block}-frame blocks"
             )
-        if latent_frames < span_frames:
+        # A span that completes on the very last block is packed after the last
+        # forward pass, so nothing ever decodes it: the run would produce a
+        # video without reading a single compressed key. Require at least one
+        # more block after the first span closes.
+        minimum_frames = span_frames + args.num_frame_per_block
+        if latent_frames < minimum_frames:
             raise ValueError(
-                f"generating {latent_frames} latent frames never fills a "
-                f"{span_frames}-frame TempoKV span; lower --span-frames or "
-                "raise --frames"
+                f"generating {latent_frames} latent frames never reads back a "
+                f"{span_frames}-frame TempoKV span; at least {minimum_frames} "
+                "latent frames are needed so a packed span is decoded by a "
+                "later block. Lower --span-frames or raise --frames"
             )
         parameters = _validate_parameters(paths["k_params"], paths["v_params"], config)
 
