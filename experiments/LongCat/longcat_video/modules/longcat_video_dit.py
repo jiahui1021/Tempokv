@@ -301,10 +301,13 @@ class LongCatVideoTransformer3DModel(
         encoder_attention_mask=None, 
         num_cond_latents=0,
         return_kv=False, 
-        kv_cache_dict={},
+        kv_cache_dict=None,
         skip_crs_attn=False, 
         offload_kv_cache=False
     ):
+
+        if kv_cache_dict is None:
+            kv_cache_dict = {}
 
         B, _, T, H, W = hidden_states.shape
 

@@ -49,11 +49,13 @@ if "LOCAL_RANK" in os.environ:
         dist.init_process_group(backend='nccl', device_id=device)
     except TypeError:
         dist.init_process_group(backend='nccl')
+    global_rank = dist.get_rank()
     world_size = dist.get_world_size()
-    set_seed(args.seed + local_rank)
+    set_seed(args.seed + global_rank)
 else:
     device = torch.device("cuda")
     local_rank = 0
+    global_rank = 0
     world_size = 1
     set_seed(args.seed)
 
@@ -110,6 +112,7 @@ if args.start_index < 0 or args.start_index > end_index:
     raise ValueError("invalid prompt range")
 selected_indices = list(range(args.start_index, end_index))
 pre_skipped_summaries = []
+pre_skipped_batches = []
 if args.skip_existing and args.save_with_index:
     pending_indices = []
     for idx in selected_indices:
@@ -133,6 +136,18 @@ if args.skip_existing and args.save_with_index:
                         "total_seconds": None,
                     }
                 )
+            pre_skipped_batches.append(
+                {
+                    "prompt_index": int(idx),
+                    "requested_samples": int(args.num_samples),
+                    "generated_samples": 0,
+                    "skipped_samples": int(args.num_samples),
+                    "generation_seconds": None,
+                    "video_save_seconds": None,
+                    "total_seconds": None,
+                    "timing_scope": "prompt_batch",
+                }
+            )
         else:
             pending_indices.append(idx)
     selected_indices = pending_indices
@@ -141,13 +156,17 @@ num_prompts = len(dataset)
 if dist.is_initialized():
     prompts_per_rank = num_prompts // world_size
     remainder = num_prompts % world_size
-    rank_start = local_rank * prompts_per_rank + min(local_rank, remainder)
+    # LOCAL_RANK selects the device on each node.  Prompt ownership must use
+    # the global rank, otherwise every node repeats the prompts owned by its
+    # local rank.
+    rank_start = global_rank * prompts_per_rank + min(global_rank, remainder)
     rank_end = rank_start + prompts_per_rank + (
-        1 if local_rank < remainder else 0
+        1 if global_rank < remainder else 0
     )
     dataset = Subset(dataset, range(rank_start, rank_end))
 print(
-    f"Rank {local_rank}/{world_size}: total={full_num_prompts}, "
+    f"Rank {global_rank}/{world_size} (local {local_rank}): "
+    f"total={full_num_prompts}, "
     f"selected={num_prompts}, assigned={len(dataset)}",
     flush=True,
 )
@@ -156,7 +175,7 @@ sampler = SequentialSampler(dataset)
 dataloader = DataLoader(dataset, batch_size=1, sampler=sampler, num_workers=0, drop_last=False)
 
 # Create output directory (only on main process to avoid race conditions)
-if local_rank == 0:
+if global_rank == 0:
     os.makedirs(args.output_folder, exist_ok=True)
 
 if dist.is_initialized():
@@ -169,7 +188,8 @@ if dist.is_initialized():
 # reference Self-Forcing measurement boundary.
 torch.cuda.reset_peak_memory_stats(device)
 generation_run_start = time.perf_counter()
-video_summaries = list(pre_skipped_summaries) if local_rank == 0 else []
+video_summaries = list(pre_skipped_summaries) if global_rank == 0 else []
+batch_summaries = list(pre_skipped_batches) if global_rank == 0 else []
 
 
 def encode(self, videos: torch.Tensor) -> torch.Tensor:
@@ -238,6 +258,18 @@ for i, batch_data in enumerate(dataloader):
                         "total_seconds": None,
                     }
                 )
+            batch_summaries.append(
+                {
+                    "prompt_index": int(idx),
+                    "requested_samples": int(args.num_samples),
+                    "generated_samples": 0,
+                    "skipped_samples": int(args.num_samples),
+                    "generation_seconds": None,
+                    "video_save_seconds": None,
+                    "total_seconds": None,
+                    "timing_scope": "prompt_batch",
+                }
+            )
             continue
 
     prompt_seed = int(args.seed) + int(idx) * 1_000_003
@@ -301,11 +333,15 @@ for i, batch_data in enumerate(dataloader):
 
     # Save the video if the current prompt is not a dummy prompt
     if idx < full_num_prompts:
+        batch_video_start = len(video_summaries)
+        save_batch_start = time.perf_counter()
         for seed_idx in range(args.num_samples):
             # All processes save their videos
             output_path = _output_path(prompt, idx, seed_idx)
             save_start = time.perf_counter()
+            save_seconds = None
             _write_video_checked(output_path, video[seed_idx], fps=16)
+            save_seconds = time.perf_counter() - save_start
             video_summaries.append(
                 {
                     "prompt_index": int(idx),
@@ -314,26 +350,60 @@ for i, batch_data in enumerate(dataloader):
                     "path": output_path,
                     "skipped": False,
                     "generation_seconds": generation_seconds,
-                    "save_seconds": time.perf_counter() - save_start,
-                    "total_seconds": time.perf_counter() - video_total_start,
+                    "save_seconds": save_seconds,
+                    # Filled with the prompt-level value after all samples
+                    # have been written.  A per-sample cumulative save time is
+                    # not a meaningful latency metric for NUM_SAMPLES > 1.
+                    "total_seconds": None,
                 }
             )
+        batch_video_save_seconds = time.perf_counter() - save_batch_start
+        batch_total_seconds = time.perf_counter() - video_total_start
+        generation_seconds_per_sample = generation_seconds / args.num_samples
+        throughput_samples_per_second = (
+            args.num_samples / batch_total_seconds
+            if batch_total_seconds > 0
+            else None
+        )
+        for entry in video_summaries[batch_video_start:]:
+            entry["batch_generation_seconds"] = generation_seconds
+            entry["batch_video_save_seconds"] = batch_video_save_seconds
+            entry["batch_total_seconds"] = batch_total_seconds
+            entry["generation_seconds_per_sample"] = generation_seconds_per_sample
+            entry["throughput_samples_per_second"] = throughput_samples_per_second
+            entry["total_seconds"] = batch_total_seconds
+        batch_summaries.append(
+            {
+                "prompt_index": int(idx),
+                "requested_samples": int(args.num_samples),
+                "generated_samples": int(args.num_samples),
+                "skipped_samples": 0,
+                "generation_seconds": generation_seconds,
+                "video_save_seconds": batch_video_save_seconds,
+                "total_seconds": batch_total_seconds,
+                "generation_seconds_per_sample": generation_seconds_per_sample,
+                "throughput_samples_per_second": throughput_samples_per_second,
+                "timing_scope": "prompt_batch",
+            }
+        )
     del video, latents, current_video, all_video, sampled_noise, initial_latent
 
 generation_wall_seconds = time.perf_counter() - generation_run_start
 rank_summary = {
-    "rank": int(local_rank),
+    "rank": int(global_rank),
+    "local_rank": int(local_rank),
     "world_size": int(world_size),
     "generation_wall_seconds": generation_wall_seconds,
+    "batches": batch_summaries,
     "videos": video_summaries,
 }
 if dist.is_initialized():
-    gathered = [None] * world_size if local_rank == 0 else None
+    gathered = [None] * world_size if global_rank == 0 else None
     dist.gather_object(rank_summary, gathered, dst=0)
-    rank_summaries = gathered if local_rank == 0 else None
+    rank_summaries = gathered if global_rank == 0 else None
 else:
     rank_summaries = [rank_summary]
-if local_rank == 0:
+if global_rank == 0:
     summary_path = os.path.join(args.output_folder, "summary.json")
     temporary_summary = f"{summary_path}.tmp-{os.getpid()}"
     with open(temporary_summary, "w", encoding="utf-8") as handle:

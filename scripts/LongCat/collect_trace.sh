@@ -59,6 +59,7 @@ merge_command=(
   "$raw_trace_dir"
   "$trace_file"
 )
+[[ -n "${CACHE_STRIDE:-}" ]] && merge_command+=(--trace-stride "$CACHE_STRIDE")
 
 if [[ "$DRY_RUN" == "1" ]]; then
   printf '[LongCat trace 1/2] '

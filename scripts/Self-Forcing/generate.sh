@@ -35,6 +35,7 @@
 #   NUM_GPUS        torchrun 使用的 GPU 数（默认 1）
 #   K_HISTORY_LENGTH  K 使用的历史帧数（1 到 8；默认读取 CONFIG）
 #   V_HISTORY_LENGTH  V 使用的历史帧数（0 到 2；默认读取 CONFIG）
+#   BENCHMARK       要求本次完整生成且不允许跳过已有视频，0 或 1（默认 0）
 #   TEMPOKV_PERSISTENT_UNITS_PER_LAUNCH  单次持续解码帧数（默认 16；范围 1 到 16）
 #
 set -euo pipefail
@@ -86,16 +87,21 @@ NUM_GPUS="${NUM_GPUS:-1}"
 DRY_RUN="${DRY_RUN:-0}"
 ALLOW_TRITON_FALLBACK="${ALLOW_TRITON_FALLBACK:-0}"
 SKIP_EXISTING="${SKIP_EXISTING:-1}"
+BENCHMARK="${BENCHMARK:-0}"
 
 check_flag DRY_RUN
 check_flag ALLOW_TRITON_FALLBACK
 check_flag SKIP_EXISTING
+check_flag BENCHMARK
 check_int FRAMES 1
 check_int NUM_SAMPLES 1
 check_int SEED 0
 check_int START_INDEX 0
 check_int END_INDEX -1
 check_int NUM_GPUS 1
+if [[ "$BENCHMARK" == "1" && "$SKIP_EXISTING" == "1" ]]; then
+  die "BENCHMARK=1 不允许 SKIP_EXISTING=1"
+fi
 if (( (FRAMES + 3) % 12 != 0 )); then
   die "FRAMES 必须满足 (FRAMES + 3) % 12 == 0，保证视频帧精确对应完整的 3-frame latent block（当前值：${FRAMES}）"
 fi
@@ -143,6 +149,7 @@ fi
 [[ -n "${TRITON_CACHE:-}" ]] && generate_command+=(--triton-cache "$(resolve_path "$TRITON_CACHE")")
 [[ "$ALLOW_TRITON_FALLBACK" == "1" ]] && generate_command+=(--allow-triton-fallback)
 [[ "$SKIP_EXISTING" == "1" ]] && generate_command+=(--skip-existing)
+[[ "$BENCHMARK" == "1" ]] && generate_command+=(--benchmark)
 [[ "$DRY_RUN" == "1" ]] && generate_command+=(--dry-run)
 
 export FORCING_WAN_MODEL_DIR="$(resolve_path "$WAN_MODEL_DIR")"

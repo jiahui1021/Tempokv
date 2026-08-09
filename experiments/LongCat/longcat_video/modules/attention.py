@@ -162,6 +162,10 @@ class Attention(nn.Module):
         q, k, v = qkv.unbind(0)
         q, k = self.q_norm(q), self.k_norm(k)
 
+        if num_cond_latents is None or num_cond_latents <= 0:
+            raise ValueError(
+                "LongCat cached attention requires positive num_cond_latents"
+            )
         T, H, W = shape
         k_cache, v_cache = uncompress_kv_cache(*kv_cache)
         assert k_cache.shape[0] == v_cache.shape[0] and k_cache.shape[0] in [1, B]
@@ -169,13 +173,14 @@ class Attention(nn.Module):
             k_cache = k_cache.repeat(B, 1, 1, 1)
             v_cache = v_cache.repeat(B, 1, 1, 1)
         
-        if num_cond_latents is not None and num_cond_latents > 0:
-            k_full = torch.cat([k_cache, k], dim=2).contiguous()
-            v_full = torch.cat([v_cache, v], dim=2).contiguous()
-            q_padding = torch.cat([torch.empty_like(k_cache), q], dim=2).contiguous()
-            q_padding, k_full = self.rope_3d(q_padding, k_full, (T + num_cond_latents, H, W))
-            q = q_padding[:, :, -N:].contiguous()
-            
+        k_full = torch.cat([k_cache, k], dim=2).contiguous()
+        v_full = torch.cat([v_cache, v], dim=2).contiguous()
+        q_padding = torch.cat([torch.empty_like(k_cache), q], dim=2).contiguous()
+        q_padding, k_full = self.rope_3d(
+            q_padding, k_full, (T + num_cond_latents, H, W)
+        )
+        q = q_padding[:, :, -N:].contiguous()
+
         x = self._process_attn(q, k_full, v_full, shape)
         
         x_output_shape = (B, N, C)

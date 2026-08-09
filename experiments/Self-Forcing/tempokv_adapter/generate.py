@@ -92,6 +92,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="use the config's Triton flags instead of enforcing strict acceleration",
     )
     parser.add_argument("--skip-existing", action="store_true")
+    parser.add_argument(
+        "--benchmark",
+        action="store_true",
+        help="require a fresh, complete generation with no skipped samples",
+    )
     parser.add_argument("--dry-run", action="store_true")
     return parser
 
@@ -117,7 +122,33 @@ def _validate_parameters(
 
     temporal = TemporalParameters.load(k_path)
     cross = CrossKVParameters.load(v_path)
-    expected_signature = config.format_signature()
+    if temporal.shared_history != cross.shared_history:
+        raise ValueError(
+            "Self-Forcing K and V parameters must use the same history parameter mode"
+        )
+    signature_config = config
+    if temporal.shared_history:
+        # Shared parameter files carry their fitted maxima.  Allow a runtime
+        # config to omit those maxima, matching TempoKVCodec's parameter-driven
+        # fallback, while still rejecting an explicitly mismatched config.
+        signature_config = replace(
+            config,
+            k_max_history_length=(
+                config.k_max_history_length
+                if config.k_max_history_length is not None
+                else temporal.max_history_length
+            ),
+            v_max_history_length=(
+                config.v_max_history_length
+                if config.v_max_history_length is not None
+                else cross.max_history_length
+            ),
+        )
+    expected_signature = (
+        signature_config.shared_format_signature()
+        if temporal.shared_history
+        else signature_config.format_signature()
+    )
     if (
         temporal.codec_signature != expected_signature
         or cross.codec_signature != expected_signature
@@ -365,13 +396,52 @@ def _video_summary_entries(videos_dir: Path) -> list[dict[str, object]]:
     return entries
 
 
-def _end_to_end_latency(entries: list[dict[str, object]]) -> float | None:
-    """Average current-run generation + save latency, excluding model load."""
+def _batch_summary_entries(videos_dir: Path) -> list[dict[str, object]]:
+    """Read prompt-level timing records from the current run summary."""
+    summary_path = videos_dir / "summary.json"
+    try:
+        payload = json.loads(summary_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as error:
+        raise RuntimeError("Self-Forcing run summary is invalid") from error
+    entries: list[dict[str, object]] = []
+    for rank in payload.get("rank_summaries") or []:
+        if not isinstance(rank, dict):
+            continue
+        for batch in rank.get("batches") or []:
+            if isinstance(batch, dict):
+                entries.append(batch)
+    return entries
+
+
+def _end_to_end_latency(
+    batch_entries: list[dict[str, object]],
+    video_entries: list[dict[str, object]],
+) -> float | None:
+    """Average prompt-batch latency, excluding model load.
+
+    New summaries measure one generation and one save interval per prompt. A
+    legacy video-only summary is accepted as a compatibility fallback, with
+    at most one sample counted for each prompt.
+    """
     candidates: list[float] = []
-    for video in entries:
-        total = video.get("total_seconds")
+    for batch in batch_entries:
+        if int(batch.get("generated_samples", 0) or 0) <= 0:
+            continue
+        total = batch.get("total_seconds")
         if isinstance(total, (int, float)) and total > 0:
             candidates.append(float(total))
+    if not candidates:
+        seen_prompts: set[object] = set()
+        for video in video_entries:
+            if bool(video.get("skipped")):
+                continue
+            prompt_index = video.get("prompt_index")
+            if prompt_index in seen_prompts:
+                continue
+            seen_prompts.add(prompt_index)
+            total = video.get("total_seconds")
+            if isinstance(total, (int, float)) and total > 0:
+                candidates.append(float(total))
     if not candidates:
         return None
     return float(sum(candidates) / len(candidates))
@@ -428,6 +498,8 @@ def run(args: argparse.Namespace) -> dict[str, object]:
 
     if args.samples < 1:
         raise ValueError("samples must be positive")
+    if args.benchmark and args.skip_existing:
+        raise ValueError("benchmark mode does not allow --skip-existing")
     if args.num_gpus < 1:
         raise ValueError("num-gpus must be positive")
     if args.local_attn_size is not None and (
@@ -560,6 +632,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         )
     performance = _load_worker_metrics(metrics_dir, args.num_gpus)
     video_entries = _video_summary_entries(paths["videos"])
+    batch_entries = _batch_summary_entries(paths["videos"])
     if not video_entries:
         raise RuntimeError("Self-Forcing current run contains no requested videos")
     videos: list[Path] = []
@@ -574,6 +647,14 @@ def run(args: argparse.Namespace) -> dict[str, object]:
     generated_entries = [
         entry for entry in video_entries if not bool(entry.get("skipped"))
     ]
+    requested_samples = len(video_entries)
+    generated_samples = len(generated_entries)
+    skipped_samples = requested_samples - generated_samples
+    benchmark_valid = generated_samples > 0 and skipped_samples == 0
+    if args.benchmark and not benchmark_valid:
+        raise RuntimeError(
+            "benchmark run must generate every requested sample without skips"
+        )
     if (
         args.mode == "tempokv"
         and not args.allow_triton_fallback
@@ -606,13 +687,21 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                     for name, count in sorted(unexpected_routes.items())
                 )
             )
-    end_to_end = _end_to_end_latency(video_entries)
+    end_to_end = _end_to_end_latency(batch_entries, video_entries)
     if end_to_end is not None:
         generation_seconds = end_to_end
+    elif generated_samples == 0:
+        generation_seconds = None
+    status = "complete" if generated_samples else "all_skipped"
     report.update(
         {
-            "status": "complete",
+            "status": status,
             "generation_seconds": generation_seconds,
+            "timing_scope": "prompt_batch",
+            "requested_samples": requested_samples,
+            "generated_samples": generated_samples,
+            "skipped_samples": skipped_samples,
+            "benchmark_valid": benchmark_valid,
             "performance": performance,
             "videos": [str(path) for path in videos],
         }

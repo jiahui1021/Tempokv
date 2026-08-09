@@ -6,8 +6,11 @@ LongCat 模型运行代码和 TempoKV 接入都在本仓库 `experiments/LongCat
 ## 安装
 
 ```bash
-pip install -e ".[longcat]"
+pip install -e ".[cuda,longcat]"
 ```
+
+LongCat 与 Self-Forcing 的 `diffusers`、`transformers`、`av` 版本不同，建议
+使用独立的虚拟环境。
 
 ## 采集并合并 clean trace
 
@@ -24,6 +27,11 @@ data/longcat/trace/raw/
 data/longcat/trace/output/
 data/longcat/trace/clean_trace.npz
 ```
+
+合并阶段默认从 trace 文件中的 `trace_stride` 读取空间步长，并检查所有 Context
+Parallel rank 的 metadata 一致。因此 `CONTEXT_PARALLEL_SIZE=1/2/4` 可以分别使用
+`1560/780/390`，不需要手动修改合并命令。只有处理旧 trace 或强制校验时才设置
+`CACHE_STRIDE`。
 
 ## 拟合参数
 

@@ -60,9 +60,36 @@ import sys
 
 config = json.load(open(sys.argv[1], encoding="utf-8"))
 config = config.get("codec", config)
-k_history = int(sys.argv[2]) if sys.argv[2] else int(config["k_history_length"])
-v_history = int(sys.argv[3]) if sys.argv[3] else int(config["v_history_length"])
-bits = int(config["k_bits"])
-print(f"kh{k_history}-vh{v_history}-int{bits}")
+k_bits = int(config["k_bits"])
+v_bits = int(config["v_bits"])
+shared_history = (
+    config.get("k_max_history_length") is not None
+    or config.get("v_max_history_length") is not None
+)
+if shared_history:
+    k_max = config.get("k_max_history_length")
+    if k_max is None:
+        k_max = config.get("k_history_length", 3)
+    v_max = config.get("v_max_history_length")
+    if v_max is None:
+        v_max = config.get("v_history_length", 0)
+    k_label = f"khshared{int(k_max)}"
+    v_label = f"vhshared{int(v_max)}"
+else:
+    k_history = int(sys.argv[2]) if sys.argv[2] else config.get("k_history_length")
+    if k_history is None:
+        k_history = 3
+    v_history = int(sys.argv[3]) if sys.argv[3] else config.get("v_history_length", 0)
+    if v_history is None:
+        v_history = 0
+    k_label = f"kh{int(k_history)}"
+    v_label = f"vh{int(v_history)}"
+if k_bits == v_bits:
+    precision_label = f"int{k_bits}"
+else:
+    # Keep the historical intN name for equal precision while making mixed
+    # K/V precision directories unambiguous.
+    precision_label = f"k{k_bits}-v{v_bits}"
+print(f"{k_label}-{v_label}-{precision_label}")
 PY
 }

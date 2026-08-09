@@ -26,6 +26,23 @@ BF16、trace、TempoKV 最终都执行
 `experiments/Self-Forcing/inference.py`。三条路径使用相同的 checkpoint、Wan
 模型、attention 和 prompt 读取逻辑。
 
+## 运行环境
+
+推理依赖可以单独安装：
+
+```bash
+pip install -e ".[cuda,self-forcing]"
+```
+
+训练或数据工具依赖另装：
+
+```bash
+pip install -e ".[cuda,self-forcing,self-forcing-train]"
+```
+
+Self-Forcing 和 LongCat 的 `diffusers`、`transformers`、`av` 版本不同，建议
+分别建立虚拟环境。
+
 ## 数据目录
 
 ```text
@@ -38,6 +55,8 @@ data/self-forcing/
     ├── kh2-vh2-int2/
     │   ├── k_temporal.npz
     │   └── v_cross_kv.npz
+    ├── kh2-vh2-k2-v4/              K/V 使用不同位宽时
+    ├── khshared3-vhshared2-int2/   shared-history 参数
     └── <其他参数方案>/
 ```
 
@@ -106,6 +125,11 @@ data/self-forcing/params/kh2-vh2-int2/v_cross_kv.npz
 
 可用 `TRACE_FILE`、`PARAM_NAME` 或 `OUTPUT_DIR` 覆盖默认位置。
 
+如果配置中的 K/V 位宽不同，方案名会使用 `kh2-vh2-k2-v4` 这样的格式。shared
+参数会保留配置中的最大 history length，并可在运行时选择不超过该上限的历史长度。
+拟合目录同时写入 `fit_report.json`，其中包含 `codec_config_sha256`，用于确认
+参数来自哪一份 codec 配置。
+
 ## 3. TempoKV 生成
 
 ```bash
@@ -149,8 +173,13 @@ START_INDEX      起始 prompt 序号
 END_INDEX        结束 prompt 序号
 NUM_GPUS         GPU 数量
 SKIP_EXISTING    跳过已有视频，0 或 1（默认 1）
+BENCHMARK        要求本次完整生成，不能跳过已有视频，0 或 1（默认 0）
 DRY_RUN          只检查并打印命令，0 或 1
 ```
+
+做 latency benchmark 时设置 `BENCHMARK=1 SKIP_EXISTING=0`。报告中的
+`generation_seconds` 是 prompt batch 的耗时；`NUM_SAMPLES>1` 时另记录每样本
+耗时和吞吐量，不会把多个视频的累计保存时间当作单个样本延迟。
 
 默认视频文件名为 `<prompt序号>_<样本序号>.mp4`，当前一次运行的明细写入
 `videos/summary.json`。默认结果目录是 `results/self_forcing/<参数方案>/`；BF16

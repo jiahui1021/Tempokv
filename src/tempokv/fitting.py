@@ -1089,16 +1089,24 @@ def _fit_shared_predictors(
         maximum_history_length=maximum_k_history_length,
     )
 
-    for _ in range(iterations):
-        reconstructed_key = _reconstruct_temporal_trace(
-            keys,
-            temporal.with_history_length(maximum_k_history_length),
-            replace(config, k_history_length=maximum_k_history_length),
-        )
-        reconstructed_keys = {
-            history_length: reconstructed_key
+    def reconstruct_keys(
+        parameters: TemporalParameters,
+    ) -> dict[int, torch.Tensor]:
+        """Roll out the exact decoder-visible K state for every active K history."""
+        return {
+            history_length: _reconstruct_temporal_trace(
+                keys,
+                parameters.with_history_length(history_length),
+                replace(config, k_history_length=history_length),
+            )
             for history_length in range(1, maximum_k_history_length + 1)
         }
+
+    for _ in range(iterations):
+        # A shared coefficient map is used with different closed-loop states at
+        # runtime.  Fitting every active length from the maximum-length rollout
+        # would silently train kh1/kh2 on a state that they never see at decode.
+        reconstructed_keys = reconstruct_keys(temporal)
         fitted_temporal = fit_shared_temporal_layers(
             reconstructed_keys,
             keys,
@@ -1109,24 +1117,22 @@ def _fit_shared_predictors(
             layer_ids=layer_ids,
         )
         temporal = TemporalParameters(
-            fitted_temporal.history_weights,
-            fitted_temporal.history_bias,
-            fitted_temporal.stride,
-            fitted_temporal.layer_ids,
-            signature,
+            history_weights=fitted_temporal.history_weights,
+            history_bias=fitted_temporal.history_bias,
+            stride=fitted_temporal.stride,
+            layer_ids=fitted_temporal.layer_ids,
+            codec_signature=signature,
             maximum_history_length=maximum_k_history_length,
         )
-        del reconstructed_keys, reconstructed_key
+        del reconstructed_keys
 
-    reconstructed_key = _reconstruct_temporal_trace(
-        keys,
-        temporal.with_history_length(maximum_k_history_length),
-        replace(config, k_history_length=maximum_k_history_length),
-    )
-    reconstructed_keys = {maximum_k_history_length: reconstructed_key}
+    reconstructed_keys = reconstruct_keys(temporal)
 
     # Start from the same K-only regression as the legacy fitter.  Wrapping a
-    # zero shared history map avoids allocating a full zero V trace.
+    # zero shared history map avoids allocating a full zero V trace.  The
+    # maximum-length K state is only an initializer; every K history is used in
+    # the shared CrossKV refit below.
+    reconstructed_key = reconstructed_keys[maximum_k_history_length]
     initial_cross = fit_cross_kv(
         reconstructed_key[..., 1:, :, :],
         values[..., 1:, :, :],
@@ -1150,19 +1156,22 @@ def _fit_shared_predictors(
         maximum_history_length=maximum_v_history_length,
     )
 
-    for _ in range(iterations if maximum_v_history_length else 0):
-        reconstructed_value = _reconstruct_cross_kv_trace(
-            reconstructed_key,
-            values,
-            cross.with_history_length(maximum_v_history_length),
-            replace(
-                config,
-                k_history_length=maximum_k_history_length,
-                v_history_length=maximum_v_history_length,
-            ),
-        )
+    # Fit at least once even for vh0.  For positive V histories, each (kh, vh)
+    # pair must be reconstructed from its own K state and active V history;
+    # reusing only the maximum-length rollout makes the resulting parameters
+    # inconsistent with the runtime state they are meant to decode.
+    for _ in range(max(1, iterations)):
         reconstructed_values = {
-            (k_history, v_history): reconstructed_value
+            (k_history, v_history): _reconstruct_cross_kv_trace(
+                reconstructed_keys[k_history],
+                values,
+                cross.with_history_length(v_history),
+                replace(
+                    config,
+                    k_history_length=k_history,
+                    v_history_length=v_history,
+                ),
+            )
             for k_history in reconstructed_keys
             for v_history in range(maximum_v_history_length + 1)
         }
@@ -1176,15 +1185,15 @@ def _fit_shared_predictors(
             layer_ids=layer_ids,
         )
         cross = CrossKVParameters(
-            fitted_cross.weight,
-            fitted_cross.bias,
-            fitted_cross.stride,
-            fitted_cross.layer_ids,
-            signature,
+            weight=fitted_cross.weight,
+            bias=fitted_cross.bias,
+            stride=fitted_cross.stride,
+            layer_ids=fitted_cross.layer_ids,
+            codec_signature=signature,
             history_weights=fitted_cross.history_weights,
             maximum_history_length=maximum_v_history_length,
         )
-        del reconstructed_values, reconstructed_value
+        del reconstructed_values
 
     identity = hashlib.sha256()
     identity.update(signature.encode("utf-8"))

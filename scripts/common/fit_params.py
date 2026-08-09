@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sys
 from dataclasses import asdict, fields
@@ -230,6 +231,11 @@ def _fit_device(name: str) -> torch.device:
 
 def run(args: argparse.Namespace) -> dict[str, Any]:
     config = _codec_config(args)
+    config_sha256 = hashlib.sha256(
+        json.dumps(asdict(config), sort_keys=True, separators=(",", ":")).encode(
+            "utf-8"
+        )
+    ).hexdigest()
     keys, values, layer_ids, trace_metadata = _load_trace(
         args.trace,
         keys_name=args.keys_name,
@@ -331,6 +337,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "runtime_stride": config.stride,
         },
         "codec_config": asdict(config),
+        "codec_config_sha256": config_sha256,
         "fit": {
             # Keep the old report key while exposing the clearer config name.
             "history_length": temporal.max_history_length,

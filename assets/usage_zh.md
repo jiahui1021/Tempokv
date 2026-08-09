@@ -11,7 +11,13 @@ TempoKV 的代码按职责分为三层：
 ## 安装
 
 ```bash
-pip install -e ".[cuda]"
+pip install -e ".[cuda,self-forcing]"
+```
+
+Self-Forcing 训练工具另需：
+
+```bash
+pip install -e ".[cuda,self-forcing,self-forcing-train]"
 ```
 
 ## Self-Forcing
@@ -85,7 +91,7 @@ block，进度条统一显示 `60/60`。`FRAMES` 必须满足
 LongCat 运行代码已经包含在本仓库，只需提供模型权重目录：
 
 ```bash
-pip install -e ".[longcat]"
+pip install -e ".[cuda,longcat]"
 
 CHECKPOINT_DIR=/models/LongCat-Video \
 bash scripts/LongCat/collect_trace.sh

@@ -51,8 +51,25 @@ NVIDIA GPU Triton 解码：
 pip install -e ".[cuda]"
 ```
 
+Self-Forcing 推理环境：
+
+```bash
+pip install -e ".[cuda,self-forcing]"
+```
+
+如果还需要 Self-Forcing 训练工具，再安装：
+
+```bash
+pip install -e ".[cuda,self-forcing,self-forcing-train]"
+```
+
+Self-Forcing 与 LongCat 对 `diffusers`、`transformers` 和 `av` 的版本要求不同，
+建议分别使用独立的虚拟环境。
+
 仓库提供 `configs/int2.json` 和 `configs/int4.json`。每一种
 `k_history_length`、`v_history_length` 与位宽组合都需要一套对应的拟合参数。
+`residual_mode=symmetric` 且位宽为 2 时使用的是 `-1, 0, 1` 三个量化值；默认的
+`residual_mode=asymmetric` 才使用 2 bit 的四个编码值。
 
 ## Self-Forcing
 
@@ -101,6 +118,9 @@ data/self-forcing/params/kh2-vh2-int2/k_temporal.npz
 data/self-forcing/params/kh2-vh2-int2/v_cross_kv.npz
 ```
 
+K/V 使用不同位宽时，目录名会明确写出两者，例如
+`kh2-vh2-k2-v4`，避免 `K2/V2` 与 `K2/V4` 覆盖到同一个目录。
+
 ### 3. 使用 TempoKV 生成
 
 ```bash
@@ -144,7 +164,7 @@ LongCat 的模型、VAE、scheduler、Context Parallel 和 TempoKV 接入代码�
 安装 LongCat 依赖：
 
 ```bash
-pip install -e ".[longcat]"
+pip install -e ".[cuda,longcat]"
 ```
 
 采集并合并 clean trace：

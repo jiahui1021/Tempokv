@@ -76,7 +76,11 @@ def _event(
                 else (
                     legacy_stride
                     if legacy_stride is not None
-                    else expected_stride or -1
+                    else (
+                        expected_stride
+                        if expected_stride is not None
+                        else -1
+                    )
                 )
             )
             temporal_units = int(_scalar(data, "temporal_units", key.shape[1]))
@@ -146,7 +150,7 @@ def convert_trace_root(
     expected_layers: int | None = LONGCAT_NUM_LAYERS,
     expected_heads: int | None = LONGCAT_NUM_HEADS,
     expected_head_dim: int | None = LONGCAT_HEAD_DIM,
-    expected_stride: int | None = LONGCAT_STRIDE,
+    expected_stride: int | None = None,
 ) -> dict[str, object]:
     """Merge event directories into ``[L,S,T,H,D]`` fitting arrays."""
     root = root.expanduser().resolve()
@@ -222,8 +226,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--stride",
         dest="trace_stride",
         type=int,
-        default=LONGCAT_STRIDE,
-        help="expected spatial stride recorded by the source trace",
+        default=None,
+        help=(
+            "expected spatial stride recorded by the source trace; "
+            "default: read it from trace metadata"
+        ),
     )
     parser.add_argument(
         "--allow-dynamic-shape",
