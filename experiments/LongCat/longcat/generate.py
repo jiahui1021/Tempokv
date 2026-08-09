@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Launch the external LongCat runner with the TempoKV bridge installed."""
+"""Launch the bundled LongCat runtime with the TempoKV bridge installed."""
 
 from __future__ import annotations
 
@@ -35,18 +35,12 @@ from longcat.trace import DEFAULT_TRACE_SPATIAL_POSITIONS  # noqa: E402
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Run the external LongCat pipeline with TempoKV, clean BF16, "
+            "Run the bundled LongCat pipeline with TempoKV, clean BF16, "
             "or collect clean traces."
         )
     )
     parser.add_argument(
         "--mode", choices=("tempokv", "bf16", "trace"), default="tempokv"
-    )
-    parser.add_argument(
-        "--longcat-repo",
-        type=Path,
-        required=True,
-        help="Quant-VideoGen checkout containing experiments/LongCat",
     )
     parser.add_argument("--config", type=Path, help="TempoKV codec JSON")
     parser.add_argument("--k-params", type=Path, help="fitted temporal K parameters")
@@ -150,7 +144,18 @@ def _gpu_memory_report() -> dict[str, object]:
     return report
 
 
-def _external_arguments(
+def _load_local_runtime(path: Path):
+    module_name = "tempokv_bundled_longcat_inference"
+    spec = importlib.util.spec_from_file_location(module_name, path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load bundled LongCat runtime: {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _runtime_arguments(
     arguments: list[str], *, trace: bool = False, bf16: bool = False
 ) -> list[str]:
     _validate_stage_options(arguments)
@@ -165,27 +170,33 @@ def _external_arguments(
     if _option_value(result, "--attn_sink_frames") is None:
         result.extend(("--attn_sink_frames", "0"))
     if trace or bf16:
-        # Both clean modes must use the original BF16 cache.  Put this last so
-        # an accidentally forwarded qvg quantizer option cannot alter the run.
+        # Both clean modes must use the original BF16 cache. Put this last so
+        # an accidentally forwarded cache option cannot alter the run.
         result.extend(("--quant_type", "none"))
+    else:
+        result.extend(("--quant_type", "tempokv"))
     return result
 
 
 def run(argv: Sequence[str] | None = None) -> int:
     run_started = time.perf_counter()
     parser = _parser()
-    known, external = parser.parse_known_args(argv)
+    known, runtime_arguments = parser.parse_known_args(argv)
     if known.stride is not None and known.stride <= 0:
         parser.error("--stride must be positive")
     if known.max_trace_spatial_positions <= 0:
         parser.error("--max-trace-spatial-positions must be positive")
-    external = _external_arguments(
-        external,
+    runtime_arguments = _runtime_arguments(
+        runtime_arguments,
         trace=known.mode == "trace",
         bf16=known.mode == "bf16",
     )
-    context_parallel_size = int(_option_value(external, "--context_parallel_size") or "1")
-    attention_sink_frames = int(_option_value(external, "--attn_sink_frames") or "0")
+    context_parallel_size = int(
+        _option_value(runtime_arguments, "--context_parallel_size") or "1"
+    )
+    attention_sink_frames = int(
+        _option_value(runtime_arguments, "--attn_sink_frames") or "0"
+    )
     rank = int(os.environ.get("RANK", "0"))
     if rank < 0:
         parser.error("RANK must be non-negative")
@@ -223,7 +234,6 @@ def run(argv: Sequence[str] | None = None) -> int:
             context_parallel_size=context_parallel_size,
             context_parallel_rank=context_parallel_rank,
             attention_sink_frames=attention_sink_frames,
-            model_repo=known.longcat_repo,
         )
     elif known.mode == "trace":
         bridge = install_longcat_bridge(
@@ -239,7 +249,6 @@ def run(argv: Sequence[str] | None = None) -> int:
             context_parallel_size=context_parallel_size,
             context_parallel_rank=context_parallel_rank,
             attention_sink_frames=attention_sink_frames,
-            model_repo=known.longcat_repo,
         )
     else:
         bridge = install_longcat_bridge(
@@ -254,24 +263,17 @@ def run(argv: Sequence[str] | None = None) -> int:
             context_parallel_size=context_parallel_size,
             context_parallel_rank=context_parallel_rank,
             attention_sink_frames=attention_sink_frames,
-            model_repo=known.longcat_repo,
         )
 
-    repo = known.longcat_repo.expanduser().resolve()
-    project_root = repo
-    if repo.name == "LongCat" and repo.parent.name == "experiments":
-        project_root = repo.parent.parent
-    runner_root = project_root / "experiments" / "LongCat"
-    runner_path = runner_root / "run_long_t2v.py"
+    runner_root = EXPERIMENT_ROOT
+    runner_path = runner_root / "inference.py"
     if not runner_path.is_file():
-        parser.error(f"LongCat runner not found: {runner_path}")
+        parser.error(f"bundled LongCat runtime not found: {runner_path}")
     if str(runner_root) not in sys.path:
         sys.path.insert(0, str(runner_root))
-    if str(project_root) not in sys.path:
-        sys.path.insert(0, str(project_root))
 
     _reset_peak_gpu_memory_stats()
-    runner = importlib.import_module("run_long_t2v")
+    runner = _load_local_runtime(runner_path)
     _reset_peak_gpu_memory_stats()
     original_get_model_and_pipe = runner.get_model_and_pipe
     model_load_seconds: float | None = None
@@ -297,13 +299,13 @@ def run(argv: Sequence[str] | None = None) -> int:
 
         runner.init_distributed_environment = init_distributed_environment
     os.environ.setdefault("TEMPOKV_LONGCAT_MODE", known.mode)
-    sys.argv = [str(runner_path), *external]
-    external_args = runner._parse_args()
-    Path(external_args.output_dir).expanduser().resolve().mkdir(
+    sys.argv = [str(runner_path), *runtime_arguments]
+    runtime_args = runner._parse_args()
+    Path(runtime_args.output_dir).expanduser().resolve().mkdir(
         parents=True, exist_ok=True
     )
     runner_started = time.perf_counter()
-    runner.generate(external_args)
+    runner.generate(runtime_args)
     gpu_memory = _gpu_memory_report()
     completed_at = time.perf_counter()
     report = bridge.report()
@@ -317,7 +319,7 @@ def run(argv: Sequence[str] | None = None) -> int:
     report["peak_gpu_allocated_bytes"] = gpu_memory["peak_allocated_bytes"]
     report["peak_gpu_reserved_bytes"] = gpu_memory["peak_reserved_bytes"]
     report_path = (
-        Path(external_args.output_dir).expanduser().resolve()
+        Path(runtime_args.output_dir).expanduser().resolve()
         / f"tempokv_bridge_report_rank_{rank:05d}.json"
     )
     report_path.write_text(
@@ -332,8 +334,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return run(argv)
     except ImportError as error:
         print(
-            "LongCat dependencies are unavailable; install the LongCat extras "
-            f"for Quant-VideoGen first: {error}",
+            "LongCat dependencies are unavailable; install this repository's "
+            f"LongCat extras first: {error}",
             file=sys.stderr,
         )
         return 2

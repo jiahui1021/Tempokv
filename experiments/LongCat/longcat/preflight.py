@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Check the external LongCat runtime before loading a large checkpoint."""
+"""Check the bundled LongCat runtime before loading a large checkpoint."""
 
 from __future__ import annotations
 
@@ -27,12 +27,14 @@ REQUIRED_CHECKPOINT_SUBDIRECTORIES = (
     "dit",
 )
 REQUIRED_LONGCAT_FILES = (
-    "experiments/LongCat/run_long_t2v.py",
+    "experiments/LongCat/inference.py",
+    "experiments/LongCat/LICENSE",
     "experiments/LongCat/longcat_video/modules/longcat_video_dit.py",
     "experiments/LongCat/longcat_video/modules/attention.py",
-    "experiments/LongCat/longcat_video/modules/utils.py",
+    "experiments/LongCat/longcat_video/modules/autoencoder_kl_wan.py",
+    "experiments/LongCat/longcat_video/modules/scheduling_flow_match_euler_discrete.py",
     "experiments/LongCat/longcat_video/pipeline_longcat_video.py",
-    "quant_videogen/uncompress.py",
+    "experiments/LongCat/longcat_video/context_parallel/context_parallel_util.py",
 )
 LONGCAT_SOURCE_CONTRACT = {
     "experiments/LongCat/longcat_video/modules/longcat_video_dit.py": (
@@ -62,11 +64,10 @@ REQUIRED_MODULES = (
     "safetensors",
     "ftfy",
     "regex",
-    "termcolor",
     "loguru",
-    "accelerate",
     "av",
     "torchvision",
+    "flash_attn",
 )
 EXPECTED_LONGCAT_MODEL = {
     "depth": 48,
@@ -119,15 +120,6 @@ def _read_codec_config(path: Path) -> tuple[dict[str, Any] | None, dict[str, obj
         path=str(path),
         stride=int(config.stride),
     )
-
-
-def _runner_path(repo: Path) -> tuple[Path, Path]:
-    if (repo / "experiments" / "LongCat").is_dir():
-        longcat_root = repo / "experiments" / "LongCat"
-        return repo, longcat_root / "run_long_t2v.py"
-    if repo.name == "LongCat" and repo.parent.name == "experiments":
-        return repo.parent.parent, repo / "run_long_t2v.py"
-    return repo, repo / "experiments" / "LongCat" / "run_long_t2v.py"
 
 
 def _longcat_runtime_check(project_root: Path) -> dict[str, object]:
@@ -365,18 +357,7 @@ def _parameter_file_check(
 
 def run(args: argparse.Namespace) -> dict[str, object]:
     checks: dict[str, object] = {}
-    repo = args.longcat_repo.expanduser().resolve()
-    project_root, runner = _runner_path(repo)
-    checks["longcat_repo"] = _check(
-        repo.is_dir() and runner.is_file(),
-        "repository and LongCat runner found"
-        if repo.is_dir() and runner.is_file()
-        else f"expected runner at {runner}",
-        path=str(repo),
-        project_root=str(project_root),
-        runner=str(runner),
-    )
-    checks["longcat_runtime"] = _longcat_runtime_check(project_root)
+    checks["longcat_runtime"] = _longcat_runtime_check(PROJECT_ROOT)
 
     checkpoint = args.checkpoint_dir.expanduser().resolve()
     missing_subdirectories = [
@@ -486,7 +467,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument(
         "--mode", choices=("tempokv", "bf16", "trace"), default="tempokv"
     )
-    parser.add_argument("--longcat-repo", type=Path, required=True)
     parser.add_argument("--checkpoint-dir", type=Path, required=True)
     parser.add_argument("--config", type=Path)
     parser.add_argument("--k-parameters", type=Path)

@@ -8,7 +8,13 @@ fi
 
 self_forcing_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 project_root="$(cd -- "$self_forcing_dir/../.." && pwd -P)"
-python_bin="${PYTHON_BIN:-python3}"
+if [[ -n "${PYTHON_BIN:-}" ]]; then
+  python_bin="$PYTHON_BIN"
+elif [[ -x "$project_root/.venv/bin/python" ]]; then
+  python_bin="$project_root/.venv/bin/python"
+else
+  python_bin="python3"
+fi
 
 die() {
   printf 'Error: %s\n' "$*" >&2

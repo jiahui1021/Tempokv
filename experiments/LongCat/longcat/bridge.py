@@ -13,7 +13,6 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 import importlib
 from pathlib import Path
-import sys
 import time
 from typing import Any, Mapping, Sequence
 
@@ -515,30 +514,12 @@ _ACTIVE_BRIDGE: ContextVar["LongCatTempoKVBridge | None"] = ContextVar(
 )
 
 
-def _add_model_paths(model_repo: str | Path) -> Path:
-    root = Path(model_repo).expanduser().resolve()
-    if (root / "experiments" / "LongCat").is_dir():
-        project_root = root
-        longcat_root = root / "experiments" / "LongCat"
-    elif root.name == "LongCat" and root.parent.name == "experiments":
-        longcat_root = root
-        project_root = root.parent.parent
-    else:
-        raise FileNotFoundError(
-            f"LongCat repository must contain experiments/LongCat: {root}"
-        )
-    for path in (project_root, longcat_root):
-        if str(path) not in sys.path:
-            sys.path.insert(0, str(path))
-    return project_root
-
-
 def _unwrap_compiled_module(value: Any) -> Any:
     """Return the original module hidden by torch.compile wrappers.
 
-    Quant-VideoGen compiles each LongCat block before returning the model from
-    ``get_model_and_pipe``.  The wrapper still executes the original block, so
-    bridge state must be attached to that original module and its attention.
+    The bundled runtime may compile LongCat before returning the model. The
+    wrapper still executes the original block, so bridge state must be attached
+    to that original module and its attention.
     """
     current = value
     seen: set[int] = set()
@@ -793,6 +774,22 @@ class LongCatTempoKVBridge:
             return kv_cache_dict
         if self.codec is None:
             raise RuntimeError("TempoKV codec is not loaded")
+        if kv_cache_dict and all(
+            isinstance(pair[0], (PackedTensor, PackedTensorSpanSet))
+            and isinstance(pair[1], (PackedTensor, PackedTensorSpanSet))
+            for pair in kv_cache_dict.values()
+        ):
+            if not offload:
+                return kv_cache_dict
+            moved = {
+                int(layer): move_kv_cache(pair, torch.device("cpu"))
+                for layer, pair in kv_cache_dict.items()
+            }
+            if isinstance(kv_cache_dict, MutableMapping):
+                kv_cache_dict.clear()
+                kv_cache_dict.update(moved)
+                return kv_cache_dict
+            return moved
         temporal_units = int(getattr(dit, "_tempokv_num_units", 0))
         if temporal_units <= 0:
             raise ValueError(
@@ -991,15 +988,12 @@ class LongCatTempoKVBridge:
 
     def install(
         self,
-        model_repo: str | Path | None = None,
         *,
         dit_module: Any | None = None,
         attention_module: Any | None = None,
         pipeline_module: Any | None = None,
     ) -> "LongCatTempoKVBridge":
-        """Patch LongCat modules, importing them lazily when a repo is given."""
-        if model_repo is not None:
-            _add_model_paths(model_repo)
+        """Patch the repository-local LongCat runtime modules."""
         if dit_module is None:
             dit_module = importlib.import_module(
                 "longcat_video.modules.longcat_video_dit"
@@ -1105,7 +1099,23 @@ class LongCatTempoKVBridge:
             bridge = getattr(instance, "_tempokv_bridge", None)
             result = original_clean_cache(instance, cond_latents, *args, **kwargs)
             if bridge is not None:
+                # Trace the original normalized, pre-RoPE BF16 cache before
+                # ownership is transferred to the packed TempoKV state.
                 bridge.on_clean_cache(instance, cond_latents)
+                if bridge.mode == "tempokv":
+                    offload = kwargs.get("offload_kv_cache")
+                    if offload is None and len(args) >= 2:
+                        offload = args[1]
+                    cache = instance._get_kv_cache_dict()
+                    cache = instance.dit.quantize_kv_cache(
+                        cache,
+                        offload_kv_cache=bool(offload),
+                    )
+                    update_cache = getattr(instance, "_update_kv_cache_dict", None)
+                    if callable(update_cache):
+                        update_cache(cache)
+                    else:
+                        instance.kv_cache_dict = cache
             return result
 
         pipeline_class._cache_clean_latents = cache_clean_latents
@@ -1126,7 +1136,6 @@ def install_longcat_bridge(
     context_parallel_size: int = 1,
     context_parallel_rank: int = 0,
     attention_sink_frames: int = 0,
-    model_repo: str | Path | None = None,
     **modules: Any,
 ) -> LongCatTempoKVBridge:
     """Create and install a LongCat bridge.
@@ -1156,5 +1165,5 @@ def install_longcat_bridge(
         attention_sink_frames=attention_sink_frames,
         auto_context_parallel_stride=spec is None,
     )
-    bridge.install(model_repo=model_repo, **modules)
+    bridge.install(**modules)
     return bridge

@@ -75,3 +75,29 @@ Self-Forcing 三种模式都使用
 `TRACE_RUNNER` 或 QVG。
 
 详细说明见 [scripts/Self-Forcing/README.md](../scripts/Self-Forcing/README.md)。
+
+## LongCat
+
+LongCat 运行代码已经包含在本仓库，只需提供模型权重目录：
+
+```bash
+pip install -e ".[longcat]"
+
+CHECKPOINT_DIR=/models/LongCat-Video \
+bash scripts/LongCat/collect_trace.sh
+
+CONFIG=configs/longcat_int4.json \
+bash scripts/LongCat/fit_params.sh
+
+CHECKPOINT_DIR=/models/LongCat-Video \
+bash scripts/LongCat/run_bf16.sh
+
+CHECKPOINT_DIR=/models/LongCat-Video \
+CONFIG=configs/longcat_int4.json \
+K_PARAMS=data/longcat/params/kh2-vh2-int4/k_temporal.npz \
+V_PARAMS=data/longcat/params/kh2-vh2-int4/v_cross_kv.npz \
+bash scripts/LongCat/run_tempokv.sh
+```
+
+默认会根据 prompt 生成首段，再继续生成长视频。`INIT_VIDEO_PATH` 仅用于从已有
+视频继续生成，不再是必需参数。

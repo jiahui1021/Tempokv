@@ -1,42 +1,67 @@
 # LongCat 调用入口
 
-该目录只保存用户直接调用的 shell：
+LongCat 模型运行代码和 TempoKV 接入都在本仓库 `experiments/LongCat/`。这些
+脚本不读取 `LONGCAT_REPO`，也不调用外部 runner。
 
-```text
-scripts/LongCat/
-├── README.md
-├── _common.sh
-├── collect_trace.sh
-├── fit_params.sh
-├── generate.sh
-├── run_bf16.sh
-└── run_tempokv.sh
-```
-
-Python 接入代码位于 `experiments/LongCat/longcat/`，TempoKV 核心算法位于
-`src/tempokv/`，trace 与拟合参数位于 `data/longcat/`。
-
-BF16：
+## 安装
 
 ```bash
-LONGCAT_REPO=/path/to/LongCat-runtime \
+pip install -e ".[longcat]"
+```
+
+## 采集并合并 clean trace
+
+```bash
 CHECKPOINT_DIR=/models/LongCat-Video \
-INIT_VIDEO_PATH=results/longcat/base/0-0.mp4 \
-OUTPUT_DIR=results/longcat/bf16 \
+PROMPT="a cinematic mountain road" \
+bash scripts/LongCat/collect_trace.sh
+```
+
+默认输出：
+
+```text
+data/longcat/trace/raw/
+data/longcat/trace/output/
+data/longcat/trace/clean_trace.npz
+```
+
+## 拟合参数
+
+```bash
+CONFIG=configs/longcat_int4.json \
+bash scripts/LongCat/fit_params.sh
+```
+
+## BF16
+
+```bash
+CHECKPOINT_DIR=/models/LongCat-Video \
+PROMPT="a cinematic mountain road" \
 bash scripts/LongCat/run_bf16.sh
 ```
 
-TempoKV：
+默认输出到 `results/longcat/bf16/`。
+
+## TempoKV
 
 ```bash
-LONGCAT_REPO=/path/to/LongCat-runtime \
 CHECKPOINT_DIR=/models/LongCat-Video \
-INIT_VIDEO_PATH=results/longcat/base/0-0.mp4 \
-OUTPUT_DIR=results/longcat/tempokv-int4 \
 CONFIG=configs/longcat_int4.json \
 K_PARAMS=data/longcat/params/kh2-vh2-int4/k_temporal.npz \
 V_PARAMS=data/longcat/params/kh2-vh2-int4/v_cross_kv.npz \
+PROMPT="a cinematic mountain road" \
 bash scripts/LongCat/run_tempokv.sh
 ```
 
-完整 LongCat 说明见 `experiments/LongCat/longcat/README.md`。
+默认输出到 `results/longcat/tempokv/`。
+
+三种模式都会先从 prompt 生成首段视频，然后在本仓库内执行 video
+continuation。若希望从现有视频开始，可额外设置：
+
+```bash
+INIT_VIDEO_PATH=/data/input.mp4
+```
+
+常用可选变量：`NUM_SEGMENTS`、`NUM_FRAMES`、`NUM_COND_FRAMES`、
+`NUM_INFERENCE_STEPS`、`CONTEXT_PARALLEL_SIZE`、`NUM_GPUS`、`SEED`、
+`OUTPUT_DIR`、`DRY_RUN`。

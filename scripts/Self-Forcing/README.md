@@ -41,7 +41,7 @@ data/self-forcing/
     └── <其他参数方案>/
 ```
 
-`results/` 只保存视频与运行报告，不保存 trace 或拟合参数。
+`results/self_forcing/` 只保存视频与运行报告，不保存 trace 或拟合参数。
 
 ## 1. 采集 clean trace
 

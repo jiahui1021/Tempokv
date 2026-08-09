@@ -1,6 +1,7 @@
 from typing import List, Optional
 from types import SimpleNamespace
 import torch
+from tqdm.auto import tqdm
 
 from utils.wan_wrapper import WanDiffusionWrapper, WanTextEncoder, WanVAEWrapper
 from kv_cache import ChunkedKVCache
@@ -201,85 +202,97 @@ class CausalInferencePipeline(torch.nn.Module):
         if self.independent_first_frame and initial_latent is None:
             all_num_frames = [1] + all_num_frames
         quantization_factor = 8
-        for chunk_index, current_num_frames in enumerate(all_num_frames):
-            if profile:
-                block_start.record()
+        hide_progress = (
+            torch.distributed.is_initialized()
+            and torch.distributed.get_rank() != 0
+        )
+        total_denoising_steps = (
+            len(all_num_frames) * len(self.denoising_step_list)
+        )
+        with tqdm(
+            total=total_denoising_steps,
+            disable=hide_progress,
+            dynamic_ncols=True,
+        ) as progress_bar:
+            for chunk_index, current_num_frames in enumerate(all_num_frames):
+                if profile:
+                    block_start.record()
 
-            if (
-                chunk_index >= quantization_factor
-                and chunk_index % quantization_factor == 0
-            ):
-                quantized_frames_start = sum(
-                    all_num_frames[: chunk_index - quantization_factor]
-                )
-                quantized_frames_end = sum(all_num_frames[:chunk_index])
-                self.quantize_kv_cache(
-                    quantized_frames_start * self.frame_seq_length,
-                    quantized_frames_end * self.frame_seq_length,
-                    int(self.kv_cache1[0]["local_end_index"]),
-                )
-
-            noisy_input = noise[
-                :, current_start_frame - num_input_frames:current_start_frame + current_num_frames - num_input_frames]
-
-            # Step 3.1: Spatial denoising loop
-            for index, current_timestep in enumerate(self.denoising_step_list):
-                print(f"current_timestep: {current_timestep}")
-                # set current timestep
-                timestep = torch.ones(
-                    [batch_size, current_num_frames],
-                    device=noise.device,
-                    dtype=torch.int64) * current_timestep
-
-                if index < len(self.denoising_step_list) - 1:
-                    _, denoised_pred = self.generator(
-                        noisy_image_or_video=noisy_input,
-                        conditional_dict=conditional_dict,
-                        timestep=timestep,
-                        kv_cache=self.kv_cache1,
-                        crossattn_cache=self.crossattn_cache,
-                        current_start=current_start_frame * self.frame_seq_length
+                if (
+                    chunk_index >= quantization_factor
+                    and chunk_index % quantization_factor == 0
+                ):
+                    quantized_frames_start = sum(
+                        all_num_frames[: chunk_index - quantization_factor]
                     )
-                    next_timestep = self.denoising_step_list[index + 1]
-                    noisy_input = self.scheduler.add_noise(
-                        denoised_pred.flatten(0, 1),
-                        torch.randn_like(denoised_pred.flatten(0, 1)),
-                        next_timestep * torch.ones(
-                            [batch_size * current_num_frames], device=noise.device, dtype=torch.long)
-                    ).unflatten(0, denoised_pred.shape[:2])
-                else:
-                    # for getting real output
-                    _, denoised_pred = self.generator(
-                        noisy_image_or_video=noisy_input,
-                        conditional_dict=conditional_dict,
-                        timestep=timestep,
-                        kv_cache=self.kv_cache1,
-                        crossattn_cache=self.crossattn_cache,
-                        current_start=current_start_frame * self.frame_seq_length
+                    quantized_frames_end = sum(all_num_frames[:chunk_index])
+                    self.quantize_kv_cache(
+                        quantized_frames_start * self.frame_seq_length,
+                        quantized_frames_end * self.frame_seq_length,
+                        int(self.kv_cache1[0]["local_end_index"]),
                     )
 
-            # Step 3.2: record the model's output
-            output[:, current_start_frame:current_start_frame + current_num_frames] = denoised_pred
+                noisy_input = noise[
+                    :, current_start_frame - num_input_frames:current_start_frame + current_num_frames - num_input_frames]
 
-            # Step 3.3: rerun with timestep zero to update KV cache using clean context
-            context_timestep = torch.ones_like(timestep) * self.args.context_noise
-            self.generator(
-                noisy_image_or_video=denoised_pred,
-                conditional_dict=conditional_dict,
-                timestep=context_timestep,
-                kv_cache=self.kv_cache1,
-                crossattn_cache=self.crossattn_cache,
-                current_start=current_start_frame * self.frame_seq_length,
-            )
+                # Step 3.1: Spatial denoising loop
+                for index, current_timestep in enumerate(self.denoising_step_list):
+                    # set current timestep
+                    timestep = torch.ones(
+                        [batch_size, current_num_frames],
+                        device=noise.device,
+                        dtype=torch.int64) * current_timestep
 
-            if profile:
-                block_end.record()
-                torch.cuda.synchronize()
-                block_time = block_start.elapsed_time(block_end)
-                block_times.append(block_time)
+                    if index < len(self.denoising_step_list) - 1:
+                        _, denoised_pred = self.generator(
+                            noisy_image_or_video=noisy_input,
+                            conditional_dict=conditional_dict,
+                            timestep=timestep,
+                            kv_cache=self.kv_cache1,
+                            crossattn_cache=self.crossattn_cache,
+                            current_start=current_start_frame * self.frame_seq_length
+                        )
+                        next_timestep = self.denoising_step_list[index + 1]
+                        noisy_input = self.scheduler.add_noise(
+                            denoised_pred.flatten(0, 1),
+                            torch.randn_like(denoised_pred.flatten(0, 1)),
+                            next_timestep * torch.ones(
+                                [batch_size * current_num_frames], device=noise.device, dtype=torch.long)
+                        ).unflatten(0, denoised_pred.shape[:2])
+                    else:
+                        # for getting real output
+                        _, denoised_pred = self.generator(
+                            noisy_image_or_video=noisy_input,
+                            conditional_dict=conditional_dict,
+                            timestep=timestep,
+                            kv_cache=self.kv_cache1,
+                            crossattn_cache=self.crossattn_cache,
+                            current_start=current_start_frame * self.frame_seq_length
+                        )
+                    progress_bar.update(1)
 
-            # Step 3.4: update the start and end frame indices
-            current_start_frame += current_num_frames
+                # Step 3.2: record the model's output
+                output[:, current_start_frame:current_start_frame + current_num_frames] = denoised_pred
+
+                # Step 3.3: rerun with timestep zero to update KV cache using clean context
+                context_timestep = torch.ones_like(timestep) * self.args.context_noise
+                self.generator(
+                    noisy_image_or_video=denoised_pred,
+                    conditional_dict=conditional_dict,
+                    timestep=context_timestep,
+                    kv_cache=self.kv_cache1,
+                    crossattn_cache=self.crossattn_cache,
+                    current_start=current_start_frame * self.frame_seq_length,
+                )
+
+                if profile:
+                    block_end.record()
+                    torch.cuda.synchronize()
+                    block_time = block_start.elapsed_time(block_end)
+                    block_times.append(block_time)
+
+                # Step 3.4: update the start and end frame indices
+                current_start_frame += current_num_frames
 
         if profile:
             # End diffusion timing and synchronize CUDA

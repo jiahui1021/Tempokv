@@ -9,7 +9,13 @@ fi
 longcat_script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 project_root="$(cd -- "$longcat_script_dir/../.." && pwd -P)"
 adapter_root="$project_root/experiments/LongCat/longcat"
-python_bin="${PYTHON_BIN:-python3}"
+if [[ -n "${PYTHON_BIN:-}" ]]; then
+  python_bin="$PYTHON_BIN"
+elif [[ -x "$project_root/.venv/bin/python" ]]; then
+  python_bin="$project_root/.venv/bin/python"
+else
+  python_bin="python3"
+fi
 torchrun_bin="${TORCHRUN_BIN:-torchrun}"
 
 die() {
@@ -31,4 +37,18 @@ resolve_path() {
     /*) printf '%s\n' "$1" ;;
     *) printf '%s/%s\n' "$project_root" "${1#./}" ;;
   esac
+}
+
+check_flag() {
+  local name="$1" value="${!1:-0}"
+  [[ "$value" == "0" || "$value" == "1" ]] || \
+    die "$name 必须是 0 或 1（当前值：$value）"
+}
+
+check_int() {
+  local name="$1" min="$2" value="${!1:-}"
+  if [[ "$value" =~ ^-?[0-9]+$ ]] && (( value >= min )); then
+    return 0
+  fi
+  die "$name 必须是整数且 >= $min（当前值：$value）"
 }

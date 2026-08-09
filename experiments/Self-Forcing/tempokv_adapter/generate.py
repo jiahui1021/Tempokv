@@ -508,18 +508,28 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         and not args.allow_triton_fallback
         and not args.skip_existing
     ):
-        required_routes = (
-            "temporal_persistent_direct",
-            "cross_kv_persistent_direct",
-        )
+        required_routes = {
+            "temporal_persistent": (
+                "temporal_persistent",
+                "temporal_persistent_direct",
+            ),
+            "cross_kv_persistent": (
+                "cross_kv_persistent",
+                "cross_kv_persistent_direct",
+            ),
+        }
         missing_routes = [
-            route
-            for route in required_routes
-            if performance["decode_routes"].get(route, 0) <= 0
+            route_name
+            for route_name, accepted_names in required_routes.items()
+            if sum(
+                int(performance["decode_routes"].get(name, 0))
+                for name in accepted_names
+            )
+            <= 0
         ]
         if missing_routes:
             raise RuntimeError(
-                "TempoKV direct decode fast path was not used: "
+                "TempoKV persistent Triton decode was not used: "
                 + ", ".join(missing_routes)
             )
     videos = sorted(paths["videos"].rglob("*.mp4"))

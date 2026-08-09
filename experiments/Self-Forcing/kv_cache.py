@@ -247,12 +247,27 @@ class ChunkedKVCache:
                 span=span,
                 source_layout=output_layout,
             )
-            decoded = uncompress_single_kv_cache(
-                span["quant_data"], source_tensor=source
-            )
             expected_tokens = (
                 span["end_chunk"] - span["start_chunk"]
             ) * self.frame_seq_length
+            # The persistent Triton decoder writes BSHD directly. Returning
+            # its BHSD view keeps the cache API unchanged and avoids the
+            # slower temporary BHSD allocation used before the refactor.
+            direct_output = torch.empty(
+                (
+                    self.batch_size,
+                    expected_tokens,
+                    self.num_heads,
+                    self.head_dim,
+                ),
+                device=self.device,
+                dtype=self.dtype,
+            )
+            decoded = uncompress_single_kv_cache(
+                span["quant_data"],
+                source_tensor=source,
+                output_tensor=direct_output,
+            )
             expected_shape = (
                 self.batch_size,
                 self.num_heads,

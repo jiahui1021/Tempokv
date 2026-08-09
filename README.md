@@ -134,9 +134,43 @@ BF16 不读取 TempoKV 配置或参数。两种生成方式都会在 `results/` 
 
 ## LongCat
 
-LongCat 的模型接入代码位于 `experiments/LongCat/longcat/`，最终入口位于
-`scripts/LongCat/`。现有 LongCat 接入仍使用 `LONGCAT_REPO` 指向已安装的
-LongCat 模型运行环境；它与 Self-Forcing 的本地运行方式互不混用。
+LongCat 的模型、VAE、scheduler、Context Parallel 和 TempoKV 接入代码都位于
+`experiments/LongCat/`，最终入口位于 `scripts/LongCat/`。不需要
+`LONGCAT_REPO`、外部 runner 或预先生成的 init 视频。模型权重仍由
+`CHECKPOINT_DIR` 指定。
+
+安装 LongCat 依赖：
+
+```bash
+pip install -e ".[longcat]"
+```
+
+采集并合并 clean trace：
+
+```bash
+CHECKPOINT_DIR=/models/LongCat-Video \
+bash scripts/LongCat/collect_trace.sh
+```
+
+BF16：
+
+```bash
+CHECKPOINT_DIR=/models/LongCat-Video \
+bash scripts/LongCat/run_bf16.sh
+```
+
+TempoKV：
+
+```bash
+CHECKPOINT_DIR=/models/LongCat-Video \
+CONFIG=configs/longcat_int4.json \
+K_PARAMS=data/longcat/params/kh2-vh2-int4/k_temporal.npz \
+V_PARAMS=data/longcat/params/kh2-vh2-int4/v_cross_kv.npz \
+bash scripts/LongCat/run_tempokv.sh
+```
+
+默认会从 prompt 生成首段，再执行 LongCat video continuation。只有希望从已有
+视频继续生成时才需要设置 `INIT_VIDEO_PATH`。
 
 ## 评测
 
@@ -145,7 +179,7 @@ pip install -e ".[metrics]"
 
 python scripts/evaluation/evaluate_quality.py \
   /data/reference_videos \
-  results/self-forcing/videos \
+  results/self_forcing/videos \
   --device cuda \
-  --output results/self-forcing/quality.json
+  --output results/self_forcing/quality.json
 ```

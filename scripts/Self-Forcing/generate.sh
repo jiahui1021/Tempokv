@@ -68,7 +68,7 @@ else
   result_label="bf16"
 fi
 
-model_type="${MODEL_TYPE:-self-forcing}"
+model_type="${MODEL_TYPE:-self_forcing}"
 model_type="${model_type%/}"
 output_dir="$(resolve_path "${OUTPUT_DIR:-$project_root/results/$model_type/$result_label}")"
 if [[ "$output_dir" == "/" ]]; then

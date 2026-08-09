@@ -2,7 +2,6 @@ import argparse
 import torch
 import os
 from omegaconf import OmegaConf
-from tqdm import tqdm
 from torchvision import transforms
 from torchvision.io import write_video
 from einops import rearrange
@@ -41,10 +40,13 @@ args = parser.parse_args()
 
 # Initialize distributed inference
 if "LOCAL_RANK" in os.environ:
-    dist.init_process_group(backend='nccl')
     local_rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(local_rank)
     device = torch.device(f"cuda:{local_rank}")
+    try:
+        dist.init_process_group(backend='nccl', device_id=device)
+    except TypeError:
+        dist.init_process_group(backend='nccl')
     world_size = dist.get_world_size()
     set_seed(args.seed + local_rank)
 else:
@@ -132,7 +134,7 @@ def encode(self, videos: torch.Tensor) -> torch.Tensor:
     return output
 
 
-for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
+for i, batch_data in enumerate(dataloader):
     idx = batch_data['idx'].item()
 
     # For DataLoader batch_size=1, the batch_data is already a single item, but in a batch container
