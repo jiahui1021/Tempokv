@@ -26,8 +26,7 @@ Tempokv/
 │       ├── trace/
 │       └── params/
 ├── configs/                   TempoKV 配置
-├── results/                   生成视频、报告与评测结果
-└── tests/
+└── results/                   生成视频、报告与评测结果
 ```
 
 目录职责固定：

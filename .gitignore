@@ -9,9 +9,7 @@ htmlcov/
 .venv/
 
 # Local verification files
-/tests/*
-!/tests/test_longcat_review_regressions.py
-!/tests/test_self_forcing_trace_flow.py
+/tests/
 
 # Build and packaging output
 build/
