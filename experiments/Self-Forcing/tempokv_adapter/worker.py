@@ -85,6 +85,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         torch.cuda.synchronize(cuda_device)
 
     started = time.perf_counter()
+    generation_wall_seconds: float | None = None
     try:
         if args.mode == "tempokv":
             cache_root = os.environ.get("TEMPOKV_TRITON_CACHE")
@@ -101,11 +102,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             from trace_bridge import install
 
             install(runtime_root)
-            import torchvision.io
-
-            torchvision.io.write_video = lambda *args, **kwargs: None
+            arguments.append("--skip_video_save")
         sys.argv = [str(inference), *arguments]
-        runpy.run_path(str(inference), run_name="__main__")
+        runtime_namespace = runpy.run_path(str(inference), run_name="__main__")
+        measured = (
+            runtime_namespace.get("generation_wall_seconds")
+            if isinstance(runtime_namespace, dict)
+            else None
+        )
+        if isinstance(measured, (int, float)) and measured >= 0:
+            generation_wall_seconds = float(measured)
         return 0
     finally:
         os.chdir(original_cwd)
@@ -114,7 +120,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 torch.cuda.synchronize(cuda_device)
             except Exception:
                 pass
-        wall_seconds = time.perf_counter() - started
+        wall_seconds = (
+            generation_wall_seconds
+            if generation_wall_seconds is not None
+            else time.perf_counter() - started
+        )
         peak_allocated_bytes = 0
         peak_reserved_bytes = 0
         if cuda_available:

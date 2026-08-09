@@ -75,7 +75,9 @@ def causal_rope_apply_long_input(x, grid_sizes, freqs, start_frame=0):
         [c - 2 * (c // 3), c // 3, c // 3], dim=1
     )
     result = torch.empty_like(x)
-    for batch_index, (_, h, w) in enumerate(grid_sizes.tolist()):
+    for batch_index, (model_block_frames, h, w) in enumerate(
+        grid_sizes.tolist()
+    ):
         tokens_per_frame = h * w
         if x.shape[1] % tokens_per_frame:
             raise ValueError("cached sequence is not frame aligned")
@@ -85,21 +87,40 @@ def causal_rope_apply_long_input(x, grid_sizes, freqs, start_frame=0):
                 f"RoPE table supports {temporal.shape[0]} frames, requested "
                 f"[{start_frame}, {start_frame + frames})"
             )
-        complex_x = torch.view_as_complex(
-            x[batch_index].to(torch.float32).reshape(x.shape[1], n, -1, 2)
-        )
-        multipliers = torch.cat(
-            [
-                temporal[start_frame:start_frame + frames]
-                .view(frames, 1, 1, -1)
-                .expand(frames, h, w, -1),
-                height[:h].view(1, h, 1, -1).expand(frames, h, w, -1),
-                width[:w].view(1, 1, w, -1).expand(frames, h, w, -1),
-            ],
-            dim=-1,
-        ).reshape(x.shape[1], 1, -1).to(dtype=complex_x.dtype)
-        rotated = torch.view_as_real(complex_x * multipliers).flatten(2)
-        result[batch_index].copy_(rotated.to(dtype=x.dtype))
+        # Keep the full BF16 result, but create float32/complex temporaries
+        # only for one model block at a time. This matches the original QVG
+        # long-input path and avoids a full-history float32 copy.
+        block_frames = max(1, int(model_block_frames))
+        for relative_frame in range(0, frames, block_frames):
+            current_frames = min(block_frames, frames - relative_frame)
+            token_start = relative_frame * tokens_per_frame
+            token_end = token_start + current_frames * tokens_per_frame
+            complex_x = torch.view_as_complex(
+                x[batch_index, token_start:token_end]
+                .to(torch.float32)
+                .reshape(token_end - token_start, n, -1, 2)
+            )
+            absolute_frame = start_frame + relative_frame
+            multipliers = torch.cat(
+                [
+                    temporal[absolute_frame:absolute_frame + current_frames]
+                    .view(current_frames, 1, 1, -1)
+                    .expand(current_frames, h, w, -1),
+                    height[:h]
+                    .view(1, h, 1, -1)
+                    .expand(current_frames, h, w, -1),
+                    width[:w]
+                    .view(1, 1, w, -1)
+                    .expand(current_frames, h, w, -1),
+                ],
+                dim=-1,
+            ).reshape(token_end - token_start, 1, -1).to(
+                dtype=complex_x.dtype
+            )
+            rotated = torch.view_as_real(complex_x * multipliers).flatten(2)
+            result[batch_index, token_start:token_end].copy_(
+                rotated.to(dtype=x.dtype)
+            )
     return result
 
 

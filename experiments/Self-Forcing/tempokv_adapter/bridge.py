@@ -71,15 +71,15 @@ def install(runtime_root: str | Path) -> type:
     pipeline_module = importlib.import_module("pipeline.causal_inference")
     base = pipeline_module.CausalInferencePipeline
     cache_module = sys.modules[pipeline_module.ChunkedKVCache.__module__]
-    fallback_decode = cache_module.uncompress_single_kv_cache
+    fallback_decode = getattr(cache_module, "_quantized_decoder", None)
 
     class TempoKVCausalInferencePipeline(base):
         def __init__(self, *args: Any, **kwargs: Any) -> None:
             super().__init__(*args, **kwargs)
             self.codec_shape = SimpleNamespace(
                 frame_seq_length=self.frame_seq_length,
-                num_heads=12,
-                head_dim=128,
+                num_heads=getattr(self, "num_heads", 12),
+                head_dim=getattr(self, "head_dim", 128),
             )
             self.tempokv_codec = load_codec_from_env()
             config = self.tempokv_codec.config
@@ -125,8 +125,11 @@ def install(runtime_root: str | Path) -> type:
             frames = int(os.environ.get("TEMPOKV_NUM_FRAMES", "0"))
             if frames <= 0:
                 raise ValueError("TEMPOKV_NUM_FRAMES must be set for TempoKV runs")
-            if self.local_attn_size != -1:
-                raise ValueError("TempoKV Self-Forcing requires global attention")
+            if self.local_attn_size != -1 and self.local_attn_size < frames:
+                raise ValueError(
+                    "TempoKV Self-Forcing attention window must cover the "
+                    "complete generated sequence"
+                )
             target = frames * self.frame_seq_length
             for block in self.generator.model.blocks:
                 if hasattr(block.self_attn, "max_attention_size"):

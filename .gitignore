@@ -10,6 +10,7 @@ htmlcov/
 
 # Local verification files
 /tests/
+.planning/
 
 # Build and packaging output
 build/

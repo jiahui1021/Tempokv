@@ -28,7 +28,7 @@
 # 常用可选变量：
 #   PARAM_DIR       参数目录（默认 data/self-forcing/params/<参数方案>）
 #   OUTPUT_DIR      结果输出目录（默认 results/$MODEL_TYPE/<量化标签>）
-#   FRAMES          最终视频帧数（tempokv 默认 105，bf16 默认 81）
+#   FRAMES          最终视频帧数（两种模式默认均为 717）
 #   NUM_SAMPLES     每条 prompt 采样数（默认 1）
 #   SEED            随机种子（默认 0）
 #   START_INDEX / END_INDEX  prompt 序号范围（默认 0 .. -1 全部）
@@ -77,11 +77,7 @@ fi
 
 # ---------- 生成参数 ----------
 
-if [[ "$mode" == "tempokv" ]]; then
-  FRAMES="${FRAMES:-105}"
-else
-  FRAMES="${FRAMES:-81}"
-fi
+FRAMES="${FRAMES:-717}"
 NUM_SAMPLES="${NUM_SAMPLES:-1}"
 SEED="${SEED:-0}"
 START_INDEX="${START_INDEX:-0}"
@@ -89,7 +85,7 @@ END_INDEX="${END_INDEX:--1}"
 NUM_GPUS="${NUM_GPUS:-1}"
 DRY_RUN="${DRY_RUN:-0}"
 ALLOW_TRITON_FALLBACK="${ALLOW_TRITON_FALLBACK:-0}"
-SKIP_EXISTING="${SKIP_EXISTING:-0}"
+SKIP_EXISTING="${SKIP_EXISTING:-1}"
 
 check_flag DRY_RUN
 check_flag ALLOW_TRITON_FALLBACK
@@ -100,6 +96,9 @@ check_int SEED 0
 check_int START_INDEX 0
 check_int END_INDEX -1
 check_int NUM_GPUS 1
+if (( (FRAMES + 3) % 12 != 0 )); then
+  die "FRAMES 必须满足 (FRAMES + 3) % 12 == 0，保证视频帧精确对应完整的 3-frame latent block（当前值：${FRAMES}）"
+fi
 if [[ -n "${K_HISTORY_LENGTH:-}" ]]; then
   check_int K_HISTORY_LENGTH 1
   (( K_HISTORY_LENGTH <= 8 )) || die "K_HISTORY_LENGTH 必须 <= 8（当前值：$K_HISTORY_LENGTH）"
@@ -147,6 +146,10 @@ fi
 [[ "$DRY_RUN" == "1" ]] && generate_command+=(--dry-run)
 
 export FORCING_WAN_MODEL_DIR="$(resolve_path "$WAN_MODEL_DIR")"
+if [[ "$DRY_RUN" != "1" ]]; then
+  [[ -d "$FORCING_WAN_MODEL_DIR" ]] || \
+    die "WAN_MODEL_DIR 不存在：$FORCING_WAN_MODEL_DIR"
+fi
 
 if [[ "$DRY_RUN" == "1" ]]; then
   printf '[generate] 干跑模式：打印最终命令，不执行\n'

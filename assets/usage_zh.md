@@ -66,13 +66,17 @@ BF16 生成：
 CHECKPOINT=/models/self_forcing_dmd.pt \
 WAN_MODEL_DIR=/models/Wan2.1-T2V-1.3B \
 PROMPTS=assets/generation_prompts.txt \
-FRAMES=81 \
+FRAMES=717 \
 bash scripts/Self-Forcing/run_bf16.sh
 ```
 
 Self-Forcing 三种模式都使用
 `experiments/Self-Forcing/inference.py`，不需要 `MODEL_REPO`、
 `TRACE_RUNNER` 或 QVG。
+
+BF16 与 TempoKV 默认都生成 717 帧，对应 180 个 latent 帧和 60 个生成
+block，进度条统一显示 `60/60`。`FRAMES` 必须满足
+`(FRAMES + 3) % 12 == 0`，脚本不会静默修改帧数。
 
 详细说明见 [scripts/Self-Forcing/README.md](../scripts/Self-Forcing/README.md)。
 

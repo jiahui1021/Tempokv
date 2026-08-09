@@ -33,8 +33,13 @@ class CausalInferencePipeline(torch.nn.Module):
             timesteps = torch.cat((self.scheduler.timesteps.cpu(), torch.tensor([0], dtype=torch.float32)))
             self.denoising_step_list = timesteps[1000 - self.denoising_step_list]
 
-        self.num_transformer_blocks = 30
-        self.frame_seq_length = 1560
+        self.num_transformer_blocks = len(self.generator.model.blocks)
+        if self.num_transformer_blocks < 1:
+            raise ValueError("Self-Forcing model contains no transformer blocks")
+        first_attention = self.generator.model.blocks[0].self_attn
+        self.num_heads = int(first_attention.num_heads)
+        self.head_dim = int(first_attention.head_dim)
+        self.frame_seq_length = int(getattr(args, "frame_seq_length", 1560))
 
         self.kv_cache1 = None
         self.args = args
@@ -47,6 +52,10 @@ class CausalInferencePipeline(torch.nn.Module):
             "quantization_events": [],
             "last_kv_cache_memory": None,
         }
+        if getattr(self.quant_config, "kv_cache_cpu_offload", False):
+            raise ValueError(
+                "bundled Self-Forcing does not support KV cache CPU offload"
+            )
         self.num_frame_per_block = getattr(args, "num_frame_per_block", 1)
         self.independent_first_frame = args.independent_first_frame
         self.local_attn_size = self.generator.model.local_attn_size
@@ -206,11 +215,8 @@ class CausalInferencePipeline(torch.nn.Module):
             torch.distributed.is_initialized()
             and torch.distributed.get_rank() != 0
         )
-        total_denoising_steps = (
-            len(all_num_frames) * len(self.denoising_step_list)
-        )
         with tqdm(
-            total=total_denoising_steps,
+            total=len(all_num_frames),
             disable=hide_progress,
             dynamic_ncols=True,
         ) as progress_bar:
@@ -269,8 +275,6 @@ class CausalInferencePipeline(torch.nn.Module):
                             crossattn_cache=self.crossattn_cache,
                             current_start=current_start_frame * self.frame_seq_length
                         )
-                    progress_bar.update(1)
-
                 # Step 3.2: record the model's output
                 output[:, current_start_frame:current_start_frame + current_num_frames] = denoised_pred
 
@@ -293,6 +297,7 @@ class CausalInferencePipeline(torch.nn.Module):
 
                 # Step 3.4: update the start and end frame indices
                 current_start_frame += current_num_frames
+                progress_bar.update(1)
 
         if profile:
             # End diffusion timing and synchronize CUDA
@@ -304,7 +309,7 @@ class CausalInferencePipeline(torch.nn.Module):
 
         # Step 4: Decode the output
         video = self.vae.decode_to_pixel(output, use_cache=False)
-        video = (video * 0.5 + 0.5).clamp(0, 1)
+        video.mul_(0.5).add_(0.5).clamp_(0, 1)
 
         if profile:
             # End VAE timing and synchronize CUDA
@@ -352,8 +357,8 @@ class CausalInferencePipeline(torch.nn.Module):
                 "k": ChunkedKVCache(
                     batch_size,
                     self.frame_seq_length,
-                    12,
-                    128,
+                    self.num_heads,
+                    self.head_dim,
                     max_num_chunks,
                     dtype,
                     device,
@@ -363,8 +368,8 @@ class CausalInferencePipeline(torch.nn.Module):
                 "v": ChunkedKVCache(
                     batch_size,
                     self.frame_seq_length,
-                    12,
-                    128,
+                    self.num_heads,
+                    self.head_dim,
                     max_num_chunks,
                     dtype,
                     device,
@@ -385,8 +390,16 @@ class CausalInferencePipeline(torch.nn.Module):
 
         for _ in range(self.num_transformer_blocks):
             crossattn_cache.append({
-                "k": torch.zeros([batch_size, 512, 12, 128], dtype=dtype, device=device),
-                "v": torch.zeros([batch_size, 512, 12, 128], dtype=dtype, device=device),
+                "k": torch.zeros(
+                    [batch_size, 512, self.num_heads, self.head_dim],
+                    dtype=dtype,
+                    device=device,
+                ),
+                "v": torch.zeros(
+                    [batch_size, 512, self.num_heads, self.head_dim],
+                    dtype=dtype,
+                    device=device,
+                ),
                 "is_init": False
             })
         self.crossattn_cache = crossattn_cache

@@ -1,13 +1,14 @@
 import argparse
+import json
 import torch
 import os
+import time
 from omegaconf import OmegaConf
 from torchvision import transforms
 from torchvision.io import write_video
 from einops import rearrange
 import torch.distributed as dist
 from torch.utils.data import DataLoader, SequentialSampler, Subset
-from torch.utils.data.distributed import DistributedSampler
 
 from pipeline import (
     CausalDiffusionInferencePipeline,
@@ -16,7 +17,7 @@ from pipeline import (
 from utils.dataset import TextDataset, TextImagePairDataset
 from utils.misc import set_seed
 
-from demo_utils.memory import gpu, get_cuda_free_memory_gb, DynamicSwapInstaller
+from demo_utils.memory import get_cuda_free_memory_gb, DynamicSwapInstaller
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--config_path", type=str, help="Path to the config file")
@@ -36,6 +37,7 @@ parser.add_argument("--start_index", type=int, default=0)
 parser.add_argument("--end_index", type=int, default=-1)
 parser.add_argument("--local_attn_size", type=int, default=-1)
 parser.add_argument("--skip_existing", action="store_true")
+parser.add_argument("--skip_video_save", action="store_true", help=argparse.SUPPRESS)
 args = parser.parse_args()
 
 # Initialize distributed inference
@@ -55,13 +57,16 @@ else:
     world_size = 1
     set_seed(args.seed)
 
-print(f'Free VRAM {get_cuda_free_memory_gb(gpu)} GB')
-low_memory = get_cuda_free_memory_gb(gpu) < 40
+print(f'Free VRAM {get_cuda_free_memory_gb(device)} GB')
+low_memory = get_cuda_free_memory_gb(device) < 40
 
 torch.set_grad_enabled(False)
 
 config = OmegaConf.load(args.config_path)
-default_config = OmegaConf.load("configs/default_config.yaml")
+runtime_root = os.path.dirname(os.path.abspath(__file__))
+default_config = OmegaConf.load(
+    os.path.join(runtime_root, "configs", "default_config.yaml")
+)
 config = OmegaConf.merge(default_config, config)
 config.model_kwargs.local_attn_size = args.local_attn_size
 
@@ -79,11 +84,11 @@ if args.checkpoint_path:
 
 pipeline = pipeline.to(dtype=torch.bfloat16)
 if low_memory:
-    DynamicSwapInstaller.install_model(pipeline.text_encoder, device=gpu)
+    DynamicSwapInstaller.install_model(pipeline.text_encoder, device=device)
 else:
-    pipeline.text_encoder.to(device=gpu)
-pipeline.generator.to(device=gpu)
-pipeline.vae.to(device=gpu)
+    pipeline.text_encoder.to(device=device)
+pipeline.generator.to(device=device)
+pipeline.vae.to(device=device)
 
 
 # Create dataset
@@ -103,14 +108,51 @@ end_index = full_num_prompts if args.end_index < 0 else min(
 )
 if args.start_index < 0 or args.start_index > end_index:
     raise ValueError("invalid prompt range")
-dataset = Subset(dataset, range(args.start_index, end_index))
+selected_indices = list(range(args.start_index, end_index))
+pre_skipped_summaries = []
+if args.skip_existing and args.save_with_index:
+    pending_indices = []
+    for idx in selected_indices:
+        expected = [
+            os.path.join(args.output_folder, f"{idx}_{seed_idx}.mp4")
+            for seed_idx in range(args.num_samples)
+        ]
+        if expected and all(
+            os.path.isfile(path) and os.path.getsize(path) > 0
+            for path in expected
+        ):
+            for seed_idx, output_path in enumerate(expected):
+                pre_skipped_summaries.append(
+                    {
+                        "prompt_index": idx,
+                        "sample_index": seed_idx,
+                        "noise_seed": int(args.seed) + idx * 1_000_003,
+                        "path": output_path,
+                        "skipped": True,
+                        "generation_seconds": None,
+                        "total_seconds": None,
+                    }
+                )
+        else:
+            pending_indices.append(idx)
+    selected_indices = pending_indices
+dataset = Subset(dataset, selected_indices)
 num_prompts = len(dataset)
-print(f"Number of prompts: {num_prompts}")
-
 if dist.is_initialized():
-    sampler = DistributedSampler(dataset, shuffle=False, drop_last=True)
-else:
-    sampler = SequentialSampler(dataset)
+    prompts_per_rank = num_prompts // world_size
+    remainder = num_prompts % world_size
+    rank_start = local_rank * prompts_per_rank + min(local_rank, remainder)
+    rank_end = rank_start + prompts_per_rank + (
+        1 if local_rank < remainder else 0
+    )
+    dataset = Subset(dataset, range(rank_start, rank_end))
+print(
+    f"Rank {local_rank}/{world_size}: total={full_num_prompts}, "
+    f"selected={num_prompts}, assigned={len(dataset)}",
+    flush=True,
+)
+
+sampler = SequentialSampler(dataset)
 dataloader = DataLoader(dataset, batch_size=1, sampler=sampler, num_workers=0, drop_last=False)
 
 # Create output directory (only on main process to avoid race conditions)
@@ -118,7 +160,16 @@ if local_rank == 0:
     os.makedirs(args.output_folder, exist_ok=True)
 
 if dist.is_initialized():
-    dist.barrier()
+    try:
+        dist.barrier(device_ids=[local_rank])
+    except TypeError:
+        dist.barrier()
+
+# Generation reports exclude checkpoint and model loading, matching the
+# reference Self-Forcing measurement boundary.
+torch.cuda.reset_peak_memory_stats(device)
+generation_run_start = time.perf_counter()
+video_summaries = list(pre_skipped_summaries) if local_rank == 0 else []
 
 
 def encode(self, videos: torch.Tensor) -> torch.Tensor:
@@ -134,8 +185,32 @@ def encode(self, videos: torch.Tensor) -> torch.Tensor:
     return output
 
 
+def _output_path(prompt: str, idx: int, seed_idx: int) -> str:
+    if args.save_with_index:
+        return os.path.join(args.output_folder, f"{idx}_{seed_idx}.mp4")
+    return os.path.join(args.output_folder, f"{prompt[:100]}-{seed_idx}.mp4")
+
+
+def _is_valid_video(path: str) -> bool:
+    return os.path.isfile(path) and os.path.getsize(path) > 0
+
+
+def _write_video_checked(path: str, frames: torch.Tensor, fps: int) -> None:
+    stem, suffix = os.path.splitext(path)
+    temporary = f"{stem}.tmp-{os.getpid()}{suffix or '.mp4'}"
+    try:
+        write_video(temporary, frames, fps=fps)
+        if not _is_valid_video(temporary):
+            raise RuntimeError(f"video encoder produced an empty file: {temporary}")
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
 for i, batch_data in enumerate(dataloader):
     idx = batch_data['idx'].item()
+    video_total_start = time.perf_counter()
 
     # For DataLoader batch_size=1, the batch_data is already a single item, but in a batch container
     # Unpack the batch data for convenience
@@ -144,15 +219,29 @@ for i, batch_data in enumerate(dataloader):
     elif isinstance(batch_data, list):
         batch = batch_data[0]  # First (and only) item in the batch
 
-    model = "regular" if not args.use_ema else "ema"
     if args.skip_existing and args.save_with_index:
         expected_outputs = [
-            os.path.join(args.output_folder, f'{idx}-{seed_idx}_{model}.mp4')
+            _output_path("", idx, seed_idx)
             for seed_idx in range(args.num_samples)
         ]
-        if all(os.path.isfile(path) and os.path.getsize(path) > 0 for path in expected_outputs):
+        if all(_is_valid_video(path) for path in expected_outputs):
             print(f"Skipping existing prompt index {idx}")
+            for seed_idx, output_path in enumerate(expected_outputs):
+                video_summaries.append(
+                    {
+                        "prompt_index": int(idx),
+                        "sample_index": seed_idx,
+                        "noise_seed": int(args.seed) + int(idx) * 1_000_003,
+                        "path": output_path,
+                        "skipped": True,
+                        "generation_seconds": None,
+                        "total_seconds": None,
+                    }
+                )
             continue
+
+    prompt_seed = int(args.seed) + int(idx) * 1_000_003
+    set_seed(prompt_seed)
 
     all_video = []
     num_generated_frames = 0  # Number of generated (latent) frames
@@ -186,7 +275,7 @@ for i, batch_data in enumerate(dataloader):
             [args.num_samples, args.num_output_frames, 16, 60, 104], device=device, dtype=torch.bfloat16
         )
 
-    # Generate 81 frames
+    generation_start = time.perf_counter()
     video, latents = pipeline.inference(
         noise=sampled_noise,
         text_prompts=prompts,
@@ -194,6 +283,12 @@ for i, batch_data in enumerate(dataloader):
         initial_latent=initial_latent,
         low_memory=low_memory,
     )
+    torch.cuda.synchronize(device)
+    generation_seconds = time.perf_counter() - generation_start
+    if args.skip_video_save:
+        pipeline.vae.model.clear_cache()
+        del video, latents, sampled_noise, initial_latent
+        continue
     current_video = rearrange(video, 'b t c h w -> b t h w c').cpu()
     all_video.append(current_video)
     num_generated_frames += latents.shape[1]
@@ -208,8 +303,45 @@ for i, batch_data in enumerate(dataloader):
     if idx < full_num_prompts:
         for seed_idx in range(args.num_samples):
             # All processes save their videos
-            if args.save_with_index:
-                output_path = os.path.join(args.output_folder, f'{idx}-{seed_idx}_{model}.mp4')
-            else:
-                output_path = os.path.join(args.output_folder, f'{prompt[:100]}-{seed_idx}.mp4')
-            write_video(output_path, video[seed_idx], fps=16)
+            output_path = _output_path(prompt, idx, seed_idx)
+            save_start = time.perf_counter()
+            _write_video_checked(output_path, video[seed_idx], fps=16)
+            video_summaries.append(
+                {
+                    "prompt_index": int(idx),
+                    "sample_index": seed_idx,
+                    "noise_seed": prompt_seed,
+                    "path": output_path,
+                    "skipped": False,
+                    "generation_seconds": generation_seconds,
+                    "save_seconds": time.perf_counter() - save_start,
+                    "total_seconds": time.perf_counter() - video_total_start,
+                }
+            )
+    del video, latents, current_video, all_video, sampled_noise, initial_latent
+
+generation_wall_seconds = time.perf_counter() - generation_run_start
+rank_summary = {
+    "rank": int(local_rank),
+    "world_size": int(world_size),
+    "generation_wall_seconds": generation_wall_seconds,
+    "videos": video_summaries,
+}
+if dist.is_initialized():
+    gathered = [None] * world_size if local_rank == 0 else None
+    dist.gather_object(rank_summary, gathered, dst=0)
+    rank_summaries = gathered if local_rank == 0 else None
+else:
+    rank_summaries = [rank_summary]
+if local_rank == 0:
+    summary_path = os.path.join(args.output_folder, "summary.json")
+    temporary_summary = f"{summary_path}.tmp-{os.getpid()}"
+    with open(temporary_summary, "w", encoding="utf-8") as handle:
+        json.dump(
+            {"rank_summaries": rank_summaries},
+            handle,
+            indent=2,
+            ensure_ascii=False,
+        )
+        handle.write("\n")
+    os.replace(temporary_summary, summary_path)

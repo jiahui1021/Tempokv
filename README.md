@@ -123,12 +123,14 @@ bash scripts/Self-Forcing/run_tempokv.sh
 CHECKPOINT=/models/self_forcing_dmd.pt \
 WAN_MODEL_DIR=/models/Wan2.1-T2V-1.3B \
 PROMPTS=assets/generation_prompts.txt \
-FRAMES=81 \
+FRAMES=717 \
 bash scripts/Self-Forcing/run_bf16.sh
 ```
 
-BF16 不读取 TempoKV 配置或参数。两种生成方式都会在 `results/` 中写入视频、
-耗时和显存报告。
+BF16 不读取 TempoKV 配置或参数。BF16 与 TempoKV 默认都生成 717 帧，保证
+耗时、显存和视频质量可以直接对照。717 帧对应 60 个生成 block，因此两种
+模式的进度条都显示 `60/60`。两种生成方式都会在 `results/self_forcing/`
+中写入视频、耗时和显存报告。
 
 完整变量说明见 [Self-Forcing 使用说明](scripts/Self-Forcing/README.md)。
 

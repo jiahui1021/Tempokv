@@ -36,7 +36,15 @@ VIDEO_FRAMES_PER_LATENT = 4
 
 
 def latent_frames_for(video_frames: int) -> int:
-    return (video_frames + VIDEO_FRAMES_PER_LATENT - 1) // VIDEO_FRAMES_PER_LATENT
+    if video_frames < 1:
+        raise ValueError("video frame count must be positive")
+    shifted = video_frames + VIDEO_FRAMES_PER_LATENT - 1
+    if shifted % (VIDEO_FRAMES_PER_LATENT * 3):
+        raise ValueError(
+            "Self-Forcing FRAMES must map exactly to 3-frame latent blocks; "
+            "valid values satisfy (FRAMES + 3) % 12 == 0"
+        )
+    return shifted // VIDEO_FRAMES_PER_LATENT
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -76,7 +84,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--start-index", type=int, default=0)
     parser.add_argument("--end-index", type=int, default=-1)
     parser.add_argument("--num-gpus", type=int, default=1)
-    parser.add_argument("--local-attn-size", type=int, default=-1)
+    parser.add_argument("--local-attn-size", type=int)
     parser.add_argument("--triton-cache", type=Path)
     parser.add_argument(
         "--allow-triton-fallback",
@@ -109,6 +117,22 @@ def _validate_parameters(
 
     temporal = TemporalParameters.load(k_path)
     cross = CrossKVParameters.load(v_path)
+    expected_signature = config.format_signature()
+    if (
+        temporal.codec_signature != expected_signature
+        or cross.codec_signature != expected_signature
+    ):
+        raise ValueError(
+            "Self-Forcing parameters were not fitted with the current codec config"
+        )
+    if (
+        not temporal.parameter_set_id
+        or not cross.parameter_set_id
+        or temporal.parameter_set_id != cross.parameter_set_id
+    ):
+        raise ValueError(
+            "Self-Forcing K/V parameters must share a current parameter_set_id"
+        )
     codec = TempoKVCodec(temporal, cross, config)
     if temporal.layer_ids != EXPECTED_LAYER_IDS:
         raise ValueError("K parameters must contain layers 0 through 29")
@@ -200,8 +224,15 @@ def _generation_command(
     args: argparse.Namespace, paths: dict[str, Path]
 ) -> list[str]:
     latent_frames = latent_frames_for(args.frames)
+    local_attn_size = (
+        latent_frames
+        if args.local_attn_size is None
+        else args.local_attn_size
+    )
     command = [
-        "torchrun",
+        sys.executable,
+        "-m",
+        "torch.distributed.run",
         "--standalone",
         f"--nproc_per_node={args.num_gpus}",
         str(Path(__file__).with_name("worker.py")),
@@ -229,7 +260,7 @@ def _generation_command(
         "--save_with_index",
         "--use_ema",
         "--local_attn_size",
-        str(args.local_attn_size),
+        str(local_attn_size),
     ]
     if args.skip_existing:
         command.append("--skip_existing")
@@ -316,26 +347,31 @@ def _load_worker_metrics(
     }
 
 
-def _end_to_end_latency(videos_dir: Path) -> float | None:
-    """Read Self-Forcing's authoritative per-video timing from summary.json.
-
-    `videos[i].total_seconds` covers generation + video save and excludes
-    model loading, checkpoint loading, and Triton compilation, so it is the
-    meaningful end-to-end generation latency.
-    """
+def _video_summary_entries(videos_dir: Path) -> list[dict[str, object]]:
     summary_path = videos_dir / "summary.json"
     if not summary_path.is_file():
-        return None
+        raise RuntimeError("Self-Forcing did not write the current run summary")
     try:
         payload = json.loads(summary_path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
-        return None
-    candidates: list[float] = []
+    except (json.JSONDecodeError, OSError) as error:
+        raise RuntimeError("Self-Forcing run summary is invalid") from error
+    entries: list[dict[str, object]] = []
     for rank in payload.get("rank_summaries") or []:
+        if not isinstance(rank, dict):
+            continue
         for video in rank.get("videos") or []:
-            total = video.get("total_seconds")
-            if isinstance(total, (int, float)) and total > 0:
-                candidates.append(float(total))
+            if isinstance(video, dict):
+                entries.append(video)
+    return entries
+
+
+def _end_to_end_latency(entries: list[dict[str, object]]) -> float | None:
+    """Average current-run generation + save latency, excluding model load."""
+    candidates: list[float] = []
+    for video in entries:
+        total = video.get("total_seconds")
+        if isinstance(total, (int, float)) and total > 0:
+            candidates.append(float(total))
     if not candidates:
         return None
     return float(sum(candidates) / len(candidates))
@@ -394,11 +430,29 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         raise ValueError("samples must be positive")
     if args.num_gpus < 1:
         raise ValueError("num-gpus must be positive")
+    if args.local_attn_size is not None and (
+        args.local_attn_size == 0 or args.local_attn_size < -1
+    ):
+        raise ValueError("local-attn-size must be -1 or a positive integer")
+    visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
+    if visible_devices:
+        visible_count = len(
+            [item for item in visible_devices.split(",") if item.strip()]
+        )
+        if args.num_gpus > visible_count:
+            raise ValueError(
+                f"num-gpus={args.num_gpus} exceeds "
+                f"CUDA_VISIBLE_DEVICES ({visible_count})"
+            )
     latent_frames = latent_frames_for(args.frames)
-    if latent_frames % 3:
+    if (
+        args.local_attn_size not in (None, -1)
+        and args.local_attn_size < latent_frames
+    ):
         raise ValueError(
-            "final video frame count must map to a multiple of 3 latent frames; "
-            f"got {args.frames} video frames -> {latent_frames} latent frames"
+            "local-attn-size must cover the complete generated latent sequence "
+            f"({latent_frames} frames) so BF16 and TempoKV use identical "
+            "Self-Forcing attention semantics"
         )
     config = None
     parameters = None
@@ -489,6 +543,8 @@ def run(args: argparse.Namespace) -> dict[str, object]:
     paths["videos"].mkdir(parents=True, exist_ok=True)
     metrics_dir = paths["run"] / "metrics"
     metrics_dir.mkdir(parents=True, exist_ok=True)
+    for rank in range(args.num_gpus):
+        (metrics_dir / f"rank-{rank}.json").unlink(missing_ok=True)
     environment["SELF_FORCING_METRICS_DIR"] = str(metrics_dir)
     started = time.perf_counter()
     completed = subprocess.run(
@@ -498,44 +554,59 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         check=False,
     )
     generation_seconds = time.perf_counter() - started
-    performance = _load_worker_metrics(metrics_dir, args.num_gpus)
     if completed.returncode:
         raise subprocess.CalledProcessError(
             completed.returncode, generation_command
         )
+    performance = _load_worker_metrics(metrics_dir, args.num_gpus)
+    video_entries = _video_summary_entries(paths["videos"])
+    if not video_entries:
+        raise RuntimeError("Self-Forcing current run contains no requested videos")
+    videos: list[Path] = []
+    for entry in video_entries:
+        path_value = entry.get("path")
+        if not isinstance(path_value, str):
+            raise RuntimeError("Self-Forcing run summary contains no video path")
+        path = Path(path_value).expanduser().resolve()
+        if not path.is_file() or path.stat().st_size == 0:
+            raise RuntimeError(f"Self-Forcing video is missing or empty: {path}")
+        videos.append(path)
+    generated_entries = [
+        entry for entry in video_entries if not bool(entry.get("skipped"))
+    ]
     if (
         args.mode == "tempokv"
         and not args.allow_triton_fallback
-        and not args.skip_existing
+        and generated_entries
     ):
-        required_routes = {
-            "temporal_persistent": (
-                "temporal_persistent",
-                "temporal_persistent_direct",
-            ),
-            "cross_kv_persistent": (
-                "cross_kv_persistent",
-                "cross_kv_persistent_direct",
-            ),
-        }
+        required_routes = (
+            "temporal_persistent_direct",
+            "cross_kv_persistent_direct",
+        )
         missing_routes = [
-            route_name
-            for route_name, accepted_names in required_routes.items()
-            if sum(
-                int(performance["decode_routes"].get(name, 0))
-                for name in accepted_names
-            )
-            <= 0
+            route
+            for route in required_routes
+            if int(performance["decode_routes"].get(route, 0)) <= 0
         ]
         if missing_routes:
             raise RuntimeError(
-                "TempoKV persistent Triton decode was not used: "
+                "TempoKV direct persistent Triton decode was not used: "
                 + ", ".join(missing_routes)
             )
-    videos = sorted(paths["videos"].rglob("*.mp4"))
-    if not videos or any(path.stat().st_size == 0 for path in videos):
-        raise RuntimeError("Self-Forcing completed without a non-empty MP4")
-    end_to_end = _end_to_end_latency(paths["videos"])
+        unexpected_routes = {
+            name: int(count)
+            for name, count in performance["decode_routes"].items()
+            if int(count) > 0 and name not in required_routes
+        }
+        if unexpected_routes:
+            raise RuntimeError(
+                "TempoKV used a non-direct or non-persistent decode route: "
+                + ", ".join(
+                    f"{name}={count}"
+                    for name, count in sorted(unexpected_routes.items())
+                )
+            )
+    end_to_end = _end_to_end_latency(video_entries)
     if end_to_end is not None:
         generation_seconds = end_to_end
     report.update(

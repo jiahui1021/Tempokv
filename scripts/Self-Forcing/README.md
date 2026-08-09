@@ -120,8 +120,10 @@ bash scripts/Self-Forcing/run_tempokv.sh
 ```
 
 TempoKV 生成至少需要 27 个 latent 帧，约等于 105 个最终视频帧。`FRAMES`
-必须能换算为 3 的倍数个 latent 帧。生成参数必须与拟合参数的 history、stride
-和坐标一致。
+必须满足 `(FRAMES + 3) % 12 == 0`，避免脚本静默增减视频帧。默认的 717 帧
+对应 180 个 latent 帧、60 个 3-frame block，所以 BF16 与 TempoKV 的生成进度
+都会显示 `60/60`。每个 block 内部仍执行原模型的 4 次去噪和 1 次 clean cache
+更新，进度条不会把内部 4 次去噪重复计数。
 
 ## 4. BF16 生成
 
@@ -129,12 +131,13 @@ TempoKV 生成至少需要 27 个 latent 帧，约等于 105 个最终视频帧�
 CHECKPOINT=/models/self_forcing_dmd.pt \
 WAN_MODEL_DIR=/models/Wan2.1-T2V-1.3B \
 PROMPTS=assets/generation_prompts.txt \
-FRAMES=81 \
+FRAMES=717 \
 bash scripts/Self-Forcing/run_bf16.sh
 ```
 
 BF16 不需要 `CONFIG`、`PARAM_DIR`、K 参数或 V 参数。它与 TempoKV 使用同一
-份内置 Self-Forcing 推理代码，用于耗时、显存和视频质量对照。
+份内置 Self-Forcing 推理代码。两种模式默认都生成 717 帧，用于耗时、显存
+和视频质量对照。
 
 ## 常用生成变量
 
@@ -145,9 +148,13 @@ SEED             随机种子
 START_INDEX      起始 prompt 序号
 END_INDEX        结束 prompt 序号
 NUM_GPUS         GPU 数量
-SKIP_EXISTING    跳过已有视频，0 或 1
+SKIP_EXISTING    跳过已有视频，0 或 1（默认 1）
 DRY_RUN          只检查并打印命令，0 或 1
 ```
+
+默认视频文件名为 `<prompt序号>_<样本序号>.mp4`，当前一次运行的明细写入
+`videos/summary.json`。默认结果目录是 `results/self_forcing/<参数方案>/`；BF16
+使用 `results/self_forcing/bf16/`。
 
 仓库内没有 `MODEL_REPO` 或 `TRACE_RUNNER` 参数。模型代码固定来自
 `experiments/Self-Forcing/`；`CHECKPOINT` 与 `WAN_MODEL_DIR` 仅指定权重位置。

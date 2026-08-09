@@ -221,9 +221,43 @@ class ChunkedKVCache:
         end_chunk = self._token_to_chunk(end_index)
         if start_chunk >= end_chunk:
             raise ValueError("cache read range must be non-empty")
-        parts: list[torch.Tensor] = []
+        if (
+            end_chunk - start_chunk == 1
+            and self.chunk_state[start_chunk] == ChunkState.BF16
+            and self.layout == output_layout
+        ):
+            chunk = self.chunks[start_chunk]
+            if chunk is None:
+                raise RuntimeError("BF16 cache chunk has no tensor")
+            return chunk
+        total_tokens = end_index - start_index
+        if output_layout == "BSHD":
+            result = torch.empty(
+                (
+                    self.batch_size,
+                    total_tokens,
+                    self.num_heads,
+                    self.head_dim,
+                ),
+                device=self.device,
+                dtype=self.dtype,
+            )
+        else:
+            result = torch.empty(
+                (
+                    self.batch_size,
+                    self.num_heads,
+                    total_tokens,
+                    self.head_dim,
+                ),
+                device=self.device,
+                dtype=self.dtype,
+            )
         chunk_index = start_chunk
         while chunk_index < end_chunk:
+            output_start = (
+                chunk_index - start_chunk
+            ) * self.frame_seq_length
             state = self.chunk_state[chunk_index]
             if state == ChunkState.BF16:
                 part = self.chunks[chunk_index]
@@ -231,7 +265,11 @@ class ChunkedKVCache:
                     raise RuntimeError("BF16 cache chunk has no tensor")
                 if self.layout != output_layout:
                     part = part.permute(0, 2, 1, 3)
-                parts.append(part)
+                output_end = output_start + self.frame_seq_length
+                if output_layout == "BSHD":
+                    result[:, output_start:output_end].copy_(part)
+                else:
+                    result[:, :, output_start:output_end].copy_(part)
                 chunk_index += 1
                 continue
             if state != ChunkState.QUANTIZED:
@@ -250,19 +288,16 @@ class ChunkedKVCache:
             expected_tokens = (
                 span["end_chunk"] - span["start_chunk"]
             ) * self.frame_seq_length
-            # The persistent Triton decoder writes BSHD directly. Returning
-            # its BHSD view keeps the cache API unchanged and avoids the
-            # slower temporary BHSD allocation used before the refactor.
-            direct_output = torch.empty(
-                (
-                    self.batch_size,
-                    expected_tokens,
-                    self.num_heads,
-                    self.head_dim,
-                ),
-                device=self.device,
-                dtype=self.dtype,
-            )
+            output_end = output_start + expected_tokens
+            # The normal attention path reads BSHD. For batch size one its
+            # sequence slice is contiguous, so Triton can decode straight
+            # into the final cache-read buffer without keeping per-span
+            # outputs alive until a later torch.cat.
+            direct_output = None
+            if output_layout == "BSHD":
+                candidate = result[:, output_start:output_end]
+                if candidate.is_contiguous():
+                    direct_output = candidate
             decoded = uncompress_single_kv_cache(
                 span["quant_data"],
                 source_tensor=source,
@@ -279,13 +314,15 @@ class ChunkedKVCache:
                     f"decoded TempoKV shape mismatch: expected {expected_shape}, "
                     f"got {tuple(decoded.shape)}"
                 )
-            if output_layout == "BSHD":
-                decoded = decoded.permute(0, 2, 1, 3)
-            parts.append(decoded)
+            if direct_output is None:
+                if output_layout == "BSHD":
+                    result[:, output_start:output_end].copy_(
+                        decoded.permute(0, 2, 1, 3)
+                    )
+                else:
+                    result[:, :, output_start:output_end].copy_(decoded)
             chunk_index = span["end_chunk"]
-        seq_dim = 1 if output_layout == "BSHD" else 2
-        result = parts[0] if len(parts) == 1 else torch.cat(parts, dim=seq_dim)
-        return result if result.is_contiguous() else result.contiguous()
+        return result
 
     def store_quantized(
         self, start_index: int, end_index: int, quant_data: Any
