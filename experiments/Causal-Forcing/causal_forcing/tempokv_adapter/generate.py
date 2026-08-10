@@ -109,6 +109,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="use the config's Triton flags instead of enforcing strict acceleration",
     )
     parser.add_argument("--skip-existing", action="store_true")
+    parser.add_argument(
+        "--use-ema",
+        action="store_true",
+        help="load generator_ema instead of generator from the checkpoint",
+    )
     parser.add_argument("--dry-run", action="store_true")
     return parser
 
@@ -247,10 +252,11 @@ def _generation_command(
         "--end_index",
         str(args.end_index),
         "--save_with_index",
-        "--use_ema",
         "--local_attn_size",
         str(args.local_attn_size),
     ]
+    if args.use_ema:
+        command.append("--use_ema")
     if args.skip_existing:
         command.append("--skip_existing")
     return command

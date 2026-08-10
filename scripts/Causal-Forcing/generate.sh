@@ -36,6 +36,7 @@
 #   START_INDEX / END_INDEX  prompt 序号范围（默认 0 .. -1 全部）
 #   NUM_GPUS         torchrun 使用的 GPU 数（默认 1）
 #   LOCAL_ATTN_SIZE  局部注意力窗口（默认 -1，即全序列）
+#   USE_EMA          是否读取 checkpoint 的 generator_ema（默认 0，官方权重只有 generator）
 #   K_HISTORY_LENGTH / V_HISTORY_LENGTH  历史帧数（默认读取 CONFIG）
 #
 set -euo pipefail
@@ -95,10 +96,12 @@ LOCAL_ATTN_SIZE="${LOCAL_ATTN_SIZE:--1}"
 DRY_RUN="${DRY_RUN:-0}"
 ALLOW_TRITON_FALLBACK="${ALLOW_TRITON_FALLBACK:-0}"
 SKIP_EXISTING="${SKIP_EXISTING:-1}"
+USE_EMA="${USE_EMA:-0}"
 
 check_flag DRY_RUN
 check_flag ALLOW_TRITON_FALLBACK
 check_flag SKIP_EXISTING
+check_flag USE_EMA
 check_int FRAMES 1
 check_int NUM_SAMPLES 1
 check_int SEED 0
@@ -154,6 +157,7 @@ fi
 [[ -n "${TRITON_CACHE:-}" ]] && generate_command+=(--triton-cache "$(resolve_path "$TRITON_CACHE")")
 [[ "$ALLOW_TRITON_FALLBACK" == "1" ]] && generate_command+=(--allow-triton-fallback)
 [[ "$SKIP_EXISTING" == "1" ]] && generate_command+=(--skip-existing)
+[[ "$USE_EMA" == "1" ]] && generate_command+=(--use-ema)
 [[ "$DRY_RUN" == "1" ]] && generate_command+=(--dry-run)
 
 if [[ "$DRY_RUN" == "1" ]]; then

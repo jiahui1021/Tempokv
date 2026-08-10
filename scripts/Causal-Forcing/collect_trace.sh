@@ -29,6 +29,7 @@
 #   TRACE_FRAMES     每个 prompt 生成的 latent 帧数（默认 21）
 #   TRACE_TOKENS_PER_FRAME  每帧抽取的空间位置数（默认 8）
 #   NUM_GPUS / BASE_SEED / OVERWRITE / DRY_RUN
+#   USE_EMA          是否读取 checkpoint 的 generator_ema（默认 0，官方权重只有 generator）
 #
 set -euo pipefail
 
@@ -69,9 +70,11 @@ NUM_GPUS="${NUM_GPUS:-1}"
 BASE_SEED="${BASE_SEED:-0}"
 OVERWRITE="${OVERWRITE:-0}"
 DRY_RUN="${DRY_RUN:-0}"
+USE_EMA="${USE_EMA:-0}"
 
 check_flag OVERWRITE
 check_flag DRY_RUN
+check_flag USE_EMA
 check_int TRACE_FRAMES "$frames_per_block"
 (( TRACE_FRAMES % frames_per_block == 0 )) || \
   die "TRACE_FRAMES 必须是 $frames_per_block 的倍数（当前值：$TRACE_FRAMES）"
@@ -100,8 +103,8 @@ trace_command=(
   --num_samples 1
   --seed "$BASE_SEED"
   --save_with_index
-  --use_ema
 )
+[[ "$USE_EMA" == "1" ]] && trace_command+=(--use_ema)
 
 merge_command=(
   "$python_bin" "$adapter_root/prepare_trace.py"
