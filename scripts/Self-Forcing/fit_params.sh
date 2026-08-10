@@ -9,8 +9,8 @@
 #
 # 用法（所有参数都用环境变量传入）：
 #   CONFIG=configs/int2.json \
-#   K_HISTORY_LENGTH=2 \
-#   V_HISTORY_LENGTH=2 \
+#   KH=2 \
+#   VH=1 \
 #   bash scripts/Self-Forcing/fit_params.sh
 #
 # 必需变量：
@@ -32,6 +32,9 @@ set -euo pipefail
 
 # shellcheck source=scripts/Self-Forcing/_common.sh
 source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)/_common.sh"
+
+K_HISTORY_LENGTH="$(resolve_history K_HISTORY_LENGTH KH)"
+V_HISTORY_LENGTH="$(resolve_history V_HISTORY_LENGTH VH)"
 
 require_env CONFIG
 

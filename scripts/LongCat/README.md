@@ -40,6 +40,18 @@ CONFIG=configs/longcat_int4.json \
 bash scripts/LongCat/fit_params.sh
 ```
 
+默认输出：
+
+```text
+data/longcat/params/kh2-vh1-int4/k_temporal.npz
+data/longcat/params/kh2-vh1-int4/v_cross_kv.npz
+```
+
+目录名由 `CONFIG` 推导（与 Self-Forcing、Causal Forcing 一致），换成
+`configs/longcat_int2.json` 会写到 `kh2-vh1-int2`，不会覆盖 INT4。
+`K_HISTORY_LENGTH` / `V_HISTORY_LENGTH` 会同时影响目录名和拟合参数。
+拟合输入用 `TRACE_FILE`，与 `collect_trace.sh` 的输出变量同名。
+
 ## BF16
 
 ```bash
@@ -55,8 +67,8 @@ bash scripts/LongCat/run_bf16.sh
 ```bash
 CHECKPOINT_DIR=/models/LongCat-Video \
 CONFIG=configs/longcat_int4.json \
-K_PARAMS=data/longcat/params/kh2-vh2-int4/k_temporal.npz \
-V_PARAMS=data/longcat/params/kh2-vh2-int4/v_cross_kv.npz \
+K_PARAMS=data/longcat/params/kh2-vh1-int4/k_temporal.npz \
+V_PARAMS=data/longcat/params/kh2-vh1-int4/v_cross_kv.npz \
 PROMPT="a cinematic mountain road" \
 bash scripts/LongCat/run_tempokv.sh
 ```
@@ -73,3 +85,30 @@ INIT_VIDEO_PATH=/data/input.mp4
 常用可选变量：`NUM_SEGMENTS`、`NUM_FRAMES`、`NUM_COND_FRAMES`、
 `NUM_INFERENCE_STEPS`、`CONTEXT_PARALLEL_SIZE`、`NUM_GPUS`、`SEED`、
 `OUTPUT_DIR`、`DRY_RUN`。
+
+`FIT_DEVICE` 默认 `auto`：有 CUDA 就用 GPU，没有则回退 CPU 并在 stderr 打出告警——
+CPU 拟合同时会把方程降到 float64，比看上去慢得多，所以回退不会静默发生。
+`FIT_DEVICE=cuda` 让没有 GPU 时直接报错而不是回退。拟合报告里记录实际使用的设备。
+
+`K_HISTORY_LENGTH` / `V_HISTORY_LENGTH` 可以简写成 `KH` / `VH`，效果相同；
+两个名字都设置且取值不同会直接报错。不设置时读 `CONFIG` 里的值（默认 `kh=2`、`vh=1`）。
+
+## 历史帧数敏感性实验
+
+扫 K 与 V 的历史帧数，报告重建误差、attention 输出误差和预测项占比：
+
+```bash
+MAX_SAMPLES=64 MAX_FRAMES=8 LAYERS=0,15,29 \
+bash scripts/LongCat/sweep_history.sh    # 先小规模确认能跑通
+bash scripts/LongCat/sweep_history.sh    # 全量
+```
+
+K 扫 `k_history_length`（1 到 8），V 在 CrossKV 项之上再扫 `v_history_length`
+（0 到 2），并额外拆出 V 预测里 CrossKV 项与 history 项各自的能量占比——两项相关，
+所以并排报告而不是把总量切开。
+
+**每个取值都会重新拟合一次。** 非 shared 参数的历史长度在拟合时就固定了，拿一套
+参数改 N 得到的不是那个 N 的模型。位宽、group_size 和 stride 由 `CONFIG` 固定。
+
+报告默认写到 `results/longcat/history_sweep.json`。变量说明见
+[scripts/common/sweep_history.sh](../common/sweep_history.sh)。

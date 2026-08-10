@@ -30,6 +30,17 @@ require_env() {
   done
 }
 
+# KH / VH are short aliases for K_HISTORY_LENGTH / V_HISTORY_LENGTH. Both names
+# are accepted; setting both to different values is a mistake, not a preference.
+resolve_history() {
+  local long="$1" short="$2"
+  local long_value="${!long:-}" short_value="${!short:-}"
+  if [[ -n "$long_value" && -n "$short_value" && "$long_value" != "$short_value" ]]; then
+    die "$long=$long_value 与 $short=$short_value 冲突，只设置其中一个"
+  fi
+  printf '%s\n' "${long_value:-$short_value}"
+}
+
 resolve_path() {
   local value="$1"
   case "$value" in

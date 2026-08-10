@@ -26,8 +26,8 @@ bash scripts/LongCat/run_bf16.sh
 
 CHECKPOINT_DIR=/models/LongCat-Video \
 CONFIG=configs/longcat_int4.json \
-K_PARAMS=data/longcat/params/kh2-vh2-int4/k_temporal.npz \
-V_PARAMS=data/longcat/params/kh2-vh2-int4/v_cross_kv.npz \
+K_PARAMS=data/longcat/params/kh2-vh1-int4/k_temporal.npz \
+V_PARAMS=data/longcat/params/kh2-vh1-int4/v_cross_kv.npz \
 bash scripts/LongCat/run_tempokv.sh
 ```
 

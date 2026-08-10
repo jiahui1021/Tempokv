@@ -52,10 +52,10 @@ data/self-forcing/
 │   ├── output/                      采集过程输出
 │   └── clean_trace.npz              合并后的拟合输入
 └── params/
-    ├── kh2-vh2-int2/
+    ├── kh2-vh1-int2/
     │   ├── k_temporal.npz
     │   └── v_cross_kv.npz
-    ├── kh2-vh2-k2-v4/              K/V 使用不同位宽时
+    ├── kh2-vh1-k2-v4/              K/V 使用不同位宽时
     ├── khshared3-vhshared2-int2/   shared-history 参数
     └── <其他参数方案>/
 ```
@@ -110,22 +110,22 @@ cross_source_kind    normalized
 
 ```bash
 CONFIG=configs/int2.json \
-K_HISTORY_LENGTH=2 \
-V_HISTORY_LENGTH=2 \
+KH=2 \
+VH=1 \
 bash scripts/Self-Forcing/fit_params.sh
 ```
 
-脚本根据配置自动生成参数方案名，例如 `kh2-vh2-int2`。默认读取
+脚本根据配置自动生成参数方案名，例如 `kh2-vh1-int2`。默认读取
 `data/self-forcing/trace/clean_trace.npz`，并写入：
 
 ```text
-data/self-forcing/params/kh2-vh2-int2/k_temporal.npz
-data/self-forcing/params/kh2-vh2-int2/v_cross_kv.npz
+data/self-forcing/params/kh2-vh1-int2/k_temporal.npz
+data/self-forcing/params/kh2-vh1-int2/v_cross_kv.npz
 ```
 
 可用 `TRACE_FILE`、`PARAM_NAME` 或 `OUTPUT_DIR` 覆盖默认位置。
 
-如果配置中的 K/V 位宽不同，方案名会使用 `kh2-vh2-k2-v4` 这样的格式。shared
+如果配置中的 K/V 位宽不同，方案名会使用 `kh2-vh1-k2-v4` 这样的格式。shared
 参数会保留配置中的最大 history length，并可在运行时选择不超过该上限的历史长度。
 拟合目录同时写入 `fit_report.json`，其中包含 `codec_config_sha256`，用于确认
 参数来自哪一份 codec 配置。
@@ -137,8 +137,8 @@ CHECKPOINT=/models/self_forcing_dmd.pt \
 WAN_MODEL_DIR=/models/Wan2.1-T2V-1.3B \
 PROMPTS=assets/generation_prompts.txt \
 CONFIG=configs/int2.json \
-K_HISTORY_LENGTH=2 \
-V_HISTORY_LENGTH=2 \
+KH=2 \
+VH=1 \
 FRAMES=717 \
 bash scripts/Self-Forcing/run_tempokv.sh
 ```
@@ -187,3 +187,47 @@ DRY_RUN          只检查并打印命令，0 或 1
 
 仓库内没有 `MODEL_REPO` 或 `TRACE_RUNNER` 参数。模型代码固定来自
 `experiments/Self-Forcing/`；`CHECKPOINT` 与 `WAN_MODEL_DIR` 仅指定权重位置。
+
+`FIT_DEVICE` 默认 `auto`：有 CUDA 就用 GPU，没有则回退 CPU 并在 stderr 打出告警——
+CPU 拟合同时会把方程降到 float64，比看上去慢得多，所以回退不会静默发生。
+`FIT_DEVICE=cuda` 让没有 GPU 时直接报错而不是回退。拟合报告里记录实际使用的设备。
+
+`K_HISTORY_LENGTH` / `V_HISTORY_LENGTH` 可以简写成 `KH` / `VH`，效果相同；
+两个名字都设置且取值不同会直接报错。不设置时读 `CONFIG` 里的值（默认 `kh=2`、`vh=1`）。
+
+## 历史帧数敏感性实验
+
+扫 K 与 V 的历史帧数，看更长的历史是否值它的参数开销：
+
+```bash
+bash scripts/Self-Forcing/sweep_history.sh
+```
+
+先跑一遍小规模确认能跑通：
+
+```bash
+MAX_SAMPLES=64 MAX_FRAMES=8 LAYERS=0,15,29 \
+bash scripts/Self-Forcing/sweep_history.sh
+```
+
+每个取值报告三项：
+
+| 指标 | 含义 |
+|---|---|
+| 重建误差 | `\|\|rebuilt - clean\|\|² / \|\|clean\|\|²`，模型真正读到的 cache 的闭环误差 |
+| Attention 输出误差 | 同一份重建过 causal softmax 后的相对输出误差 |
+| 预测项占比 | `1 - \|\|clean - prediction\|\|² / \|\|clean\|\|²`，其补集就是量化器要花比特编的残差 |
+
+K 扫 `k_history_length`（1 到 8），V 在 CrossKV 项之上再扫 `v_history_length`
+（0 到 2），并额外拆出 V 预测里 CrossKV 项与 history 项各自的能量占比——两项相关，
+所以是并排报告而不是把总量切开。
+
+**每个取值都会重新拟合一次。** 非 shared 参数的历史长度在拟合时就固定了，
+拿一套参数改 N 得到的不是那个 N 的模型，所以扫描只能靠重拟合。位宽、group_size
+和 stride 由 `CONFIG` 固定，整个扫描过程中不变。
+
+报告默认写到 `results/self_forcing/history_sweep.json`。
+
+变量说明见 [scripts/common/sweep_history.sh](../common/sweep_history.sh)，三个模型
+共用同一份实现。单点分析（不扫描、直接读已有参数）用
+`scripts/tools/analyze_predictor.py`。

@@ -29,6 +29,9 @@ set -euo pipefail
 # shellcheck source=scripts/Causal-Forcing/_common.sh
 source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)/_common.sh"
 
+K_HISTORY_LENGTH="$(resolve_history K_HISTORY_LENGTH KH)"
+V_HISTORY_LENGTH="$(resolve_history V_HISTORY_LENGTH VH)"
+
 require_env CONFIG
 
 generation_mode="${GENERATION_MODE:-chunkwise}"

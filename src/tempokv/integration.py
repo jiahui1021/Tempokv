@@ -10,6 +10,56 @@ from .parameters import CrossKVParameters, TemporalParameters
 from .runtime import configure_triton_cache
 
 
+def check_parameters_match_config(
+    temporal: TemporalParameters,
+    cross_kv: CrossKVParameters,
+    config: CodecConfig,
+) -> None:
+    """Refuse parameters that were fitted for a different codec configuration.
+
+    Every fitted file is stamped with the signature of the config it was fitted
+    under, so running INT2-fitted predictors against an INT4 config — the kind
+    of mix-up an overwritten parameter directory produces — fails here instead
+    of quietly producing wrong numbers.
+
+    Hand-built parameters carry no stamp; those are left alone, since there is
+    nothing to compare against.
+    """
+    expected = (
+        config.shared_format_signature()
+        if temporal.shared_history
+        else config.format_signature()
+    )
+    for name, parameters in (("K", temporal), ("V", cross_kv)):
+        signature = parameters.codec_signature
+        if signature is not None and signature != expected:
+            raise ValueError(
+                f"{name} parameters were fitted for codec {signature!r}, but this "
+                f"run is configured as {expected!r}; refit them or point at the "
+                "parameter directory that matches this config"
+            )
+    if temporal.shared_history != cross_kv.shared_history:
+        raise ValueError("K and V parameters must use the same history sharing mode")
+    if (
+        temporal.parameter_set_id is not None
+        and cross_kv.parameter_set_id is not None
+        and temporal.parameter_set_id != cross_kv.parameter_set_id
+    ):
+        raise ValueError(
+            "K and V parameters come from different fitting runs; use the "
+            "k_temporal.npz and v_cross_kv.npz written by the same fit"
+        )
+    if (
+        temporal.coordinate_system is not None
+        and cross_kv.coordinate_system is not None
+        and temporal.coordinate_system != cross_kv.coordinate_system
+    ):
+        raise ValueError(
+            "K and V parameters use different coordinate systems: "
+            f"{temporal.coordinate_system!r} vs {cross_kv.coordinate_system!r}"
+        )
+
+
 def load_codec(
     config_path: str | Path,
     k_parameters_path: str | Path,
@@ -29,11 +79,10 @@ def load_codec(
     config = CodecConfig(**payload)
     if config.use_triton:
         configure_triton_cache(triton_cache)
-    return TempoKVCodec(
-        TemporalParameters.load(k_parameters_path),
-        CrossKVParameters.load(v_parameters_path),
-        config,
-    )
+    temporal = TemporalParameters.load(k_parameters_path)
+    cross_kv = CrossKVParameters.load(v_parameters_path)
+    check_parameters_match_config(temporal, cross_kv, config)
+    return TempoKVCodec(temporal, cross_kv, config)
 
 
 def load_codec_from_env(prefix: str = "TEMPOKV_") -> TempoKVCodec:

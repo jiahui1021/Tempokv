@@ -19,7 +19,11 @@ from .fitting import (
     fit_temporal,
     fit_temporal_layers,
 )
-from .integration import load_codec, load_codec_from_env
+from .integration import (
+    check_parameters_match_config,
+    load_codec,
+    load_codec_from_env,
+)
 from .parameters import CrossKVParameters, TemporalParameters
 from .runtime import configure_triton_cache
 
@@ -40,6 +44,7 @@ __all__ = [
     "fit_shared_temporal_layers",
     "fit_temporal",
     "fit_temporal_layers",
+    "check_parameters_match_config",
     "configure_triton_cache",
     "load_codec",
     "load_codec_from_env",

@@ -32,6 +32,17 @@ require_env() {
   done
 }
 
+# KH / VH are short aliases for K_HISTORY_LENGTH / V_HISTORY_LENGTH. Both names
+# are accepted; setting both to different values is a mistake, not a preference.
+resolve_history() {
+  local long="$1" short="$2"
+  local long_value="${!long:-}" short_value="${!short:-}"
+  if [[ -n "$long_value" && -n "$short_value" && "$long_value" != "$short_value" ]]; then
+    die "$long=$long_value 与 $short=$short_value 冲突，只设置其中一个"
+  fi
+  printf '%s\n' "${long_value:-$short_value}"
+}
+
 resolve_path() {
   case "$1" in
     /*) printf '%s\n' "$1" ;;
@@ -51,4 +62,46 @@ check_int() {
     return 0
   fi
   die "$name 必须是整数且 >= $min（当前值：$value）"
+}
+
+codec_slug() {
+  local config_path="$1" k_override="${2:-}" v_override="${3:-}"
+  "$python_bin" - "$config_path" "$k_override" "$v_override" <<'PY'
+import json
+import sys
+
+config = json.load(open(sys.argv[1], encoding="utf-8"))
+config = config.get("codec", config)
+k_bits = int(config["k_bits"])
+v_bits = int(config["v_bits"])
+shared_history = (
+    config.get("k_max_history_length") is not None
+    or config.get("v_max_history_length") is not None
+)
+if shared_history:
+    k_max = config.get("k_max_history_length")
+    if k_max is None:
+        k_max = config.get("k_history_length", 3)
+    v_max = config.get("v_max_history_length")
+    if v_max is None:
+        v_max = config.get("v_history_length", 0)
+    k_label = f"khshared{int(k_max)}"
+    v_label = f"vhshared{int(v_max)}"
+else:
+    k_history = int(sys.argv[2]) if sys.argv[2] else config.get("k_history_length")
+    if k_history is None:
+        k_history = 3
+    v_history = int(sys.argv[3]) if sys.argv[3] else config.get("v_history_length", 0)
+    if v_history is None:
+        v_history = 0
+    k_label = f"kh{int(k_history)}"
+    v_label = f"vh{int(v_history)}"
+if k_bits == v_bits:
+    precision_label = f"int{k_bits}"
+else:
+    # Keep the historical intN name for equal precision while making mixed
+    # K/V precision directories unambiguous.
+    precision_label = f"k{k_bits}-v{v_bits}"
+print(f"{k_label}-{v_label}-{precision_label}")
+PY
 }

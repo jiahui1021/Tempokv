@@ -14,8 +14,8 @@
 #   WAN_MODEL_DIR=/models/Wan2.1-T2V-1.3B \
 #   PROMPTS=assets/generation_prompts.txt \
 #   CONFIG=configs/int2.json \
-#   K_HISTORY_LENGTH=2 \
-#   V_HISTORY_LENGTH=2 \
+#   KH=2 \
+#   VH=1 \
 #   FRAMES=717 \
 #   bash scripts/Self-Forcing/generate.sh
 #
@@ -42,6 +42,9 @@ set -euo pipefail
 
 # shellcheck source=scripts/Self-Forcing/_common.sh
 source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)/_common.sh"
+
+K_HISTORY_LENGTH="$(resolve_history K_HISTORY_LENGTH KH)"
+V_HISTORY_LENGTH="$(resolve_history V_HISTORY_LENGTH VH)"
 script_dir="$self_forcing_dir"
 mode="${MODE:-tempokv}"
 

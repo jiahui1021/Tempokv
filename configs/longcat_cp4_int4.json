@@ -5,7 +5,7 @@
   "group_size": 64,
   "stride": 390,
   "k_history_length": 2,
-  "v_history_length": 2,
+  "v_history_length": 1,
   "residual_mode": "asymmetric",
   "scale_dtype": "bfloat16",
   "reconstruction_dtype": "bfloat16",

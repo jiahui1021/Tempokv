@@ -7,9 +7,11 @@ available.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 import hashlib
 import math
 from dataclasses import replace
+from typing import Iterator
 
 import torch
 
@@ -38,6 +40,26 @@ def _check_stride(stride: int | None) -> int | None:
     return None if stride is None else int(stride)
 
 
+# Scanning a production trace for non-finite values costs about as much as a
+# full pass over it, and the fitter re-validates the same tensors dozens of
+# times as it walks layers and iterations. `fit_predictors` checks once up
+# front and then suppresses the repeat scans; every public entry point still
+# performs the full check on data it has not seen.
+_ASSUME_FINITE = False
+
+
+@contextmanager
+def _assume_finite() -> Iterator[None]:
+    """Skip redundant finiteness scans on already-validated tensors."""
+    global _ASSUME_FINITE
+    previous = _ASSUME_FINITE
+    _ASSUME_FINITE = True
+    try:
+        yield
+    finally:
+        _ASSUME_FINITE = previous
+
+
 def _check_pair(
     source: torch.Tensor,
     target: torch.Tensor,
@@ -60,6 +82,8 @@ def _check_pair(
         raise ValueError(
             f"source and target must be on the same device, got {source.device} and {target.device}"
         )
+    if _ASSUME_FINITE:
+        return
     if not torch.isfinite(source).all() or not torch.isfinite(target).all():
         raise ValueError("source and target must contain only finite values")
 
@@ -1233,6 +1257,42 @@ def _fit_shared_predictors(
 
 @torch.no_grad()
 def fit_predictors(
+    keys: torch.Tensor,
+    values: torch.Tensor,
+    *,
+    config: CodecConfig | None = None,
+    history_length: int | None = None,
+    iterations: int = 2,
+    temporal_ridge: float = 0.0,
+    cross_ridge: float = 0.0,
+    max_gain: float = 1.0,
+    layer_ids: tuple[int, ...] | None = None,
+    coordinate_system: str | None = None,
+) -> tuple[TemporalParameters, CrossKVParameters]:
+    """Fit deployable K and V predictors with closed-loop K reconstruction.
+
+    The trace is scanned for non-finite values once here; everything below
+    derives from it, so the per-layer and per-iteration fits skip the repeat
+    scans, which are otherwise a sizeable share of the total runtime.
+    """
+    _check_pair(keys, values, minimum_dimensions=4, layout="[L, ..., T, H, D]")
+    with _assume_finite():
+        return _fit_predictors(
+            keys,
+            values,
+            config=config,
+            history_length=history_length,
+            iterations=iterations,
+            temporal_ridge=temporal_ridge,
+            cross_ridge=cross_ridge,
+            max_gain=max_gain,
+            layer_ids=layer_ids,
+            coordinate_system=coordinate_system,
+        )
+
+
+@torch.no_grad()
+def _fit_predictors(
     keys: torch.Tensor,
     values: torch.Tensor,
     *,

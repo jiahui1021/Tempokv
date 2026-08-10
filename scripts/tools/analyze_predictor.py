@@ -88,12 +88,19 @@ def reconstruct_v(
     k_rebuilt: torch.Tensor,
     cross: CrossKVParameters,
     config: CodecConfig,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Closed-loop V reconstruction; returns (pred, residual, rebuilt)."""
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Closed-loop V reconstruction.
+
+    Returns ``(pred, residual, rebuilt, cross_term, history_term)``.  The two
+    prediction terms are kept apart so a sweep can ask what the V history adds
+    on top of the CrossKV term alone.
+    """
     L, S, T, H, D = values.shape
     vh = cross.history_length
     pred = torch.zeros_like(values)
     resid = torch.zeros_like(values)
+    cross_term = torch.zeros_like(values)
+    history_term = torch.zeros_like(values)
     rebuilt = torch.empty_like(values)
     rebuilt[:, :, 0] = _quantization_roundtrip(
         values[:, :, 0], bits=config.anchor_bits, config=config, symmetric=True
@@ -102,15 +109,21 @@ def reconstruct_v(
     hist_weights = cross.history_weights
     bias = cross.bias.view(L, 1, H, D)
     for frame in range(1, T):
-        p = torch.einsum("lshi,lhij->lshj", k_rebuilt[:, :, frame].float(), weight)
+        c = torch.einsum("lshi,lhij->lshj", k_rebuilt[:, :, frame].float(), weight)
+        h = torch.zeros_like(c)
         order = min(frame, vh)
         for lag in range(1, order + 1):
-            p = p + torch.einsum(
-                "lshi,lhij->lshj",
-                rebuilt[:, :, frame - lag].float(),
-                hist_weights[:, lag - 1],
-            )
-        p = p + bias
+            previous = rebuilt[:, :, frame - lag].float()
+            coeff = hist_weights[:, lag - 1]
+            if cross.history_diagonal:
+                # Fitted V history is per-channel [L, P, H, D], not a full
+                # [L, P, H, D, D] matrix; this is what the codec deploys.
+                h = h + previous * coeff.unsqueeze(1)
+            else:
+                h = h + torch.einsum("lshi,lhij->lshj", previous, coeff)
+        cross_term[:, :, frame] = c
+        history_term[:, :, frame] = h
+        p = c + h + bias
         r = values[:, :, frame].float() - p
         r_rebuilt = _quantization_roundtrip(
             r,
@@ -121,7 +134,7 @@ def reconstruct_v(
         pred[:, :, frame] = p
         resid[:, :, frame] = r
         rebuilt[:, :, frame] = p + r_rebuilt
-    return pred, resid, rebuilt
+    return pred, resid, rebuilt, cross_term, history_term
 
 
 def energy_ratio(num: torch.Tensor, den: torch.Tensor) -> float:
@@ -198,7 +211,7 @@ def main() -> None:
     cross = CrossKVParameters.load(args.v_params)
 
     k_pred, k_res, k_rebuilt = reconstruct_k(keys, temporal, config)
-    v_pred, v_res, v_rebuilt = reconstruct_v(
+    v_pred, v_res, v_rebuilt, _, _ = reconstruct_v(
         keys, values, k_rebuilt, cross, config
     )
 

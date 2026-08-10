@@ -42,6 +42,9 @@ set -euo pipefail
 
 # shellcheck source=scripts/Causal-Forcing/_common.sh
 source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)/_common.sh"
+
+K_HISTORY_LENGTH="$(resolve_history K_HISTORY_LENGTH KH)"
+V_HISTORY_LENGTH="$(resolve_history V_HISTORY_LENGTH VH)"
 mode="${MODE:-tempokv}"
 
 case "$mode" in

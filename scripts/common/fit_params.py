@@ -210,8 +210,23 @@ def _load_trace(
 
 
 def _fit_device(name: str) -> torch.device:
+    """Resolve the fitting device, defaulting to the GPU.
+
+    `auto` prefers CUDA and falls back to the CPU, but says so loudly: CPU
+    fitting also runs its equations in float64 rather than float32, so an
+    unnoticed fallback is far slower than it looks, not marginally so.
+    Pass `cuda` to make an unavailable GPU an error instead of a fallback.
+    """
     if name == "auto":
-        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+        print(
+            "[fit] CUDA is unavailable; fitting on the CPU in float64, which is "
+            "much slower. Set --device cuda (FIT_DEVICE=cuda) to fail instead "
+            "of falling back.",
+            file=sys.stderr,
+        )
+        return torch.device("cpu")
     try:
         device = torch.device(name)
     except (RuntimeError, TypeError) as error:
@@ -267,6 +282,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     if trace_metadata.get("cross_source_kind") not in (None, "normalized"):
         raise ValueError("trace CrossKV source must be normalized for TempoKV")
     device = _fit_device(args.device)
+    print(f"[fit] device={device}", file=sys.stderr)
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
     fit_started = time.perf_counter()
