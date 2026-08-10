@@ -413,8 +413,32 @@ CPU 拟合同时降到 float64，比看上去慢得多；`FIT_DEVICE=cuda` 可�
 pip install -e ".[metrics]"
 
 python scripts/evaluation/evaluate_quality.py \
-  /data/reference_videos \
-  results/self_forcing/videos \
+  results/self_forcing/bf16/videos \
+  results/self_forcing/kh2-vh1-int2/videos \
   --device cuda \
-  --output results/self_forcing/quality.json
+  --output results/self_forcing/evaluation/kh2-vh1-int2/quality.json
 ```
+
+`evaluate_quality.py` 在同一次配对解码中计算 pooled RGB PSNR、平均 SSIM、
+平均 LPIPS 和 2048 维 Inception frame FID。默认使用全部帧；smoke 可以用
+`--frame-stride`、`--max-frames` 和 `--fid-batch-size` 控制工作量。这里的 FID
+以同 prompt、同 seed 的 BF16 视频为 reference，衡量量化后帧分布偏移，不是生成视频
+相对真实数据集的标准 FID，也不替代时间一致性评测。
+
+对一个候选方法一键运行 quality/FID 和 BF16、候选各自的 VBench：
+
+```bash
+BASELINE_DIR=results/self_forcing/bf16/videos \
+CANDIDATE_DIR=results/self_forcing/kh2-vh1-int2/videos \
+CANDIDATE_NAME=kh2-vh1-int2 \
+OUTPUT_DIR=results/self_forcing/evaluation \
+DEVICE=cuda \
+bash scripts/evaluation/evaluate_all.sh
+```
+
+再次评测其他方法时只需更换 `CANDIDATE_DIR` 与 `CANDIDATE_NAME`。脚本根据视频
+清单和 VBench 配置指纹复用已经完成的 BF16 VBench；输入或配置变化会自动重算，
+`FORCE=1` 可以强制重算。可选变量还有 `FRAME_STRIDE`、`MAX_FRAMES`、
+`FID_BATCH_SIZE`、`LPIPS_NETWORK`、`VBENCH_MODE`、`VBENCH_DIMENSIONS`、
+`VBENCH_FULL_INFO`、`VBENCH_LOCAL_CHECKPOINTS` 和 `VBENCH_READ_FRAME`。
+`PROMPT_FILE` 如需使用，必须是覆盖当前视频文件名的 JSON 映射。

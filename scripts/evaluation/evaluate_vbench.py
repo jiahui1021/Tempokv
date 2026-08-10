@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 import argparse
+import hashlib
 import importlib
 import json
 from pathlib import Path
@@ -72,6 +73,11 @@ def _parser() -> argparse.ArgumentParser:
         help="Validate inputs and emit configuration without importing VBench",
     )
     parser.add_argument("--config-out", type=Path, help="Write the validated JSON config")
+    parser.add_argument(
+        "--reuse-complete",
+        action="store_true",
+        help="Reuse --config-out when its completed input fingerprint still matches",
+    )
     return parser
 
 
@@ -132,6 +138,50 @@ def _safe_name(value: str) -> str:
     return value
 
 
+def _fingerprint(
+    videos: list[Path],
+    *,
+    name: str,
+    dimensions: tuple[str, ...],
+    mode: str,
+    prompts: dict[str, str],
+    full_info: Path | None,
+    device: str,
+    local_checkpoints: bool,
+    read_frame: bool,
+) -> str:
+    inventory = [
+        {
+            "name": path.name,
+            "size": path.stat().st_size,
+            "mtime_ns": path.stat().st_mtime_ns,
+        }
+        for path in videos
+    ]
+    full_info_stat = None
+    if full_info is not None:
+        stat = full_info.stat()
+        full_info_stat = {
+            "path": str(full_info),
+            "size": stat.st_size,
+            "mtime_ns": stat.st_mtime_ns,
+        }
+    payload = {
+        "videos_path": str(videos[0].parent),
+        "videos": inventory,
+        "name": name,
+        "dimensions": dimensions,
+        "mode": mode,
+        "prompts": prompts,
+        "full_info": full_info_stat,
+        "device": device,
+        "local_checkpoints": local_checkpoints,
+        "read_frame": read_frame,
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def prepare(args: argparse.Namespace) -> tuple[dict[str, Any], dict[str, str]]:
     videos_dir = args.videos.expanduser().resolve()
     output_dir = args.output_dir.expanduser().resolve()
@@ -179,6 +229,17 @@ def prepare(args: argparse.Namespace) -> tuple[dict[str, Any], dict[str, str]]:
         "device": args.device,
         "local_checkpoints": bool(args.local_checkpoints),
         "read_frame": bool(args.read_frame),
+        "input_fingerprint": _fingerprint(
+            video_paths,
+            name=name,
+            dimensions=dimensions,
+            mode=args.mode,
+            prompts=prompts,
+            full_info=full_info,
+            device=args.device,
+            local_checkpoints=bool(args.local_checkpoints),
+            read_frame=bool(args.read_frame),
+        ),
     }
     return config, prompts
 
@@ -224,17 +285,32 @@ def run(config: dict[str, Any], prompts: dict[str, str]) -> Any:
 def main(argv: list[str] | None = None) -> dict[str, Any]:
     args = _parser().parse_args(argv)
     config, prompts = prepare(args)
-    if args.config_out is not None:
-        destination = args.config_out.expanduser()
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        destination.write_text(
-            json.dumps(config, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
-        )
+    destination = args.config_out.expanduser() if args.config_out else None
+    if args.reuse_complete and destination is None:
+        raise ValueError("--reuse-complete requires --config-out")
+    if args.reuse_complete and destination is not None and destination.is_file():
+        try:
+            previous = json.loads(destination.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            previous = None
+        if (
+            isinstance(previous, dict)
+            and previous.get("status") == "complete"
+            and previous.get("input_fingerprint") == config["input_fingerprint"]
+        ):
+            previous["status"] = "reused"
+            print(json.dumps(previous, indent=2, ensure_ascii=False))
+            return previous
     if not args.dry_run:
         run(config, prompts)
         config["status"] = "complete"
     else:
         config["status"] = "dry_run"
+    if destination is not None:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text(
+            json.dumps(config, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+        )
     print(json.dumps(config, indent=2, ensure_ascii=False))
     return config
 

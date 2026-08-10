@@ -266,8 +266,28 @@ CPU 拟合会同时降到 float64，比看上去慢得多；`FIT_DEVICE=cuda` �
 pip install -e ".[metrics]"
 
 python scripts/evaluation/evaluate_quality.py \
-  /data/reference_videos \
-  results/self_forcing/videos \
+  results/self_forcing/bf16/videos \
+  results/self_forcing/kh2-vh1-int2/videos \
   --device cuda \
-  --output results/self_forcing/quality.json
+  --output results/self_forcing/evaluation/kh2-vh1-int2/quality.json
 ```
+
+该命令在一次配对解码中计算 PSNR、SSIM、LPIPS 和 2048 维 Inception frame FID。
+默认评测全部帧；`--frame-stride`、`--max-frames` 和 `--fid-batch-size` 可用于
+smoke。这里的 FID 以同 prompt、同 seed 的 BF16 视频为 reference，只表示量化前后
+的帧分布偏移，不是相对真实视频数据集的标准 FID。
+
+一键评测一个候选方法：
+
+```bash
+BASELINE_DIR=results/self_forcing/bf16/videos \
+CANDIDATE_DIR=results/self_forcing/kh2-vh1-int2/videos \
+CANDIDATE_NAME=kh2-vh1-int2 \
+OUTPUT_DIR=results/self_forcing/evaluation \
+DEVICE=cuda \
+bash scripts/evaluation/evaluate_all.sh
+```
+
+脚本先生成候选相对 BF16 的 `quality.json`，再运行 BF16 和候选的 VBench。BF16
+VBench 按视频清单与配置指纹复用；切换候选时不会重复计算，输入变化或 `FORCE=1`
+时才会重算。可选的 `PROMPT_FILE` 必须是覆盖当前视频文件名的 JSON 映射。

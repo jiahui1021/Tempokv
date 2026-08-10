@@ -6,7 +6,7 @@ scripts/
 ├── Causal-Forcing/ Causal Forcing download, trace, fit, BF16, and TempoKV commands
 ├── LongCat/        LongCat trace, fit, and generation commands
 ├── common/         shared parameter fitting command
-├── evaluation/     video quality and VBench evaluation
+├── evaluation/     paired quality/FID, VBench, and one-click evaluation
 └── tools/          generic analysis and pipeline utilities
                  (analyze_predictor.py, sweep_history_length.py)
 ```

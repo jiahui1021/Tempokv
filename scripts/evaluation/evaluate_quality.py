@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compute PSNR, SSIM, and LPIPS for matching video directories."""
+"""Compute paired frame metrics and frame FID for matching video directories."""
 
 from __future__ import annotations
 
@@ -66,11 +66,78 @@ class QualityBackend:
             return float(self.model(tensor(reference), tensor(candidate)).item())
 
 
+class FidBackend:
+    """Stream paired RGB frames into a directory-level Inception FID."""
+
+    def __init__(self, device: str = "auto", batch_size: int = 32) -> None:
+        if batch_size <= 0:
+            raise ValueError("--fid-batch-size must be a positive integer")
+        try:
+            import torch
+            from torchmetrics.image.fid import FrechetInceptionDistance
+        except ImportError as error:
+            raise RuntimeError(
+                "FID evaluation requires torchmetrics and torch-fidelity; "
+                "install TempoKV with the 'metrics' extra"
+            ) from error
+        selected = "cuda" if device == "auto" and torch.cuda.is_available() else device
+        if selected == "auto":
+            selected = "cpu"
+        if str(selected).startswith("cuda") and not torch.cuda.is_available():
+            raise RuntimeError(f"CUDA device {selected!r} is unavailable")
+        self.torch = torch
+        self.device = torch.device(selected)
+        self.batch_size = batch_size
+        self.metric = FrechetInceptionDistance(
+            feature=2048, normalize=False
+        ).to(self.device)
+        self.metric.set_dtype(torch.float64)
+        self.reference_batch: list[Any] = []
+        self.candidate_batch: list[Any] = []
+        self.batch_shape: tuple[int, ...] | None = None
+        self.frames = 0
+
+    @staticmethod
+    def _tensor(torch: Any, frame: np.ndarray) -> Any:
+        rgb = np.ascontiguousarray(frame[..., ::-1])
+        return torch.from_numpy(rgb).permute(2, 0, 1)
+
+    def add(self, reference: np.ndarray, candidate: np.ndarray) -> None:
+        shape = tuple(reference.shape)
+        if self.reference_batch and shape != self.batch_shape:
+            self.flush()
+        self.batch_shape = shape
+        self.reference_batch.append(self._tensor(self.torch, reference))
+        self.candidate_batch.append(self._tensor(self.torch, candidate))
+        self.frames += 1
+        if len(self.reference_batch) >= self.batch_size:
+            self.flush()
+
+    def flush(self) -> None:
+        if not self.reference_batch:
+            return
+        reference = self.torch.stack(self.reference_batch).to(self.device)
+        candidate = self.torch.stack(self.candidate_batch).to(self.device)
+        with self.torch.inference_mode():
+            self.metric.update(reference, real=True)
+            self.metric.update(candidate, real=False)
+        self.reference_batch.clear()
+        self.candidate_batch.clear()
+        self.batch_shape = None
+
+    def compute(self) -> float:
+        self.flush()
+        if self.frames < 2:
+            raise ValueError("FID requires at least two matched frames")
+        with self.torch.inference_mode():
+            return float(self.metric.compute().item())
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Compare videos with the same relative filename and report per-video "
-            "and pooled RGB PSNR, mean SSIM, and mean LPIPS."
+            "and pooled RGB PSNR, mean SSIM, mean LPIPS, and frame FID."
         )
     )
     parser.add_argument("reference_dir", type=Path)
@@ -90,6 +157,18 @@ def _parser() -> argparse.ArgumentParser:
         "--max-frames",
         type=int,
         help="Compare at most this many frames from each video",
+    )
+    parser.add_argument(
+        "--frame-stride",
+        type=int,
+        default=1,
+        help="Evaluate every Nth decoded frame (default: 1, all frames)",
+    )
+    parser.add_argument(
+        "--fid-batch-size",
+        type=int,
+        default=32,
+        help="Frames per Inception batch (default: 32)",
     )
     parser.add_argument("--device", default="auto", help="auto, cpu, cuda, or cuda:N")
     parser.add_argument(
@@ -159,9 +238,13 @@ def compare_video(
     max_frames: int | None = None,
     *,
     backend: QualityBackend | None = None,
+    fid_backend: FidBackend | None = None,
+    frame_stride: int = 1,
 ) -> dict[str, Any]:
     if max_frames is not None and max_frames <= 0:
         raise ValueError("--max-frames must be a positive integer")
+    if frame_stride <= 0:
+        raise ValueError("--frame-stride must be a positive integer")
     sentinel = object()
     squared_error = 0.0
     values = 0
@@ -170,23 +253,30 @@ def compare_video(
     lpips_total = 0.0
     backend = backend or QualityBackend()
     pairs = zip_longest(_iter_frames(reference), _iter_frames(candidate), fillvalue=sentinel)
+    decoded_frames = 0
     for reference_frame, candidate_frame in pairs:
         if max_frames is not None and frames >= max_frames:
             break
         if reference_frame is sentinel or candidate_frame is sentinel:
             raise ValueError(
                 f"frame count differs: {reference} and {candidate} "
-                f"(after {frames} matched frames)"
+                f"(after {decoded_frames} decoded frame pairs)"
             )
         if reference_frame.shape != candidate_frame.shape:
             raise ValueError(
-                f"frame {frames} shape differs: {reference_frame.shape} vs "
+                f"frame {decoded_frames} shape differs: {reference_frame.shape} vs "
                 f"{candidate_frame.shape} ({reference.name})"
             )
+        frame_index = decoded_frames
+        decoded_frames += 1
+        if frame_index % frame_stride != 0:
+            continue
         difference = reference_frame.astype(np.float64) - candidate_frame.astype(np.float64)
         squared_error += float(np.square(difference).sum())
         ssim_total += backend.ssim(reference_frame, candidate_frame)
         lpips_total += backend.lpips(reference_frame, candidate_frame)
+        if fid_backend is not None:
+            fid_backend.add(reference_frame, candidate_frame)
         values += int(difference.size)
         frames += 1
     if frames == 0:
@@ -210,6 +300,8 @@ def evaluate(
     extensions: tuple[str, ...] = DEFAULT_EXTENSIONS,
     allow_missing: bool = False,
     max_frames: int | None = None,
+    frame_stride: int = 1,
+    fid_batch_size: int = 32,
     device: str = "auto",
     lpips_network: str = "alex",
 ) -> dict[str, Any]:
@@ -238,13 +330,19 @@ def evaluate(
     total_ssim = 0.0
     total_lpips = 0.0
     backend = QualityBackend(device=device, network=lpips_network)
+    fid_backend = FidBackend(device=device, batch_size=fid_batch_size)
     for reference in references:
         relative = reference.relative_to(reference_dir)
         candidate = candidate_dir / relative
         if not candidate.is_file():
             continue
         metrics = compare_video(
-            reference, candidate, max_frames=max_frames, backend=backend
+            reference,
+            candidate,
+            max_frames=max_frames,
+            backend=backend,
+            fid_backend=fid_backend,
+            frame_stride=frame_stride,
         )
         total_error += metrics.pop("squared_error")
         total_values += metrics.pop("values")
@@ -256,6 +354,7 @@ def evaluate(
         raise ValueError("no matching video pairs were available to evaluate")
 
     pooled_mse = total_error / total_values
+    fid = fid_backend.compute()
     return {
         "reference_dir": str(reference_dir),
         "candidate_dir": str(candidate_dir),
@@ -267,6 +366,14 @@ def evaluate(
         "ssim": total_ssim / total_frames,
         "lpips": total_lpips / total_frames,
         "lpips_network": lpips_network,
+        "fid": fid,
+        "fid_feature": 2048,
+        "fid_reference": "bf16",
+        "fid_frames": fid_backend.frames,
+        "fid_batch_size": fid_batch_size,
+        "frame_stride": frame_stride,
+        "max_frames_per_video": max_frames,
+        "device": device,
         "per_video": results,
     }
 
@@ -279,6 +386,8 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
         extensions=_extensions(args.extensions),
         allow_missing=args.allow_missing,
         max_frames=args.max_frames,
+        frame_stride=args.frame_stride,
+        fid_batch_size=args.fid_batch_size,
         device=args.device,
         lpips_network=args.lpips_network,
     )

@@ -84,6 +84,8 @@ metrics = [
   "lpips>=0.1.4",
   "opencv-python>=4.8",
   "scikit-image>=0.22",
+  "torch-fidelity>=0.3.0",
+  "torchmetrics>=1.3",
 ]
 
 [tool.setuptools.packages.find]
