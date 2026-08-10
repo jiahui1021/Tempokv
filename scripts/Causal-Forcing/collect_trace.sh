@@ -27,7 +27,7 @@
 #   TRACE_DIR        trace 目录（默认 data/causal-forcing/trace/<模式>）
 #   TRACE_FILE       合并后的拟合输入（默认 <TRACE_DIR>/clean_trace.npz）
 #   TRACE_FRAMES     每个 prompt 生成的 latent 帧数（默认 21）
-#   TRACE_TOKENS_PER_FRAME  每帧抽取的空间位置数（默认 32）
+#   TRACE_TOKENS_PER_FRAME  每帧抽取的空间位置数（默认 8）
 #   NUM_GPUS / BASE_SEED / OVERWRITE / DRY_RUN
 #
 set -euo pipefail
@@ -64,7 +64,7 @@ if [[ "$trace_dir" == "/" ]]; then
 fi
 
 TRACE_FRAMES="${TRACE_FRAMES:-21}"
-TRACE_TOKENS_PER_FRAME="${TRACE_TOKENS_PER_FRAME:-32}"
+TRACE_TOKENS_PER_FRAME="${TRACE_TOKENS_PER_FRAME:-8}"
 NUM_GPUS="${NUM_GPUS:-1}"
 BASE_SEED="${BASE_SEED:-0}"
 OVERWRITE="${OVERWRITE:-0}"

@@ -25,7 +25,7 @@ import numpy as np
 import torch
 
 
-DEFAULT_TOKENS_PER_FRAME = 32
+DEFAULT_TOKENS_PER_FRAME = 8
 
 
 def _positive_env(name: str, default: int) -> int:

@@ -166,6 +166,15 @@ def measure(
     v_pred, v_res, v_rebuilt, v_cross, v_hist = reconstruct_v(
         keys, values, k_rebuilt, cross, config
     )
+    # Ablation reconstructions: drop one V term and run the full quantization
+    # round-trip again, so each reduced predictor also reports a closed-loop
+    # reconstruction error, not just its residual.
+    _, _, v_rebuilt_cross_only, _, _ = reconstruct_v(
+        keys, values, k_rebuilt, cross, config, use_history=False
+    )
+    _, _, v_rebuilt_history_only, _, _ = reconstruct_v(
+        keys, values, k_rebuilt, cross, config, use_cross=False
+    )
     attention_error, _ = attention_output_diff(keys, values, k_rebuilt, v_rebuilt)
 
     # Frame 0 is the anchor; it has no predictor, so prediction statistics are
@@ -186,8 +195,14 @@ def measure(
     v_without_cross = values[:, :, later] - (
         v_pred[:, :, later] - v_cross[:, :, later]
     )
+    v_without_terms = values[:, :, later] - (
+        v_pred[:, :, later] - v_cross[:, :, later] - v_hist[:, :, later]
+    )
     v_residual_cross_only = energy_ratio(v_without_history, values[:, :, later])
     v_residual_history_only = energy_ratio(v_without_cross, values[:, :, later])
+    # Pure-bias baseline with both terms dropped: what the V history and the
+    # CrossKV term each buy *from nothing*, not just on top of the other term.
+    v_residual_bias_only = energy_ratio(v_without_terms, values[:, :, later])
     return {
         "k_history_length": temporal.history_length,
         "v_history_length": cross.history_length,
@@ -221,6 +236,12 @@ def measure(
             "residual_history_only": v_residual_history_only,
             "cross_term_gain": v_residual_history_only - v_residual,
             "history_term_gain": v_residual_cross_only - v_residual,
+            # Pure-bias baseline (both terms dropped) and each term's gain from
+            # nothing. `cross_term_gain_vs_bias` is what CrossKV buys alone;
+            # `history_term_gain_vs_bias` is what V history buys alone.
+            "residual_bias_only": v_residual_bias_only,
+            "cross_term_gain_vs_bias": v_residual_bias_only - v_residual_cross_only,
+            "history_term_gain_vs_bias": v_residual_bias_only - v_residual_history_only,
         },
         "attention_output_error": attention_error,
     }
@@ -321,22 +342,28 @@ def _format_v_ablation(rows: list[dict[str, object]]) -> str:
     lines = [
         "",
         "--- V term ablation (residual energy; lower is better) ---",
-        f"{'vh':>3}  {'both':>9} {'cross only':>11} {'history only':>13} "
-        f"{'cross buys':>11} {'history buys':>13}",
+        f"{'vh':>3}  {'both':>9} {'bias':>9} {'cross only':>11} "
+        f"{'history only':>13} {'cross buys':>11} {'history buys':>13} "
+        f"{'cross from 0':>13} {'history from 0':>14}",
     ]
     for row in rows:
         v = row["v"]
         lines.append(
             f"{row['swept_value']:>3}  "
             f"{v['residual_energy_ratio']:9.5f} "
+            f"{v['residual_bias_only']:9.5f} "
             f"{v['residual_cross_only']:11.5f} "
             f"{v['residual_history_only']:13.5f} "
             f"{v['cross_term_gain']:11.5f} "
-            f"{v['history_term_gain']:13.5f}"
+            f"{v['history_term_gain']:13.5f} "
+            f"{v['cross_term_gain_vs_bias']:13.5f} "
+            f"{v['history_term_gain_vs_bias']:14.5f}"
         )
     lines.append(
-        "    'cross buys' = residual without the CrossKV term minus residual with"
-        " both; likewise for history."
+        "    'cross buys' = residual without CrossKV minus residual with both; "
+        "'history buys' likewise. 'cross from 0' = bias-only minus cross-only; "
+        "'history from 0' = bias-only minus history-only (both from the "
+        "no-prediction baseline)."
     )
     return "\n".join(lines)
 
@@ -489,6 +516,18 @@ def main(argv: list[str] | None = None) -> int:
             "history_term_gain": (
                 "residual_cross_only - residual_energy_ratio: what the V history "
                 "contributes to this fitted predictor"
+            ),
+            "residual_bias_only": (
+                "residual energy with both the V history term and the CrossKV term "
+                "removed from the fitted predictor, leaving only the bias"
+            ),
+            "cross_term_gain_vs_bias": (
+                "residual_bias_only - residual_cross_only: what the CrossKV term "
+                "buys from the no-prediction (bias-only) baseline"
+            ),
+            "history_term_gain_vs_bias": (
+                "residual_bias_only - residual_history_only: what the V history "
+                "term buys from the no-prediction (bias-only) baseline"
             ),
         },
         "k_sweep": {"baseline_v_history_length": baseline_v, "points": k_rows},

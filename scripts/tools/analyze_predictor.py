@@ -88,12 +88,18 @@ def reconstruct_v(
     k_rebuilt: torch.Tensor,
     cross: CrossKVParameters,
     config: CodecConfig,
+    use_cross: bool = True,
+    use_history: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Closed-loop V reconstruction.
 
     Returns ``(pred, residual, rebuilt, cross_term, history_term)``.  The two
     prediction terms are kept apart so a sweep can ask what the V history adds
     on top of the CrossKV term alone.
+
+    ``use_cross`` / ``use_history`` zero out the respective term so an ablation
+    can run the full quantization round-trip on a reduced predictor (e.g. V
+    history alone) and report its *reconstruction* error, not just the residual.
     """
     L, S, T, H, D = values.shape
     vh = cross.history_length
@@ -109,18 +115,22 @@ def reconstruct_v(
     hist_weights = cross.history_weights
     bias = cross.bias.view(L, 1, H, D)
     for frame in range(1, T):
-        c = torch.einsum("lshi,lhij->lshj", k_rebuilt[:, :, frame].float(), weight)
+        if use_cross:
+            c = torch.einsum("lshi,lhij->lshj", k_rebuilt[:, :, frame].float(), weight)
+        else:
+            c = torch.zeros((L, S, H, D), dtype=values.dtype, device=values.device)
         h = torch.zeros_like(c)
-        order = min(frame, vh)
-        for lag in range(1, order + 1):
-            previous = rebuilt[:, :, frame - lag].float()
-            coeff = hist_weights[:, lag - 1]
-            if cross.history_diagonal:
-                # Fitted V history is per-channel [L, P, H, D], not a full
-                # [L, P, H, D, D] matrix; this is what the codec deploys.
-                h = h + previous * coeff.unsqueeze(1)
-            else:
-                h = h + torch.einsum("lshi,lhij->lshj", previous, coeff)
+        if use_history:
+            order = min(frame, vh)
+            for lag in range(1, order + 1):
+                previous = rebuilt[:, :, frame - lag].float()
+                coeff = hist_weights[:, lag - 1]
+                if cross.history_diagonal:
+                    # Fitted V history is per-channel [L, P, H, D], not a full
+                    # [L, P, H, D, D] matrix; this is what the codec deploys.
+                    h = h + previous * coeff.unsqueeze(1)
+                else:
+                    h = h + torch.einsum("lshi,lhij->lshj", previous, coeff)
         cross_term[:, :, frame] = c
         history_term[:, :, frame] = h
         p = c + h + bias

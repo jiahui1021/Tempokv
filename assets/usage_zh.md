@@ -216,7 +216,7 @@ bash scripts/LongCat/run_bf16.sh
 
 ```bash
 bash scripts/Self-Forcing/sweep_history.sh
-bash scripts/Causal-Forcing/sweep_history.sh      # GENERATION_MODE 分开存放
+bash scripts/Causal-Forcing/sweep_history.sh      
 bash scripts/LongCat/sweep_history.sh
 ```
 
