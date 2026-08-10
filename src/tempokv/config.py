@@ -38,9 +38,9 @@ class CodecConfig:
         if (
             isinstance(self.v_history_length, bool)
             or int(self.v_history_length) != self.v_history_length
-            or int(self.v_history_length) not in (0, 1, 2)
+            or not 0 <= int(self.v_history_length) <= 5
         ):
-            raise ValueError("v_history_length must be 0, 1, or 2")
+            raise ValueError("v_history_length must be an integer from 0 to 5")
         if self.k_history_length is not None and (
             isinstance(self.k_history_length, bool)
             or int(self.k_history_length) != self.k_history_length
@@ -77,9 +77,9 @@ class CodecConfig:
         if self.v_max_history_length is not None and (
             isinstance(self.v_max_history_length, bool)
             or int(self.v_max_history_length) != self.v_max_history_length
-            or int(self.v_max_history_length) not in (0, 1, 2)
+            or not 0 <= int(self.v_max_history_length) <= 5
         ):
-            raise ValueError("v_max_history_length must be 0, 1, 2, or null")
+            raise ValueError("v_max_history_length must be an integer from 0 to 5, or null")
         if (
             self.k_history_length is not None
             and self.k_max_history_length is not None

@@ -347,10 +347,10 @@ class CrossKVParameters:
             if (
                 isinstance(maximum_history_length, bool)
                 or int(maximum_history_length) != maximum_history_length
-                or int(maximum_history_length) not in (0, 1, 2)
+                or not 0 <= int(maximum_history_length) <= 5
             ):
                 raise ValueError(
-                    "maximum_history_length must be 0, 1, or 2"
+                    "maximum_history_length must be an integer from 0 to 5"
                 )
             maximum_history_length = int(maximum_history_length)
             if tuple(history_weights.shape) != tuple(bias.shape):
@@ -416,9 +416,9 @@ class CrossKVParameters:
                     f"{expected_dense} or diagonal shape {expected_diagonal}"
                 )
             history_length = int(history_weights.shape[history_axis])
-            if history_length not in (0, 1, 2):
+            if not 0 <= history_length <= 5:
                 raise ValueError(
-                    "history_weights must contain 0, 1, or 2 V history maps"
+                    "history_weights must contain between 0 and 5 V history maps"
                 )
         if self.stride is not None and int(self.stride) <= 0:
             raise ValueError("stride must be positive")

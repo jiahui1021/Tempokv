@@ -159,7 +159,20 @@ def attention_output_diff(
     errors propagate into the output.
     """
     L, S, T, H, D = clean_keys.shape
-    flat = lambda t: t.reshape(-1, T, H, D).transpose(0, 2).reshape(L * S * H, T, D)  # noqa: E731
+
+    def flat(tensor: torch.Tensor) -> torch.Tensor:
+        """[L, S, T, H, D] -> [L*S*H, T, D], one row per (layer, sample, head).
+
+        The time axis has to stay the second one. Transposing L*S with H
+        instead of permuting would interleave different samples and layers
+        into what attention then reads as a single causal sequence.
+        """
+        return (
+            tensor.reshape(-1, T, H, D)
+            .permute(0, 2, 1, 3)
+            .reshape(L * S * H, T, D)
+        )
+
     Q = flat(clean_keys)
     Kc, Vc = flat(clean_keys), flat(clean_values)
     Kr, Vr = flat(rebuilt_keys), flat(rebuilt_values)
@@ -281,7 +294,9 @@ def main() -> None:
         args.output.write_text(rendered + "\n", encoding="utf-8")
 
     def row(label: str, vals: list[float]) -> str:
-        return f"{label:22s} mean={sum(vals)/len(vals):7.4f}  [{" ".join(f"{v:6.3f}" for v in vals[:15])}...]"
+        head = " ".join(f"{value:6.3f}" for value in vals[:15])
+        mean = sum(vals) / len(vals)
+        return f"{label:22s} mean={mean:7.4f}  [{head}...]"
 
     print(rendered)
     print("\n--- K (layers, frames>=1) ---")

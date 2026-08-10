@@ -76,11 +76,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--anchor-bits", type=int)
     parser.add_argument("--group-size", type=int)
     parser.add_argument("--stride", type=int)
-    parser.add_argument("--v-history-length", type=int, choices=(0, 1, 2))
+    parser.add_argument("--v-history-length", type=int, choices=range(0, 6))
     parser.add_argument(
         "--v-max-history-length",
         type=int,
-        choices=(0, 1, 2),
+        choices=range(0, 6),
         help="fit one shared V parameter set usable from 0 through this length",
     )
     parser.add_argument("--residual-mode", choices=("symmetric", "asymmetric"))

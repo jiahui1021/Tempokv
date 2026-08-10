@@ -69,7 +69,7 @@ from tempokv.config import CodecConfig  # noqa: E402
 from tempokv.fitting import fit_predictors  # noqa: E402
 
 K_HISTORY_CHOICES = tuple(range(1, 9))
-V_HISTORY_CHOICES = (0, 1, 2)
+V_HISTORY_CHOICES = tuple(range(0, 6))
 
 
 def _load_config(path: Path) -> CodecConfig:
@@ -174,6 +174,20 @@ def measure(
     later = slice(1, None)
     k_residual = energy_ratio(k_res[:, :, later], keys[:, :, later])
     v_residual = energy_ratio(v_res[:, :, later], values[:, :, later])
+
+    # Leave-one-out ablation of the two V prediction terms. Both are dropped
+    # from the *jointly fitted* model rather than refitted without each other,
+    # so these say what each term contributes to this predictor, not what a
+    # predictor trained without it would achieve. The terms are correlated, so
+    # the two residuals do not decompose the full one.
+    v_without_history = values[:, :, later] - (
+        v_pred[:, :, later] - v_hist[:, :, later]
+    )
+    v_without_cross = values[:, :, later] - (
+        v_pred[:, :, later] - v_cross[:, :, later]
+    )
+    v_residual_cross_only = energy_ratio(v_without_history, values[:, :, later])
+    v_residual_history_only = energy_ratio(v_without_cross, values[:, :, later])
     return {
         "k_history_length": temporal.history_length,
         "v_history_length": cross.history_length,
@@ -201,6 +215,12 @@ def measure(
             "history_term_energy_ratio": energy_ratio(
                 v_hist[:, :, later], values[:, :, later]
             ),
+            # Ablation: residual left when one term is removed from the fitted
+            # predictor. Compare against `residual_energy_ratio` (both terms).
+            "residual_cross_only": v_residual_cross_only,
+            "residual_history_only": v_residual_history_only,
+            "cross_term_gain": v_residual_history_only - v_residual,
+            "history_term_gain": v_residual_cross_only - v_residual,
         },
         "attention_output_error": attention_error,
     }
@@ -229,7 +249,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--v-history",
-        default="0,1,2",
+        default="0,1,2,3,4,5",
         help=f"V history lengths to sweep, from {V_HISTORY_CHOICES}",
     )
     parser.add_argument(
@@ -293,6 +313,31 @@ def _format_v_terms(rows: list[dict[str, object]]) -> str:
             f"{row['v']['history_term_energy_ratio']:13.5f} "
             f"{row['v']['residual_energy_ratio']:11.5f}"
         )
+    return "\n".join(lines)
+
+
+def _format_v_ablation(rows: list[dict[str, object]]) -> str:
+    """Residual left when one term is dropped from the fitted V predictor."""
+    lines = [
+        "",
+        "--- V term ablation (residual energy; lower is better) ---",
+        f"{'vh':>3}  {'both':>9} {'cross only':>11} {'history only':>13} "
+        f"{'cross buys':>11} {'history buys':>13}",
+    ]
+    for row in rows:
+        v = row["v"]
+        lines.append(
+            f"{row['swept_value']:>3}  "
+            f"{v['residual_energy_ratio']:9.5f} "
+            f"{v['residual_cross_only']:11.5f} "
+            f"{v['residual_history_only']:13.5f} "
+            f"{v['cross_term_gain']:11.5f} "
+            f"{v['history_term_gain']:13.5f}"
+        )
+    lines.append(
+        "    'cross buys' = residual without the CrossKV term minus residual with"
+        " both; likewise for history."
+    )
     return "\n".join(lines)
 
 
@@ -429,6 +474,22 @@ def main(argv: list[str] | None = None) -> int:
             "prediction_share": "1 - ||clean - prediction||^2 / ||clean||^2, frames >= 1",
             "cross_term_energy_ratio": "||W k_hat||^2 / ||V||^2, frames >= 1",
             "history_term_energy_ratio": "||sum_l W_l v_hat_l||^2 / ||V||^2, frames >= 1",
+            "residual_cross_only": (
+                "residual energy with the V history term removed from the fitted "
+                "predictor, leaving the CrossKV term and bias"
+            ),
+            "residual_history_only": (
+                "residual energy with the CrossKV term removed, leaving the V "
+                "history term and bias"
+            ),
+            "cross_term_gain": (
+                "residual_history_only - residual_energy_ratio: what the CrossKV "
+                "term contributes to this fitted predictor"
+            ),
+            "history_term_gain": (
+                "residual_cross_only - residual_energy_ratio: what the V history "
+                "contributes to this fitted predictor"
+            ),
         },
         "k_sweep": {"baseline_v_history_length": baseline_v, "points": k_rows},
         "v_sweep": {"baseline_k_history_length": baseline_k, "points": v_rows},
@@ -453,6 +514,7 @@ def main(argv: list[str] | None = None) -> int:
         )
     )
     print(_format_v_terms(v_rows))
+    print(_format_v_ablation(v_rows))
     return 0
 
 

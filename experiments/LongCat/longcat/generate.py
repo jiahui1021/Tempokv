@@ -178,6 +178,24 @@ def _runtime_arguments(
     return result
 
 
+def _require_tempokv_activity(report: dict) -> None:
+    """Fail a TempoKV run that never actually used the codec.
+
+    Without this a hook that stops firing produces a perfectly good video from
+    an untouched BF16 cache and reports it as a TempoKV result.
+    """
+    empty = [
+        name
+        for name in ("encode_key_calls", "encode_value_calls", "decode_tensor_calls")
+        if int(report.get(name) or 0) <= 0
+    ]
+    if empty:
+        raise RuntimeError(
+            "TempoKV generation did not exercise the codec: "
+            + ", ".join(f"{name}=0" for name in empty)
+        )
+
+
 def run(argv: Sequence[str] | None = None) -> int:
     run_started = time.perf_counter()
     parser = _parser()
@@ -318,6 +336,8 @@ def run(argv: Sequence[str] | None = None) -> int:
     report["gpu_memory"] = gpu_memory
     report["peak_gpu_allocated_bytes"] = gpu_memory["peak_allocated_bytes"]
     report["peak_gpu_reserved_bytes"] = gpu_memory["peak_reserved_bytes"]
+    if known.mode == "tempokv":
+        _require_tempokv_activity(report)
     report_path = (
         Path(runtime_args.output_dir).expanduser().resolve()
         / f"tempokv_bridge_report_rank_{rank:05d}.json"

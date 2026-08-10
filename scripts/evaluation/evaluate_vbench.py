@@ -10,16 +10,26 @@ import re
 from typing import Any
 
 
-DEFAULT_DIMENSIONS = (
+# VBench states that customized videos and prompts are supported for exactly
+# these dimensions.  `temporal_flickering` and `overall_consistency` are part
+# of the standard suite only: the first additionally needs VBench's static
+# filtering, and neither is defined for arbitrary input, so asking for them
+# with `--mode custom_input` yields numbers that do not mean what the name
+# suggests.  See "Evaluate Your Own Videos" in the VBench README.
+CUSTOM_INPUT_DIMENSIONS = (
     "subject_consistency",
     "background_consistency",
-    "temporal_flickering",
     "motion_smoothness",
     "dynamic_degree",
     "aesthetic_quality",
     "imaging_quality",
+)
+STANDARD_ONLY_DIMENSIONS = (
+    "temporal_flickering",
     "overall_consistency",
 )
+DEFAULT_DIMENSIONS = CUSTOM_INPUT_DIMENSIONS
+DEFAULT_STANDARD_DIMENSIONS = CUSTOM_INPUT_DIMENSIONS + STANDARD_ONLY_DIMENSIONS
 VIDEO_EXTENSIONS = (".mp4", ".gif")
 DIMENSION_NAME = re.compile(r"^[a-z][a-z0-9_]*$")
 
@@ -33,8 +43,10 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--name", help="Result name (defaults to the video directory name)")
     parser.add_argument(
         "--dimensions",
-        default=",".join(DEFAULT_DIMENSIONS),
-        help="Comma-separated VBench dimensions",
+        help=(
+            "Comma-separated VBench dimensions; defaults to the six VBench "
+            "supports for custom input, or all eight in standard mode"
+        ),
     )
     parser.add_argument(
         "--mode",
@@ -124,7 +136,23 @@ def prepare(args: argparse.Namespace) -> tuple[dict[str, Any], dict[str, str]]:
     videos_dir = args.videos.expanduser().resolve()
     output_dir = args.output_dir.expanduser().resolve()
     video_paths = _videos(videos_dir)
-    dimensions = _dimensions(args.dimensions)
+    if args.dimensions:
+        dimensions = _dimensions(args.dimensions)
+    elif args.mode == "vbench_standard":
+        dimensions = DEFAULT_STANDARD_DIMENSIONS
+    else:
+        dimensions = CUSTOM_INPUT_DIMENSIONS
+    if args.mode == "custom_input":
+        unsupported = [
+            name for name in dimensions if name in STANDARD_ONLY_DIMENSIONS
+        ]
+        if unsupported:
+            raise ValueError(
+                "VBench does not support "
+                + ", ".join(unsupported)
+                + " for custom input; drop them or run --mode vbench_standard "
+                "with --full-info"
+            )
     name = _safe_name(args.name or videos_dir.name)
     prompt_path = args.prompt_file.expanduser().resolve() if args.prompt_file else None
     prompts = _prompts(prompt_path, video_paths, args.mode)

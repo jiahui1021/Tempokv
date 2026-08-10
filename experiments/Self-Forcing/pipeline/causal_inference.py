@@ -280,6 +280,7 @@ class CausalInferencePipeline(torch.nn.Module):
 
                 # Step 3.3: rerun with timestep zero to update KV cache using clean context
                 context_timestep = torch.ones_like(timestep) * self.args.context_noise
+                self.note_clean_refresh()
                 self.generator(
                     noisy_image_or_video=denoised_pred,
                     conditional_dict=conditional_dict,
@@ -330,6 +331,15 @@ class CausalInferencePipeline(torch.nn.Module):
             return video, output
         else:
             return video
+
+    def note_clean_refresh(self) -> None:
+        """Announce that the next generator call writes clean, keepable K/V.
+
+        Trace collection used to recognise the clean pass by comparing the
+        timestep against ``context_noise``, which quietly mis-selects noisy
+        passes whenever the denoising schedule changes. The pipeline knows
+        which pass is which, so it says so.
+        """
 
     def quantize_kv_cache(
         self,

@@ -40,14 +40,14 @@ def check_parameters_match_config(
             )
     if temporal.shared_history != cross_kv.shared_history:
         raise ValueError("K and V parameters must use the same history sharing mode")
-    if (
-        temporal.parameter_set_id is not None
-        and cross_kv.parameter_set_id is not None
-        and temporal.parameter_set_id != cross_kv.parameter_set_id
-    ):
+    if temporal.parameter_set_id != cross_kv.parameter_set_id:
+        # One stamped and one unstamped file means a freshly fitted parameter
+        # was paired with a leftover from an older run. Both being unstamped is
+        # a legitimate hand-built pair and compares equal here.
         raise ValueError(
-            "K and V parameters come from different fitting runs; use the "
-            "k_temporal.npz and v_cross_kv.npz written by the same fit"
+            "K and V parameters come from different fitting runs "
+            f"({temporal.parameter_set_id!r} vs {cross_kv.parameter_set_id!r}); "
+            "use the k_temporal.npz and v_cross_kv.npz written by the same fit"
         )
     if (
         temporal.coordinate_system is not None

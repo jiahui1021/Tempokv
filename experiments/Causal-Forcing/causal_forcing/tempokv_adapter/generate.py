@@ -68,7 +68,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--k-params", type=Path)
     parser.add_argument("--v-params", type=Path)
     parser.add_argument("--k-history-length", type=int, choices=range(1, 9))
-    parser.add_argument("--v-history-length", type=int, choices=(0, 1, 2))
+    parser.add_argument("--v-history-length", type=int, choices=range(0, 6))
     parser.add_argument(
         "--model-config",
         type=Path,

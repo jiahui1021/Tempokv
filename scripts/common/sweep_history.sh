@@ -15,7 +15,7 @@
 #                   其补集就是量化器要花比特去编的残差
 #
 # K 扫 k_history_length（1 到 8），V 在 CrossKV 项之上再扫 v_history_length
-# （0 到 2），并额外拆出 V 预测里 CrossKV 项与 history 项各自的能量占比。
+# （0 到 5），并额外拆出 V 预测里 CrossKV 项与 history 项各自的能量占比。
 #
 # 每个取值都会**重新拟合一次**：非 shared 参数的历史长度是拟合时固定的，
 # 拿一套参数改 N 得到的不是那个 N 的模型。
@@ -24,7 +24,7 @@
 #   TRACE_FILE   拟合输入（默认取该模型 collect_trace.sh 的输出）
 #   CONFIG       位宽等固定设置（默认取该模型的 INT4 配置）
 #   K_HISTORY    K 扫描点（默认 1,2,3,4；上限 8）
-#   V_HISTORY    V 扫描点（默认 0,1,2）
+#   V_HISTORY    V 扫描点（默认 0,1,2,3,4,5）
 #   BASELINE_K_HISTORY / BASELINE_V_HISTORY  扫另一侧时固定的取值
 #   MAX_SAMPLES  下采样空间位置数，先跑小规模时用
 #   MAX_FRAMES   截断时间轴
@@ -84,7 +84,7 @@ config_path="$(resolve_path "${CONFIG:-$default_config}")"
 output="$(resolve_path "${OUTPUT:-$default_output}")"
 
 K_HISTORY="${K_HISTORY:-1,2,3,4}"
-V_HISTORY="${V_HISTORY:-0,1,2}"
+V_HISTORY="${V_HISTORY:-0,1,2,3,4,5}"
 ITERATIONS="${ITERATIONS:-2}"
 TEMPORAL_RIDGE="${TEMPORAL_RIDGE:-0.1}"
 CROSS_RIDGE="${CROSS_RIDGE:-0.1}"

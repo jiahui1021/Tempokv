@@ -117,7 +117,7 @@ if [[ -n "${K_HISTORY_LENGTH:-}" ]]; then
 fi
 if [[ -n "${V_HISTORY_LENGTH:-}" ]]; then
   check_int V_HISTORY_LENGTH 0
-  (( V_HISTORY_LENGTH <= 2 )) || die "V_HISTORY_LENGTH 必须 <= 2（当前值：$V_HISTORY_LENGTH）"
+  (( V_HISTORY_LENGTH <= 5 )) || die "V_HISTORY_LENGTH 必须 <= 5（当前值：$V_HISTORY_LENGTH）"
 fi
 if [[ -n "${SPAN_FRAMES:-}" ]]; then
   check_int SPAN_FRAMES 2

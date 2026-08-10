@@ -262,9 +262,9 @@ def fit_cross_kv(
     if (
         isinstance(history_length, bool)
         or int(history_length) != history_length
-        or int(history_length) not in (0, 1, 2)
+        or not 0 <= int(history_length) <= 5
     ):
-        raise ValueError("history_length must be 0, 1, or 2")
+        raise ValueError("history_length must be an integer from 0 to 5")
     history_length = int(history_length)
     if history_mode not in ("dense", "diagonal"):
         raise ValueError("history_mode must be 'dense' or 'diagonal'")
@@ -665,9 +665,9 @@ def fit_shared_cross_kv(
     if (
         isinstance(maximum_v_history_length, bool)
         or int(maximum_v_history_length) != maximum_v_history_length
-        or int(maximum_v_history_length) not in (0, 1, 2)
+        or not 0 <= int(maximum_v_history_length) <= 5
     ):
-        raise ValueError("maximum_v_history_length must be 0, 1, or 2")
+        raise ValueError("maximum_v_history_length must be an integer from 0 to 5")
     maximum_v_history_length = int(maximum_v_history_length)
     if not reconstructed_keys:
         raise ValueError("reconstructed_keys must not be empty")

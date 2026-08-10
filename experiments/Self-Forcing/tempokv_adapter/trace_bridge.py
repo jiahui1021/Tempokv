@@ -150,6 +150,7 @@ def install(runtime_root: str | Path) -> type:
 
             output_root.mkdir(parents=True, exist_ok=True)
             self._trace_enabled = False
+            self._clean_refresh_announced = False
             self._trace_start = 0
             self._trace_event_index = 0
             self._trace_layers: dict[int, dict[str, np.ndarray]] = {}
@@ -178,6 +179,9 @@ def install(runtime_root: str | Path) -> type:
                     self._trace_projection_hook(layer_index, "v")
                 )
 
+        def note_clean_refresh(self) -> None:
+            self._clean_refresh_announced = True
+
         def inference(self, *args: Any, **kwargs: Any) -> Any:
             self._reset_trace_sequence()
             try:
@@ -194,17 +198,14 @@ def install(runtime_root: str | Path) -> type:
             args: tuple[Any, ...],
             kwargs: dict[str, Any],
         ) -> None:
-            del module
-            timestep = _argument(args, kwargs, "timestep", 2)
+            del module, kwargs
             kv_cache = _argument(args, kwargs, "kv_cache", 3)
             current_start = _argument(args, kwargs, "current_start", 5)
-            context_noise = int(getattr(self.args, "context_noise", 0))
-            is_clean = (
-                isinstance(timestep, torch.Tensor)
-                and timestep.numel() > 0
-                and bool(torch.all(timestep == context_noise).item())
-            )
-            self._trace_enabled = kv_cache is not None and is_clean
+            # The pipeline announced this pass with `note_clean_refresh`; the
+            # timestep is not consulted, so a changed denoising schedule cannot
+            # cause noisy K/V to be traced as if it were clean.
+            self._trace_enabled = kv_cache is not None and self._clean_refresh_announced
+            self._clean_refresh_announced = False
             self._trace_layers = {}
             self._trace_token_indices = None
             if self._trace_enabled:
@@ -361,6 +362,7 @@ def install(runtime_root: str | Path) -> type:
                 raise
 
         def _reset_trace_sequence(self) -> None:
+            self._clean_refresh_announced = False
             self._trace_sequence_layers = {}
             self._trace_sequence_token_indices = None
             self._trace_sequence_start = None

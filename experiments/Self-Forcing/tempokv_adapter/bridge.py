@@ -196,21 +196,30 @@ def install(runtime_root: str | Path) -> type:
             self._record_kv_cache_memory()
 
         def _record_kv_cache_memory(self) -> None:
-            """Aggregate stored K/V bytes across every layer's quantized spans.
+            """Aggregate resident K/V bytes across every layer.
 
             Fills ``self.summary["last_kv_cache_memory"]`` (consumed by the
             Self-Forcing runtime as ``summary.json -> memory.kv_cache``) with a
             per-layer breakdown, totals, and the achieved compression rate
             versus the equivalent BF16 cache.  Predictor parameters are shared
             across spans and already excluded from ``storage_bytes``.
+
+            Frames that have not been packed yet are still dense on the device,
+            so they are counted separately rather than omitted: a peak-memory
+            figure built only from packed spans understates what the run
+            actually needed.  ``compression_rate`` deliberately compares only
+            the packed part against its own BF16 equivalent, so it stays a
+            property of one cache state.
             """
             per_layer: dict[str, dict[str, object]] = {}
             total_kv_bytes = 0
             total_bf16_bytes = 0
+            resident_bf16_bytes = 0
             bf16_per_value = 2  # bytes for a bfloat16 element
 
             for layer_index, layer in enumerate(self.kv_cache1):
                 k_bytes = v_bytes = 0
+                layer_dense_bytes = 0
                 for cache, name in ((layer["k"], "k"), (layer["v"], "v")):
                     bytes_per_cache = 0
                     for span in cache.quantized_spans:
@@ -222,15 +231,18 @@ def install(runtime_root: str | Path) -> type:
                             int(torch.tensor(packed.shape).prod().item())
                             * bf16_per_value
                         )
+                    layer_dense_bytes += cache.bf16_resident_bytes()
                     if name == "k":
                         k_bytes = bytes_per_cache
                     else:
                         v_bytes = bytes_per_cache
                 total_kv_bytes += k_bytes + v_bytes
+                resident_bf16_bytes += layer_dense_bytes
                 per_layer[str(layer_index)] = {
                     "k_bytes": k_bytes,
                     "v_bytes": v_bytes,
                     "kv_bytes": k_bytes + v_bytes,
+                    "resident_bf16_bytes": layer_dense_bytes,
                 }
 
             self.summary["last_kv_cache_memory"] = {
@@ -238,6 +250,8 @@ def install(runtime_root: str | Path) -> type:
                 "per_layer_kv_bytes": per_layer,
                 "total_kv_cache_bytes": total_kv_bytes,
                 "total_bf16_kv_bytes": total_bf16_bytes,
+                "resident_bf16_bytes": resident_bf16_bytes,
+                "resident_total_bytes": total_kv_bytes + resident_bf16_bytes,
                 "compression_rate": (
                     total_bf16_bytes / total_kv_bytes if total_kv_bytes else None
                 ),

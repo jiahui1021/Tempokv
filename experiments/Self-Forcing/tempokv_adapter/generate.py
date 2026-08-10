@@ -66,7 +66,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--v-history-length",
         type=int,
-        choices=(0, 1, 2),
+        choices=range(0, 6),
         help="number of reconstructed V frames used by the predictor",
     )
     parser.add_argument("--model-config", type=Path)

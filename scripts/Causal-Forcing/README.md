@@ -143,8 +143,21 @@ bash scripts/Causal-Forcing/sweep_history.sh    # 全量
 ```
 
 K 扫 `k_history_length`（1 到 8），V 在 CrossKV 项之上再扫 `v_history_length`
-（0 到 2），并额外拆出 V 预测里 CrossKV 项与 history 项各自的能量占比——两项相关，
+（0 到 5），并额外拆出 V 预测里 CrossKV 项与 history 项各自的能量占比——两项相关，
 所以并排报告而不是把总量切开。
+
+每个 vh 取值还会做一次 **CrossKV 项的留一消融**：把 V 预测里的 CrossKV 项或
+history 项从**已拟合好的**模型里去掉，看残差各涨多少。
+
+```text
+vh       both  cross only  history only  cross buys  history buys
+ 0    0.01493     0.01493       0.99618     0.98125       0.00000
+ 1    0.00489     0.48567       0.12061     0.11573       0.48078
+```
+
+`cross buys` = 去掉 CrossKV 项后的残差减去两项都在时的残差，`history buys` 同理。
+这是**留一消融**而不是"不带该项重新拟合"，所以说的是该项在这个预测器里贡献了多少，
+不是"不用它训出来的模型能做到多好"。两项相关，所以两个残差不构成对总残差的分解。
 
 **每个取值都会重新拟合一次。** 非 shared 参数的历史长度在拟合时就固定了，拿一套
 参数改 N 得到的不是那个 N 的模型。位宽、group_size 和 stride 由 `CONFIG` 固定。
