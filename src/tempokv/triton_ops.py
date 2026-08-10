@@ -27,8 +27,15 @@ def _record(route: str) -> None:
     _ROUTE_COUNTS[route] = _ROUTE_COUNTS.get(route, 0) + 1
 
 
-def _route_name(route: str, direct_output: bool) -> str:
-    return f"{route}_direct" if direct_output else route
+def _route_name(route: str, direct_output_layout: str | None) -> str:
+    if direct_output_layout is None:
+        return route
+    # Preserve the established BSHD route name used by the Self-Forcing
+    # benchmark contract.  BHSD is named explicitly so reports still
+    # distinguish the two direct-output layouts.
+    if direct_output_layout == "BSHD":
+        return f"{route}_direct"
+    return f"{route}_direct_bhsd"
 
 
 @triton.jit
@@ -1027,30 +1034,54 @@ def _prepare_output(
     packed: "PackedTensor",
     output_dtype: torch.dtype,
     output_tensor: torch.Tensor | None,
-) -> tuple[torch.Tensor, bool] | None:
+    output_layout: str,
+) -> tuple[torch.Tensor, str | None] | None:
     batch, heads, sequence, width = packed.shape
     device = packed.anchor_quant.device
+    if output_layout not in {"BHSD", "BSHD"}:
+        return None
     if output_tensor is None:
         return (
             torch.empty(packed.shape, device=device, dtype=output_dtype),
-            False,
+            None,
         )
+    expected_shape = (
+        (batch, heads, sequence, width)
+        if output_layout == "BHSD"
+        else (batch, sequence, heads, width)
+    )
+    dimensions = sorted(
+        (stride, size)
+        for size, stride in zip(output_tensor.shape, output_tensor.stride())
+        if size > 1
+    )
+    covered_span = 1
+    safe_strides = all(stride > 0 for stride in output_tensor.stride())
+    for stride, size in dimensions:
+        if stride < covered_span:
+            safe_strides = False
+            break
+        covered_span += (size - 1) * stride
     if (
         not output_tensor.is_cuda
         or output_tensor.device != device
         or output_tensor.dtype != output_dtype
-        or tuple(output_tensor.shape) != (batch, sequence, heads, width)
-        or not output_tensor.is_contiguous()
+        or tuple(output_tensor.shape) != expected_shape
+        or not safe_strides
     ):
         return None
-    return output_tensor, True
+    return output_tensor, output_layout
 
 
 def _logical_bhsd_output(
     output: torch.Tensor,
-    output_bshd: bool,
+    direct_output_layout: str | None,
 ) -> torch.Tensor:
-    return output.permute(0, 2, 1, 3) if output_bshd else output
+    return (
+        output.permute(0, 2, 1, 3)
+        if direct_output_layout == "BSHD"
+        else output
+    )
 
 
 def decode(
@@ -1059,6 +1090,7 @@ def decode(
     source: torch.Tensor | None,
     output_dtype: torch.dtype,
     output_tensor: torch.Tensor | None = None,
+    output_layout: str = "BSHD",
 ) -> torch.Tensor | None:
     """Fused GPU prediction and residual decode for TempoKV's two runtime routes."""
     if not _supported(packed, source):
@@ -1068,11 +1100,13 @@ def decode(
     block_s = 16
     block_d = max(16, min(128, triton.next_power_of_2(width)))
     scale_width = width // packed.group_size
-    prepared_output = _prepare_output(packed, output_dtype, output_tensor)
+    prepared_output = _prepare_output(
+        packed, output_dtype, output_tensor, output_layout
+    )
     if prepared_output is None:
         return None
-    output, output_bshd = prepared_output
-    if output_bshd:
+    output, direct_output_layout = prepared_output
+    if direct_output_layout == "BSHD":
         output_stride_b, output_stride_s, output_stride_h, output_stride_d = (
             output.stride()
         )
@@ -1107,8 +1141,8 @@ def decode(
         block_d,
     )
     if packed.residual_quant is None:
-        _record(_route_name("anchor", output_bshd))
-        return _logical_bhsd_output(output, output_bshd)
+        _record(_route_name("anchor", direct_output_layout))
+        return _logical_bhsd_output(output, direct_output_layout)
     assert packed.residual_scale is not None
     residual_sequence = int(packed.residual_quant.shape[2])
     residual_packed_width = width if packed.bits == 8 else width // (8 // packed.bits)
@@ -1182,8 +1216,8 @@ def decode(
                     block_s,
                     block_d,
                 )
-            _record(_route_name("temporal_persistent", output_bshd))
-            return _logical_bhsd_output(output, output_bshd)
+            _record(_route_name("temporal_persistent", direct_output_layout))
+            return _logical_bhsd_output(output, direct_output_layout)
         for unit_index, unit_length in enumerate(packed.unit_lengths[1:], start=1):
             order = min(unit_index, parameters.history_length)
             if parameters.shared_history:
@@ -1229,8 +1263,8 @@ def decode(
             )
             current_start += unit_length
             residual_start += unit_length
-        _record(_route_name("temporal", output_bshd))
-        return _logical_bhsd_output(output, output_bshd)
+        _record(_route_name("temporal", direct_output_layout))
+        return _logical_bhsd_output(output, direct_output_layout)
 
     assert source is not None and packed.cross_kv is not None
     parameters = packed.cross_kv.to(output.device)
@@ -1353,8 +1387,8 @@ def decode(
                     cross_block_d,
                     block_k,
                 )
-        _record(_route_name("cross_kv_persistent", output_bshd))
-        return _logical_bhsd_output(output, output_bshd)
+        _record(_route_name("cross_kv_persistent", direct_output_layout))
+        return _logical_bhsd_output(output, direct_output_layout)
     for unit_index, unit_length in enumerate(packed.unit_lengths[1:], start=1):
         history_order = min(unit_index, parameters.history_length)
         grid = (
@@ -1402,5 +1436,5 @@ def decode(
         )
         current_start += unit_length
         residual_start += unit_length
-    _record(_route_name("cross_kv", output_bshd))
-    return _logical_bhsd_output(output, output_bshd)
+    _record(_route_name("cross_kv", direct_output_layout))
+    return _logical_bhsd_output(output, direct_output_layout)

@@ -41,6 +41,7 @@ def decode_cache_state(
     *,
     source_tensor: torch.Tensor | None = None,
     output_tensor: torch.Tensor | None = None,
+    output_layout: str = "BSHD",
     codec: TempoKVCodec,
     fallback: Callable[..., torch.Tensor] | None = None,
 ) -> torch.Tensor:
@@ -49,16 +50,22 @@ def decode_cache_state(
     if packed is None:
         if fallback is None:
             raise TypeError(f"unsupported cache state: {type(state).__name__}")
-        return fallback(
-            state, source_tensor=source_tensor, output_tensor=output_tensor
-        )
-    return decode_tensor(
-        packed,
-        source=source_tensor,
-        output_tensor=output_tensor,
-        use_triton=codec.config.use_triton,
-        strict_triton=codec.config.strict_triton,
-    )
+        fallback_kwargs = {
+            "source_tensor": source_tensor,
+            "output_tensor": output_tensor,
+        }
+        if output_layout != "BSHD":
+            fallback_kwargs["output_layout"] = output_layout
+        return fallback(state, **fallback_kwargs)
+    decode_kwargs = {
+        "source": source_tensor,
+        "output_tensor": output_tensor,
+        "use_triton": codec.config.use_triton,
+        "strict_triton": codec.config.strict_triton,
+    }
+    if output_layout != "BSHD":
+        decode_kwargs["output_layout"] = output_layout
+    return decode_tensor(packed, **decode_kwargs)
 
 
 def install(runtime_root: str | Path) -> type:
@@ -106,11 +113,13 @@ def install(runtime_root: str | Path) -> type:
                 state: Any,
                 source_tensor: torch.Tensor | None = None,
                 output_tensor: torch.Tensor | None = None,
+                output_layout: str = "BSHD",
             ) -> torch.Tensor:
                 return decode_cache_state(
                     state,
                     source_tensor=source_tensor,
                     output_tensor=output_tensor,
+                    output_layout=output_layout,
                     codec=self.tempokv_codec,
                     fallback=fallback_decode,
                 )

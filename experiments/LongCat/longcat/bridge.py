@@ -34,6 +34,11 @@ _RECONSTRUCTION_ELEMENT_SIZE = {
     "float16": 2,
     "bfloat16": 2,
 }
+_RECONSTRUCTION_DTYPE = {
+    "float32": torch.float32,
+    "float16": torch.float16,
+    "bfloat16": torch.bfloat16,
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -100,11 +105,6 @@ def _move_tensor(value: torch.Tensor | None, device: torch.device) -> torch.Tens
     return None if value is None else value.to(device)
 
 
-def _synchronize(device: torch.device) -> None:
-    if device.type == "cuda":
-        torch.cuda.synchronize(device)
-
-
 def move_packed_tensor(packed: PackedState, device: torch.device | str) -> PackedState:
     """Move PackedTensor storage while retaining shared predictor parameters.
 
@@ -160,6 +160,9 @@ def decode_kv_cache(
     k_cache: Any,
     v_cache: Any,
     codec: TempoKVCodec,
+    *,
+    key_output: torch.Tensor | None = None,
+    value_output: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Decode LongCat K/V in the required K-first closed-loop order."""
     k_is_packed = isinstance(k_cache, (PackedTensor, PackedTensorSpanSet))
@@ -169,6 +172,12 @@ def decode_kv_cache(
     if not k_is_packed:
         if not isinstance(k_cache, torch.Tensor) or not isinstance(v_cache, torch.Tensor):
             raise TypeError("uncompressed LongCat cache entries must be tensors")
+        if key_output is not None:
+            key_output.copy_(k_cache)
+            k_cache = key_output
+        if value_output is not None:
+            value_output.copy_(v_cache)
+            v_cache = value_output
         return k_cache, v_cache
     if k_cache.predictor_kind != "temporal":
         raise ValueError("LongCat K cache must use temporal TempoKV prediction")
@@ -179,35 +188,98 @@ def decode_kv_cache(
     if isinstance(k_cache, PackedTensorSpanSet):
         if len(k_cache.spans) != len(v_cache.spans):
             raise ValueError("LongCat K and V must contain the same number of spans")
-        key_parts = []
-        value_parts = []
+        if k_cache.shape != v_cache.shape:
+            raise ValueError("LongCat K and V span sets must have matching shapes")
+        output_dtype = _RECONSTRUCTION_DTYPE[
+            k_cache.spans[0].reconstruction_dtype
+        ]
+        device = k_cache.spans[0].anchor_quant.device
+        key = _prepare_decode_output(
+            key_output,
+            shape=k_cache.shape,
+            dtype=output_dtype,
+            device=device,
+            name="key_output",
+        )
+        value = _prepare_decode_output(
+            value_output,
+            shape=v_cache.shape,
+            dtype=output_dtype,
+            device=device,
+            name="value_output",
+        )
+        start = 0
         for packed_key, packed_value in zip(k_cache.spans, v_cache.spans):
+            end = start + int(packed_key.shape[2])
+            key_target = key[:, :, start:end, :]
+            value_target = value[:, :, start:end, :]
             key_part = decode_tensor(
                 packed_key,
+                output_tensor=key_target,
+                output_layout="BHSD",
                 use_triton=codec.config.use_triton,
                 strict_triton=codec.config.strict_triton,
             )
-            value_part = decode_tensor(
+            decode_tensor(
                 packed_value,
                 source=key_part,
+                output_tensor=value_target,
+                output_layout="BHSD",
                 use_triton=codec.config.use_triton,
                 strict_triton=codec.config.strict_triton,
             )
-            key_parts.append(key_part)
-            value_parts.append(value_part)
-        return torch.cat(key_parts, dim=2), torch.cat(value_parts, dim=2)
-    key = decode_tensor(
+            start = end
+        return key, value
+    output_dtype = _RECONSTRUCTION_DTYPE[k_cache.reconstruction_dtype]
+    key = _prepare_decode_output(
+        key_output,
+        shape=k_cache.shape,
+        dtype=output_dtype,
+        device=k_cache.anchor_quant.device,
+        name="key_output",
+    )
+    value = _prepare_decode_output(
+        value_output,
+        shape=v_cache.shape,
+        dtype=output_dtype,
+        device=v_cache.anchor_quant.device,
+        name="value_output",
+    )
+    decoded_key = decode_tensor(
         k_cache,
+        output_tensor=key,
+        output_layout="BHSD",
         use_triton=codec.config.use_triton,
         strict_triton=codec.config.strict_triton,
     )
-    value = decode_tensor(
+    decode_tensor(
         v_cache,
-        source=key,
+        source=decoded_key,
+        output_tensor=value,
+        output_layout="BHSD",
         use_triton=codec.config.use_triton,
         strict_triton=codec.config.strict_triton,
     )
     return key, value
+
+
+def _prepare_decode_output(
+    output: torch.Tensor | None,
+    *,
+    shape: tuple[int, int, int, int],
+    dtype: torch.dtype,
+    device: torch.device,
+    name: str,
+) -> torch.Tensor:
+    if output is None:
+        return torch.empty(shape, dtype=dtype, device=device)
+    if tuple(output.shape) != tuple(shape):
+        raise ValueError(f"LongCat {name} must have shape {shape}, got {tuple(output.shape)}")
+    if output.dtype != dtype:
+        raise ValueError(f"LongCat {name} must use {dtype}, got {output.dtype}")
+    if output.device != device:
+        raise ValueError(f"LongCat {name} must be on {device}, got {output.device}")
+    return output
 
 
 def _layer_pair(
@@ -307,6 +379,7 @@ def encode_kv_cache(
     spec: LongCatRuntimeSpec | None = None,
     encode_device: torch.device | str | None = None,
     storage_device: torch.device | str | None = None,
+    profile: bool = False,
 ) -> tuple[dict[int, tuple[PackedState, PackedState]], dict[str, object]]:
     """Encode all clean LongCat layers with K-first closed-loop semantics."""
     layout = validate_cache_layout(
@@ -315,7 +388,6 @@ def encode_kv_cache(
         codec=codec,
         spec=spec,
     )
-    first_key, _ = _layer_pair(kv_cache_dict, 0)
     uncompressed_cache_bytes = sum(
         int(key.numel() * key.element_size() + value.numel() * value.element_size())
         for layer_id in sorted(kv_cache_dict)
@@ -323,9 +395,7 @@ def encode_kv_cache(
     )
     encoded: dict[int, tuple[PackedState, PackedState]] = {}
     target_device = None if encode_device is None else torch.device(encode_device)
-    timing_device = target_device or first_key.device
-    _synchronize(timing_device)
-    started = time.perf_counter()
+    started = time.perf_counter() if profile else None
     with torch.no_grad():
         for layer_id in sorted(kv_cache_dict):
             key, value = _layer_pair(kv_cache_dict, int(layer_id))
@@ -350,7 +420,6 @@ def encode_kv_cache(
                 packed_value = move_packed_tensor(packed_value, storage_device)
             encoded[int(layer_id)] = (packed_key, packed_value)
             del key, value, reconstructed_key
-    _synchronize(timing_device)
     storage_bytes = sum(
         packed.storage_bytes()
         for pair in encoded.values()
@@ -386,7 +455,11 @@ def encode_kv_cache(
             else None
         ),
         "temporary_reconstruction_bytes": temporary_reconstruction_bytes,
-        "duration_ms": (time.perf_counter() - started) * 1000.0,
+        "enqueue_duration_ms": (
+            (time.perf_counter() - started) * 1000.0
+            if started is not None
+            else None
+        ),
     }
 
 
@@ -398,6 +471,7 @@ def encode_kv_cache_spans(
     spec: LongCatRuntimeSpec | None = None,
     encode_device: torch.device | str | None = None,
     storage_device: torch.device | str | None = None,
+    profile: bool = False,
 ) -> tuple[dict[int, tuple[PackedTensorSpanSet, PackedTensorSpanSet]], dict[str, object]]:
     """Encode independent temporal spans and concatenate them for attention."""
     units = tuple(int(item) for item in span_temporal_units)
@@ -439,6 +513,7 @@ def encode_kv_cache_spans(
             spec=spec,
             encode_device=encode_device,
             storage_device=storage_device,
+            profile=profile,
         )
         reports.append(report)
         for layer, (packed_key, packed_value) in encoded.items():
@@ -505,7 +580,11 @@ def encode_kv_cache_spans(
         "temporary_reconstruction_bytes": max(
             int(report["temporary_reconstruction_bytes"]) for report in reports
         ),
-        "duration_ms": sum(float(report["duration_ms"]) for report in reports),
+        "enqueue_duration_ms": (
+            sum(float(report["enqueue_duration_ms"]) for report in reports)
+            if profile
+            else None
+        ),
     }
 
 
@@ -548,12 +627,17 @@ class LongCatTempoKVBridge:
     context_parallel_rank: int = 0
     attention_sink_frames: int = 0
     auto_context_parallel_stride: bool = True
+    profile_encode: bool = False
+    profile_decode: bool = False
     trace_collector: LongCatTraceCollector | None = field(init=False, default=None)
     local_trace_spatial_positions: int = field(init=False, default=0)
     _installed: bool = field(init=False, default=False)
     trace_events: list[dict[str, object]] = field(init=False, default_factory=list)
     quantization_events: list[dict[str, object]] = field(init=False, default_factory=list)
     decode_events: list[dict[str, object]] = field(init=False, default_factory=list)
+    decode_calls: int = field(init=False, default=0)
+    decode_tensor_calls: int = field(init=False, default=0)
+    decoded_sequence_tokens: int = field(init=False, default=0)
 
     def __post_init__(self) -> None:
         if self.mode not in {"tempokv", "bf16", "trace"}:
@@ -715,6 +799,28 @@ class LongCatTempoKVBridge:
             setattr(block.attn, "_tempokv_bridge", self)
         if pipeline is not None:
             setattr(pipeline, "_tempokv_bridge", self)
+            self._patch_vae_decode(pipeline)
+
+    @staticmethod
+    def _patch_vae_decode(pipeline: Any) -> None:
+        """Drop the shared RoPE table immediately before VAE allocation peaks."""
+        vae = getattr(pipeline, "vae", None)
+        if vae is None or getattr(vae, "_tempokv_rope_release_patch", False):
+            return
+        original_decode = getattr(vae, "decode", None)
+        if not callable(original_decode):
+            return
+
+        def decode(*args: Any, **kwargs: Any) -> Any:
+            from longcat_video.modules.rope_3d import (
+                clear_shared_rope_device_cache,
+            )
+
+            clear_shared_rope_device_cache()
+            return original_decode(*args, **kwargs)
+
+        setattr(vae, "decode", decode)
+        setattr(vae, "_tempokv_rope_release_patch", True)
 
     def on_clean_cache(self, pipeline: Any, cond_latents: torch.Tensor) -> None:
         if cond_latents.ndim < 3:
@@ -813,6 +919,7 @@ class LongCatTempoKVBridge:
                 spec=self.spec,
                 encode_device=encode_device,
                 storage_device=storage_device,
+                profile=self.profile_encode,
             )
         else:
             encoded, report = encode_kv_cache(
@@ -822,6 +929,7 @@ class LongCatTempoKVBridge:
                 spec=self.spec,
                 encode_device=encode_device,
                 storage_device=storage_device,
+                profile=self.profile_encode,
             )
         events = getattr(dit, "_tempokv_quantization_events", None)
         if events is None:
@@ -835,20 +943,28 @@ class LongCatTempoKVBridge:
             return kv_cache_dict
         return encoded
 
-    def decode(self, k_cache: Any, v_cache: Any) -> tuple[torch.Tensor, torch.Tensor]:
+    def decode(
+        self,
+        k_cache: Any,
+        v_cache: Any,
+        *,
+        key_output: torch.Tensor | None = None,
+        value_output: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         if self.codec is None:
             raise RuntimeError("TempoKV codec is not loaded")
-        timing_device = None
-        if isinstance(k_cache, PackedTensor):
-            timing_device = k_cache.anchor_quant.device
-        elif isinstance(k_cache, PackedTensorSpanSet):
-            timing_device = k_cache.spans[0].anchor_quant.device
-        if timing_device is not None:
-            _synchronize(timing_device)
-        started = time.perf_counter()
-        result = decode_kv_cache(k_cache, v_cache, self.codec)
-        if timing_device is not None:
-            _synchronize(timing_device)
+        # Synchronizing around every layer decode serializes the entire GPU
+        # pipeline.  Production runs keep aggregate counters only.  Optional
+        # profiling measures host enqueue time and deliberately never waits for
+        # CUDA work to finish.
+        started = time.perf_counter() if self.profile_decode else None
+        result = decode_kv_cache(
+            k_cache,
+            v_cache,
+            self.codec,
+            key_output=key_output,
+            value_output=value_output,
+        )
         span_count = (
             len(k_cache.spans) if isinstance(k_cache, PackedTensorSpanSet) else 1
         )
@@ -857,14 +973,19 @@ class LongCatTempoKVBridge:
             if isinstance(k_cache, (PackedTensor, PackedTensorSpanSet))
             else 0
         )
-        self.decode_events.append(
-            {
-                "spans": span_count,
-                "decode_tensor_calls": decode_tensor_calls,
-                "sequence": int(result[0].shape[2]),
-                "duration_ms": (time.perf_counter() - started) * 1000.0,
-            }
-        )
+        sequence = int(result[0].shape[2])
+        self.decode_calls += 1
+        self.decode_tensor_calls += decode_tensor_calls
+        self.decoded_sequence_tokens += sequence
+        if started is not None:
+            self.decode_events.append(
+                {
+                    "spans": span_count,
+                    "decode_tensor_calls": decode_tensor_calls,
+                    "sequence": sequence,
+                    "enqueue_duration_ms": (time.perf_counter() - started) * 1000.0,
+                }
+            )
         return result
 
     def report(self) -> dict[str, object]:
@@ -907,9 +1028,14 @@ class LongCatTempoKVBridge:
             int(event.get("encode_value_calls", 0))
             for event in self.quantization_events
         )
-        decode_tensor_calls = sum(
-            int(event.get("decode_tensor_calls", 0)) for event in self.decode_events
-        )
+        decode_routes: dict[str, int] = {}
+        try:
+            from tempokv.triton_ops import route_report
+        except ImportError:
+            # Triton is optional for CPU-only development and tests.
+            pass
+        else:
+            decode_routes = route_report()
         temporary_reconstruction_bytes = max(
             (
                 int(event.get("temporary_reconstruction_bytes", 0))
@@ -941,6 +1067,8 @@ class LongCatTempoKVBridge:
             "context_parallel_size": self.context_parallel_size,
             "context_parallel_rank": self.context_parallel_rank,
             "attention_sink_frames": self.attention_sink_frames,
+            "profile_encode": self.profile_encode,
+            "profile_decode": self.profile_decode,
             "num_layers": self.spec.num_layers,
             "num_heads": self.spec.num_heads,
             "head_dim": self.spec.head_dim,
@@ -954,7 +1082,10 @@ class LongCatTempoKVBridge:
             "predictor_parameter_bytes": predictor_parameter_bytes,
             "encode_key_calls": encode_key_calls,
             "encode_value_calls": encode_value_calls,
-            "decode_tensor_calls": decode_tensor_calls,
+            "decode_calls": self.decode_calls,
+            "decode_tensor_calls": self.decode_tensor_calls,
+            "decoded_sequence_tokens": self.decoded_sequence_tokens,
+            "decode_routes": decode_routes,
             "current_compressed_cache_bytes": current_compressed_cache_bytes,
             "peak_compressed_cache_bytes": peak_compressed_cache_bytes,
             "total_encoded_cache_bytes": total_encoded_cache_bytes,
@@ -1048,20 +1179,42 @@ class LongCatTempoKVBridge:
         original_uncompress = module.uncompress_kv_cache
         if not getattr(module, "_tempokv_uncompress_patch", False):
 
-            def uncompress_kv_cache(k_cache: Any, v_cache: Any) -> Any:
+            def uncompress_kv_cache(
+                k_cache: Any,
+                v_cache: Any,
+                *,
+                key_output: torch.Tensor | None = None,
+                value_output: torch.Tensor | None = None,
+            ) -> Any:
                 bridge = _ACTIVE_BRIDGE.get()
                 if bridge is None or bridge.mode != "tempokv":
+                    if key_output is not None or value_output is not None:
+                        raise RuntimeError(
+                            "direct LongCat cache output requires an active TempoKV bridge"
+                        )
                     return original_uncompress(k_cache, v_cache)
                 if isinstance(k_cache, PackedTensor) or isinstance(v_cache, PackedTensor):
                     if bridge.codec is None:
                         raise RuntimeError("TempoKV codec is not loaded")
-                    return bridge.decode(k_cache, v_cache)
+                    return bridge.decode(
+                        k_cache,
+                        v_cache,
+                        key_output=key_output,
+                        value_output=value_output,
+                    )
                 if isinstance(k_cache, PackedTensorSpanSet) or isinstance(
                     v_cache, PackedTensorSpanSet
                 ):
                     if bridge.codec is None:
                         raise RuntimeError("TempoKV codec is not loaded")
-                    return bridge.decode(k_cache, v_cache)
+                    return bridge.decode(
+                        k_cache,
+                        v_cache,
+                        key_output=key_output,
+                        value_output=value_output,
+                    )
+                if key_output is not None or value_output is not None:
+                    raise TypeError("direct LongCat cache output requires packed TempoKV K/V")
                 return original_uncompress(k_cache, v_cache)
 
             module.uncompress_kv_cache = uncompress_kv_cache
@@ -1136,6 +1289,8 @@ def install_longcat_bridge(
     context_parallel_size: int = 1,
     context_parallel_rank: int = 0,
     attention_sink_frames: int = 0,
+    profile_encode: bool = False,
+    profile_decode: bool = False,
     **modules: Any,
 ) -> LongCatTempoKVBridge:
     """Create and install a LongCat bridge.
@@ -1164,6 +1319,8 @@ def install_longcat_bridge(
         context_parallel_rank=context_parallel_rank,
         attention_sink_frames=attention_sink_frames,
         auto_context_parallel_stride=spec is None,
+        profile_encode=profile_encode,
+        profile_decode=profile_decode,
     )
     bridge.install(**modules)
     return bridge

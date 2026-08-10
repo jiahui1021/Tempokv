@@ -66,6 +66,7 @@ class CausalInferencePipeline(torch.nn.Module):
         self.summary = {
             "finalize_events": [],
             "last_kv_cache_memory": None,
+            "terminal_cache_event": None,
         }
         self.num_frame_per_block = getattr(args, "num_frame_per_block", 1)
         self.independent_first_frame = args.independent_first_frame
@@ -90,6 +91,7 @@ class CausalInferencePipeline(torch.nn.Module):
         profile: bool = False,
         low_memory: bool = False,
         report_timing: bool = False,
+        retain_final_cache: bool = False,
     ) -> torch.Tensor:
         """
         Perform inference on the given noise and text prompts.
@@ -102,6 +104,10 @@ class CausalInferencePipeline(torch.nn.Module):
                 If num_input_frames is 1, perform image to video.
                 If num_input_frames is greater than 1, perform video extension.
             return_latents (bool): Whether to return the latents.
+            retain_final_cache (bool): Keep and finalize the last generated
+                block's clean K/V. Enable this only when a caller will continue
+                generation from this cache or explicitly needs terminal cache
+                state. Trace collection enables it automatically.
         Outputs:
             video (torch.Tensor): The generated video tensor of shape
                 (batch_size, num_output_frames, num_channels, height, width).
@@ -185,6 +191,7 @@ class CausalInferencePipeline(torch.nn.Module):
                 layer["local_end_index"] = 0
         self.summary["finalize_events"] = []
         self.summary["last_kv_cache_memory"] = None
+        self.summary["terminal_cache_event"] = None
         self.reset_kv_cache_state()
 
         # Step 2: Cache context feature
@@ -305,23 +312,38 @@ class CausalInferencePipeline(torch.nn.Module):
                 self.first_chunk_time = time.time() - _first_block_start
                 print(f"First chunk time: {self.first_chunk_time:.2f}s")
 
-            # Step 3.3: rerun with timestep zero to update KV cache using clean context
-            context_timestep = torch.ones_like(timestep) * self.args.context_noise
+            is_terminal_block = block_index == len(all_num_frames) - 1
+            if is_terminal_block and not retain_final_cache:
+                # No later attention call can read this block. A clean refresh
+                # would therefore run the whole generator once more only to
+                # create cache state that is immediately discarded; TempoKV's
+                # terminal force-flush would also encode a span that is never
+                # decoded. Release both caches before VAE decoding instead.
+                self.discard_terminal_kv_cache(
+                    current_start_frame, current_num_frames
+                )
+            else:
+                # Step 3.3: rerun with timestep zero to update KV cache using
+                # clean context whenever future generation or trace collection
+                # needs the block.
+                context_timestep = (
+                    torch.ones_like(timestep) * self.args.context_noise
+                )
 
-            self.note_clean_refresh()
-            self.generator(
-                noisy_image_or_video=denoised_pred,
-                conditional_dict=conditional_dict,
-                timestep=context_timestep,
-                kv_cache=self.kv_cache1,
-                crossattn_cache=self.crossattn_cache,
-                current_start=current_start_frame * self.frame_seq_length,
-            )
+                self.note_clean_refresh()
+                self.generator(
+                    noisy_image_or_video=denoised_pred,
+                    conditional_dict=conditional_dict,
+                    timestep=context_timestep,
+                    kv_cache=self.kv_cache1,
+                    crossattn_cache=self.crossattn_cache,
+                    current_start=current_start_frame * self.frame_seq_length,
+                )
 
-            # Step 3.3b: the cache now holds this block's clean state. This is
-            # the only point at which a block becomes long-term history, and it
-            # happens exactly once per block.
-            self.finalize_kv_cache(current_start_frame, current_num_frames)
+                # Step 3.3b: the cache now holds this block's clean state. This
+                # is the only point at which a block becomes long-term history,
+                # and it happens exactly once per retained block.
+                self.finalize_kv_cache(current_start_frame, current_num_frames)
 
             if profile:
                 block_end.record()
@@ -344,7 +366,16 @@ class CausalInferencePipeline(torch.nn.Module):
             torch.cuda.synchronize()
             self.last_generation_time = time.time() - self._gen_start_time
 
-        self.flush_kv_cache()
+        if retain_final_cache or not all_num_frames:
+            if all_num_frames:
+                self.summary["terminal_cache_event"] = {
+                    "action": "retained",
+                    "start_frame": int(
+                        current_start_frame - all_num_frames[-1]
+                    ),
+                    "num_frames": int(all_num_frames[-1]),
+                }
+            self.flush_kv_cache()
 
         # Step 4: Decode the output
         video = self.vae.decode_to_pixel(output, use_cache=False)
@@ -402,6 +433,20 @@ class CausalInferencePipeline(torch.nn.Module):
 
     def flush_kv_cache(self) -> None:
         """Announce the end of a rollout, so a partial span can still pack."""
+
+    def discard_terminal_kv_cache(
+        self, start_frame: int, num_frames: int
+    ) -> None:
+        """Release terminal K/V that no future attention call can consume."""
+        self.summary["terminal_cache_event"] = {
+            "action": "discarded",
+            "start_frame": int(start_frame),
+            "num_frames": int(num_frames),
+        }
+        # Dropping the owning lists releases dense and packed self-attention
+        # cache tensors as well as the text cross-attention cache before VAE.
+        self.kv_cache1 = None
+        self.crossattn_cache = None
 
     def _initialize_kv_cache(
         self, batch_size, dtype, device, target_frames: Optional[int] = None

@@ -484,16 +484,59 @@ def encode_cross_kv(
     )
 
 
+def _direct_output_shape(
+    packed_shape: tuple[int, int, int, int],
+    output_layout: str,
+) -> tuple[int, int, int, int]:
+    batch, heads, sequence, width = packed_shape
+    if output_layout == "BHSD":
+        return batch, heads, sequence, width
+    if output_layout == "BSHD":
+        return batch, sequence, heads, width
+    raise ValueError(
+        f"direct decode output_layout must be 'BHSD' or 'BSHD', got {output_layout!r}"
+    )
+
+
+def _has_non_overlapping_positive_strides(tensor: torch.Tensor) -> bool:
+    """Return whether a strided output is safe for independent kernel stores.
+
+    A sequence slice of a larger BSHD/BHSD allocation is commonly not dense:
+    its batch or head stride still includes the omitted suffix.  Sorting the
+    dimensions by stride and requiring every dimension to start beyond the
+    complete span of the faster dimensions accepts those slices while
+    conservatively rejecting overlapping ``as_strided`` views.
+    """
+    dimensions = sorted(
+        (stride, size)
+        for size, stride in zip(tensor.shape, tensor.stride())
+        if size > 1
+    )
+    covered_span = 1
+    for stride, size in dimensions:
+        if stride <= 0 or stride < covered_span:
+            return False
+        covered_span += (size - 1) * stride
+    return all(stride > 0 for stride in tensor.stride())
+
+
 def decode_tensor(
     packed: PackedTensor,
     *,
     source: torch.Tensor | None = None,
     output_dtype: torch.dtype | None = None,
     output_tensor: torch.Tensor | None = None,
+    output_layout: str = "BSHD",
     use_triton: bool = True,
     strict_triton: bool = False,
 ) -> torch.Tensor:
-    """Decode a packed cache, using Triton when its supported CUDA path is available."""
+    """Decode a packed cache, using Triton when its CUDA path is available.
+
+    ``output_tensor`` may be a non-overlapping positive-stride BHSD or BSHD
+    view.  ``output_layout`` describes that physical target and defaults to the
+    historical BSHD direct-output API.  The returned tensor remains BHSD so a
+    reconstructed K can always be passed directly as the CrossKV ``source``.
+    """
     stored_dtype = _dtype(packed.reconstruction_dtype)
     if output_dtype is None:
         output_dtype = stored_dtype
@@ -502,12 +545,12 @@ def decode_tensor(
             "decode dtype must match the closed-loop reconstruction dtype "
             f"{stored_dtype}, got {output_dtype}"
         )
+    expected_shape = _direct_output_shape(packed.shape, output_layout)
     if output_tensor is not None:
-        batch, heads, sequence, width = packed.shape
-        expected_shape = (batch, sequence, heads, width)
         if tuple(output_tensor.shape) != expected_shape:
+            layout_shape = "[B,S,H,D]" if output_layout == "BSHD" else "[B,H,S,D]"
             raise ValueError(
-                "direct decode output must use [B,S,H,D] shape "
+                f"direct decode output must use {layout_shape} shape "
                 f"{expected_shape}, got {tuple(output_tensor.shape)}"
             )
         if output_tensor.device != packed.anchor_quant.device:
@@ -516,8 +559,10 @@ def decode_tensor(
             raise ValueError(
                 f"direct decode output must use {output_dtype}, got {output_tensor.dtype}"
             )
-        if not output_tensor.is_contiguous():
-            raise ValueError("direct decode output must be contiguous BSHD")
+        if not _has_non_overlapping_positive_strides(output_tensor):
+            raise ValueError(
+                "direct decode output must have non-overlapping positive strides"
+            )
     if packed.predictor_kind == "cross_kv":
         if source is None:
             raise ValueError("CrossKV decoding requires reconstructed K")
@@ -539,6 +584,7 @@ def decode_tensor(
                 source=source,
                 output_dtype=output_dtype,
                 output_tensor=output_tensor,
+                output_layout=output_layout,
             )
             if accelerated is not None:
                 return accelerated
@@ -555,15 +601,16 @@ def decode_tensor(
 
     _, _, sequence, width = packed.shape
     anchor_length = packed.unit_lengths[0]
-    output = (
-        output_tensor.permute(0, 2, 1, 3)
-        if output_tensor is not None
-        else torch.empty(
+    if output_tensor is None:
+        output = torch.empty(
             packed.shape,
             device=packed.anchor_quant.device,
             dtype=output_dtype,
         )
-    )
+    elif output_layout == "BSHD":
+        output = output_tensor.permute(0, 2, 1, 3)
+    else:
+        output = output_tensor
     anchor = dequantize_symmetric(
         packed.anchor_quant,
         packed.anchor_scale,

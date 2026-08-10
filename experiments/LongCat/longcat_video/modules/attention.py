@@ -11,8 +11,20 @@ from ..block_sparse_attention.bsa_interface import flash_attn_bsa_3d
 from ..context_parallel.ulysses_wrapper import ulysses_wrapper
 
 
-def uncompress_kv_cache(k_cache, v_cache):
+def uncompress_kv_cache(
+    k_cache,
+    v_cache,
+    *,
+    key_output=None,
+    value_output=None,
+):
     """Return BF16 cache tensors; TempoKV replaces this hook at startup."""
+    if key_output is not None:
+        key_output.copy_(k_cache)
+        k_cache = key_output
+    if value_output is not None:
+        value_output.copy_(v_cache)
+        v_cache = value_output
     return k_cache, v_cache
 
 
@@ -167,19 +179,70 @@ class Attention(nn.Module):
                 "LongCat cached attention requires positive num_cond_latents"
             )
         T, H, W = shape
-        k_cache, v_cache = uncompress_kv_cache(*kv_cache)
-        assert k_cache.shape[0] == v_cache.shape[0] and k_cache.shape[0] in [1, B]
-        if k_cache.shape[0] == 1:
-            k_cache = k_cache.repeat(B, 1, 1, 1)
-            v_cache = v_cache.repeat(B, 1, 1, 1)
-        
-        k_full = torch.cat([k_cache, k], dim=2).contiguous()
-        v_full = torch.cat([v_cache, v], dim=2).contiguous()
-        q_padding = torch.cat([torch.empty_like(k_cache), q], dim=2).contiguous()
-        q_padding, k_full = self.rope_3d(
-            q_padding, k_full, (T + num_cond_latents, H, W)
+        raw_k_cache, raw_v_cache = kv_cache
+        if isinstance(raw_k_cache, torch.Tensor) and isinstance(
+            raw_v_cache, torch.Tensor
+        ):
+            # Preserve the upstream BF16/trace path exactly.
+            k_cache, v_cache = uncompress_kv_cache(raw_k_cache, raw_v_cache)
+            assert k_cache.shape[0] == v_cache.shape[0] and k_cache.shape[0] in [1, B]
+            if k_cache.shape[0] == 1 and B > 1:
+                # CFG branches share the same conditioning cache. ``cat``
+                # materializes the final attention buffer, so expanded views
+                # avoid two redundant cache-sized copies.
+                k_cache = k_cache.expand(B, -1, -1, -1)
+                v_cache = v_cache.expand(B, -1, -1, -1)
+            cache_sequence = int(k_cache.shape[2])
+            k_full = torch.cat([k_cache, k], dim=2).contiguous()
+            v_full = torch.cat([v_cache, v], dim=2).contiguous()
+        else:
+            if isinstance(raw_k_cache, torch.Tensor) or isinstance(
+                raw_v_cache, torch.Tensor
+            ):
+                raise TypeError("LongCat K/V cache formats must match")
+            cache_shape = tuple(int(value) for value in raw_k_cache.shape)
+            if tuple(raw_v_cache.shape) != cache_shape:
+                raise ValueError("LongCat packed K/V cache shapes must match")
+            cache_batch, cache_heads, cache_sequence, cache_width = cache_shape
+            if cache_batch not in (1, B):
+                raise ValueError(
+                    f"LongCat packed cache batch must be 1 or {B}, got {cache_batch}"
+                )
+            if cache_heads != self.num_heads or cache_width != self.head_dim:
+                raise ValueError(
+                    "LongCat packed cache head shape does not match attention"
+                )
+            k_full = torch.empty(
+                (B, self.num_heads, cache_sequence + N, self.head_dim),
+                dtype=k.dtype,
+                device=k.device,
+            )
+            v_full = torch.empty_like(k_full)
+            key_prefix = k_full[:cache_batch, :, :cache_sequence, :]
+            value_prefix = v_full[:cache_batch, :, :cache_sequence, :]
+            uncompress_kv_cache(
+                raw_k_cache,
+                raw_v_cache,
+                key_output=key_prefix,
+                value_output=value_prefix,
+            )
+            if cache_batch == 1 and B > 1:
+                k_full[1:, :, :cache_sequence, :].copy_(
+                    key_prefix.expand(B - 1, -1, -1, -1)
+                )
+                v_full[1:, :, :cache_sequence, :].copy_(
+                    value_prefix.expand(B - 1, -1, -1, -1)
+                )
+            k_full[:, :, cache_sequence:, :].copy_(k)
+            v_full[:, :, cache_sequence:, :].copy_(v)
+
+        q, k_full = self.rope_3d(
+            q,
+            k_full,
+            (T + num_cond_latents, H, W),
+            q_position_offset=cache_sequence,
+            inplace_key=True,
         )
-        q = q_padding[:, :, -N:].contiguous()
 
         x = self._process_attn(q, k_full, v_full, shape)
         

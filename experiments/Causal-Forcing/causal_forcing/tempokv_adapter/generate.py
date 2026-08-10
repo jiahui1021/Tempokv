@@ -317,6 +317,11 @@ def _merge_tempokv_reports(ranks: list[dict[str, object]]) -> dict[str, object]:
         "ephemeral_writes",
         "cache_evictions",
         "cache_resets",
+        "terminal_discard_events",
+        "terminal_discarded_frames",
+        "terminal_encode_frames_avoided",
+        "terminal_discarded_bf16_bytes",
+        "terminal_discarded_compressed_bytes",
         # Cumulative volume over the run, not a state: these do add up.
         "total_encoded_cache_bytes",
         "total_uncompressed_cache_bytes",
@@ -374,6 +379,32 @@ def _require_tempokv_activity(report: dict[str, object]) -> None:
         raise RuntimeError(
             "TempoKV generation did not exercise the codec: "
             + ", ".join(f"{name}=0" for name in empty)
+        )
+
+
+def _require_direct_persistent_routes(routes: dict[str, object]) -> None:
+    """Reject a nominally accelerated run that missed the production kernels."""
+    required = (
+        "temporal_persistent_direct",
+        "cross_kv_persistent_direct",
+    )
+    missing = [name for name in required if int(routes.get(name) or 0) <= 0]
+    if missing:
+        raise RuntimeError(
+            "TempoKV direct persistent Triton decode was not used: "
+            + ", ".join(missing)
+        )
+    unexpected = {
+        name: int(count)
+        for name, count in routes.items()
+        if int(count) > 0 and name not in required
+    }
+    if unexpected:
+        raise RuntimeError(
+            "TempoKV used a non-direct or non-persistent decode route: "
+            + ", ".join(
+                f"{name}={count}" for name, count in sorted(unexpected.items())
+            )
         )
 
 
@@ -579,6 +610,8 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         if args.mode == "tempokv":
             tempokv_report = _merge_tempokv_reports(ranks)
             _require_tempokv_activity(tempokv_report)
+            if not args.allow_triton_fallback:
+                _require_direct_persistent_routes(performance["decode_routes"])
             report["tempokv"] = tempokv_report
             (paths["run"] / "tempokv_report.json").write_text(
                 json.dumps(tempokv_report, indent=2, ensure_ascii=False) + "\n",

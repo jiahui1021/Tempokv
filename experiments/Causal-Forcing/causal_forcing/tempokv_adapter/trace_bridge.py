@@ -204,6 +204,9 @@ def install(runtime_root: str | Path | None = None) -> type:
 
         def inference(self, *args: Any, **kwargs: Any) -> Any:
             self._reset_sequence()
+            # The final clean refresh is trace data, even though ordinary
+            # one-shot generation can discard terminal K/V without creating it.
+            kwargs["retain_final_cache"] = True
             try:
                 result = super().inference(*args, **kwargs)
             except BaseException:

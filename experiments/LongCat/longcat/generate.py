@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import replace
 import importlib
 import json
 import os
@@ -47,6 +48,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--v-params", type=Path, help="fitted CrossKV V parameters")
     parser.add_argument(
         "--triton-cache", type=Path, help="optional Triton compilation cache directory"
+    )
+    parser.add_argument(
+        "--allow-triton-fallback",
+        action="store_true",
+        help="use the config's Triton flags instead of enforcing strict acceleration",
     )
     parser.add_argument(
         "--trace-dir",
@@ -196,6 +202,45 @@ def _require_tempokv_activity(report: dict) -> None:
         )
 
 
+def _enforce_accelerated_codec(bridge: object) -> None:
+    """Make the production TempoKV path fail instead of silently running PyTorch."""
+    codec = getattr(bridge, "codec", None)
+    config = getattr(codec, "config", None)
+    if codec is None or config is None:
+        raise RuntimeError("LongCat TempoKV bridge did not load a codec")
+    codec.config = replace(config, use_triton=True, strict_triton=True)
+
+
+def _require_direct_persistent_routes(report: dict[str, object]) -> None:
+    """Reject production runs that missed LongCat's fused direct decoders."""
+    routes = report.get("decode_routes")
+    if not isinstance(routes, dict):
+        raise RuntimeError("LongCat TempoKV report did not include decode routes")
+    required = (
+        "temporal_persistent_direct_bhsd",
+        "cross_kv_persistent_direct_bhsd",
+    )
+    missing = [name for name in required if int(routes.get(name) or 0) <= 0]
+    if missing:
+        raise RuntimeError(
+            "LongCat TempoKV direct persistent Triton decode was not used: "
+            + ", ".join(missing)
+        )
+    allowed = {*required, "anchor_direct_bhsd"}
+    unexpected = {
+        str(name): int(count)
+        for name, count in routes.items()
+        if int(count) > 0 and name not in allowed
+    }
+    if unexpected:
+        raise RuntimeError(
+            "LongCat TempoKV used a non-direct or non-persistent decode route: "
+            + ", ".join(
+                f"{name}={count}" for name, count in sorted(unexpected.items())
+            )
+        )
+
+
 def run(argv: Sequence[str] | None = None) -> int:
     run_started = time.perf_counter()
     parser = _parser()
@@ -253,6 +298,14 @@ def run(argv: Sequence[str] | None = None) -> int:
             context_parallel_rank=context_parallel_rank,
             attention_sink_frames=attention_sink_frames,
         )
+        if not known.allow_triton_fallback:
+            _enforce_accelerated_codec(bridge)
+            # A user-supplied config may have disabled Triton, in which case
+            # load_codec intentionally skipped cache setup before this launcher
+            # enforced the production path.
+            from tempokv.runtime import configure_triton_cache
+
+            configure_triton_cache(known.triton_cache)
     elif known.mode == "trace":
         bridge = install_longcat_bridge(
             mode="trace",
@@ -338,6 +391,8 @@ def run(argv: Sequence[str] | None = None) -> int:
     report["peak_gpu_reserved_bytes"] = gpu_memory["peak_reserved_bytes"]
     if known.mode == "tempokv":
         _require_tempokv_activity(report)
+        if not known.allow_triton_fallback:
+            _require_direct_persistent_routes(report)
     report_path = (
         Path(runtime_args.output_dir).expanduser().resolve()
         / f"tempokv_bridge_report_rank_{rank:05d}.json"

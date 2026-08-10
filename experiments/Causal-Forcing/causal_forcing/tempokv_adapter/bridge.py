@@ -40,6 +40,52 @@ _TEMPOKV_STATE_KEY = "_tempokv_packed"
 DEFAULT_SPAN_FRAMES = 12
 
 
+class _CausalTempoKVRuntimeReport(TempoKVRuntimeReport):
+    """TempoKV counters plus explicit terminal-cache discard accounting."""
+
+    terminal_discard_events: int = 0
+    # Frames in the final block whose clean refresh/finalize was skipped.
+    terminal_discarded_frames: int = 0
+    # Finalized dense frames plus the skipped final block that the old
+    # terminal flush would have encoded despite having no future reader.
+    terminal_encode_frames_avoided: int = 0
+    terminal_discarded_bf16_bytes: int = 0
+    terminal_discarded_compressed_bytes: int = 0
+
+    def record_terminal_discard(
+        self,
+        *,
+        frames: int,
+        encode_frames_avoided: int,
+        bf16_bytes: int,
+        compressed_bytes: int,
+    ) -> None:
+        self.terminal_discard_events += 1
+        self.terminal_discarded_frames += int(frames)
+        self.terminal_encode_frames_avoided += int(encode_frames_avoided)
+        self.terminal_discarded_bf16_bytes += int(bf16_bytes)
+        self.terminal_discarded_compressed_bytes += int(compressed_bytes)
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = super().to_dict()
+        payload.update(
+            {
+                "terminal_discard_events": self.terminal_discard_events,
+                "terminal_discarded_frames": self.terminal_discarded_frames,
+                "terminal_encode_frames_avoided": (
+                    self.terminal_encode_frames_avoided
+                ),
+                "terminal_discarded_bf16_bytes": (
+                    self.terminal_discarded_bf16_bytes
+                ),
+                "terminal_discarded_compressed_bytes": (
+                    self.terminal_discarded_compressed_bytes
+                ),
+            }
+        )
+        return payload
+
+
 def wrap_cache_state(state: PackedTensor) -> dict[str, Any]:
     """Store one TempoKV state in the bundled Causal Forcing cache."""
     if not isinstance(state, PackedTensor):
@@ -65,6 +111,7 @@ def decode_cache_state(
     *,
     source_tensor: torch.Tensor | None = None,
     output_tensor: torch.Tensor | None = None,
+    output_layout: str = "BSHD",
     codec: TempoKVCodec,
     fallback: Callable[..., torch.Tensor] | None = None,
 ) -> torch.Tensor:
@@ -73,13 +120,18 @@ def decode_cache_state(
     if packed is None:
         if fallback is None:
             raise TypeError(f"unsupported cache state: {type(state).__name__}")
-        return fallback(
-            state, source_tensor=source_tensor, output_tensor=output_tensor
-        )
+        kwargs = {
+            "source_tensor": source_tensor,
+            "output_tensor": output_tensor,
+        }
+        if output_layout != "BSHD":
+            kwargs["output_layout"] = output_layout
+        return fallback(state, **kwargs)
     return decode_tensor(
         packed,
         source=source_tensor,
         output_tensor=output_tensor,
+        output_layout=output_layout,
         use_triton=codec.config.use_triton,
         strict_triton=codec.config.strict_triton,
     )
@@ -135,7 +187,7 @@ def install(runtime_root: str | Path | None = None) -> type:
                     "Causal Forcing requires fast diagonal V history parameters; "
                     "refit v_cross_kv.npz with the current fitter"
                 )
-            self.tempokv_report = TempoKVRuntimeReport(
+            self.tempokv_report = _CausalTempoKVRuntimeReport(
                 model=os.environ.get("TEMPOKV_MODEL_NAME", "causal_forcing"),
                 kv_mode="tempokv",
                 num_layers=self.num_transformer_blocks,
@@ -159,6 +211,7 @@ def install(runtime_root: str | Path | None = None) -> type:
                 state: Any,
                 source_tensor: torch.Tensor | None = None,
                 output_tensor: torch.Tensor | None = None,
+                output_layout: str = "BSHD",
             ) -> torch.Tensor:
                 self.tempokv_report.decode_tensor_calls += 1
                 with self.tempokv_report.timer("decode_ms"):
@@ -166,6 +219,7 @@ def install(runtime_root: str | Path | None = None) -> type:
                         state,
                         source_tensor=source_tensor,
                         output_tensor=output_tensor,
+                        output_layout=output_layout,
                         codec=self.tempokv_codec,
                         fallback=fallback_decode,
                     )
@@ -194,6 +248,37 @@ def install(runtime_root: str | Path | None = None) -> type:
 
         def flush_kv_cache(self) -> None:
             self.tempokv_stream.flush(self.kv_cache1, force=True)
+            self.summary["last_kv_cache_memory"] = self.tempokv_report.to_dict()
+
+        def discard_terminal_kv_cache(
+            self, start_frame: int, num_frames: int
+        ) -> None:
+            encode_frames_avoided = (
+                self.tempokv_stream.pending_frames + num_frames
+            )
+            resident_bf16_bytes = sum(
+                layer[role].bf16_resident_bytes()
+                for layer in self.kv_cache1
+                for role in ("k", "v")
+            )
+            # The skipped finalize no longer observes this dense terminal
+            # state, so account for its real peak before clearing the cache.
+            self.tempokv_report.observe_resident_bf16_bytes(
+                resident_bf16_bytes
+            )
+            compressed_bytes = (
+                self.tempokv_report.current_compressed_cache_bytes
+            )
+            super().discard_terminal_kv_cache(start_frame, num_frames)
+            self.tempokv_report.record_terminal_discard(
+                frames=num_frames,
+                encode_frames_avoided=encode_frames_avoided,
+                bf16_bytes=resident_bf16_bytes,
+                compressed_bytes=compressed_bytes,
+            )
+            # The physical cache has been released, so current-resident byte
+            # counters must reach zero while cumulative and peak counters stay.
+            self.tempokv_stream.reset()
             self.summary["last_kv_cache_memory"] = self.tempokv_report.to_dict()
 
         def inference(self, *args: Any, **kwargs: Any) -> Any:

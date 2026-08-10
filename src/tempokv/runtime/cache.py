@@ -74,14 +74,19 @@ def uncompress_single_kv_cache(
     *,
     source_tensor: torch.Tensor | None = None,
     output_tensor: torch.Tensor | None = None,
+    output_layout: str = "BSHD",
 ) -> torch.Tensor:
     if _quantized_decoder is None:
         raise RuntimeError("no TempoKV decoder is installed for this cache span")
-    return _quantized_decoder(
-        state,
-        source_tensor=source_tensor,
-        output_tensor=output_tensor,
-    )
+    kwargs: dict[str, Any] = {
+        "source_tensor": source_tensor,
+        "output_tensor": output_tensor,
+    }
+    # Keep the historical decoder callback contract unchanged for BSHD.  A
+    # decoder only needs the new keyword when a BHSD target is requested.
+    if output_layout != "BSHD":
+        kwargs["output_layout"] = output_layout
+    return _quantized_decoder(state, **kwargs)
 
 
 class ChunkedKVCache:
@@ -305,7 +310,10 @@ class ChunkedKVCache:
             raise ValueError("cache read does not contain the complete K source span")
         if source_layout == "BSHD":
             return source_tensor[:, offset:offset + length].permute(0, 2, 1, 3)
-        return source_tensor[:, :, offset:offset + length].contiguous()
+        # Triton CrossKV consumes explicit source strides, so a BHSD slice of
+        # a larger reconstructed-K buffer can stay a view instead of making a
+        # cache-sized copy for every quantized span.
+        return source_tensor[:, :, offset:offset + length]
 
     def _read_layout(
         self,
@@ -387,19 +395,18 @@ class ChunkedKVCache:
                 span["end_chunk"] - span["start_chunk"]
             ) * self.frame_seq_length
             output_end = output_start + expected_tokens
-            # The normal attention path reads BSHD. For batch size one its
-            # sequence slice is contiguous, so Triton can decode straight
-            # into the final cache-read buffer without keeping per-span
-            # outputs alive until a later torch.cat.
-            direct_output = None
+            # Decode into the final cache-read buffer.  Its sequence slice can
+            # retain gaps from the surrounding allocation; the codec accepts
+            # these non-overlapping positive strides for both layouts.
             if output_layout == "BSHD":
-                candidate = result[:, output_start:output_end]
-                if candidate.is_contiguous():
-                    direct_output = candidate
+                direct_output = result[:, output_start:output_end]
+            else:
+                direct_output = result[:, :, output_start:output_end]
             decoded = uncompress_single_kv_cache(
                 span["quant_data"],
                 source_tensor=source,
                 output_tensor=direct_output,
+                output_layout=output_layout,
             )
             expected_shape = (
                 self.batch_size,
@@ -412,13 +419,11 @@ class ChunkedKVCache:
                     f"decoded TempoKV shape mismatch: expected {expected_shape}, "
                     f"got {tuple(decoded.shape)}"
                 )
-            if direct_output is None:
+            if decoded.data_ptr() != direct_output.data_ptr():
                 if output_layout == "BSHD":
-                    result[:, output_start:output_end].copy_(
-                        decoded.permute(0, 2, 1, 3)
-                    )
+                    direct_output.copy_(decoded.permute(0, 2, 1, 3))
                 else:
-                    result[:, :, output_start:output_end].copy_(decoded)
+                    direct_output.copy_(decoded)
             chunk_index = span["end_chunk"]
         return result
 
