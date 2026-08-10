@@ -1,5 +1,7 @@
 import importlib.util
+import importlib
 from pathlib import Path
+import sys
 
 
 MODULE_PATH = Path(__file__).with_name("generate.py")
@@ -10,6 +12,13 @@ SPEC.loader.exec_module(MODULE)
 
 _generation_command = MODULE._generation_command
 build_parser = MODULE.build_parser
+
+
+def test_bundled_runtime_is_importable_without_external_pythonpath():
+    assert str(MODULE.RUNTIME_ROOT) in sys.path
+    bridge = importlib.import_module("causal_forcing.tempokv_adapter.bridge")
+
+    assert bridge.DEFAULT_SPAN_FRAMES > 0
 
 
 def _parse(*extra: str):

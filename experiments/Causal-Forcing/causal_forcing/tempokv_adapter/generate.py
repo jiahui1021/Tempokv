@@ -27,6 +27,9 @@ if SOURCE_ROOT.is_dir() and str(SOURCE_ROOT) not in sys.path:
     sys.path.insert(0, str(SOURCE_ROOT))
 
 RUNTIME_ROOT = PROJECT_ROOT / "experiments" / "Causal-Forcing"
+if RUNTIME_ROOT.is_dir() and str(RUNTIME_ROOT) not in sys.path:
+    sys.path.insert(0, str(RUNTIME_ROOT))
+
 REQUIRED_RUNTIME_FILES = (
     "inference.py",
     "causal_forcing/kv_cache.py",
