@@ -10,6 +10,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 import hashlib
 import math
+import os
 from dataclasses import replace
 from typing import Iterator
 
@@ -24,6 +25,14 @@ from .quantization import (
     quantize_asymmetric,
     quantize_symmetric,
 )
+
+
+# The legacy V rollout replays each captured record separately to reproduce the
+# reference GEMM shapes.  That costs one Python iteration per layer, event and
+# frame, which dominates fitting on an accelerator.  The batched path over the
+# whole trace is bit-identical on CPU and is the default; set this to "1" to
+# restore the record-by-record ordering when auditing a numeric difference.
+RECORD_ROLLOUT_ENV = "TEMPOKV_LEGACY_RECORD_ROLLOUT"
 
 
 def _check_scalar(name: str, value: float, *, positive: bool = False) -> float:
@@ -1372,7 +1381,11 @@ def _reconstruct_cross_kv_trace(
     }[config.reconstruction_dtype]
     weight = parameters.weight.to(clean_values.device)
     history_weights = parameters.history_weights.to(clean_values.device)
-    if config.fit_mode == "legacy" and clean_values.ndim == 7:
+    if (
+        config.fit_mode == "legacy"
+        and clean_values.ndim == 7
+        and os.environ.get(RECORD_ROLLOUT_ENV) == "1"
+    ):
         rebuilt = torch.empty_like(clean_values, dtype=torch.float32)
         parameter_bias = parameters.bias.to(clean_values.device)
         for layer in range(layer_count):

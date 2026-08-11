@@ -40,6 +40,7 @@ class PackedTensor:
     residual_zero_point: torch.Tensor | None
     cross_matmul_precision: str = "tf32"
     compatibility_mode: str = "native"
+    legacy_v_decode: str = "torch"
     temporal: TemporalParameters | None = None
     cross_kv: CrossKVParameters | None = None
 
@@ -67,6 +68,8 @@ class PackedTensor:
             raise ValueError("cross_matmul_precision must be ieee or tf32")
         if self.compatibility_mode not in {"native", "legacy"}:
             raise ValueError("compatibility_mode must be native or legacy")
+        if self.legacy_v_decode not in {"torch", "triton"}:
+            raise ValueError("legacy_v_decode must be torch or triton")
         has_residual = len(self.unit_lengths) > 1
         if has_residual != (self.residual_quant is not None):
             raise ValueError("residual tensors do not match unit layout")
@@ -495,6 +498,7 @@ def _encode(
         reconstruction_dtype=config.reconstruction_dtype,
         cross_matmul_precision=config.cross_matmul_precision,
         compatibility_mode=config.fit_mode,
+        legacy_v_decode=config.legacy_v_decode,
         unit_lengths=tuple(unit_lengths),
         anchor_quant=anchor_quant,
         anchor_scale=anchor_scale,
@@ -643,15 +647,15 @@ def decode_tensor(
             )
     legacy_torch_cross = (
         packed.compatibility_mode == "legacy"
+        and packed.legacy_v_decode == "torch"
         and packed.predictor_kind == "cross_kv"
         and packed.cross_kv is not None
         and packed.cross_kv.history_length > 0
     )
-    legacy_strict_temporal = (
-        packed.compatibility_mode == "legacy"
-        and packed.predictor_kind == "temporal"
-    )
-    effective_strict_triton = strict_triton or legacy_strict_temporal
+    # Legacy mode picks its decode route deliberately, so a silent PyTorch
+    # fallback would hide both a correctness and a throughput regression.
+    legacy_strict = packed.compatibility_mode == "legacy" and not legacy_torch_cross
+    effective_strict_triton = strict_triton or legacy_strict
     if use_triton and packed.anchor_quant.is_cuda and legacy_torch_cross:
         if strict_triton:
             raise RuntimeError(

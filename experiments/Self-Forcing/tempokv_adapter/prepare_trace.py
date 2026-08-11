@@ -211,7 +211,10 @@ def convert_trace_root(
             )
     output = output.expanduser().resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(
+    # Store uncompressed: the merged trace is float activation data, so deflate
+    # spends about a minute on a production trace to save under a tenth of the
+    # file, and every fitting run pays the decompression again.
+    np.savez(
         output,
         keys=keys,
         values=values,

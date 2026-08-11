@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING
 
 import torch
 import triton
 import triton.language as tl
 
-from .runtime import persistent_units_per_launch
+from .runtime import PERSISTENT_UNITS_ENV, persistent_units_per_launch
 
 if TYPE_CHECKING:
     from .codec import PackedTensor
@@ -1194,10 +1195,14 @@ def decode(
                 _ceil_div(packed.stride, block_s),
                 _ceil_div(width, block_d),
             )
+            # Legacy K decode keeps the reference launch batch unless the
+            # environment asks for another one, so the batch stays a tuning
+            # knob rather than a silent difference between the two modes.
             persistent_units = (
-                8
-                if packed.compatibility_mode == "legacy"
-                else persistent_units_per_launch()
+                persistent_units_per_launch()
+                if packed.compatibility_mode != "legacy"
+                or PERSISTENT_UNITS_ENV in os.environ
+                else 8
             )
             # Large K orders create a nested compile-time expansion.  Keep the
             # original bound unless the production-size order is small.

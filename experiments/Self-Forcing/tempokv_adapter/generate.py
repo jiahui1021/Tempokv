@@ -19,7 +19,10 @@ SOURCE_ROOT = PROJECT_ROOT / "src"
 if SOURCE_ROOT.is_dir() and str(SOURCE_ROOT) not in sys.path:
     sys.path.insert(0, str(SOURCE_ROOT))
 
-from tempokv.runtime import persistent_units_per_launch  # noqa: E402
+from tempokv.runtime import (  # noqa: E402
+    PERSISTENT_UNITS_ENV,
+    persistent_units_per_launch,
+)
 
 RUNTIME_ROOT = PROJECT_ROOT / "experiments" / "Self-Forcing"
 REQUIRED_RUNTIME_FILES = (
@@ -589,11 +592,17 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         report["parameters"] = parameters
         report["runtime_config"] = str(paths["runtime_config"])
         requested_persistent_units = persistent_units_per_launch()
+        legacy_torch_v = (
+            config.fit_mode == "legacy"
+            and config.legacy_v_decode == "torch"
+            and parameters["v_history_length"]
+        )
         report["persistent_units_per_launch"] = {
             "requested": requested_persistent_units,
             "k": (
                 8
                 if config.fit_mode == "legacy"
+                and PERSISTENT_UNITS_ENV not in os.environ
                 else (
                     min(requested_persistent_units, 8)
                     if parameters["k_history_length"] > 4
@@ -602,8 +611,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             ),
             "v": (
                 None
-                if config.fit_mode == "legacy"
-                and parameters["v_history_length"]
+                if legacy_torch_v
                 else (
                     min(requested_persistent_units, 8)
                     if parameters["v_history_length"]
@@ -611,12 +619,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                     else requested_persistent_units
                 )
             ),
-            "v_backend": (
-                "torch_cross_temporal_v"
-                if config.fit_mode == "legacy"
-                and parameters["v_history_length"]
-                else "triton"
-            ),
+            "v_backend": "torch_cross_temporal_v" if legacy_torch_v else "triton",
         }
     if args.dry_run:
         print(json.dumps(report, indent=2, ensure_ascii=False))
@@ -626,7 +629,9 @@ def run(args: argparse.Namespace) -> dict[str, object]:
     environment = os.environ.copy()
     if args.mode == "tempokv":
         runtime_payload = asdict(config)
-        if not args.allow_triton_fallback and config.fit_mode != "legacy":
+        if not args.allow_triton_fallback and (
+            config.fit_mode != "legacy" or config.legacy_v_decode == "triton"
+        ):
             runtime_payload["use_triton"] = True
             runtime_payload["strict_triton"] = True
         paths["runtime_config"].write_text(
@@ -714,7 +719,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                 "temporal_persistent_direct",
                 "cross_kv_temporal_v_torch",
             )
-            if config.fit_mode == "legacy"
+            if config.fit_mode == "legacy" and config.legacy_v_decode == "torch"
             else (
                 "temporal_persistent_direct",
                 "cross_kv_persistent_direct",
