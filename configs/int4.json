@@ -11,6 +11,7 @@
   "reconstruction_dtype": "bfloat16",
   "cross_matmul_precision": "ieee",
   "k_predictor_mode": "shared",
+  "v_predictor_mode": "temporal",
   "fit_mode": "legacy",
   "use_triton": true,
   "strict_triton": false

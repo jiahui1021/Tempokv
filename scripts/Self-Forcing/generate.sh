@@ -67,6 +67,19 @@ if [[ "$mode" == "tempokv" ]]; then
   parameter_name="${PARAM_NAME:-$(codec_slug "$(resolve_path "$CONFIG")" "${K_HISTORY_LENGTH:-}" "${V_HISTORY_LENGTH:-}")}"
   param_dir="$(resolve_path "${PARAM_DIR:-data/self-forcing/params/$parameter_name}")"
   result_label="$parameter_name"
+  v_predictor_mode="$("$python_bin" - "$(resolve_path "$CONFIG")" <<'PY'
+import json
+import sys
+
+config = json.load(open(sys.argv[1], encoding="utf-8"))
+print(config.get("codec", config).get("v_predictor_mode", "cross_kv"))
+PY
+)"
+  if [[ "$v_predictor_mode" == "temporal" ]]; then
+    v_artifact_name="v_temporal.npz"
+  else
+    v_artifact_name="v_cross_kv.npz"
+  fi
 else
   param_dir=""
   result_label="bf16"
@@ -141,7 +154,7 @@ if [[ "$mode" == "tempokv" ]]; then
   generate_command+=(
     --config "$(resolve_path "$CONFIG")"
     --k-params "$param_dir/k_temporal.npz"
-    --v-params "$param_dir/v_cross_kv.npz"
+    --v-params "$param_dir/$v_artifact_name"
   )
   [[ -n "${K_HISTORY_LENGTH:-}" ]] && generate_command+=(--k-history-length "$K_HISTORY_LENGTH")
   [[ -n "${V_HISTORY_LENGTH:-}" ]] && generate_command+=(--v-history-length "$V_HISTORY_LENGTH")

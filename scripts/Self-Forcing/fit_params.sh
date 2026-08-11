@@ -43,6 +43,19 @@ trace_file="$(resolve_path "${TRACE_FILE:-data/self-forcing/trace/clean_trace.np
 config_path="$(resolve_path "$CONFIG")"
 parameter_name="${PARAM_NAME:-$(codec_slug "$config_path" "${K_HISTORY_LENGTH:-}" "${V_HISTORY_LENGTH:-}")}"
 output_dir="$(resolve_path "${OUTPUT_DIR:-data/self-forcing/params/$parameter_name}")"
+v_predictor_mode="$("$python_bin" - "$config_path" <<'PY'
+import json
+import sys
+
+config = json.load(open(sys.argv[1], encoding="utf-8"))
+print(config.get("codec", config).get("v_predictor_mode", "cross_kv"))
+PY
+)"
+if [[ "$v_predictor_mode" == "temporal" ]]; then
+  v_artifact_name="v_temporal.npz"
+else
+  v_artifact_name="v_cross_kv.npz"
+fi
 
 if [[ "$output_dir" == "/" ]]; then
   die "OUTPUT_DIR 不能是文件系统根目录"
@@ -104,7 +117,7 @@ fi
 [[ -f "$trace_file" ]] || die "TRACE_FILE 不存在：$trace_file"
 
 if [[ "$OVERWRITE" != "1" ]]; then
-  for artifact in "$output_dir/k_temporal.npz" "$output_dir/v_cross_kv.npz"; do
+  for artifact in "$output_dir/k_temporal.npz" "$output_dir/$v_artifact_name"; do
     if [[ -e "$artifact" ]]; then
       die "已存在参数：$artifact。设置 OVERWRITE=1 覆盖，或换一个 OUTPUT_DIR。"
     fi
@@ -116,9 +129,9 @@ mkdir -p -- "$output_dir"
 printf '\n[2/2] 拟合 TempoKV 参数 ...\n'
 "${fit_command[@]}"
 
-for artifact in "$output_dir/k_temporal.npz" "$output_dir/v_cross_kv.npz"; do
+for artifact in "$output_dir/k_temporal.npz" "$output_dir/$v_artifact_name"; do
   [[ -s "$artifact" ]] || die "拟合后未生成参数文件：$artifact"
 done
 
 printf '\n完成。参数已写入：\n  %s\n  %s\n' \
-  "$output_dir/k_temporal.npz" "$output_dir/v_cross_kv.npz"
+  "$output_dir/k_temporal.npz" "$output_dir/$v_artifact_name"

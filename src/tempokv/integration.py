@@ -6,7 +6,11 @@ from pathlib import Path
 
 from .codec import TempoKVCodec
 from .config import CodecConfig
-from .parameters import CrossKVParameters, TemporalParameters
+from .parameters import (
+    CrossKVParameters,
+    TemporalParameters,
+    load_parameters,
+)
 from .runtime import configure_triton_cache
 
 
@@ -80,7 +84,7 @@ def load_codec(
     if config.use_triton:
         configure_triton_cache(triton_cache)
     temporal = TemporalParameters.load(k_parameters_path)
-    cross_kv = CrossKVParameters.load(v_parameters_path)
+    cross_kv = load_parameters(v_parameters_path)
     check_parameters_match_config(temporal, cross_kv, config)
     return TempoKVCodec(temporal, cross_kv, config)
 

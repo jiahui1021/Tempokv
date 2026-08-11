@@ -300,10 +300,18 @@ def _validate_parameters(
             if config.k_predictor_mode == "shared"
             else temporal.history_mode
         ),
-        "v_history_length": codec.cross_kv.history_length,
+        "v_history_length": codec.v_parameters.history_length,
         "v_max_history_length": cross.max_history_length,
-        "v_history_mode": cross.history_mode,
-        "v_history_diagonal": cross.history_diagonal,
+        "v_history_mode": (
+            "temporal"
+            if temporal_v
+            else cross.history_mode
+        ),
+        "v_history_diagonal": (
+            False
+            if temporal_v
+            else cross.history_diagonal
+        ),
         "predictor_parameter_bytes": predictor_parameter_bytes,
         "predictor_parameter_mib": predictor_parameter_bytes / (1024**2),
         "v_history_parameter_bytes": v_history_parameter_bytes,
