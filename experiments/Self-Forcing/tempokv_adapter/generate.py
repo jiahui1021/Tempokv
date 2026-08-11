@@ -124,7 +124,12 @@ def _validate_parameters(
     from tempokv.parameters import CrossKVParameters, TemporalParameters
 
     temporal = TemporalParameters.load(k_path)
-    cross = CrossKVParameters.load(v_path)
+    temporal_v = config.v_predictor_mode == "temporal"
+    cross = (
+        TemporalParameters.load(v_path)
+        if temporal_v
+        else CrossKVParameters.load(v_path)
+    )
     if temporal.shared_history != cross.shared_history:
         raise ValueError(
             "Self-Forcing K and V parameters must use the same history parameter mode"
@@ -173,7 +178,12 @@ def _validate_parameters(
             raise ValueError("legacy K parameters must be shared across layers")
     elif temporal.layer_ids != EXPECTED_LAYER_IDS:
         raise ValueError("K parameters must contain layers 0 through 29")
-    if cross.layer_ids != EXPECTED_LAYER_IDS:
+    if temporal_v:
+        if cross.layer_ids is not None:
+            raise ValueError(
+                "temporal V parameters must be shared across layers"
+            )
+    elif cross.layer_ids != EXPECTED_LAYER_IDS:
         raise ValueError("V parameters must contain layers 0 through 29")
     if temporal.stride != config.stride or cross.stride != config.stride:
         raise ValueError("parameter stride does not match the codec config")
@@ -220,9 +230,27 @@ def _validate_parameters(
             )
     elif tuple(temporal.history_weights.shape[-2:]) != (12, 128):
         raise ValueError("K parameters must contain 12 heads with dimension 128")
-    if tuple(cross.weight.shape[-3:]) != (12, 128, 128):
+    if temporal_v:
+        # The temporal V predictor is shared across every layer and head, so
+        # its parameters carry no layer or head axis at all.
+        expected_v_shape = (
+            config.v_history_length,
+            config.v_history_length,
+            128,
+        )
+        if tuple(cross.history_weights.shape) != expected_v_shape:
+            raise ValueError(
+                "temporal V parameters must be shared across all layers and "
+                f"heads with shape {expected_v_shape}, got "
+                f"{tuple(cross.history_weights.shape)}"
+            )
+        if tuple(cross.history_bias.shape) != (config.v_history_length, 128):
+            raise ValueError(
+                "temporal V bias must be shared across all layers and heads"
+            )
+    elif tuple(cross.weight.shape[-3:]) != (12, 128, 128):
         raise ValueError("V parameters must contain 12 heads with 128x128 weights")
-    if cross.shared_history:
+    elif cross.shared_history:
         if tuple(cross.history_weights.shape) != (30, 12, 128):
             raise ValueError(
                 "shared V history parameters must contain one coefficient for "
@@ -237,11 +265,20 @@ def _validate_parameters(
                 "128; refit v_cross_kv.npz with the current fitter"
             )
     parameter_tensors = (
-        temporal.history_weights,
-        temporal.history_bias,
-        cross.weight,
-        cross.bias,
-        cross.history_weights,
+        (
+            temporal.history_weights,
+            temporal.history_bias,
+            cross.history_weights,
+            cross.history_bias,
+        )
+        if temporal_v
+        else (
+            temporal.history_weights,
+            temporal.history_bias,
+            cross.weight,
+            cross.bias,
+            cross.history_weights,
+        )
     )
     predictor_parameter_bytes = sum(
         tensor.numel() * tensor.element_size() for tensor in parameter_tensors

@@ -95,7 +95,10 @@ else:
     if v_history is None:
         v_history = 0
     k_label = f"kh{int(k_history)}"
-    v_label = f"vh{int(v_history)}"
+    # The V segment records the predictor structure: parameters fitted for the
+    # temporal V predictor are not interchangeable with CrossKV ones.
+    v_prefix = "vt" if config.get("v_predictor_mode") == "temporal" else "vh"
+    v_label = f"{v_prefix}{int(v_history)}"
 if k_bits == v_bits:
     precision_label = f"int{k_bits}"
 else:

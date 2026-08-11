@@ -105,8 +105,8 @@ class PackedKV:
     def __post_init__(self) -> None:
         if self.key.predictor_kind != "temporal":
             raise ValueError("PackedKV key must use temporal prediction")
-        if self.value.predictor_kind != "cross_kv":
-            raise ValueError("PackedKV value must use CrossKV prediction")
+        if self.value.predictor_kind not in {"cross_kv", "temporal"}:
+            raise ValueError("PackedKV value must use CrossKV or temporal prediction")
         if self.key.shape != self.value.shape:
             raise ValueError("packed K and V must have the same shape")
         if self.key.reconstruction_dtype != self.value.reconstruction_dtype:
@@ -313,6 +313,7 @@ def _encode(
     bits: int,
     config: CodecConfig,
     reuse_input_for_reconstruction: bool = False,
+    history_length: int | None = None,
 ) -> tuple[PackedTensor, torch.Tensor]:
     _validate_input(value, config)
     batch, heads, sequence, width = map(int, value.shape)
@@ -326,8 +327,10 @@ def _encode(
         )
     if predictor_kind == "temporal":
         if temporal is None:
-            raise ValueError("K encoding requires temporal parameters")
-        temporal = temporal.with_history_length(config.k_history_length)
+            raise ValueError("temporal encoding requires temporal parameters")
+        temporal = temporal.with_history_length(
+            config.k_history_length if history_length is None else history_length
+        )
         if temporal.stride is not None and temporal.stride != config.stride:
             raise ValueError("temporal parameters were fitted for a different stride")
         temporal = temporal.to(value.device)
@@ -517,8 +520,14 @@ def encode_temporal(
     config: CodecConfig | None = None,
     *,
     reuse_input_for_reconstruction: bool = False,
+    bits: int | None = None,
+    history_length: int | None = None,
 ) -> tuple[PackedTensor, torch.Tensor]:
-    """Encode K and return both packed data and its closed-loop reconstruction."""
+    """Encode a temporally predicted tensor with its closed-loop reconstruction.
+
+    ``bits`` and ``history_length`` default to the K settings.  A temporal V
+    predictor passes the V settings instead; the predictor itself is identical.
+    """
     resolved = config or CodecConfig()
     return _encode(
         key,
@@ -526,9 +535,10 @@ def encode_temporal(
         temporal=parameters,
         cross_kv=None,
         source=None,
-        bits=resolved.k_bits,
+        bits=resolved.k_bits if bits is None else bits,
         config=resolved,
         reuse_input_for_reconstruction=reuse_input_for_reconstruction,
+        history_length=history_length,
     )
 
 
@@ -799,10 +809,17 @@ class TempoKVCodec:
     def __init__(
         self,
         temporal: TemporalParameters,
-        cross_kv: CrossKVParameters,
+        cross_kv: CrossKVParameters | TemporalParameters,
         config: CodecConfig | None = None,
     ) -> None:
         self.config = config or CodecConfig()
+        expects_temporal_v = self.config.v_predictor_mode == "temporal"
+        if expects_temporal_v != isinstance(cross_kv, TemporalParameters):
+            expected = "TemporalParameters" if expects_temporal_v else "CrossKVParameters"
+            raise ValueError(
+                f"v_predictor_mode={self.config.v_predictor_mode} requires V "
+                f"parameters of type {expected}, got {type(cross_kv).__name__}"
+            )
         if temporal.shared_history != cross_kv.shared_history:
             raise ValueError("K and V parameters must use the same history sharing mode")
         if temporal.shared_history:
@@ -839,13 +856,13 @@ class TempoKVCodec:
         temporal = temporal.with_history_length(self.config.k_history_length)
         cross_kv = cross_kv.with_history_length(self.config.v_history_length)
         self.temporal = temporal
-        self.cross_kv = cross_kv
+        self.v_parameters = cross_kv
         expected_signature = (
             self.config.shared_format_signature()
             if temporal.shared_history
             else self.config.format_signature()
         )
-        for name, parameters in (("K", self.temporal), ("V", self.cross_kv)):
+        for name, parameters in (("K", self.temporal), ("V", self.v_parameters)):
             signature = parameters.codec_signature
             if signature is not None and signature != expected_signature:
                 raise ValueError(
@@ -853,20 +870,20 @@ class TempoKVCodec:
                 )
         if (
             self.temporal.codec_signature is not None
-            and self.cross_kv.codec_signature is not None
-            and self.temporal.codec_signature != self.cross_kv.codec_signature
+            and self.v_parameters.codec_signature is not None
+            and self.temporal.codec_signature != self.v_parameters.codec_signature
         ):
             raise ValueError("K and V parameters use different codec configs")
         if (
             self.temporal.parameter_set_id is not None
-            and self.cross_kv.parameter_set_id is not None
-            and self.temporal.parameter_set_id != self.cross_kv.parameter_set_id
+            and self.v_parameters.parameter_set_id is not None
+            and self.temporal.parameter_set_id != self.v_parameters.parameter_set_id
         ):
             raise ValueError("K and V parameters were not fitted together")
         if (
             self.temporal.coordinate_system is not None
-            and self.cross_kv.coordinate_system is not None
-            and self.temporal.coordinate_system != self.cross_kv.coordinate_system
+            and self.v_parameters.coordinate_system is not None
+            and self.temporal.coordinate_system != self.v_parameters.coordinate_system
         ):
             raise ValueError("K and V parameters use different coordinate systems")
         self._temporal_by_device: dict[str, TemporalParameters] = {}
@@ -902,7 +919,7 @@ class TempoKVCodec:
             return cached
         parameters = self._cross_by_device.get(device_key)
         if parameters is None:
-            parameters = self.cross_kv.to(device)
+            parameters = self.v_parameters.to(device)
             self._cross_by_device[device_key] = parameters
         selected = parameters.for_layer(layer) if parameters.layered else parameters
         self._cross_layer_cache[cache_key] = selected
@@ -924,20 +941,54 @@ class TempoKVCodec:
             reuse_input_for_reconstruction=reuse_input,
         )
 
+    @property
+    def cross_kv(self) -> CrossKVParameters:
+        """The CrossKV parameters, when this codec predicts V from K."""
+        parameters = self.v_parameters
+        if not isinstance(parameters, CrossKVParameters):
+            raise AttributeError(
+                "this codec predicts V with the temporal predictor; read "
+                "codec.v_parameters instead of codec.cross_kv"
+            )
+        return parameters
+
+    @property
+    def predicts_v_from_key(self) -> bool:
+        """Whether encoding V requires the reconstructed K of the same span."""
+        return self.config.v_predictor_mode == "cross_kv"
+
     def encode_value(
         self,
         value: torch.Tensor,
-        reconstructed_key: torch.Tensor,
+        reconstructed_key: torch.Tensor | None = None,
         *,
         layer: int = 0,
         reuse_input: bool = False,
     ) -> PackedTensor:
-        """Encode one V cache from reconstructed K without retaining V output."""
-        cross = self._cross_for_layer(value.device, layer)
+        """Encode one V cache without retaining the decoded V output.
+
+        ``reconstructed_key`` is required only when V is predicted from K; the
+        temporal V predictor reads its own reconstructed history instead.
+        """
+        parameters = self._cross_for_layer(value.device, layer)
+        if not self.predicts_v_from_key:
+            assert isinstance(parameters, TemporalParameters)
+            packed, _ = encode_temporal(
+                value,
+                parameters,
+                self.config,
+                reuse_input_for_reconstruction=reuse_input,
+                bits=self.config.v_bits,
+                history_length=self.config.v_history_length,
+            )
+            return packed
+        if reconstructed_key is None:
+            raise ValueError("CrossKV V encoding requires the reconstructed K")
+        assert isinstance(parameters, CrossKVParameters)
         packed, _ = encode_cross_kv(
             value,
             reconstructed_key,
-            cross,
+            parameters,
             self.config,
             reuse_input_for_reconstruction=reuse_input,
         )
@@ -965,7 +1016,7 @@ class TempoKVCodec:
         )
         value = decode_tensor(
             packed.value,
-            source=key,
+            source=key if self.predicts_v_from_key else None,
             output_dtype=output_dtype,
             use_triton=self.config.use_triton,
             strict_triton=self.config.strict_triton,

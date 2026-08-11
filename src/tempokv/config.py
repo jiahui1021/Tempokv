@@ -30,6 +30,10 @@ class CodecConfig:
     cross_matmul_precision: str = "tf32"
     # ``shared`` pools all Self-Forcing layers and heads into [P,P,D].
     k_predictor_mode: str = "layer_head"
+    # ``temporal`` predicts V from its own reconstructed history with the same
+    # predictor K uses, so V needs no reconstructed K and no CrossKV matrix.
+    # ``cross_kv`` keeps the Cross(K) projection.
+    v_predictor_mode: str = "cross_kv"
     # Select the legacy fixed-point/shared-K and direct temporal-V fitting math.
     fit_mode: str = "native"
     # Legacy Cross+previous-V decoding runs in Torch by default: the fused
@@ -119,6 +123,8 @@ class CodecConfig:
             raise ValueError(
                 "k_predictor_mode must be layer_head or shared"
             )
+        if self.v_predictor_mode not in {"cross_kv", "temporal"}:
+            raise ValueError("v_predictor_mode must be cross_kv or temporal")
         if self.fit_mode not in {"native", "legacy"}:
             raise ValueError("fit_mode must be native or legacy")
         if self.legacy_v_decode not in {"torch", "triton"}:
@@ -172,6 +178,7 @@ class CodecConfig:
                 )
             if (
                 self.v_history_length
+                and self.v_predictor_mode == "cross_kv"
                 and self.strict_triton
                 and self.legacy_v_decode == "torch"
             ):
@@ -195,6 +202,7 @@ class CodecConfig:
             "scale_dtype": self.scale_dtype,
             "stride": self.stride,
             "v_bits": self.v_bits,
+            "v_predictor_mode": self.v_predictor_mode,
         }
         if self.k_history_length is not None:
             payload["k_history_length"] = int(self.k_history_length)
@@ -227,6 +235,7 @@ class CodecConfig:
             "stride": self.stride,
             "v_bits": self.v_bits,
             "v_max_history_length": self.v_max_history_length,
+            "v_predictor_mode": self.v_predictor_mode,
         }
         return "tempokv-codec-v6:" + json.dumps(
             payload, sort_keys=True, separators=(",", ":")

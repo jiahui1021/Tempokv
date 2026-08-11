@@ -1174,8 +1174,15 @@ def _reconstruct_temporal_trace(
     clean_keys: torch.Tensor,
     parameters: TemporalParameters,
     config: CodecConfig,
+    *,
+    bits: int | None = None,
 ) -> torch.Tensor:
-    """Apply the codec's closed-loop anchor/residual rules to a trace."""
+    """Apply the codec's closed-loop anchor/residual rules to a trace.
+
+    ``bits`` defaults to the K residual width.  A temporal V predictor runs the
+    identical loop over V and passes ``config.v_bits``.
+    """
+    residual_bits = config.k_bits if bits is None else bits
     layer_count = int(clean_keys.shape[0])
     frame_count = int(clean_keys.shape[-3])
     head_count = int(clean_keys.shape[-2])
@@ -1294,7 +1301,7 @@ def _reconstruct_temporal_trace(
         residual = clean_keys[..., frame, :, :].float() - prediction
         residual_rebuilt = _quantization_roundtrip(
             residual,
-            bits=config.k_bits,
+            bits=residual_bits,
             config=config,
             symmetric=config.residual_mode == "symmetric",
         )
@@ -1606,48 +1613,110 @@ def fit_legacy_temporal_v_alpha(
 
 def _stamp_parameter_identity(
     temporal: TemporalParameters,
-    cross: CrossKVParameters,
+    cross: CrossKVParameters | TemporalParameters,
     *,
     signature: str,
     coordinate_system: str | None,
-) -> tuple[TemporalParameters, CrossKVParameters]:
+) -> tuple[TemporalParameters, CrossKVParameters | TemporalParameters]:
+    """Give a K/V pair one shared identity so they can only be loaded together."""
     identity = hashlib.sha256()
     identity.update(signature.encode("utf-8"))
     identity.update((coordinate_system or "unspecified").encode("utf-8"))
-    for tensor in (
-        temporal.history_weights,
-        temporal.history_bias,
-        cross.weight,
-        cross.history_weights,
-        cross.bias,
-    ):
+    v_tensors = (
+        (cross.history_weights, cross.history_bias)
+        if isinstance(cross, TemporalParameters)
+        else (cross.weight, cross.history_weights, cross.bias)
+    )
+    for tensor in (temporal.history_weights, temporal.history_bias, *v_tensors):
         identity.update(tensor.detach().cpu().contiguous().numpy().tobytes())
     parameter_set_id = identity.hexdigest()
-    return (
-        TemporalParameters(
-            temporal.history_weights,
-            temporal.history_bias,
-            temporal.stride,
-            temporal.layer_ids,
-            signature,
-            parameter_set_id,
-            coordinate_system,
-            temporal.maximum_history_length,
-            temporal.active_history_length,
-        ),
-        CrossKVParameters(
-            cross.weight,
-            cross.bias,
+    stamped_k = TemporalParameters(
+        temporal.history_weights,
+        temporal.history_bias,
+        temporal.stride,
+        temporal.layer_ids,
+        signature,
+        parameter_set_id,
+        coordinate_system,
+        temporal.maximum_history_length,
+        temporal.active_history_length,
+    )
+    if isinstance(cross, TemporalParameters):
+        return stamped_k, TemporalParameters(
+            cross.history_weights,
+            cross.history_bias,
             cross.stride,
             cross.layer_ids,
             signature,
             parameter_set_id,
             coordinate_system,
-            cross.history_weights,
             cross.maximum_history_length,
             cross.active_history_length,
-        ),
+        )
+    return stamped_k, CrossKVParameters(
+        cross.weight,
+        cross.bias,
+        cross.stride,
+        cross.layer_ids,
+        signature,
+        parameter_set_id,
+        coordinate_system,
+        cross.history_weights,
+        cross.maximum_history_length,
+        cross.active_history_length,
     )
+
+
+@torch.no_grad()
+def _fit_legacy_shared_temporal_v(
+    values: torch.Tensor,
+    *,
+    config: CodecConfig,
+    history_length: int,
+    iterations: int,
+    ridge: float,
+    max_gain: float,
+    signature: str,
+) -> TemporalParameters:
+    """Fit V with the predictor K uses, shared across every layer and head.
+
+    V never sees K here: the closed loop runs over V's own reconstruction, so
+    the fit is the same fixed-point procedure as the K fit with V's bit width.
+    """
+    if history_length <= 0:
+        raise ValueError("temporal V fitting requires v_history_length >= 1")
+    dim = int(values.shape[-1])
+    weights = torch.zeros(
+        history_length, history_length, dim, dtype=torch.float32, device=values.device
+    )
+    weights[:, 0] = 1.0
+    parameters = TemporalParameters(
+        history_weights=weights,
+        history_bias=torch.zeros(
+            history_length, dim, dtype=torch.float32, device=values.device
+        ),
+        stride=config.stride,
+        codec_signature=signature,
+    )
+    for _ in range(iterations):
+        reconstructed = _reconstruct_temporal_trace(
+            values, parameters, config, bits=config.v_bits
+        )
+        fitted = fit_legacy_shared_temporal(
+            reconstructed,
+            values,
+            history_length=history_length,
+            ridge=ridge,
+            max_gain=max_gain,
+            stride=config.stride,
+        )
+        parameters = TemporalParameters(
+            fitted.history_weights,
+            fitted.history_bias,
+            fitted.stride,
+            codec_signature=signature,
+        )
+    return parameters
 
 
 def _fit_legacy_predictors(
@@ -1704,6 +1773,22 @@ def _fit_legacy_predictors(
         )
 
     reconstructed_keys = _reconstruct_temporal_trace(keys, temporal, config)
+    if config.v_predictor_mode == "temporal":
+        cross = _fit_legacy_shared_temporal_v(
+            values,
+            config=config,
+            history_length=config.v_history_length,
+            iterations=iterations,
+            ridge=temporal_ridge,
+            max_gain=max_gain,
+            signature=signature,
+        )
+        return _stamp_parameter_identity(
+            temporal,
+            cross,
+            signature=signature,
+            coordinate_system=coordinate_system,
+        )
     cross = fit_legacy_cross_kv(
         reconstructed_keys,
         values,
@@ -2083,6 +2168,14 @@ def _fit_predictors(
     if resolved.v_history_length >= int(keys.shape[-3]):
         raise ValueError(
             "config.v_history_length must be smaller than the trace frame count"
+        )
+    if resolved.v_predictor_mode == "temporal" and resolved.fit_mode != "legacy":
+        # The codec decodes temporal V at any scale, but only the legacy fitter
+        # produces temporal V parameters.  Say so here rather than let the
+        # native fitters return CrossKV parameters the codec will reject.
+        raise ValueError(
+            "v_predictor_mode=temporal is currently fitted only by "
+            "fit_mode=legacy"
         )
     if resolved.fit_mode == "legacy":
         if resolved.v_history_length and v_history_mode != "diagonal":

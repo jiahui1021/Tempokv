@@ -107,6 +107,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--k-predictor-mode", choices=("layer_head", "shared")
     )
+    parser.add_argument("--v-predictor-mode", choices=("cross_kv", "temporal"))
     parser.add_argument("--fit-mode", choices=("native", "legacy"))
     parser.add_argument(
         "--use-triton", action=argparse.BooleanOptionalAction, default=None
@@ -418,14 +419,22 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     output_dir = args.output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     temporal_path = output_dir / "k_temporal.npz"
-    cross_path = output_dir / "v_cross_kv.npz"
+    # The V file name states its structure, so a temporal V parameter set can
+    # never be mistaken for a CrossKV one on disk.
+    temporal_v = config.v_predictor_mode == "temporal"
+    cross_path = output_dir / ("v_temporal.npz" if temporal_v else "v_cross_kv.npz")
     report_path = output_dir / "fit_report.json"
     parameter_tensors = (
-        temporal.history_weights,
-        temporal.history_bias,
-        cross.weight,
-        cross.history_weights,
-        cross.bias,
+        (temporal.history_weights, temporal.history_bias,
+         cross.history_weights, cross.history_bias)
+        if temporal_v
+        else (
+            temporal.history_weights,
+            temporal.history_bias,
+            cross.weight,
+            cross.history_weights,
+            cross.bias,
+        )
     )
     parameter_bytes = sum(
         tensor.numel() * tensor.element_size() for tensor in parameter_tensors
@@ -483,17 +492,27 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "peak_gpu_reserved_bytes": peak_fit_reserved,
         },
         "parameters": {
+            "v_predictor_mode": config.v_predictor_mode,
             "temporal_weight_shape": list(temporal.history_weights.shape),
             "temporal_bias_shape": list(temporal.history_bias.shape),
-            "cross_weight_shape": list(cross.weight.shape),
-            "cross_history_weight_shape": list(cross.history_weights.shape),
-            "cross_bias_shape": list(cross.bias.shape),
+            **(
+                {
+                    "v_temporal_weight_shape": list(cross.history_weights.shape),
+                    "v_temporal_bias_shape": list(cross.history_bias.shape),
+                }
+                if temporal_v
+                else {
+                    "cross_weight_shape": list(cross.weight.shape),
+                    "cross_history_weight_shape": list(cross.history_weights.shape),
+                    "cross_bias_shape": list(cross.bias.shape),
+                }
+            ),
             "bytes": parameter_bytes,
             "mib": parameter_bytes / (1024**2),
         },
         "artifacts": {
             "k_temporal": temporal_path.name,
-            "v_cross_kv": cross_path.name,
+            "v_temporal" if temporal_v else "v_cross_kv": cross_path.name,
         },
     }
     report_path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
