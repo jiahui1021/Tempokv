@@ -26,8 +26,8 @@ fit_s=$((t1 - t0))
 t0=$(date +%s)
 rm -rf "results/self_forcing/$LABEL"
 mkdir -p "results/self_forcing/$LABEL"
-# Both legacy accelerations on: triton V decode (from CONFIG legacy_v_decode)
-# and a larger persistent launch batch for the legacy K kernel.
+# The persistent launch batch is the one remaining decode tuning knob; the
+# temporal V predictor removed the CrossKV projection that used to dominate.
 env PYTHON_BIN=$QVG CONFIG="$CONFIG" KH="$KH" VH="$VH" \
   TEMPOKV_PERSISTENT_UNITS_PER_LAUNCH=16 \
   CHECKPOINT=/mnt/cpfs/epic-user/hujiahui-20260612/checkpoints/self_forcing_dmd.pt \

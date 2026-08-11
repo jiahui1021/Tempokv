@@ -40,7 +40,6 @@ class PackedTensor:
     residual_zero_point: torch.Tensor | None
     cross_matmul_precision: str = "tf32"
     compatibility_mode: str = "native"
-    legacy_v_decode: str = "torch"
     temporal: TemporalParameters | None = None
     cross_kv: CrossKVParameters | None = None
 
@@ -68,8 +67,6 @@ class PackedTensor:
             raise ValueError("cross_matmul_precision must be ieee or tf32")
         if self.compatibility_mode not in {"native", "legacy"}:
             raise ValueError("compatibility_mode must be native or legacy")
-        if self.legacy_v_decode not in {"torch", "triton"}:
-            raise ValueError("legacy_v_decode must be torch or triton")
         has_residual = len(self.unit_lengths) > 1
         if has_residual != (self.residual_quant is not None):
             raise ValueError("residual tensors do not match unit layout")
@@ -501,7 +498,6 @@ def _encode(
         reconstruction_dtype=config.reconstruction_dtype,
         cross_matmul_precision=config.cross_matmul_precision,
         compatibility_mode=config.fit_mode,
-        legacy_v_decode=config.legacy_v_decode,
         unit_lengths=tuple(unit_lengths),
         anchor_quant=anchor_quant,
         anchor_scale=anchor_scale,
@@ -657,7 +653,6 @@ def decode_tensor(
             )
     legacy_torch_cross = (
         packed.compatibility_mode == "legacy"
-        and packed.legacy_v_decode == "torch"
         and packed.predictor_kind == "cross_kv"
         and packed.cross_kv is not None
         and packed.cross_kv.history_length > 0
@@ -717,8 +712,6 @@ def decode_tensor(
     )
     output[:, :, :anchor_length] = anchor
     if packed.residual_quant is None:
-        if legacy_torch_cross:
-            _record_legacy_torch_cross_route()
         return output
     assert packed.residual_scale is not None
     history = (
@@ -789,18 +782,7 @@ def decode_tensor(
         offset += unit_length
         residual_offset = end
         del prediction, zero_point, residual, rebuilt
-    if legacy_torch_cross:
-        _record_legacy_torch_cross_route()
     return output
-
-
-def _record_legacy_torch_cross_route() -> None:
-    """Expose the expected legacy direct-V Torch fallback in run reports."""
-    try:
-        from .triton_ops import record_route
-    except (ImportError, ModuleNotFoundError):
-        return
-    record_route("cross_kv_temporal_v_torch")
 
 
 class TempoKVCodec:

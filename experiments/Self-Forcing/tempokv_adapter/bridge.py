@@ -57,18 +57,15 @@ def decode_cache_state(
         if output_layout != "BSHD":
             fallback_kwargs["output_layout"] = output_layout
         return fallback(state, **fallback_kwargs)
+    # Legacy Cross+previous-V has no Triton path: its Torch decoder takes a
+    # standalone contiguous K source and builds a standalone BHSD result, which
+    # the cache copies afterwards.  The temporal V predictor needs neither.
     legacy_direct_v = (
         packed.compatibility_mode == "legacy"
-        and packed.legacy_v_decode == "torch"
         and packed.predictor_kind == "cross_kv"
         and packed.cross_kv is not None
         and packed.cross_kv.history_length > 0
     )
-    # The legacy Torch path deliberately excludes direct-output and Triton for
-    # Cross+previous-V.  Its Torch decoder takes a standalone contiguous K
-    # source, builds a standalone BHSD result, and the cache copies it after.
-    # Both copies disappear under legacy_v_decode=triton, which decodes
-    # straight into the cache-read buffer.
     if legacy_direct_v and source_tensor is not None:
         source_tensor = source_tensor.contiguous()
     decode_kwargs = {

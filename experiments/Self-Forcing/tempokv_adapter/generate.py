@@ -19,10 +19,7 @@ SOURCE_ROOT = PROJECT_ROOT / "src"
 if SOURCE_ROOT.is_dir() and str(SOURCE_ROOT) not in sys.path:
     sys.path.insert(0, str(SOURCE_ROOT))
 
-from tempokv.runtime import (  # noqa: E402
-    PERSISTENT_UNITS_ENV,
-    persistent_units_per_launch,
-)
+from tempokv.runtime import persistent_units_per_launch  # noqa: E402
 
 RUNTIME_ROOT = PROJECT_ROOT / "experiments" / "Self-Forcing"
 REQUIRED_RUNTIME_FILES = (
@@ -637,34 +634,31 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         report["parameters"] = parameters
         report["runtime_config"] = str(paths["runtime_config"])
         requested_persistent_units = persistent_units_per_launch()
-        legacy_torch_v = (
-            config.fit_mode == "legacy"
-            and config.legacy_v_decode == "torch"
+        # CrossKV V with history is the one layout Triton cannot decode.
+        torch_v = (
+            config.v_predictor_mode == "cross_kv"
+            and config.fit_mode == "legacy"
             and parameters["v_history_length"]
         )
         report["persistent_units_per_launch"] = {
             "requested": requested_persistent_units,
             "k": (
-                8
-                if config.fit_mode == "legacy"
-                and PERSISTENT_UNITS_ENV not in os.environ
-                else (
-                    min(requested_persistent_units, 8)
-                    if parameters["k_history_length"] > 4
-                    else requested_persistent_units
-                )
+                min(requested_persistent_units, 8)
+                if parameters["k_history_length"] > 4
+                else requested_persistent_units
             ),
             "v": (
                 None
-                if legacy_torch_v
+                if torch_v
                 else (
                     min(requested_persistent_units, 8)
                     if parameters["v_history_length"]
+                    and config.v_predictor_mode == "cross_kv"
                     and not parameters.get("v_history_diagonal", False)
                     else requested_persistent_units
                 )
             ),
-            "v_backend": "torch_cross_temporal_v" if legacy_torch_v else "triton",
+            "v_backend": "torch_cross_kv" if torch_v else "triton",
         }
     if args.dry_run:
         print(json.dumps(report, indent=2, ensure_ascii=False))
@@ -674,9 +668,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
     environment = os.environ.copy()
     if args.mode == "tempokv":
         runtime_payload = asdict(config)
-        if not args.allow_triton_fallback and (
-            config.fit_mode != "legacy" or config.legacy_v_decode == "triton"
-        ):
+        if not args.allow_triton_fallback and not torch_v:
             runtime_payload["use_triton"] = True
             runtime_payload["strict_triton"] = True
         paths["runtime_config"].write_text(
@@ -760,15 +752,9 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         and generated_entries
     ):
         required_routes = (
-            (
-                "temporal_persistent_direct",
-                "cross_kv_temporal_v_torch",
-            )
-            if config.fit_mode == "legacy" and config.legacy_v_decode == "torch"
-            else (
-                "temporal_persistent_direct",
-                "cross_kv_persistent_direct",
-            )
+            ("temporal_persistent_direct",)
+            if config.v_predictor_mode == "temporal" or torch_v
+            else ("temporal_persistent_direct", "cross_kv_persistent_direct")
         )
         missing_routes = [
             route

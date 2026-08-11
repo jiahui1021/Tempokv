@@ -36,12 +36,6 @@ class CodecConfig:
     v_predictor_mode: str = "cross_kv"
     # Select the legacy fixed-point/shared-K and direct temporal-V fitting math.
     fit_mode: str = "native"
-    # Legacy Cross+previous-V decoding runs in Torch by default: the fused
-    # Triton kernel implements the same arithmetic but has not been shown
-    # bit-exact for this layout yet.  ``triton`` opts into it, which removes
-    # one PyTorch launch chain per decoded unit.  Decode-only, so it stays out
-    # of the parameter signatures.
-    legacy_v_decode: str = "torch"
 
     def __post_init__(self) -> None:
         for name in ("k_bits", "v_bits", "anchor_bits"):
@@ -127,8 +121,6 @@ class CodecConfig:
             raise ValueError("v_predictor_mode must be cross_kv or temporal")
         if self.fit_mode not in {"native", "legacy"}:
             raise ValueError("fit_mode must be native or legacy")
-        if self.legacy_v_decode not in {"torch", "triton"}:
-            raise ValueError("legacy_v_decode must be torch or triton")
         if (
             self.k_predictor_mode == "shared"
             and self.fit_mode != "legacy"
@@ -176,15 +168,10 @@ class CodecConfig:
                 raise ValueError(
                     "legacy fitting requires bfloat16 scales and reconstruction"
                 )
-            if (
-                self.v_history_length
-                and self.v_predictor_mode == "cross_kv"
-                and self.strict_triton
-                and self.legacy_v_decode == "torch"
-            ):
+            if self.v_history_length and self.v_predictor_mode == "cross_kv" and self.strict_triton:
                 raise ValueError(
-                    "legacy direct Cross+V-history decodes in Torch; set "
-                    "legacy_v_decode=triton before requiring strict Triton"
+                    "legacy Cross+previous-V decodes in Torch and has no "
+                    "Triton path; use v_predictor_mode=temporal for one"
                 )
 
     def format_signature(self) -> str:
