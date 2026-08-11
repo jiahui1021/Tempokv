@@ -200,10 +200,69 @@ def _triton_parity(args, directory: Path) -> dict:
     return results
 
 
+def _preflight(args) -> None:
+    """Validate every input before launching any fit.
+
+    Each cell is a full closed-loop fit, so a bad path or too-short trace must
+    fail here rather than four times over after minutes of work.
+    """
+    import numpy as np
+
+    trace = Path(args.trace)
+    if not trace.is_file():
+        raise SystemExit(
+            f"trace not found: {trace}\n"
+            "Collect one first:  bash scripts/Self-Forcing/collect_trace.sh\n"
+            "It writes data/self-forcing/trace/clean_trace.npz by default; pass "
+            "--trace if yours lives elsewhere."
+        )
+    if args.config and not Path(args.config).is_file():
+        raise SystemExit(f"config not found: {args.config}")
+
+    with np.load(trace, allow_pickle=False) as data:
+        missing = [n for n in (args.keys_name, args.values_name) if n not in data]
+        if missing:
+            raise SystemExit(
+                f"trace {trace} has no array named {' or '.join(missing)}; "
+                f"it contains {sorted(data)}. Use --keys-name/--values-name."
+            )
+        shape = data[args.keys_name].shape
+    if len(shape) != 5:
+        raise SystemExit(
+            f"expected a [L,N,T,H,D] trace, got shape {tuple(shape)}"
+        )
+    frames = int(shape[2])
+    needed = max(args.k_history_length or 1, args.v_history_length or 0) + 1
+    if frames < needed:
+        raise SystemExit(
+            f"trace has {frames} frames but kh={args.k_history_length} / "
+            f"vh={args.v_history_length} needs at least {needed}. Recollect with "
+            "a larger TRACE_FRAMES or lower the history lengths."
+        )
+    print(
+        f"trace {tuple(shape)}  layers={shape[0]} tokens/frame={shape[1]} "
+        f"frames={frames} heads={shape[3]} dim={shape[4]}"
+    )
+    # Returned so the report records what was measured; a summary without the
+    # trace geometry cannot be compared against an earlier sweep.
+    return {
+        "shape": [int(x) for x in shape],
+        "layers": int(shape[0]),
+        "tokens_per_frame": int(shape[1]),
+        "frames": frames,
+        "heads": int(shape[3]),
+        "dim": int(shape[4]),
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--trace", required=True)
+    parser.add_argument(
+        "--trace",
+        default=str(PROJECT_ROOT / "data" / "self-forcing" / "trace" / "clean_trace.npz"),
+        help="clean trace written by collect_trace.sh",
+    )
     parser.add_argument("--config")
     parser.add_argument("--workdir", default="runs/verify")
     parser.add_argument("--k-history-length", type=int)
@@ -229,11 +288,13 @@ def main() -> None:
     unknown = [c for c in selected if c not in CELLS]
     if unknown:
         raise SystemExit(f"unknown cells: {', '.join(unknown)}")
+    trace_geometry = _preflight(args)
 
     workdir = Path(args.workdir).resolve()
     workdir.mkdir(parents=True, exist_ok=True)
     summary: dict = {
         "trace": str(Path(args.trace).resolve()),
+        "trace_geometry": trace_geometry,
         "config": str(Path(args.config).resolve()) if args.config else None,
         "k_history_length": args.k_history_length,
         "v_history_length": args.v_history_length,
@@ -273,13 +334,18 @@ def main() -> None:
         entry.update(_gain_saturation(directory / "k_temporal.npz"))
         summary["cells"][cell] = entry
 
-    best = "both" if "both" in summary["cells"] else selected[-1]
-    if best in summary["cells"] and "error" not in summary["cells"][best]:
-        print(f"\n[trit] Triton decode parity using the '{best}' parameters", flush=True)
+    # Parity is measured per cell, not once: the V-history map differs between
+    # cells, so a gap that appears only under one mode localizes the fault to
+    # that Triton branch rather than to the shared CrossKV matmul.
+    summary["triton_parity"] = {}
+    for cell in selected:
+        if "error" in summary["cells"].get(cell, {"error": "missing"}):
+            continue
+        print(f"\n[trit] Triton decode parity for '{cell}'", flush=True)
         try:
-            summary["triton_parity"] = _triton_parity(args, workdir / best)
+            summary["triton_parity"][cell] = _triton_parity(args, workdir / cell)
         except Exception as error:  # noqa: BLE001 - recorded for the report
-            summary["triton_parity"] = {"error": str(error)}
+            summary["triton_parity"][cell] = {"error": str(error)}
 
     destination = workdir / "summary.json"
     destination.write_text(json.dumps(summary, indent=2), encoding="utf-8")
@@ -307,15 +373,22 @@ def main() -> None:
                   f"   attn err x{entry['attention_error'] / reference['attention_error']:.3f}")
 
     parity = summary.get("triton_parity", {})
-    if parity and "skipped" not in parity and "error" not in parity:
-        print("\nTriton decode parity (K must be 0.0; nonzero V is unabsorbed error):")
-        for layer, values in parity.items():
-            if "error" in values:
-                print(f"  layer {layer}: {values['error']}")
+    if parity:
+        print("\nTriton decode vs encoder reconstruction "
+              "(K must be 0.0; V is shown relative to its own RMS):")
+        for cell, layers in parity.items():
+            if not isinstance(layers, dict) or "skipped" in layers or "error" in layers:
+                print(f"  {cell}: {layers}")
                 continue
-            print(f"  layer {layer:>3}: K {values['k_max_abs_diff']:.3e}   "
-                  f"V {values['v_max_abs_diff']:.3e}   "
-                  f"(V rms {values['v_recon_rms']:.3e})")
+            mode = summary["cells"][cell]["v_history_mode"]
+            print(f"  {cell} (v_history={mode}):")
+            for layer, values in layers.items():
+                if "error" in values:
+                    print(f"    layer {layer}: {values['error']}")
+                    continue
+                share = values["v_max_abs_diff"] / max(values["v_recon_rms"], 1e-12)
+                print(f"    layer {layer:>3}: K {values['k_max_abs_diff']:.3e}   "
+                      f"V {values['v_max_abs_diff']:.3e} ({share:.1%} of RMS)")
 
     print(f"\nwrote {destination}")
     print("Send that file back -- it carries every number above plus the fit settings.")
