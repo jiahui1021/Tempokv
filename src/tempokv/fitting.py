@@ -1266,6 +1266,7 @@ def fit_predictors(
     temporal_ridge: float = 0.0,
     cross_ridge: float = 0.0,
     max_gain: float = 1.0,
+    v_history_mode: str = "dense",
     layer_ids: tuple[int, ...] | None = None,
     coordinate_system: str | None = None,
 ) -> tuple[TemporalParameters, CrossKVParameters]:
@@ -1286,6 +1287,7 @@ def fit_predictors(
             temporal_ridge=temporal_ridge,
             cross_ridge=cross_ridge,
             max_gain=max_gain,
+            v_history_mode=v_history_mode,
             layer_ids=layer_ids,
             coordinate_system=coordinate_system,
         )
@@ -1302,10 +1304,18 @@ def _fit_predictors(
     temporal_ridge: float = 0.0,
     cross_ridge: float = 0.0,
     max_gain: float = 1.0,
+    v_history_mode: str = "dense",
     layer_ids: tuple[int, ...] | None = None,
     coordinate_system: str | None = None,
 ) -> tuple[TemporalParameters, CrossKVParameters]:
     """Fit deployable K and V predictors with closed-loop K reconstruction.
+
+    ``v_history_mode`` selects the V-history map: ``"dense"`` fits a full
+    ``D x D`` matrix per lag, so the V history can mix channels the way the
+    reference joint predictor does; ``"diagonal"`` fits one coefficient per
+    output channel instead.  Diagonal is far cheaper to store but cannot
+    represent cross-channel recurrence, so it is only the right choice when a
+    trace shows the V history is genuinely per-channel.
 
     Clean traces use ``[L, ..., T, H, D]`` layout.  K starts from a persistence
     predictor.  Each iteration reconstructs K with the configured anchor and
@@ -1331,6 +1341,10 @@ def _fit_predictors(
     temporal_ridge = _check_scalar("temporal_ridge", temporal_ridge)
     cross_ridge = _check_scalar("cross_ridge", cross_ridge)
     max_gain = _check_scalar("max_gain", max_gain, positive=True)
+    # Checked before the first quantization pass so a typo fails immediately
+    # rather than after a full closed-loop K fit.
+    if v_history_mode not in ("dense", "diagonal"):
+        raise ValueError("v_history_mode must be 'dense' or 'diagonal'")
     shared_history = (
         resolved.k_max_history_length is not None
         or resolved.v_max_history_length is not None
@@ -1490,7 +1504,7 @@ def _fit_predictors(
                 values,
                 reconstructed_values=reconstructed_values,
                 history_length=resolved.v_history_length,
-                history_mode="diagonal",
+                history_mode=v_history_mode,
                 ridge=cross_ridge,
                 stride=resolved.stride,
                 layer_ids=layer_ids,

@@ -56,6 +56,14 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         help="fit one shared K parameter set usable from 1 through this length",
     )
+    parser.add_argument(
+        "--v-history-mode",
+        choices=("dense", "diagonal"),
+        default="dense",
+        help="V-history map: dense fits a full DxD matrix per lag so the "
+        "history can mix channels; diagonal fits one coefficient per output "
+        "channel and cannot represent cross-channel recurrence",
+    )
     parser.add_argument("--iterations", type=int, default=2)
     parser.add_argument("--temporal-ridge", type=float, default=0.0)
     parser.add_argument("--cross-ridge", type=float, default=0.0)
@@ -311,6 +319,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         temporal_ridge=args.temporal_ridge,
         cross_ridge=args.cross_ridge,
         max_gain=args.max_gain,
+        v_history_mode=args.v_history_mode,
         layer_ids=layer_ids,
         coordinate_system=coordinate_system,
     )

@@ -51,10 +51,19 @@ def quantize_symmetric(
     _validate(value, bits, group_size)
     groups = value.float().reshape(*value.shape[:-1], -1, group_size)
     qmax = (1 << (bits - 1)) - 1
-    scale = groups.abs().amax(dim=-1).div(qmax).clamp_min(torch.finfo(torch.float32).eps)
-    quant = torch.round(groups / scale.unsqueeze(-1)).clamp(-qmax, qmax)
+    # Round the scale to its stored precision *before* quantizing against it.
+    # The decoder only ever sees the stored scale, so quantizing against a
+    # higher-precision one leaves a gain error the residual never absorbs.
+    scale = (
+        groups.abs()
+        .amax(dim=-1)
+        .div(qmax)
+        .clamp_min(torch.finfo(torch.float32).eps)
+        .to(scale_dtype)
+    )
+    quant = torch.round(groups / scale.float().unsqueeze(-1)).clamp(-qmax, qmax)
     unsigned = (quant + qmax).to(torch.uint8).reshape_as(value)
-    return _pack(unsigned, bits), scale.to(scale_dtype)
+    return _pack(unsigned, bits), scale
 
 
 def dequantize_symmetric(
@@ -84,11 +93,18 @@ def quantize_asymmetric(
     low = torch.minimum(groups.amin(dim=-1, keepdim=True), zeros)
     high = torch.maximum(groups.amax(dim=-1, keepdim=True), zeros)
     qmax = (1 << bits) - 1
-    scale = (high - low).div(qmax).clamp_min(torch.finfo(torch.float32).eps)
-    zero_point = torch.round(-low / scale).clamp(0, qmax)
-    quant = torch.round(groups / scale + zero_point).clamp(0, qmax)
+    # Same ordering as the symmetric path: the zero point and the codes must be
+    # derived from the scale the decoder will actually use.
+    scale = (
+        (high - low)
+        .div(qmax)
+        .clamp_min(torch.finfo(torch.float32).eps)
+        .to(scale_dtype)
+    )
+    zero_point = torch.round(-low / scale.float()).clamp(0, qmax)
+    quant = torch.round(groups / scale.float() + zero_point).clamp(0, qmax)
     packed = _pack(quant.to(torch.uint8).reshape_as(value), bits)
-    return packed, scale.squeeze(-1).to(scale_dtype), zero_point.squeeze(-1).to(torch.uint8)
+    return packed, scale.squeeze(-1), zero_point.squeeze(-1).to(torch.uint8)
 
 
 def dequantize_asymmetric(
