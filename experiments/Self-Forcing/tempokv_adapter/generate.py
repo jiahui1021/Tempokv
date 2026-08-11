@@ -604,6 +604,14 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                 "TEMPOKV_NUM_FRAMES": str(latent_frames_for(args.frames)),
             }
         )
+        # The attention window normally spans every generated frame, because
+        # TempoKV compresses the whole cache and no longer needs the model's
+        # 21-frame default.  Overriding it back to a smaller window is what
+        # makes a run comparable against a baseline that kept that default,
+        # since the window decides how many quantized frames reach the output.
+        attention_frames = os.environ.get("TEMPOKV_ATTENTION_FRAMES")
+        if attention_frames:
+            environment["TEMPOKV_NUM_FRAMES"] = str(int(attention_frames))
         if args.triton_cache is not None:
             environment["TEMPOKV_TRITON_CACHE"] = str(
                 args.triton_cache.expanduser().resolve()
