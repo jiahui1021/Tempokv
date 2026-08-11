@@ -272,7 +272,7 @@ def _triton_rotate(
         raise ValueError("Triton RoPE output must match the input tensor")
     # D=128 already contributes 64 rotary pairs.  Sixteen tokens keep the
     # per-program tile at 1024 pairs, avoiding the register pressure and
-    # compilation risk of the 4096-pair QVG reference tile.
+    # compilation risk of the 4096-pair legacy reference tile.
     block_s = 16
     block_pairs = triton.next_power_of_2(width // 2)
     grid = (batch * heads, triton.cdiv(sequence, block_s))

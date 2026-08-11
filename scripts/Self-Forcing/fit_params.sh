@@ -22,7 +22,8 @@
 #   K_HISTORY_LENGTH  K 历史长度（默认读取 CONFIG）
 #   V_HISTORY_LENGTH  V 历史长度（默认读取 CONFIG）
 #   ITERATIONS     拟合迭代次数（默认 2）
-#   TEMPORAL_RIDGE / CROSS_RIDGE / MAX_GAIN  拟合正则与增益（默认 0.1/0.1/1.0）
+#   TEMPORAL_RIDGE / CROSS_RIDGE / V_HISTORY_RIDGE / MAX_GAIN
+#                  拟合正则与增益（legacy 模式默认 1.0/0.1/0.0/1.0）
 #   FIT_DEVICE     拟合设备（默认 auto，有 CUDA 时自动使用 GPU）
 #   OVERWRITE      已存在参数时覆盖（0/1，默认 0）
 #   DRY_RUN        只打印命令不执行（0/1，默认 0）
@@ -48,8 +49,22 @@ if [[ "$output_dir" == "/" ]]; then
 fi
 
 ITERATIONS="${ITERATIONS:-2}"
-TEMPORAL_RIDGE="${TEMPORAL_RIDGE:-0.1}"
+fit_mode="$("$python_bin" - "$config_path" <<'PY'
+import json
+import sys
+
+config = json.load(open(sys.argv[1], encoding="utf-8"))
+print(config.get("codec", config).get("fit_mode", "native"))
+PY
+)"
+if [[ "$fit_mode" == "legacy" ]]; then
+  default_temporal_ridge=1.0
+else
+  default_temporal_ridge=0.1
+fi
+TEMPORAL_RIDGE="${TEMPORAL_RIDGE:-$default_temporal_ridge}"
 CROSS_RIDGE="${CROSS_RIDGE:-0.1}"
+V_HISTORY_RIDGE="${V_HISTORY_RIDGE:-0.0}"
 MAX_GAIN="${MAX_GAIN:-1.0}"
 FIT_DEVICE="${FIT_DEVICE:-auto}"
 OVERWRITE="${OVERWRITE:-0}"
@@ -67,6 +82,8 @@ fit_command=(
   --iterations "$ITERATIONS"
   --temporal-ridge "$TEMPORAL_RIDGE"
   --cross-ridge "$CROSS_RIDGE"
+  --v-history-ridge "$V_HISTORY_RIDGE"
+  --v-history-mode diagonal
   --max-gain "$MAX_GAIN"
   --device "$FIT_DEVICE"
   --stride 1560

@@ -165,7 +165,10 @@ def _validate_parameters(
             "Self-Forcing K/V parameters must share a current parameter_set_id"
         )
     codec = TempoKVCodec(temporal, cross, config)
-    if temporal.layer_ids != EXPECTED_LAYER_IDS:
+    if config.k_predictor_mode == "shared":
+        if temporal.layer_ids is not None:
+            raise ValueError("legacy K parameters must be shared across layers")
+    elif temporal.layer_ids != EXPECTED_LAYER_IDS:
         raise ValueError("K parameters must contain layers 0 through 29")
     if cross.layer_ids != EXPECTED_LAYER_IDS:
         raise ValueError("V parameters must contain layers 0 through 29")
@@ -178,7 +181,22 @@ def _validate_parameters(
         raise ValueError(
             "Self-Forcing parameters must use pre_rope_normalized coordinates"
         )
-    if temporal.shared_history:
+    if config.k_predictor_mode == "shared":
+        expected_k_history_shape = (
+            config.k_history_length,
+            config.k_history_length,
+            128,
+        )
+        expected_k_bias_shape = (config.k_history_length, 128)
+        if (
+            tuple(temporal.history_weights.shape) != expected_k_history_shape
+            or tuple(temporal.history_bias.shape) != expected_k_bias_shape
+        ):
+            raise ValueError(
+                "legacy K parameters must be shared across all layers "
+                "and heads"
+            )
+    elif temporal.shared_history:
         if tuple(temporal.history_weights.shape) != (30, 12, 128):
             raise ValueError(
                 "shared K parameters must contain one coefficient for each of "
@@ -237,7 +255,11 @@ def _validate_parameters(
         "history_length": codec.temporal.history_length,
         "k_history_length": codec.temporal.history_length,
         "k_max_history_length": temporal.max_history_length,
-        "k_history_mode": temporal.history_mode,
+        "k_history_mode": (
+            "shared"
+            if config.k_predictor_mode == "shared"
+            else temporal.history_mode
+        ),
         "v_history_length": codec.cross_kv.history_length,
         "v_max_history_length": cross.max_history_length,
         "v_history_mode": cross.history_mode,
@@ -570,15 +592,30 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         report["persistent_units_per_launch"] = {
             "requested": requested_persistent_units,
             "k": (
-                min(requested_persistent_units, 8)
-                if parameters["k_history_length"] > 4
-                else requested_persistent_units
+                8
+                if config.fit_mode == "legacy"
+                else (
+                    min(requested_persistent_units, 8)
+                    if parameters["k_history_length"] > 4
+                    else requested_persistent_units
+                )
             ),
             "v": (
-                min(requested_persistent_units, 8)
-                if parameters["v_history_length"]
-                and not parameters.get("v_history_diagonal", False)
-                else requested_persistent_units
+                None
+                if config.fit_mode == "legacy"
+                and parameters["v_history_length"]
+                else (
+                    min(requested_persistent_units, 8)
+                    if parameters["v_history_length"]
+                    and not parameters.get("v_history_diagonal", False)
+                    else requested_persistent_units
+                )
+            ),
+            "v_backend": (
+                "torch_cross_temporal_v"
+                if config.fit_mode == "legacy"
+                and parameters["v_history_length"]
+                else "triton"
             ),
         }
     if args.dry_run:
@@ -589,7 +626,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
     environment = os.environ.copy()
     if args.mode == "tempokv":
         runtime_payload = asdict(config)
-        if not args.allow_triton_fallback:
+        if not args.allow_triton_fallback and config.fit_mode != "legacy":
             runtime_payload["use_triton"] = True
             runtime_payload["strict_triton"] = True
         paths["runtime_config"].write_text(
@@ -620,6 +657,10 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         for name in tuple(environment):
             if name.startswith("TEMPOKV_"):
                 environment.pop(name)
+        if args.mode == "bf16":
+            # The legacy runtime also rotates dense cached K in complex64.  Keep the
+            # BF16 reference on the same arithmetic path as its quantized run.
+            environment["SELF_FORCING_CACHE_ROPE_PRECISION"] = "complex64"
     paths["videos"].mkdir(parents=True, exist_ok=True)
     metrics_dir = paths["run"] / "metrics"
     metrics_dir.mkdir(parents=True, exist_ok=True)
@@ -669,8 +710,15 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         and generated_entries
     ):
         required_routes = (
-            "temporal_persistent_direct",
-            "cross_kv_persistent_direct",
+            (
+                "temporal_persistent_direct",
+                "cross_kv_temporal_v_torch",
+            )
+            if config.fit_mode == "legacy"
+            else (
+                "temporal_persistent_direct",
+                "cross_kv_persistent_direct",
+            )
         )
         missing_routes = [
             route

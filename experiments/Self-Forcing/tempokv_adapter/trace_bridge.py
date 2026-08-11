@@ -28,6 +28,17 @@ def _positive_env(name: str, default: int) -> int:
     return parsed
 
 
+def _nonnegative_env(name: str, default: int) -> int:
+    value = os.environ.get(name, str(default))
+    try:
+        parsed = int(value)
+    except ValueError as error:
+        raise ValueError(f"{name} must be an integer, got {value!r}") from error
+    if parsed < 0:
+        raise ValueError(f"{name} must not be negative, got {parsed}")
+    return parsed
+
+
 def _sample_projection(
     tensor: torch.Tensor,
     *,
@@ -56,11 +67,13 @@ def _sample_projection(
         )
 
     frame_count = sequence // _FRAME_SEQ_LENGTH
-    token_indices = torch.div(
-        torch.arange(tokens_per_frame, device=tensor.device) * _FRAME_SEQ_LENGTH,
-        tokens_per_frame,
-        rounding_mode="floor",
-    )
+    # Match the legacy deterministic sampler: rounded linspace over both ends.
+    token_indices = torch.linspace(
+        0,
+        _FRAME_SEQ_LENGTH - 1,
+        steps=tokens_per_frame,
+        device=tensor.device,
+    ).round().long().unique()
     sampled = (
         tensor.detach()
         .reshape(
@@ -99,6 +112,14 @@ def install(runtime_root: str | Path) -> type:
         raise ValueError("TEMPOKV_TRACE_DIR must be set for trace collection")
     output_root = Path(output_value).expanduser().resolve()
     tokens_per_frame = _positive_env("TEMPOKV_TRACE_TOKENS_PER_FRAME", 8)
+    event_frames = _nonnegative_env("TEMPOKV_TRACE_EVENT_FRAMES", 0)
+    rope_precision = os.environ.get(
+        "TEMPOKV_TRACE_ROPE_PRECISION", "native"
+    ).strip()
+    if rope_precision not in {"native", "complex64"}:
+        raise ValueError(
+            "TEMPOKV_TRACE_ROPE_PRECISION must be native or complex64"
+        )
 
     pipeline_package = importlib.import_module("pipeline")
     pipeline_module = importlib.import_module("pipeline.causal_inference")
@@ -133,6 +154,8 @@ def install(runtime_root: str | Path) -> type:
     class TraceCausalInferencePipeline(base):
         def __init__(self, *args: Any, **kwargs: Any) -> None:
             super().__init__(*args, **kwargs)
+            self._trace_rope_precision = rope_precision
+            self._apply_trace_rope_precision()
             frame_seq_length = int(getattr(self, "frame_seq_length", 0))
             if frame_seq_length != _FRAME_SEQ_LENGTH:
                 raise ValueError(
@@ -179,6 +202,17 @@ def install(runtime_root: str | Path) -> type:
                     self._trace_projection_hook(layer_index, "v")
                 )
 
+        def _apply_trace_rope_precision(self) -> None:
+            if self.kv_cache1 is None:
+                return
+            for layer in self.kv_cache1:
+                layer["k"].rope_precision = self._trace_rope_precision
+
+        def _initialize_kv_cache(self, *args: Any, **kwargs: Any) -> Any:
+            result = super()._initialize_kv_cache(*args, **kwargs)
+            self._apply_trace_rope_precision()
+            return result
+
         def note_clean_refresh(self) -> None:
             self._clean_refresh_announced = True
 
@@ -198,7 +232,7 @@ def install(runtime_root: str | Path) -> type:
             args: tuple[Any, ...],
             kwargs: dict[str, Any],
         ) -> None:
-            del module, kwargs
+            del module
             kv_cache = _argument(args, kwargs, "kv_cache", 3)
             current_start = _argument(args, kwargs, "current_start", 5)
             # The pipeline announced this pass with `note_clean_refresh`; the
@@ -317,49 +351,73 @@ def install(runtime_root: str | Path) -> type:
             if token_indices is None:
                 raise RuntimeError("Self-Forcing inference did not capture token indices")
 
-            tokens_start = self._trace_sequence_start
-            tokens_end = self._trace_sequence_end
+            sequence_start = self._trace_sequence_start
+            sequence_end = self._trace_sequence_end
             rank = int(os.environ.get("RANK", "0"))
             rank_dir = output_root / f"rank_{rank:03d}"
-            event_name = (
-                f"event_{self._trace_event_index:06d}_tokens_"
-                f"{tokens_start}_{tokens_end}"
-            )
-            event_dir = rank_dir / event_name
-            temporary_dir = rank_dir / f".{event_name}.tmp-{os.getpid()}"
-            if event_dir.exists():
-                raise FileExistsError(f"trace event already exists: {event_dir}")
-            temporary_dir.mkdir(parents=True, exist_ok=False)
-
-            try:
-                for layer_index in range(_LAYERS):
-                    arrays = self._trace_sequence_layers[layer_index]
-                    keys = np.concatenate(arrays["k_pre_rope"], axis=1)
-                    values = np.concatenate(arrays["v"], axis=1)
-                    if keys.shape != values.shape:
-                        raise ValueError(
-                            f"layer {layer_index} K/V shapes differ: "
-                            f"{keys.shape} vs {values.shape}"
-                        )
-                    np.savez_compressed(
-                        temporary_dir / f"layer_{layer_index:02d}.npz",
-                        k_pre_rope=keys,
-                        v=values,
-                        layer_index=np.asarray(layer_index, dtype=np.int32),
-                        token_indices=token_indices,
-                        head_indices=np.arange(_HEADS, dtype=np.int32),
-                        tokens_start=np.asarray(tokens_start, dtype=np.int64),
-                        tokens_end=np.asarray(tokens_end, dtype=np.int64),
-                        frame_seq_length=np.asarray(
-                            _FRAME_SEQ_LENGTH, dtype=np.int32
-                        ),
+            combined: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+            total_frames: int | None = None
+            for layer_index in range(_LAYERS):
+                arrays = self._trace_sequence_layers[layer_index]
+                keys = np.concatenate(arrays["k_pre_rope"], axis=1)
+                values = np.concatenate(arrays["v"], axis=1)
+                if keys.shape != values.shape:
+                    raise ValueError(
+                        f"layer {layer_index} K/V shapes differ: "
+                        f"{keys.shape} vs {values.shape}"
                     )
-                temporary_dir.replace(event_dir)
-                self._trace_event_index += 1
-                self._reset_trace_sequence()
-            except BaseException:
-                shutil.rmtree(temporary_dir, ignore_errors=True)
-                raise
+                if total_frames is None:
+                    total_frames = int(keys.shape[1])
+                elif total_frames != int(keys.shape[1]):
+                    raise ValueError("trace layers contain different frame counts")
+                combined[layer_index] = (keys, values)
+            assert total_frames is not None
+            if sequence_end - sequence_start != total_frames * _FRAME_SEQ_LENGTH:
+                raise ValueError("trace token range does not match captured frames")
+
+            frames_per_event = event_frames or total_frames
+            complete_events = total_frames // frames_per_event
+            if complete_events < 1:
+                raise ValueError(
+                    "trace did not reach one complete production event of "
+                    f"{frames_per_event} frames"
+                )
+            for event_offset in range(complete_events):
+                frame_start = event_offset * frames_per_event
+                frame_end = frame_start + frames_per_event
+                tokens_start = sequence_start + frame_start * _FRAME_SEQ_LENGTH
+                tokens_end = sequence_start + frame_end * _FRAME_SEQ_LENGTH
+                event_name = (
+                    f"event_{self._trace_event_index:06d}_tokens_"
+                    f"{tokens_start}_{tokens_end}"
+                )
+                event_dir = rank_dir / event_name
+                temporary_dir = rank_dir / f".{event_name}.tmp-{os.getpid()}"
+                if event_dir.exists():
+                    raise FileExistsError(f"trace event already exists: {event_dir}")
+                temporary_dir.mkdir(parents=True, exist_ok=False)
+                try:
+                    for layer_index in range(_LAYERS):
+                        keys, values = combined[layer_index]
+                        np.savez_compressed(
+                            temporary_dir / f"layer_{layer_index:02d}.npz",
+                            k_pre_rope=keys[:, frame_start:frame_end],
+                            v=values[:, frame_start:frame_end],
+                            layer_index=np.asarray(layer_index, dtype=np.int32),
+                            token_indices=token_indices,
+                            head_indices=np.arange(_HEADS, dtype=np.int32),
+                            tokens_start=np.asarray(tokens_start, dtype=np.int64),
+                            tokens_end=np.asarray(tokens_end, dtype=np.int64),
+                            frame_seq_length=np.asarray(
+                                _FRAME_SEQ_LENGTH, dtype=np.int32
+                            ),
+                        )
+                    temporary_dir.replace(event_dir)
+                    self._trace_event_index += 1
+                except BaseException:
+                    shutil.rmtree(temporary_dir, ignore_errors=True)
+                    raise
+            self._reset_trace_sequence()
 
         def _reset_trace_sequence(self) -> None:
             self._clean_refresh_announced = False

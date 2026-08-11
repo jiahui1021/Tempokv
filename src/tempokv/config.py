@@ -25,6 +25,13 @@ class CodecConfig:
     # Shared parameter files can serve any active length up to these maxima.
     k_max_history_length: int | None = None
     v_max_history_length: int | None = None
+    # The legacy predictor uses IEEE FP32 CrossKV projections. ``tf32``
+    # retains the native TempoKV execution policy for other configurations.
+    cross_matmul_precision: str = "tf32"
+    # ``shared`` pools all Self-Forcing layers and heads into [P,P,D].
+    k_predictor_mode: str = "layer_head"
+    # Select the legacy fixed-point/shared-K and direct temporal-V fitting math.
+    fit_mode: str = "native"
 
     def __post_init__(self) -> None:
         for name in ("k_bits", "v_bits", "anchor_bits"):
@@ -100,13 +107,76 @@ class CodecConfig:
             raise ValueError(
                 "reconstruction_dtype must be float32, float16, or bfloat16"
             )
+        if self.cross_matmul_precision not in {"ieee", "tf32"}:
+            raise ValueError("cross_matmul_precision must be ieee or tf32")
+        if self.k_predictor_mode not in {"layer_head", "shared"}:
+            raise ValueError(
+                "k_predictor_mode must be layer_head or shared"
+            )
+        if self.fit_mode not in {"native", "legacy"}:
+            raise ValueError("fit_mode must be native or legacy")
+        if (
+            self.k_predictor_mode == "shared"
+            and self.fit_mode != "legacy"
+        ):
+            raise ValueError(
+                "k_predictor_mode=shared requires fit_mode=legacy"
+            )
+        if self.fit_mode == "legacy":
+            if self.k_predictor_mode != "shared":
+                raise ValueError(
+                    "legacy fitting requires k_predictor_mode=shared"
+                )
+            if self.k_history_length is None:
+                raise ValueError(
+                    "legacy fitting requires an explicit k_history_length"
+                )
+            if (
+                self.k_max_history_length is not None
+                or self.v_max_history_length is not None
+            ):
+                raise ValueError(
+                    "legacy fitting does not use shared maximum-history parameters"
+                )
+            if self.v_history_length not in (0, 1):
+                raise ValueError(
+                    "legacy fitting supports V history length 0 or 1"
+                )
+            if self.cross_matmul_precision != "ieee":
+                raise ValueError(
+                    "legacy fitting requires cross_matmul_precision=ieee"
+                )
+            if self.k_bits != self.v_bits:
+                raise ValueError("legacy fitting requires matching K/V bits")
+            if self.anchor_bits != 4 or self.group_size != 64 or self.stride != 1560:
+                raise ValueError(
+                    "legacy fitting requires anchor_bits=4, group_size=64, "
+                    "and stride=1560"
+                )
+            if self.residual_mode != "asymmetric":
+                raise ValueError("legacy fitting requires asymmetric residuals")
+            if (
+                self.scale_dtype != "bfloat16"
+                or self.reconstruction_dtype != "bfloat16"
+            ):
+                raise ValueError(
+                    "legacy fitting requires bfloat16 scales and reconstruction"
+                )
+            if self.v_history_length and self.strict_triton:
+                raise ValueError(
+                    "legacy direct Cross+V-history does not support strict Triton"
+                )
 
     def format_signature(self) -> str:
         """Return a stable identity for settings used during fitting."""
         payload = {
             "anchor_bits": self.anchor_bits,
+            "cross_matmul_precision": self.cross_matmul_precision,
+            "fit_mode": self.fit_mode,
             "group_size": self.group_size,
             "k_bits": self.k_bits,
+            "k_predictor_mode": self.k_predictor_mode,
+            "quantizer_version": "scale_floor_v1",
             "reconstruction_dtype": self.reconstruction_dtype,
             "residual_mode": self.residual_mode,
             "scale_dtype": self.scale_dtype,
@@ -117,13 +187,12 @@ class CodecConfig:
             payload["k_history_length"] = int(self.k_history_length)
             if self.v_history_length:
                 payload["v_history_length"] = int(self.v_history_length)
-            version = "v3"
+            version = "v5"
         elif self.v_history_length:
             payload["v_history_length"] = int(self.v_history_length)
-            version = "v2"
+            version = "v5"
         else:
-            # Preserve the exact signature used by legacy CrossKV-only files.
-            version = "v1"
+            version = "v5"
         return f"tempokv-codec-{version}:" + json.dumps(
             payload, sort_keys=True, separators=(",", ":")
         )
@@ -132,9 +201,13 @@ class CodecConfig:
         """Identity for parameters reusable across active history lengths."""
         payload = {
             "anchor_bits": self.anchor_bits,
+            "cross_matmul_precision": self.cross_matmul_precision,
+            "fit_mode": self.fit_mode,
             "group_size": self.group_size,
             "k_bits": self.k_bits,
             "k_max_history_length": self.k_max_history_length,
+            "k_predictor_mode": self.k_predictor_mode,
+            "quantizer_version": "scale_floor_v1",
             "reconstruction_dtype": self.reconstruction_dtype,
             "residual_mode": self.residual_mode,
             "scale_dtype": self.scale_dtype,
@@ -142,6 +215,6 @@ class CodecConfig:
             "v_bits": self.v_bits,
             "v_max_history_length": self.v_max_history_length,
         }
-        return "tempokv-codec-v4:" + json.dumps(
+        return "tempokv-codec-v6:" + json.dumps(
             payload, sort_keys=True, separators=(",", ":")
         )

@@ -120,8 +120,8 @@ def main() -> None:
     print(f"  codec_signature     : {temporal.codec_signature}")
     if temporal.shared_history:
         print("  !! shared history: prediction collapses to w*mean(history)+b,")
-        print("     which has no QVG counterpart and loses per-lag structure.")
-        print("     Refit without --k-max-history-length to compare against QVG.")
+        print("     which has no legacy counterpart and loses per-lag structure.")
+        print("     Refit without --k-max-history-length for a legacy comparison.")
 
     # The fitter caps each channel's L1 gain across lags at --max-gain. A cap
     # of 1.0 forbids extrapolation (lag-1 above 1 against negative higher
@@ -202,15 +202,24 @@ def main() -> None:
         def unit(tensor: torch.Tensor, index: int) -> torch.Tensor:
             return tensor[:, :, index * stride: (index + 1) * stride]
 
+        # Probe with the same predictor arithmetic the codec itself runs, so
+        # A never disagrees with B for a reason the report cannot show.
+        legacy = config.fit_mode == "legacy"
         k_history = [unit(key, order - 1 - lag) for lag in range(order)]
-        k_pred = predict_temporal(k_history, selected_k)
+        k_pred = predict_temporal(k_history, selected_k, legacy=legacy)
         a_k = _relative_mse(k_pred, unit(key, order))
 
         v_history = [
             unit(value, order - 1 - lag)
             for lag in range(selected_v.history_length)
         ]
-        v_pred = predict_cross_kv(unit(key, order), selected_v, v_history or None)
+        v_pred = predict_cross_kv(
+            unit(key, order),
+            selected_v,
+            v_history or None,
+            matmul_precision=config.cross_matmul_precision,
+            legacy=legacy,
+        )
         a_v = _relative_mse(v_pred, unit(value, order))
 
         # --- B. encoder closed-loop reconstruction error -------------------
@@ -257,7 +266,7 @@ How to read this
       quantized. If A is much worse than the sweep_history report claimed,
       the parameter files are wrong (stale, wrong mode, wrong coordinates).
   B.* closed-loop reconstruction error. This is the number to compare against
-      QVG at the same bit width. If A is fine and B is bad, the bug is in the
+      the legacy predictor at the same bit width. If A is fine and B is bad, the bug is in the
       quantizer or the closed loop, not the predictor.
   C.* max |Triton decode - encoder reconstruction|. C.K must be 0.0: the K
       path is asserted bit-exact in the test suite. C.V is the CrossKV path,

@@ -124,6 +124,9 @@ class ChunkedKVCache:
         self.device = device
         self.layout = layout
         self.cache_role = cache_role
+        # The TempoKV bridge switches reconstructed K to the legacy complex64
+        # cached-key RoPE without changing native/BF16 cache behavior.
+        self.rope_precision = "native"
         self.seq_dim = 1 if layout == "BSHD" else 2
         self.chunks: list[torch.Tensor | None] = [None] * max_num_chunks
         self.chunk_state: list[ChunkState] = [ChunkState.EMPTY] * max_num_chunks

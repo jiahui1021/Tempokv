@@ -12,6 +12,16 @@ from typing import Sequence
 import numpy as np
 
 
+# One fitting prompt produces two independent 24-frame records, so the
+# collected trace holds ``2 * _LEGACY_PROMPT_COUNT`` events.
+_LEGACY_PROMPT_COUNT = 12
+_LEGACY_TOKEN_INDICES = (0, 223, 445, 668, 891, 1114, 1336, 1559)
+_LEGACY_EVENT_STARTS = (0, 37440) * _LEGACY_PROMPT_COUNT
+_LEGACY_EVENT_ENDS = (37440, 74880) * _LEGACY_PROMPT_COUNT
+_LEGACY_TRACE_SHAPE = (30, 2 * _LEGACY_PROMPT_COUNT, 1, 8, 24, 12, 128)
+_LEGACY_TRACE_PROTOCOL = f"direct_v_{_LEGACY_PROMPT_COUNT}p_51f_8t_24x2_v1"
+
+
 def _event_directories(root: Path) -> list[Path]:
     directories = sorted({path.parent for path in root.rglob("layer_*.npz")})
     if not directories:
@@ -37,6 +47,8 @@ def _event_directories(root: Path) -> list[Path]:
 
 def _event(
     event_dir: Path,
+    *,
+    legacy_protocol: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, dict[str, object]]:
     files = sorted(event_dir.glob("layer_*.npz"))
     if len(files) != 30:
@@ -103,12 +115,24 @@ def _event(
             event_metadata = current_metadata
         elif event_metadata != current_metadata:
             raise ValueError(f"{event_dir} layer trace metadata is inconsistent")
-        # [B,F,P,H,D] -> [B*P,F,H,D], with F as the temporal axis.
+        # Tempo's generic schema flattens B/P.  The legacy protocol preserves
+        # every production event and the original B/P axes so fitting can
+        # replay record-by-record FP64 accumulation in the original order.
         batch, frames, samples, heads, width = key.shape
-        keys.append(key.transpose(0, 2, 1, 3, 4).reshape(-1, frames, heads, width))
-        values.append(
-            value.transpose(0, 2, 1, 3, 4).reshape(-1, frames, heads, width)
-        )
+        if legacy_protocol:
+            keys.append(key.transpose(0, 2, 1, 3, 4))
+            values.append(value.transpose(0, 2, 1, 3, 4))
+        else:
+            keys.append(
+                key.transpose(0, 2, 1, 3, 4).reshape(
+                    -1, frames, heads, width
+                )
+            )
+            values.append(
+                value.transpose(0, 2, 1, 3, 4).reshape(
+                    -1, frames, heads, width
+                )
+            )
         seen_layers.append(layer)
     if seen_layers != list(range(30)):
         raise ValueError(f"{event_dir} layer indices must be 0 through 29")
@@ -116,30 +140,75 @@ def _event(
     return np.stack(keys), np.stack(values), event_metadata
 
 
-def convert_trace_root(root: Path, output: Path) -> dict[str, object]:
+def convert_trace_root(
+    root: Path,
+    output: Path,
+    *,
+    legacy_protocol: bool = False,
+) -> dict[str, object]:
     root = root.expanduser().resolve()
     if not root.is_dir():
         raise FileNotFoundError(f"trace directory does not exist: {root}")
     key_events = []
     value_events = []
     expected_tail = None
-    expected_metadata = None
-    for event_dir in _event_directories(root):
-        keys, values, metadata = _event(event_dir)
-        tail = keys.shape[2:]
+    expected_protocol = None
+    event_starts: list[int] = []
+    event_ends: list[int] = []
+    event_directories = _event_directories(root)
+    if legacy_protocol and {
+        directory.parent.name for directory in event_directories
+    } != {"rank_000"}:
+        raise ValueError("legacy trace collection requires rank_000 only")
+    for event_dir in event_directories:
+        keys, values, metadata = _event(event_dir, legacy_protocol=legacy_protocol)
+        tail = keys.shape[1:] if legacy_protocol else keys.shape[2:]
         if expected_tail is None:
             expected_tail = tail
         elif tail != expected_tail:
             raise ValueError("all trace events must use the same frame/head layout")
-        if expected_metadata is None:
-            expected_metadata = metadata
-        elif metadata != expected_metadata:
-            raise ValueError("all trace events must use matching token metadata")
+        protocol = {
+            "token_indices": metadata["token_indices"],
+            "frame_seq_length": metadata["frame_seq_length"],
+        }
+        if expected_protocol is None:
+            expected_protocol = protocol
+        elif protocol != expected_protocol:
+            raise ValueError("all trace events must use matching sampling metadata")
+        event_starts.append(int(metadata["tokens_start"]))
+        event_ends.append(int(metadata["tokens_end"]))
         key_events.append(keys)
         value_events.append(values)
-    keys = np.concatenate(key_events, axis=1)
-    values = np.concatenate(value_events, axis=1)
-    assert expected_metadata is not None
+    if legacy_protocol:
+        keys = np.stack(key_events, axis=1)
+        values = np.stack(value_events, axis=1)
+    else:
+        keys = np.concatenate(key_events, axis=1)
+        values = np.concatenate(value_events, axis=1)
+    assert expected_protocol is not None
+    frame_counts = [
+        (end - start) // int(expected_protocol["frame_seq_length"])
+        for start, end in zip(event_starts, event_ends)
+    ]
+    if legacy_protocol and any(count != 24 for count in frame_counts):
+        raise ValueError("legacy trace events must contain exactly 24 frames")
+    if legacy_protocol:
+        if tuple(expected_protocol["token_indices"]) != _LEGACY_TOKEN_INDICES:
+            raise ValueError(
+                "legacy trace token indices do not match the reference"
+            )
+        if tuple(event_starts) != _LEGACY_EVENT_STARTS or tuple(
+            event_ends
+        ) != _LEGACY_EVENT_ENDS:
+            raise ValueError(
+                f"legacy trace must contain {_LEGACY_PROMPT_COUNT} ordered "
+                "pairs of [0,37440) and [37440,74880) events"
+            )
+        if tuple(keys.shape) != _LEGACY_TRACE_SHAPE:
+            raise ValueError(
+                "legacy trace must use shape "
+                f"{_LEGACY_TRACE_SHAPE}, got {tuple(keys.shape)}"
+            )
     output = output.expanduser().resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(
@@ -150,21 +219,41 @@ def convert_trace_root(root: Path, output: Path) -> dict[str, object]:
         stride=np.asarray(1560, dtype=np.int32),
         coordinate_system=np.asarray("pre_rope_normalized"),
         cross_source_kind=np.asarray("normalized"),
-        token_indices=np.asarray(
-            expected_metadata["token_indices"], dtype=np.int32
+        trace_layout=np.asarray(
+            "legacy_event_bpfhd_v1" if legacy_protocol else "tempokv_flat_samples_v1"
         ),
-        tokens_start=np.asarray(expected_metadata["tokens_start"], dtype=np.int64),
-        tokens_end=np.asarray(expected_metadata["tokens_end"], dtype=np.int64),
+        token_indices=np.asarray(
+            expected_protocol["token_indices"], dtype=np.int32
+        ),
+        event_tokens_start=np.asarray(event_starts, dtype=np.int64),
+        event_tokens_end=np.asarray(event_ends, dtype=np.int64),
+        tokens_start=np.asarray(min(event_starts), dtype=np.int64),
+        tokens_end=np.asarray(max(event_ends), dtype=np.int64),
         frame_seq_length=np.asarray(
-            expected_metadata["frame_seq_length"], dtype=np.int32
+            expected_protocol["frame_seq_length"], dtype=np.int32
         ),
         trace_event_count=np.asarray(len(key_events), dtype=np.int32),
+        prompt_count=np.asarray(
+            _LEGACY_PROMPT_COUNT if legacy_protocol else 0, dtype=np.int32
+        ),
+        frames_per_event=np.asarray(frame_counts[0], dtype=np.int32),
+        tokens_per_frame=np.asarray(
+            len(expected_protocol["token_indices"]), dtype=np.int32
+        ),
+        num_layers=np.asarray(30, dtype=np.int32),
+        num_heads=np.asarray(12, dtype=np.int32),
+        head_dim=np.asarray(128, dtype=np.int32),
+        temporal_units=np.asarray(keys.shape[-3], dtype=np.int32),
+        legacy_trace_protocol=np.asarray(
+            _LEGACY_TRACE_PROTOCOL if legacy_protocol else ""
+        ),
     )
     report = {
         "status": "complete",
         "source": str(root),
         "output": str(output),
         "events": len(key_events),
+        "legacy_protocol": legacy_protocol,
         "shape": list(keys.shape),
     }
     print(json.dumps(report, indent=2, ensure_ascii=False))
@@ -177,9 +266,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     parser.add_argument("trace_root", type=Path)
     parser.add_argument("output", type=Path)
+    parser.add_argument("--legacy-protocol", action="store_true")
     args = parser.parse_args(argv)
     try:
-        convert_trace_root(args.trace_root, args.output)
+        convert_trace_root(
+            args.trace_root,
+            args.output,
+            legacy_protocol=args.legacy_protocol,
+        )
     except (OSError, ValueError) as error:
         parser.error(str(error))
     return 0

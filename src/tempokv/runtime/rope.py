@@ -36,6 +36,7 @@ def _rotate_frames(
     temporal: torch.Tensor,
     height_freqs: torch.Tensor,
     width_freqs: torch.Tensor,
+    precision: str,
 ) -> None:
     heads = x.size(2)
     if absolute_start_frame + num_frames > temporal.shape[0]:
@@ -43,20 +44,19 @@ def _rotate_frames(
             f"RoPE table supports {temporal.shape[0]} frames, requested "
             f"[{absolute_start_frame}, {absolute_start_frame + num_frames})"
         )
-    # Rotate in complex128, matching upstream `causal_rope_apply`: the RoPE
-    # table is built in float64 and downcasting it to complex64 here would make
-    # a handful of bf16 keys per frame differ from the reference
-    # implementation, which an autoregressive rollout then feeds back into
-    # itself. Temporaries stay bounded by processing one model block at a time
-    # rather than the whole history, so for Wan2.1-1.3B this costs about
-    # 114 MiB transiently per layer call instead of 57 MiB.
+    if precision not in {"native", "complex64"}:
+        raise ValueError("RoPE precision must be native or complex64")
+    work_dtype = torch.float32 if precision == "complex64" else torch.float64
+    # The native path follows upstream causal_rope_apply in complex128.  The
+    # legacy long cached-K reader intentionally converts each model block to
+    # float32/complex64 instead, so legacy mode reproduces that branch.
     for relative_frame in range(0, num_frames, block_frames):
         current_frames = min(block_frames, num_frames - relative_frame)
         block_start = token_start + relative_frame * tokens_per_frame
         block_end = block_start + current_frames * tokens_per_frame
         complex_x = torch.view_as_complex(
             x[batch_index, block_start:block_end]
-            .to(torch.float64)
+            .to(work_dtype)
             .reshape(block_end - block_start, heads, -1, 2)
         )
         absolute_frame = absolute_start_frame + relative_frame
@@ -83,6 +83,8 @@ def apply_rope_by_span(
     grid_sizes: torch.Tensor,
     freqs: torch.Tensor,
     spans: Sequence[CacheSpan] | Iterable[CacheSpan],
+    *,
+    precision: str = "native",
 ) -> torch.Tensor:
     """Rotate a pre-RoPE cache read, one absolute-position span at a time.
 
@@ -126,6 +128,7 @@ def apply_rope_by_span(
                 temporal=temporal,
                 height_freqs=height_freqs,
                 width_freqs=width_freqs,
+                precision=precision,
             )
             token_start += span.num_frames * tokens_per_frame
     return result
@@ -136,6 +139,8 @@ def causal_rope_apply_long_input(
     grid_sizes: torch.Tensor,
     freqs: torch.Tensor,
     start_frame: int = 0,
+    *,
+    precision: str = "native",
 ) -> torch.Tensor:
     """Rotate one contiguous pre-RoPE cache read starting at ``start_frame``."""
     tokens_per_frame = int(grid_sizes[0][1]) * int(grid_sizes[0][2])
@@ -149,6 +154,7 @@ def causal_rope_apply_long_input(
         grid_sizes,
         freqs,
         [CacheSpan(0, int(start_frame), frames)],
+        precision=precision,
     )
 
 

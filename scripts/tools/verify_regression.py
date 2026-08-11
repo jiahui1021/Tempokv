@@ -184,19 +184,35 @@ def _triton_parity(args, directory: Path) -> dict:
         value_recon = decode_tensor(packed_value, source=key_recon, use_triton=False)
         try:
             triton_key = decode_tensor(packed_key, use_triton=True, strict_triton=True)
-            triton_value = decode_tensor(
-                packed_value, source=triton_key, use_triton=True, strict_triton=True
-            )
         except Exception as error:  # noqa: BLE001 - reported, not raised
             results[str(layer)] = {"error": str(error)}
             continue
-        results[str(layer)] = {
+        entry: dict[str, object] = {
             "k_max_abs_diff": float((triton_key.float() - key_recon.float()).abs().max()),
-            "v_max_abs_diff": float(
-                (triton_value.float() - value_recon.float()).abs().max()
-            ),
             "v_recon_rms": float(value_recon.float().pow(2).mean().sqrt()),
         }
+        # Legacy Cross+previous-V decoding is Torch-only by design.  Report K
+        # parity on its own there instead of failing the whole layer.
+        if (
+            packed_value.compatibility_mode == "legacy"
+            and packed_value.cross_kv is not None
+            and packed_value.cross_kv.history_length > 0
+        ):
+            entry["v_route"] = "torch"
+            entry["v_max_abs_diff"] = None
+        else:
+            entry["v_route"] = "triton"
+            try:
+                triton_value = decode_tensor(
+                    packed_value, source=triton_key, use_triton=True, strict_triton=True
+                )
+            except Exception as error:  # noqa: BLE001 - reported, not raised
+                entry["v_error"] = str(error)
+            else:
+                entry["v_max_abs_diff"] = float(
+                    (triton_value.float() - value_recon.float()).abs().max()
+                )
+        results[str(layer)] = entry
     return results
 
 
@@ -385,6 +401,14 @@ def main() -> None:
             for layer, values in layers.items():
                 if "error" in values:
                     print(f"    layer {layer}: {values['error']}")
+                    continue
+                if values.get("v_error"):
+                    print(f"    layer {layer:>3}: K {values['k_max_abs_diff']:.3e}   "
+                          f"V failed: {values['v_error'].splitlines()[0][:50]}")
+                    continue
+                if values.get("v_max_abs_diff") is None:
+                    print(f"    layer {layer:>3}: K {values['k_max_abs_diff']:.3e}   "
+                          f"V decoded in Torch (no Triton path)")
                     continue
                 share = values["v_max_abs_diff"] / max(values["v_recon_rms"], 1e-12)
                 print(f"    layer {layer:>3}: K {values['k_max_abs_diff']:.3e}   "

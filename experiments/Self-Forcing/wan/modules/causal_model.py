@@ -250,6 +250,7 @@ class CausalWanSelfAttention(nn.Module):
                 grid_sizes,
                 freqs,
                 start_frame=attention_start // frame_seqlen,
+                precision=getattr(kv_cache["k"], "rope_precision", "native"),
             ).type_as(v)
             v_all = kv_cache["v"].read(
                 attention_start,

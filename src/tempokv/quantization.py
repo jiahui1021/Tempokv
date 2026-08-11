@@ -57,8 +57,8 @@ def quantize_symmetric(
     scale = (
         groups.abs()
         .amax(dim=-1)
+        .clamp_min(1e-12)
         .div(qmax)
-        .clamp_min(torch.finfo(torch.float32).eps)
         .to(scale_dtype)
     )
     quant = torch.round(groups / scale.float().unsqueeze(-1)).clamp(-qmax, qmax)
@@ -97,8 +97,8 @@ def quantize_asymmetric(
     # derived from the scale the decoder will actually use.
     scale = (
         (high - low)
+        .clamp_min(1e-12)
         .div(qmax)
-        .clamp_min(torch.finfo(torch.float32).eps)
         .to(scale_dtype)
     )
     zero_point = torch.round(-low / scale.float()).clamp(0, qmax)

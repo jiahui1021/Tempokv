@@ -73,6 +73,7 @@ config = json.load(open(sys.argv[1], encoding="utf-8"))
 config = config.get("codec", config)
 k_bits = int(config["k_bits"])
 v_bits = int(config["v_bits"])
+mode_label = "legacy-" if config.get("fit_mode") == "legacy" else ""
 shared_history = (
     config.get("k_max_history_length") is not None
     or config.get("v_max_history_length") is not None
@@ -101,6 +102,6 @@ else:
     # Keep the historical intN name for equal precision while making mixed
     # K/V precision directories unambiguous.
     precision_label = f"k{k_bits}-v{v_bits}"
-print(f"{k_label}-{v_label}-{precision_label}")
+print(f"{mode_label}{k_label}-{v_label}-{precision_label}")
 PY
 }

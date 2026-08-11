@@ -38,6 +38,8 @@ class PackedTensor:
     residual_quant: torch.Tensor | None
     residual_scale: torch.Tensor | None
     residual_zero_point: torch.Tensor | None
+    cross_matmul_precision: str = "tf32"
+    compatibility_mode: str = "native"
     temporal: TemporalParameters | None = None
     cross_kv: CrossKVParameters | None = None
 
@@ -61,6 +63,10 @@ class PackedTensor:
             raise ValueError("packed temporal parameters must contain one selected layer")
         if self.cross_kv is not None and self.cross_kv.layered:
             raise ValueError("packed CrossKV parameters must contain one selected layer")
+        if self.cross_matmul_precision not in {"ieee", "tf32"}:
+            raise ValueError("cross_matmul_precision must be ieee or tf32")
+        if self.compatibility_mode not in {"native", "legacy"}:
+            raise ValueError("compatibility_mode must be native or legacy")
         has_residual = len(self.unit_lengths) > 1
         if has_residual != (self.residual_quant is not None):
             raise ValueError("residual tensors do not match unit layout")
@@ -120,7 +126,10 @@ def _validate_input(value: torch.Tensor, config: CodecConfig) -> None:
 
 
 def predict_temporal(
-    history: list[torch.Tensor], parameters: TemporalParameters
+    history: list[torch.Tensor],
+    parameters: TemporalParameters,
+    *,
+    legacy: bool = False,
 ) -> torch.Tensor:
     """Predict one unit from newest-to-oldest reconstructed K units."""
     if not history:
@@ -141,6 +150,17 @@ def predict_temporal(
     weights = parameters.history_weights[order - 1, :order].to(history[0].device)
     bias = parameters.history_bias[order - 1].to(history[0].device)
     prediction = torch.zeros_like(history[0], dtype=torch.float32)
+    if legacy:
+        if parameters.per_head:
+            raise ValueError("legacy temporal parameters must share heads")
+        for index in range(order):
+            coefficient = weights[index].view(
+                *([1] * (history[index].ndim - 1)), history[index].shape[-1]
+            )
+            prediction += history[index].float() * coefficient
+        return prediction + bias.view(
+            *([1] * (history[0].ndim - 1)), history[0].shape[-1]
+        )
     if parameters.per_head:
         if weights.shape[1] != history[0].shape[1]:
             raise ValueError("per-head temporal parameters do not match the cache")
@@ -162,6 +182,10 @@ def predict_cross_kv(
     source: torch.Tensor,
     parameters: CrossKVParameters,
     history: list[torch.Tensor] | tuple[torch.Tensor, ...] | None = None,
+    *,
+    # Defaults follow CodecConfig so an implicit call keeps native semantics.
+    matmul_precision: str = "tf32",
+    legacy: bool = False,
 ) -> torch.Tensor:
     """Predict V from current reconstructed K and newest-to-oldest V history."""
     if parameters.layered:
@@ -177,8 +201,18 @@ def predict_cross_kv(
     bias = parameters.bias.to(source.device)
     if source.shape[1] != weight.shape[0] or source.shape[-1] != weight.shape[-1]:
         raise ValueError("CrossKV parameters do not match cache heads/head dimension")
-    with _tf32_matmul(source.device):
-        prediction = torch.matmul(source.float(), weight)
+    with _cuda_matmul_precision(source.device, matmul_precision):
+        if legacy:
+            prediction = torch.matmul(
+                source.float().permute(1, 0, 2, 3),
+                weight[:, None, :, :],
+            ).permute(1, 0, 2, 3)
+            prediction = prediction + bias.view(
+                1, source.shape[1], 1, source.shape[-1]
+            )
+        else:
+            prediction = torch.matmul(source.float(), weight)
+            prediction.add_(bias[None, :, None, :])
         if parameters.shared_history and order:
             history_weight = parameters.history_weights.to(source.device)
             scale = 1.0 / order
@@ -192,24 +226,30 @@ def predict_cross_kv(
             for lag, previous in enumerate(resolved_history[:order]):
                 history_weight = parameters.history_weights[lag].to(source.device)
                 if parameters.history_diagonal:
-                    prediction.addcmul_(
-                        previous, history_weight[None, :, None, :]
-                    )
+                    if legacy:
+                        prediction = prediction + history_weight.view(
+                            1, source.shape[1], 1, source.shape[-1]
+                        ) * previous.float()
+                    else:
+                        prediction.addcmul_(
+                            previous, history_weight[None, :, None, :]
+                        )
                 else:
                     prediction.add_(torch.matmul(previous.float(), history_weight))
-    prediction.add_(bias[None, :, None, :])
     return prediction
 
 
 @contextmanager
-def _tf32_matmul(device: torch.device):
-    """Allow TF32 for CrossKV matmul, matching the Triton decoder precision."""
+def _cuda_matmul_precision(device: torch.device, precision: str):
+    """Apply one explicit FP32 GEMM policy around a CrossKV projection."""
+    if precision not in {"ieee", "tf32"}:
+        raise ValueError("matmul precision must be ieee or tf32")
     if device.type != "cuda":
         yield
         return
     backend = torch.backends.cuda.matmul
     previous = backend.allow_tf32
-    backend.allow_tf32 = True
+    backend.allow_tf32 = precision == "tf32"
     try:
         yield
     finally:
@@ -323,9 +363,15 @@ def _encode(
         else torch.empty(value.shape, device=value.device, dtype=reconstruction_dtype)
     )
     reconstruction[:, :, :stride] = anchor_rebuilt
-    # Keep history as views into the reconstruction.  Retaining the temporary
-    # rebuilt units would otherwise duplicate up to P full units on the GPU.
-    history = [reconstruction[:, :, :stride]]
+    # The legacy predictor keeps every encoder history unit as the standalone
+    # result returned by QDQ.  Native TempoKV keeps cheaper views into the
+    # reconstruction buffer.  The distinction affects CUDA dispatch and exact
+    # accumulation.
+    history = (
+        [anchor_rebuilt]
+        if config.fit_mode == "legacy"
+        else [reconstruction[:, :, :stride]]
+    )
     del anchor_rebuilt
     residual_sequence = sequence - stride
     packed_width = width if bits == 8 else width // (8 // bits)
@@ -376,7 +422,9 @@ def _encode(
         if predictor_kind == "temporal":
             assert temporal is not None
             prediction = predict_temporal(
-                [item[:, :, :unit_length] for item in history], temporal
+                [item[:, :, :unit_length] for item in history],
+                temporal,
+                legacy=config.fit_mode == "legacy",
             )
         else:
             assert cross_kv is not None and source is not None
@@ -384,9 +432,14 @@ def _encode(
                 source[:, :, offset : offset + unit_length],
                 cross_kv,
                 [item[:, :, :unit_length] for item in history],
+                matmul_precision=config.cross_matmul_precision,
+                legacy=config.fit_mode == "legacy",
             )
-        residual_input = torch.empty_like(current, dtype=torch.float32)
-        torch.sub(current, prediction, out=residual_input)
+        if config.fit_mode == "legacy":
+            residual_input = current.float() - prediction
+        else:
+            residual_input = torch.empty_like(current, dtype=torch.float32)
+            torch.sub(current, prediction, out=residual_input)
         quant, scale, zero_point, residual_rebuilt = _quantize(
             residual_input,
             bits=bits,
@@ -395,17 +448,28 @@ def _encode(
             scale_dtype=scale_dtype,
         )
         del residual_input
-        rebuilt = prediction.add_(residual_rebuilt).to(reconstruction_dtype)
+        rebuilt = (
+            (prediction + residual_rebuilt).to(reconstruction_dtype)
+            if config.fit_mode == "legacy"
+            else prediction.add_(residual_rebuilt).to(reconstruction_dtype)
+        )
         reconstruction[:, :, offset : offset + unit_length] = rebuilt
-        rebuilt_view = reconstruction[:, :, offset : offset + unit_length]
+        rebuilt_history = (
+            rebuilt
+            if config.fit_mode == "legacy"
+            else reconstruction[:, :, offset : offset + unit_length]
+        )
         if predictor_kind == "temporal":
             assert temporal is not None
-            history = [rebuilt_view, *history[: temporal.history_length - 1]]
+            history = [
+                rebuilt_history,
+                *history[: temporal.history_length - 1],
+            ]
         else:
             assert cross_kv is not None
             if cross_kv.history_length:
                 history = [
-                    rebuilt_view,
+                    rebuilt_history,
                     *history[: cross_kv.history_length - 1],
                 ]
         residual_end = residual_offset + unit_length
@@ -429,6 +493,8 @@ def _encode(
         stride=stride,
         residual_mode=config.residual_mode,
         reconstruction_dtype=config.reconstruction_dtype,
+        cross_matmul_precision=config.cross_matmul_precision,
+        compatibility_mode=config.fit_mode,
         unit_lengths=tuple(unit_lengths),
         anchor_quant=anchor_quant,
         anchor_scale=anchor_scale,
@@ -575,7 +641,23 @@ def decode_tensor(
                 "reconstructed K dtype must match the packed V reconstruction dtype "
                 f"{stored_dtype}, got {source.dtype}"
             )
-    if use_triton and packed.anchor_quant.is_cuda:
+    legacy_torch_cross = (
+        packed.compatibility_mode == "legacy"
+        and packed.predictor_kind == "cross_kv"
+        and packed.cross_kv is not None
+        and packed.cross_kv.history_length > 0
+    )
+    legacy_strict_temporal = (
+        packed.compatibility_mode == "legacy"
+        and packed.predictor_kind == "temporal"
+    )
+    effective_strict_triton = strict_triton or legacy_strict_temporal
+    if use_triton and packed.anchor_quant.is_cuda and legacy_torch_cross:
+        if strict_triton:
+            raise RuntimeError(
+                "legacy direct Cross+V-history decoding does not support Triton"
+            )
+    if use_triton and packed.anchor_quant.is_cuda and not legacy_torch_cross:
         try:
             from .triton_ops import decode as decode_triton
 
@@ -588,10 +670,10 @@ def decode_tensor(
             )
             if accelerated is not None:
                 return accelerated
-            if strict_triton:
+            if effective_strict_triton:
                 raise RuntimeError("this packed layout is not supported by Triton")
         except Exception as error:
-            if strict_triton:
+            if effective_strict_triton:
                 raise
             warnings.warn(
                 f"Triton decode failed; using the PyTorch decoder: {error}",
@@ -620,18 +702,26 @@ def decode_tensor(
         output_dtype,
     )
     output[:, :, :anchor_length] = anchor
-    del anchor
     if packed.residual_quant is None:
+        if legacy_torch_cross:
+            _record_legacy_torch_cross_route()
         return output
     assert packed.residual_scale is not None
-    history = [output[:, :, :anchor_length]]
+    history = (
+        [anchor]
+        if packed.compatibility_mode == "legacy"
+        else [output[:, :, :anchor_length]]
+    )
+    del anchor
     offset = anchor_length
     residual_offset = 0
     for unit_length in packed.unit_lengths[1:]:
         if packed.predictor_kind == "temporal":
             assert packed.temporal is not None
             prediction = predict_temporal(
-                [item[:, :, :unit_length] for item in history], packed.temporal
+                [item[:, :, :unit_length] for item in history],
+                packed.temporal,
+                legacy=packed.compatibility_mode == "legacy",
             )
         else:
             if source is None or packed.cross_kv is None:
@@ -640,6 +730,8 @@ def decode_tensor(
                 source[:, :, offset : offset + unit_length],
                 packed.cross_kv,
                 [item[:, :, :unit_length] for item in history],
+                matmul_precision=packed.cross_matmul_precision,
+                legacy=packed.compatibility_mode == "legacy",
             )
         end = residual_offset + unit_length
         zero_point = (
@@ -656,26 +748,45 @@ def decode_tensor(
             width=width,
             mode=packed.residual_mode,
         )
-        rebuilt = prediction.add_(residual).to(output_dtype)
+        rebuilt = (
+            (prediction + residual).to(output_dtype)
+            if packed.compatibility_mode == "legacy"
+            else prediction.add_(residual).to(output_dtype)
+        )
         output[:, :, offset : offset + unit_length] = rebuilt
-        rebuilt_view = output[:, :, offset : offset + unit_length]
+        rebuilt_history = (
+            rebuilt
+            if packed.compatibility_mode == "legacy"
+            else output[:, :, offset : offset + unit_length]
+        )
         if packed.predictor_kind == "temporal":
             assert packed.temporal is not None
             history = [
-                rebuilt_view,
+                rebuilt_history,
                 *history[: packed.temporal.history_length - 1],
             ]
         else:
             assert packed.cross_kv is not None
             if packed.cross_kv.history_length:
                 history = [
-                    rebuilt_view,
+                    rebuilt_history,
                     *history[: packed.cross_kv.history_length - 1],
                 ]
         offset += unit_length
         residual_offset = end
         del prediction, zero_point, residual, rebuilt
+    if legacy_torch_cross:
+        _record_legacy_torch_cross_route()
     return output
+
+
+def _record_legacy_torch_cross_route() -> None:
+    """Expose the expected legacy direct-V Torch fallback in run reports."""
+    try:
+        from .triton_ops import record_route
+    except (ImportError, ModuleNotFoundError):
+        return
+    record_route("cross_kv_temporal_v_torch")
 
 
 class TempoKVCodec:

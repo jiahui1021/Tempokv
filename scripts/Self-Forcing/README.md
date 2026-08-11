@@ -71,7 +71,9 @@ PROMPTS=assets/fit_prompts.txt \
 bash scripts/Self-Forcing/collect_trace.sh
 ```
 
-默认采集 21 个 latent 帧，每帧抽取 8 个 token，保存全部 30 层和 12 个
+默认使用 legacy 的 direct temporal-V 拟合协议：`assets/fit_prompts.txt` 中的 12 条
+prompt、每条 51 个 latent 帧、每帧 8 个 token。每条 prompt 保存两个独立的
+24 帧记录并分别重置历史，末尾 3 帧不进入拟合。保存全部 30 层和 12 个
 attention head。K 来自 `norm_k` 输出，坐标为 normalized、pre-RoPE；V 来自同
 一次 clean attention 计算。采集过程不启用 TempoKV。
 
@@ -80,7 +82,8 @@ attention head。K 来自 `norm_k` 输出，坐标为 normalized、pre-RoPE；V 
 ```bash
 TRACE_DIR=data/self-forcing/trace
 TRACE_FILE=data/self-forcing/trace/clean_trace.npz
-TRACE_FRAMES=21
+LEGACY_PROTOCOL=1
+TRACE_FRAMES=51
 TRACE_TOKENS_PER_FRAME=8
 NUM_GPUS=1
 BASE_SEED=0
@@ -92,14 +95,15 @@ OVERWRITE=1
 ```bash
 python experiments/Self-Forcing/tempokv_adapter/prepare_trace.py \
   data/self-forcing/trace/raw \
-  data/self-forcing/trace/clean_trace.npz
+  data/self-forcing/trace/clean_trace.npz \
+  --legacy-protocol
 ```
 
 合并文件包含：
 
 ```text
-keys                 [30,samples,T,12,128]
-values               [30,samples,T,12,128]
+keys                 [30,24,1,8,24,12,128]
+values               [30,24,1,8,24,12,128]
 layer_ids            [0..29]
 stride               1560
 coordinate_system    pre_rope_normalized
@@ -115,12 +119,12 @@ VH=1 \
 bash scripts/Self-Forcing/fit_params.sh
 ```
 
-脚本根据配置自动生成参数方案名，例如 `kh2-vh1-int2`。默认读取
+脚本根据配置自动生成参数方案名，例如 `legacy-kh2-vh1-int2`。默认读取
 `data/self-forcing/trace/clean_trace.npz`，并写入：
 
 ```text
-data/self-forcing/params/kh2-vh1-int2/k_temporal.npz
-data/self-forcing/params/kh2-vh1-int2/v_cross_kv.npz
+data/self-forcing/params/legacy-kh2-vh1-int2/k_temporal.npz
+data/self-forcing/params/legacy-kh2-vh1-int2/v_cross_kv.npz
 ```
 
 可用 `TRACE_FILE`、`PARAM_NAME` 或 `OUTPUT_DIR` 覆盖默认位置。

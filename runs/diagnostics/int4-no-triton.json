@@ -9,6 +9,9 @@
   "residual_mode": "asymmetric",
   "scale_dtype": "bfloat16",
   "reconstruction_dtype": "bfloat16",
+  "cross_matmul_precision": "ieee",
+  "k_predictor_mode": "shared",
+  "fit_mode": "legacy",
   "use_triton": false,
   "strict_triton": false
 }

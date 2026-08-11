@@ -85,18 +85,11 @@ FRAMES=717 \
 bash scripts/Self-Forcing/run_bf16.sh
 ```
 
-三种模式都使用 `experiments/Self-Forcing/inference.py`，不需要 `MODEL_REPO`、
-`TRACE_RUNNER` 或 QVG。BF16 与 TempoKV 默认都生成 717 帧，对应 180 个 latent 帧、
-60 个生成 block，进度条统一显示 `60/60`。`FRAMES` 必须满足
-`(FRAMES + 3) % 12 == 0`，脚本不会静默修改帧数。
 
 详细说明见 [scripts/Self-Forcing/README.md](../scripts/Self-Forcing/README.md)。
 
 ## Causal Forcing
 
-模型与 TempoKV 接入代码都在 `experiments/Causal-Forcing/`，不需要 clone 外部
-`thu-ml/Causal-Forcing`，权重由 `MODEL_ROOT`（Wan2.1 base）和 `CHECKPOINT`
-（Causal Forcing 权重）指定。
 
 ### 0. 下载权重
 
@@ -153,17 +146,6 @@ MODEL_ROOT=checkpoints/causal_forcing/wan2.1-t2v-1.3b \
 PROMPTS=assets/generation_prompts.txt \
 bash scripts/Causal-Forcing/run_bf16.sh
 ```
-
-两种模式默认都生成 81 帧。`GENERATION_MODE=framewise` 切换到 frame-wise 模型，
-上面四步命令不变，trace、参数和结果分别存在 `framewise/` 子目录，互不覆盖。
-`FRAMES` 需满足 chunkwise `(FRAMES + 3) % 12 == 0`、framewise
-`(FRAMES + 3) % 4 == 0`。
-
-Causal Forcing 与 Self-Forcing 的 30 层 / 12 头 / D=128 / stride=1560 完全相同，
-但 checkpoint 与 cache 分布不同，**参数不能互相复用**，必须各自采 trace 各自拟合。
-
-已接入的是标准 Causal Forcing 推理（chunk-wise 与 frame-wise）的 BF16 / trace /
-INT4 / INT2 全流程；上游的 Rolling Forcing / long-video 扩展尚未接入。
 
 详细说明见 [scripts/Causal-Forcing/README.md](../scripts/Causal-Forcing/README.md)。
 

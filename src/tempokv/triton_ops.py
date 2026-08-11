@@ -23,6 +23,11 @@ def reset_route_report() -> None:
     _ROUTE_COUNTS.clear()
 
 
+def record_route(route: str) -> None:
+    """Record an expected non-Triton route in the shared runtime report."""
+    _record(route)
+
+
 def _record(route: str) -> None:
     _ROUTE_COUNTS[route] = _ROUTE_COUNTS.get(route, 0) + 1
 
@@ -441,6 +446,7 @@ def _cross_kv_residual_decode_kernel(
     bits: tl.constexpr,
     group_size: tl.constexpr,
     asymmetric: tl.constexpr,
+    cross_input_precision: tl.constexpr,
     block_s: tl.constexpr,
     block_d: tl.constexpr,
     block_k: tl.constexpr,
@@ -478,8 +484,15 @@ def _cross_kv_residual_decode_kernel(
         other=0.0,
     ).to(tl.float32)
     prediction = tl.dot(
-        source, weight, out_dtype=tl.float32, input_precision="tf32"
+        source,
+        weight,
+        out_dtype=tl.float32,
+        input_precision=cross_input_precision,
     )
+    bias = tl.load(
+        bias_ptr + head * width + channel, mask=channel < width, other=0.0
+    ).to(tl.float32)
+    prediction += bias[None, :]
     if history_shared and history_length > 0:
         shared_history_weight = tl.load(
             history_weight_ptr + head * width + channel,
@@ -565,12 +578,8 @@ def _cross_kv_residual_decode_kernel(
                     previous,
                     history_weight,
                     out_dtype=tl.float32,
-                    input_precision="tf32",
+                    input_precision=cross_input_precision,
                 )
-    bias = tl.load(
-        bias_ptr + head * width + channel, mask=channel < width, other=0.0
-    )
-    prediction += bias[None, :]
 
     residual_token = residual_start + token
     if bits == 8:
@@ -646,6 +655,7 @@ def _cross_kv_persistent_decode_kernel(
     bits: tl.constexpr,
     group_size: tl.constexpr,
     asymmetric: tl.constexpr,
+    cross_input_precision: tl.constexpr,
     block_s: tl.constexpr,
     block_d: tl.constexpr,
     block_k: tl.constexpr,
@@ -730,7 +740,10 @@ def _cross_kv_persistent_decode_kernel(
             other=0.0,
         ).to(tl.float32)
         prediction = tl.dot(
-            source, weight, out_dtype=tl.float32, input_precision="tf32"
+            source,
+            weight,
+            out_dtype=tl.float32,
+            input_precision=cross_input_precision,
         ) + bias[None, :]
         output_offset = _strided_bhsd_offsets(
             batch_head,
@@ -778,6 +791,7 @@ def _cross_kv_history_persistent_decode_kernel(
     bits: tl.constexpr,
     group_size: tl.constexpr,
     asymmetric: tl.constexpr,
+    cross_input_precision: tl.constexpr,
     block_s: tl.constexpr,
     block_d: tl.constexpr,
     block_k: tl.constexpr,
@@ -932,8 +946,12 @@ def _cross_kv_history_persistent_decode_kernel(
             other=0.0,
         ).to(tl.float32)
         prediction = tl.dot(
-            source, weight, out_dtype=tl.float32, input_precision="tf32"
+            source,
+            weight,
+            out_dtype=tl.float32,
+            input_precision=cross_input_precision,
         )
+        prediction += bias[None, :]
 
         if history_shared:
             history_order = 1
@@ -966,7 +984,7 @@ def _cross_kv_history_persistent_decode_kernel(
                 previous_one,
                 history_weight_one,
                 out_dtype=tl.float32,
-                input_precision="tf32",
+                input_precision=cross_input_precision,
             )
         if history_length > 1 and not history_shared:
             if unit_index > 1:
@@ -988,9 +1006,9 @@ def _cross_kv_history_persistent_decode_kernel(
                         previous_two,
                         history_weight_two,
                         out_dtype=tl.float32,
-                        input_precision="tf32",
+                        input_precision=cross_input_precision,
                     )
-        current = (prediction + bias[None, :] + residual).to(tl.bfloat16).to(
+        current = (prediction + residual).to(tl.bfloat16).to(
             tl.float32
         )
         output_offset = _strided_bhsd_offsets(
@@ -1176,7 +1194,11 @@ def decode(
                 _ceil_div(packed.stride, block_s),
                 _ceil_div(width, block_d),
             )
-            persistent_units = persistent_units_per_launch()
+            persistent_units = (
+                8
+                if packed.compatibility_mode == "legacy"
+                else persistent_units_per_launch()
+            )
             # Large K orders create a nested compile-time expansion.  Keep the
             # original bound unless the production-size order is small.
             if parameters.history_length > 4:
@@ -1350,6 +1372,7 @@ def decode(
                     packed.bits,
                     packed.group_size,
                     asymmetric,
+                    packed.cross_matmul_precision,
                     block_s,
                     recurrent_block_d,
                     block_k,
@@ -1383,6 +1406,7 @@ def decode(
                     packed.bits,
                     packed.group_size,
                     asymmetric,
+                    packed.cross_matmul_precision,
                     block_s,
                     cross_block_d,
                     block_k,
@@ -1430,6 +1454,7 @@ def decode(
             packed.bits,
             packed.group_size,
             asymmetric,
+            packed.cross_matmul_precision,
             block_s,
             cross_block_d,
             block_k,

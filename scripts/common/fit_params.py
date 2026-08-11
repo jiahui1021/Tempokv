@@ -29,6 +29,12 @@ from tempokv.fitting import fit_predictors  # noqa: E402
 
 CODEC_FIELDS = {field.name for field in fields(CodecConfig)}
 
+# The legacy fitting protocol collects two 24-frame records per prompt.  Keep
+# these in step with `Self-Forcing/tempokv_adapter/prepare_trace.py`, which
+# writes the metadata checked below.
+LEGACY_PROMPT_COUNT = 12
+LEGACY_TRACE_PROTOCOL = f"direct_v_{LEGACY_PROMPT_COUNT}p_51f_8t_24x2_v1"
+
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -65,8 +71,9 @@ def build_parser() -> argparse.ArgumentParser:
         "channel and cannot represent cross-channel recurrence",
     )
     parser.add_argument("--iterations", type=int, default=2)
-    parser.add_argument("--temporal-ridge", type=float, default=0.0)
-    parser.add_argument("--cross-ridge", type=float, default=0.0)
+    parser.add_argument("--temporal-ridge", type=float)
+    parser.add_argument("--cross-ridge", type=float)
+    parser.add_argument("--v-history-ridge", type=float)
     parser.add_argument("--max-gain", type=float, default=1.0)
     parser.add_argument(
         "--device",
@@ -96,6 +103,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--reconstruction-dtype", choices=("float32", "float16", "bfloat16")
     )
+    parser.add_argument("--cross-matmul-precision", choices=("ieee", "tf32"))
+    parser.add_argument(
+        "--k-predictor-mode", choices=("layer_head", "shared")
+    )
+    parser.add_argument("--fit-mode", choices=("native", "legacy"))
     parser.add_argument(
         "--use-triton", action=argparse.BooleanOptionalAction, default=None
     )
@@ -163,9 +175,30 @@ def _load_trace(
                 "head_dim",
                 "coordinate_system",
                 "cross_source_kind",
+                "trace_layout",
+                "trace_event_count",
+                "prompt_count",
+                "frames_per_event",
+                "tokens_per_frame",
+                "legacy_trace_protocol",
             ):
                 if name in archive:
                     metadata[name] = np.asarray(archive[name]).item()
+            for name in (
+                "token_indices",
+                "event_tokens_start",
+                "event_tokens_end",
+            ):
+                if name in archive:
+                    array = np.asarray(archive[name])
+                    if array.ndim != 1 or not np.issubdtype(
+                        array.dtype, np.integer
+                    ):
+                        raise ValueError(
+                            f"trace {name} metadata must be a one-dimensional "
+                            "integer array"
+                        )
+                    metadata[name] = tuple(int(item) for item in array)
             named_trace_stride = (
                 np.asarray(archive["trace_stride"]).item()
                 if "trace_stride" in archive
@@ -254,6 +287,24 @@ def _fit_device(name: str) -> torch.device:
 
 def run(args: argparse.Namespace) -> dict[str, Any]:
     config = _codec_config(args)
+    temporal_ridge = (
+        1.0
+        if args.temporal_ridge is None and config.fit_mode == "legacy"
+        else 0.0 if args.temporal_ridge is None else args.temporal_ridge
+    )
+    cross_ridge = (
+        0.1
+        if args.cross_ridge is None and config.fit_mode == "legacy"
+        else 0.0 if args.cross_ridge is None else args.cross_ridge
+    )
+    v_history_ridge = (
+        0.0 if args.v_history_ridge is None else args.v_history_ridge
+    )
+    v_history_mode = (
+        "diagonal"
+        if config.fit_mode == "legacy" and config.v_history_length
+        else args.v_history_mode
+    )
     config_sha256 = hashlib.sha256(
         json.dumps(asdict(config), sort_keys=True, separators=(",", ":")).encode(
             "utf-8"
@@ -276,6 +327,37 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             raise ValueError(
                 f"trace {name} metadata is {int(recorded)}, but the array has {actual}"
             )
+    if config.fit_mode == "legacy":
+        events = 2 * LEGACY_PROMPT_COUNT
+        expected_trace_metadata: dict[str, object] = {
+            "trace_layout": "legacy_event_bpfhd_v1",
+            "trace_event_count": events,
+            "prompt_count": LEGACY_PROMPT_COUNT,
+            "frames_per_event": 24,
+            "tokens_per_frame": 8,
+            "legacy_trace_protocol": LEGACY_TRACE_PROTOCOL,
+            "token_indices": (0, 223, 445, 668, 891, 1114, 1336, 1559),
+            "event_tokens_start": (0, 37440) * LEGACY_PROMPT_COUNT,
+            "event_tokens_end": (37440, 74880) * LEGACY_PROMPT_COUNT,
+            "trace_stride": 1560,
+        }
+        for name, expected in expected_trace_metadata.items():
+            actual = trace_metadata.get(name)
+            if actual != expected:
+                raise ValueError(
+                    f"legacy fitting requires trace {name}={expected!r}, "
+                    f"got {actual!r}; recollect the legacy-protocol trace"
+                )
+        expected_shape = (30, events, 1, 8, 24, 12, 128)
+        if tuple(keys.shape) != expected_shape:
+            raise ValueError(
+                f"legacy trace must use {list(expected_shape)} layout, got "
+                f"{tuple(keys.shape)}"
+            )
+        if keys.dtype != torch.float32 or values.dtype != torch.float32:
+            raise ValueError("legacy trace K/V arrays must use float32")
+        if layer_ids != tuple(range(30)):
+            raise ValueError("legacy trace layer_ids must be 0 through 29")
     trace_coordinate_system = trace_metadata.get("coordinate_system")
     coordinate_system = args.coordinate_system
     if trace_coordinate_system is not None:
@@ -316,10 +398,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             )
         ),
         iterations=args.iterations,
-        temporal_ridge=args.temporal_ridge,
-        cross_ridge=args.cross_ridge,
+        temporal_ridge=temporal_ridge,
+        cross_ridge=cross_ridge,
+        v_history_ridge=v_history_ridge,
         max_gain=args.max_gain,
-        v_history_mode=args.v_history_mode,
+        v_history_mode=v_history_mode,
         layer_ids=layer_ids,
         coordinate_system=coordinate_system,
     )
@@ -357,7 +440,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "shape": list(keys.shape),
             "keys_dtype": str(keys.dtype).removeprefix("torch."),
             "values_dtype": str(values.dtype).removeprefix("torch."),
-            "layer_ids": list(temporal.layer_ids or ()),
+            "layer_ids": list(layer_ids or ()),
             "trace_stride": trace_metadata.get("trace_stride"),
             "runtime_stride": config.stride,
         },
@@ -370,10 +453,15 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 config.k_history_length
             ).history_length,
             "k_max_history_length": temporal.max_history_length,
-            "k_history_mode": temporal.history_mode,
+            "k_history_mode": (
+                "shared"
+                if config.k_predictor_mode == "shared"
+                else temporal.history_mode
+            ),
             "iterations": int(args.iterations),
-            "temporal_ridge": float(args.temporal_ridge),
-            "cross_ridge": float(args.cross_ridge),
+            "temporal_ridge": float(temporal_ridge),
+            "cross_ridge": float(cross_ridge),
+            "v_history_ridge": float(v_history_ridge),
             "v_history_length": cross.with_history_length(
                 config.v_history_length
             ).history_length,
@@ -383,7 +471,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "coordinate_system": coordinate_system,
             "trace_metadata": trace_metadata,
             "device": str(device),
-            "compute_dtype": "float32" if device.type == "cuda" else "float64",
+            "compute_dtype": (
+                "float64_stats"
+                if config.fit_mode == "legacy"
+                else "float32" if device.type == "cuda" else "float64"
+            ),
             "seconds": fit_seconds,
             # Keep the original name as an alias for allocated memory.
             "peak_gpu_bytes": peak_fit_allocated,

@@ -57,9 +57,20 @@ def decode_cache_state(
         if output_layout != "BSHD":
             fallback_kwargs["output_layout"] = output_layout
         return fallback(state, **fallback_kwargs)
+    legacy_direct_v = (
+        packed.compatibility_mode == "legacy"
+        and packed.predictor_kind == "cross_kv"
+        and packed.cross_kv is not None
+        and packed.cross_kv.history_length > 0
+    )
+    # The legacy path deliberately excludes direct-output and Triton for
+    # Cross+previous-V.  Its Torch decoder takes a standalone contiguous K
+    # source, builds a standalone BHSD result, and the cache copies it after.
+    if legacy_direct_v and source_tensor is not None:
+        source_tensor = source_tensor.contiguous()
     decode_kwargs = {
         "source": source_tensor,
-        "output_tensor": output_tensor,
+        "output_tensor": None if legacy_direct_v else output_tensor,
         "use_triton": codec.config.use_triton,
         "strict_triton": codec.config.strict_triton,
     }
@@ -90,6 +101,12 @@ def install(runtime_root: str | Path) -> type:
             )
             self.tempokv_codec = load_codec_from_env()
             config = self.tempokv_codec.config
+            self._tempokv_rope_precision = (
+                "complex64"
+                if getattr(config, "fit_mode", "native") == "legacy"
+                else "native"
+            )
+            self._apply_tempokv_rope_precision()
             if config.stride != self.frame_seq_length:
                 raise ValueError(
                     f"TempoKV stride {config.stride} does not match Self-Forcing "
@@ -125,6 +142,17 @@ def install(runtime_root: str | Path) -> type:
                 )
 
             cache_module.set_quantized_decoder(decode_with_codec)
+
+        def _apply_tempokv_rope_precision(self) -> None:
+            if self.kv_cache1 is None:
+                return
+            for layer in self.kv_cache1:
+                layer["k"].rope_precision = self._tempokv_rope_precision
+
+        def _initialize_kv_cache(self, *args: Any, **kwargs: Any) -> Any:
+            result = super()._initialize_kv_cache(*args, **kwargs)
+            self._apply_tempokv_rope_precision()
+            return result
 
         def _patch_attention_windows(self) -> None:
             # TempoKV takes over cache compression, so the model must keep the

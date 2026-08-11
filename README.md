@@ -81,8 +81,8 @@ Self-Forcing 与 LongCat 对 `diffusers`、`transformers` 和 `av` 的版本要�
 
 仓库提供 `configs/int2.json` 和 `configs/int4.json`。每一种
 `k_history_length`、`v_history_length` 与位宽组合都需要一套对应的拟合参数，
-参数目录名会带上这三者（如 `kh2-vh1-int4`），互不覆盖。历史帧数默认
-`kh=2`、`vh=1`；命令行用 `KH=` / `VH=` 覆盖即可（等价于长名
+参数目录名会带上这三者（如 `legacy-kh3-vh1-int4`），互不覆盖。INT2 默认
+`kh=2`、`vh=1`，INT4 默认 `kh=3`、`vh=1`；命令行用 `KH=` / `VH=` 覆盖即可（等价于长名
 `K_HISTORY_LENGTH` / `V_HISTORY_LENGTH`，两个都设且不同会报错）。
 `residual_mode=symmetric` 且位宽为 2 时使用的是 `-1, 0, 1` 三个量化值；默认的
 `residual_mode=asymmetric` 才使用 2 bit 的四个编码值。
@@ -91,7 +91,7 @@ Self-Forcing 与 LongCat 对 `diffusers`、`transformers` 和 `av` 的版本要�
 
 Self-Forcing 的 BF16、clean trace 和 TempoKV 使用同一份本地模型代码：
 `experiments/Self-Forcing/inference.py`。不需要 `MODEL_REPO`、`TRACE_RUNNER`
-或 QVG 仓库。`CHECKPOINT` 与 `WAN_MODEL_DIR` 只负责指定本机模型权重。
+或外部仓库。`CHECKPOINT` 与 `WAN_MODEL_DIR` 只负责指定本机模型权重。
 
 ### 1. 采集并合并 clean trace
 
@@ -115,7 +115,8 @@ data/self-forcing/trace/clean_trace.npz
 ```bash
 python experiments/Self-Forcing/tempokv_adapter/prepare_trace.py \
   data/self-forcing/trace/raw \
-  data/self-forcing/trace/clean_trace.npz
+  data/self-forcing/trace/clean_trace.npz \
+  --legacy-protocol
 ```
 
 ### 2. 拟合一套参数
@@ -130,8 +131,8 @@ bash scripts/Self-Forcing/fit_params.sh
 默认输出：
 
 ```text
-data/self-forcing/params/kh2-vh1-int2/k_temporal.npz
-data/self-forcing/params/kh2-vh1-int2/v_cross_kv.npz
+data/self-forcing/params/legacy-kh2-vh1-int2/k_temporal.npz
+data/self-forcing/params/legacy-kh2-vh1-int2/v_cross_kv.npz
 ```
 
 K/V 使用不同位宽时，目录名会明确写出两者，例如

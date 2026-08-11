@@ -1,5 +1,6 @@
 from typing import List, Optional
 from types import SimpleNamespace
+import os
 import torch
 from tqdm.auto import tqdm
 
@@ -361,20 +362,29 @@ class CausalInferencePipeline(torch.nn.Module):
         # window is local, while storage remains frame-addressable so RoPE and
         # TempoKV spans never change coordinates.
         max_num_chunks = int(target_frames or 21)
+        rope_precision = os.environ.get(
+            "SELF_FORCING_CACHE_ROPE_PRECISION", "native"
+        )
+        if rope_precision not in {"native", "complex64"}:
+            raise ValueError(
+                "SELF_FORCING_CACHE_ROPE_PRECISION must be native or complex64"
+            )
 
         for _ in range(self.num_transformer_blocks):
+            key_cache = ChunkedKVCache(
+                batch_size,
+                self.frame_seq_length,
+                self.num_heads,
+                self.head_dim,
+                max_num_chunks,
+                dtype,
+                device,
+                layout="BSHD",
+                cache_role="K",
+            )
+            key_cache.rope_precision = rope_precision
             kv_cache1.append({
-                "k": ChunkedKVCache(
-                    batch_size,
-                    self.frame_seq_length,
-                    self.num_heads,
-                    self.head_dim,
-                    max_num_chunks,
-                    dtype,
-                    device,
-                    layout="BSHD",
-                    cache_role="K",
-                ),
+                "k": key_cache,
                 "v": ChunkedKVCache(
                     batch_size,
                     self.frame_seq_length,
