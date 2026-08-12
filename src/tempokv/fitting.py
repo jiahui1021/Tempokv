@@ -1883,8 +1883,6 @@ def fit_legacy_temporal_v_alpha(
         stride=cross.stride,
         layer_ids=cross.layer_ids,
         history_weights=alpha.contiguous(),
-        input_factor=cross.input_factor,
-        output_factor=cross.output_factor,
     )
 
 
@@ -1941,8 +1939,6 @@ def _stamp_parameter_identity(
         cross.history_weights,
         cross.maximum_history_length,
         cross.active_history_length,
-        input_factor=cross.input_factor,
-        output_factor=cross.output_factor,
     )
 
 

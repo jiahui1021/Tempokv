@@ -167,11 +167,6 @@ class CodecConfig:
                 raise ValueError(
                     "legacy fitting requires bfloat16 scales and reconstruction"
                 )
-            if self.v_history_length and self.v_predictor_mode == "cross_kv" and self.strict_triton:
-                raise ValueError(
-                    "legacy Cross+previous-V decodes in Torch and has no "
-                    "Triton path; use v_predictor_mode=temporal for one"
-                )
 
     def format_signature(self) -> str:
         """Return a stable identity for settings used during fitting."""
