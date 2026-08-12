@@ -822,52 +822,15 @@ def _cross_kv_history_persistent_decode_kernel(
         other=0.0,
     ).to(tl.float32)
     # Shared history reuses one coefficient set for every lag; the plain
-    # diagonal map carries one set per lag.
+    # diagonal map carries one set per lag, loaded on demand below.  Previous
+    # units are re-read from output_ptr instead of kept in a Python list, which
+    # Triton cannot materialize inside a kernel.
     if history_shared:
         history_weight_one = tl.load(
             history_weight_ptr + head * width + channel,
             mask=channel < width,
             other=0.0,
         ).to(tl.float32)
-    else:
-        diagonal_weights = []
-        for lag in range(history_length):
-            diagonal_weights.append(
-                tl.load(
-                    history_weight_ptr + (lag * heads + head) * width + channel,
-                    mask=channel < width,
-                    other=0.0,
-                ).to(tl.float32)
-            )
-
-    # Newest-to-oldest reconstructed units feeding the recurrence.  start_unit
-    # is a compile-time constant, so units before the span resolve to zeros
-    # without a runtime branch.
-    history_values = []
-    for lag in range(1, history_length + 1):
-        if start_unit >= lag:
-            previous_token = (start_unit - lag) * stride + token
-            previous_offset = _strided_bhsd_offsets(
-                batch_head,
-                previous_token,
-                channel,
-                heads,
-                output_stride_b,
-                output_stride_h,
-                output_stride_s,
-                output_stride_d,
-            )
-            history_values.append(
-                tl.load(
-                    output_ptr + previous_offset,
-                    mask=(token[:, None] < stride)
-                    & (previous_token[:, None] < sequence)
-                    & (channel[None, :] < width),
-                    other=0.0,
-                ).to(tl.float32)
-            )
-        else:
-            history_values.append(tl.zeros((block_s, block_d), tl.float32))
 
     for chunk_index in tl.static_range(0, chunk_units):
         unit_index = start_unit + chunk_index
@@ -957,16 +920,57 @@ def _cross_kv_history_persistent_decode_kernel(
 
         if history_shared:
             history_order = min(unit_index, history_length)
-            for lag in range(history_order):
-                prediction += history_values[lag] * (
+            for lag in tl.static_range(0, history_order):
+                previous_token = (unit_index - lag - 1) * stride + token
+                previous_offset = _strided_bhsd_offsets(
+                    batch_head,
+                    previous_token,
+                    channel,
+                    heads,
+                    output_stride_b,
+                    output_stride_h,
+                    output_stride_s,
+                    output_stride_d,
+                )
+                previous = tl.load(
+                    output_ptr + previous_offset,
+                    mask=(token[:, None] < stride)
+                    & (previous_token[:, None] < sequence)
+                    & (channel[None, :] < width),
+                    other=0.0,
+                ).to(tl.float32)
+                prediction += previous * (
                     history_weight_one[None, :] / history_order
                 )
         else:
-            for lag in range(history_length):
+            for lag in tl.static_range(0, history_length):
                 if unit_index > lag:
-                    prediction += (
-                        history_values[lag] * diagonal_weights[lag][None, :]
+                    coefficient = tl.load(
+                        history_weight_ptr
+                        + (lag * heads + head) * width
+                        + channel,
+                        mask=channel < width,
+                        other=0.0,
+                    ).to(tl.float32)
+                    previous_token = (unit_index - lag - 1) * stride + token
+                    previous_offset = _strided_bhsd_offsets(
+                        batch_head,
+                        previous_token,
+                        channel,
+                        heads,
+                        output_stride_b,
+                        output_stride_h,
+                        output_stride_s,
+                        output_stride_d,
                     )
+                    previous = tl.load(
+                        output_ptr + previous_offset,
+                        mask=(token[:, None] < stride)
+                        & (previous_token[:, None] < sequence)
+                        & (channel[None, :] < width),
+                        other=0.0,
+                    ).to(tl.float32)
+                    prediction += previous * coefficient[None, :]
         current = (prediction + residual).to(tl.bfloat16).to(tl.float32)
         output_offset = _strided_bhsd_offsets(
             batch_head,
@@ -979,7 +983,6 @@ def _cross_kv_history_persistent_decode_kernel(
             output_stride_d,
         )
         tl.store(output_ptr + output_offset, current, mask=valid)
-        history_values = [current] + history_values[: history_length - 1]
 
 
 def _ceil_div(left: int, right: int) -> int:
