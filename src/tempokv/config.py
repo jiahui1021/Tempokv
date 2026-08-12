@@ -34,10 +34,6 @@ class CodecConfig:
     # predictor K uses, so V needs no reconstructed K and no CrossKV matrix.
     # ``cross_kv`` keeps the Cross(K) projection.
     v_predictor_mode: str = "cross_kv"
-    # Rank of the all-head Cross(K) map.  None keeps one dense [D,D] map per
-    # head, which cannot mix heads; an integer fits a rank-r map over all heads
-    # at 2r/D of the arithmetic.
-    cross_rank: int | None = None
     # Select the legacy fixed-point/shared-K and direct temporal-V fitting math.
     fit_mode: str = "native"
 
@@ -121,14 +117,6 @@ class CodecConfig:
             raise ValueError(
                 "k_predictor_mode must be layer_head or shared"
             )
-        if self.cross_rank is not None and (
-            isinstance(self.cross_rank, bool)
-            or int(self.cross_rank) != self.cross_rank
-            or int(self.cross_rank) <= 0
-        ):
-            raise ValueError("cross_rank must be a positive integer or null")
-        if self.cross_rank is not None and self.v_predictor_mode != "cross_kv":
-            raise ValueError("cross_rank only applies to v_predictor_mode=cross_kv")
         if self.v_predictor_mode not in {"cross_kv", "temporal"}:
             raise ValueError("v_predictor_mode must be cross_kv or temporal")
         if self.fit_mode not in {"native", "legacy"}:
@@ -201,7 +189,6 @@ class CodecConfig:
             "stride": self.stride,
             "v_bits": self.v_bits,
             "v_predictor_mode": self.v_predictor_mode,
-            "cross_rank": self.cross_rank,
         }
         if self.k_history_length is not None:
             payload["k_history_length"] = int(self.k_history_length)
