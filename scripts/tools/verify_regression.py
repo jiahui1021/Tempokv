@@ -408,7 +408,7 @@ def main() -> None:
                     continue
                 if values.get("v_max_abs_diff") is None:
                     print(f"    layer {layer:>3}: K {values['k_max_abs_diff']:.3e}   "
-                          f"V decoded in Torch (no Triton path)")
+                          f"V decoded in Torch (Triton declined this layout)")
                     continue
                 share = values["v_max_abs_diff"] / max(values["v_recon_rms"], 1e-12)
                 print(f"    layer {layer:>3}: K {values['k_max_abs_diff']:.3e}   "

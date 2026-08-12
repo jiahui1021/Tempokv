@@ -634,12 +634,6 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         report["parameters"] = parameters
         report["runtime_config"] = str(paths["runtime_config"])
         requested_persistent_units = persistent_units_per_launch()
-        # CrossKV V with history is the one layout Triton cannot decode.
-        torch_v = (
-            config.v_predictor_mode == "cross_kv"
-            and config.fit_mode == "legacy"
-            and parameters["v_history_length"]
-        )
         report["persistent_units_per_launch"] = {
             "requested": requested_persistent_units,
             "k": (
@@ -647,18 +641,14 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                 if parameters["k_history_length"] > 4
                 else requested_persistent_units
             ),
+            # Both Cross routes unroll a K projection per unit, so they cap the
+            # launch batch where the reference implementation does.
             "v": (
-                None
-                if torch_v
-                else (
-                    min(requested_persistent_units, 8)
-                    if parameters["v_history_length"]
-                    and config.v_predictor_mode == "cross_kv"
-                    and not parameters.get("v_history_diagonal", False)
-                    else requested_persistent_units
-                )
+                min(requested_persistent_units, 8)
+                if config.v_predictor_mode == "cross_kv"
+                else requested_persistent_units
             ),
-            "v_backend": "torch_cross_kv" if torch_v else "triton",
+            "v_backend": "triton",
         }
     if args.dry_run:
         print(json.dumps(report, indent=2, ensure_ascii=False))
@@ -668,7 +658,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
     environment = os.environ.copy()
     if args.mode == "tempokv":
         runtime_payload = asdict(config)
-        if not args.allow_triton_fallback and not torch_v:
+        if not args.allow_triton_fallback:
             runtime_payload["use_triton"] = True
             runtime_payload["strict_triton"] = True
         paths["runtime_config"].write_text(
@@ -753,7 +743,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
     ):
         required_routes = (
             ("temporal_persistent_direct",)
-            if config.v_predictor_mode == "temporal" or torch_v
+            if config.v_predictor_mode == "temporal"
             else ("temporal_persistent_direct", "cross_kv_persistent_direct")
         )
         missing_routes = [
@@ -766,18 +756,38 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                 "TempoKV direct persistent Triton decode was not used: "
                 + ", ".join(missing_routes)
             )
+        # "declined:" entries are not routes; each names the gate that sent a
+        # span to the Torch decoder, so report them as the reason alongside
+        # whichever fallback route actually ran.
+        declines = {
+            name.split(":", 1)[1]: int(count)
+            for name, count in performance["decode_routes"].items()
+            if name.startswith("declined:") and int(count) > 0
+        }
+        report["triton_declines"] = declines
         unexpected_routes = {
             name: int(count)
             for name, count in performance["decode_routes"].items()
-            if int(count) > 0 and name not in required_routes
+            if int(count) > 0
+            and name not in required_routes
+            and not name.startswith("declined:")
         }
         if unexpected_routes:
+            reason = (
+                "; declined because: "
+                + ", ".join(
+                    f"{name}={count}" for name, count in sorted(declines.items())
+                )
+                if declines
+                else ""
+            )
             raise RuntimeError(
                 "TempoKV used a non-direct or non-persistent decode route: "
                 + ", ".join(
                     f"{name}={count}"
                     for name, count in sorted(unexpected_routes.items())
                 )
+                + reason
             )
     end_to_end = _end_to_end_latency(batch_entries, video_entries)
     if end_to_end is not None:

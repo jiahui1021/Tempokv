@@ -27,6 +27,16 @@ def _record(route: str) -> None:
     _ROUTE_COUNTS[route] = _ROUTE_COUNTS.get(route, 0) + 1
 
 
+def _decline(reason: str) -> None:
+    """Name why a span fell back, so a slow run says which gate rejected it.
+
+    A silent ``return None`` is indistinguishable from a kernel that never
+    existed: the caller only sees the Torch decoder running, or, under strict
+    Triton, a bare "not supported" with nothing to act on.
+    """
+    _record(f"declined:{reason}")
+
+
 def _route_name(route: str, direct_output_layout: str | None) -> str:
     if direct_output_layout is None:
         return route
@@ -1002,6 +1012,7 @@ def _prepare_output(
     batch, heads, sequence, width = packed.shape
     device = packed.anchor_quant.device
     if output_layout not in {"BHSD", "BSHD"}:
+        _decline("output_layout")
         return None
     if output_tensor is None:
         return (
@@ -1032,6 +1043,7 @@ def _prepare_output(
         or tuple(output_tensor.shape) != expected_shape
         or not safe_strides
     ):
+        _decline("output_tensor_layout")
         return None
     return output_tensor, output_layout
 
@@ -1057,6 +1069,7 @@ def decode(
 ) -> torch.Tensor | None:
     """Fused GPU prediction and residual decode for TempoKV's two runtime routes."""
     if not _supported(packed, source):
+        _decline("unsupported_state")
         return None
     batch, heads, sequence, width = packed.shape
     batch_heads = batch * heads
@@ -1232,11 +1245,13 @@ def decode(
     assert source is not None and packed.cross_kv is not None
     parameters = packed.cross_kv.to(output.device)
     if parameters.layered:
+        _decline("layered_parameters")
         return None
     if parameters.history_length and not parameters.history_diagonal:
         # A dense per-lag matrix mixes output channels, so one program would
         # have to own all of them and the block_d tiling would buy nothing.
         # The Torch decoder applies every lag.
+        _decline("dense_v_history")
         return None
     source_stride_b, source_stride_h, source_stride_s, source_stride_d = (
         source.stride()
