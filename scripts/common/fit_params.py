@@ -111,6 +111,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--v-predictor-mode", choices=("cross_kv", "temporal"))
     parser.add_argument(
+        "--cross-rank",
+        type=int,
+        help="fit one rank-r all-head Cross map instead of a dense map per "
+        "head; costs 2r/head_dim of the per-head arithmetic",
+    )
+    parser.add_argument(
         "--attention-steps",
         type=float,
         nargs="*",
@@ -483,7 +489,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         else (
             temporal.history_weights,
             temporal.history_bias,
-            cross.weight,
+            *(
+                (cross.input_factor, cross.output_factor)
+                if cross.factored
+                else (cross.weight,)
+            ),
             cross.history_weights,
             cross.bias,
         )
@@ -555,7 +565,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 }
                 if temporal_v
                 else {
-                    "cross_weight_shape": list(cross.weight.shape),
+                    "cross_rank": cross.rank,
+                    "cross_weight_shape": (
+                        [list(cross.input_factor.shape), list(cross.output_factor.shape)]
+                        if cross.factored
+                        else list(cross.weight.shape)
+                    ),
                     "cross_history_weight_shape": list(cross.history_weights.shape),
                     "cross_bias_shape": list(cross.bias.shape),
                 }

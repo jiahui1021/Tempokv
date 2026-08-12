@@ -199,18 +199,34 @@ def cross_projection(
     bias = parameters.bias.to(source.device)
     if source.shape[1] != weight.shape[0] or source.shape[-1] != weight.shape[-1]:
         raise ValueError("CrossKV parameters do not match cache heads/head dimension")
+    batch, heads, tokens, dim = source.shape
     with _cuda_matmul_precision(source.device, matmul_precision):
-        # Head-major and contiguous: the cache read is usually a strided view,
-        # and matmul would otherwise materialize its own copy.
-        head_major = source.permute(1, 0, 2, 3).to(
-            dtype=torch.float32, memory_format=torch.contiguous_format
-        )
-        prediction = torch.matmul(head_major, weight[:, None, :, :])
-        # A span-sized FP32 buffer is large; release the source copy before
-        # the bias pass so two of them never coexist.
-        del head_major
-    prediction = prediction.permute(1, 0, 2, 3)
-    prediction.add_(bias.view(1, source.shape[1], 1, source.shape[-1]))
+        if parameters.factored:
+            # One all-head map through a rank-r bottleneck.  The intermediate
+            # is [tokens, r] rather than [tokens, heads*dim], so this saves
+            # bandwidth as well as arithmetic.
+            left = parameters.input_factor.to(device=source.device, dtype=torch.float32)
+            right = parameters.output_factor.to(
+                device=source.device, dtype=torch.float32
+            )
+            flat = source.permute(0, 2, 1, 3).reshape(batch, tokens, heads * dim)
+            prediction = torch.matmul(torch.matmul(flat.float(), left), right)
+            prediction = prediction.reshape(batch, tokens, heads, dim).permute(
+                0, 2, 1, 3
+            )
+        else:
+            # Head-major and contiguous: the cache read is usually a strided
+            # view, and matmul would otherwise materialize its own copy.
+            head_major = source.permute(1, 0, 2, 3).to(
+                dtype=torch.float32, memory_format=torch.contiguous_format
+            )
+            prediction = torch.matmul(head_major, weight[:, None, :, :])
+            # A span-sized FP32 buffer is large; release the source copy before
+            # the bias pass so two of them never coexist.
+            del head_major
+            prediction = prediction.permute(1, 0, 2, 3)
+    prediction = prediction.contiguous()
+    prediction.add_(bias.view(1, heads, 1, dim))
     return prediction
 
 
@@ -240,8 +256,14 @@ def predict_cross_kv(
             raise ValueError("reconstructed K and V history must be on the same device")
     weight = parameters.weight.to(source.device)
     bias = parameters.bias.to(source.device)
-    if source.shape[1] != weight.shape[0] or source.shape[-1] != weight.shape[-1]:
+    if not parameters.factored and (
+        source.shape[1] != weight.shape[0] or source.shape[-1] != weight.shape[-1]
+    ):
         raise ValueError("CrossKV parameters do not match cache heads/head dimension")
+    if parameters.factored and projection is None:
+        raise ValueError(
+            "a factored CrossKV map is projected by cross_projection first"
+        )
     with _cuda_matmul_precision(source.device, matmul_precision):
         if projection is not None:
             if tuple(projection.shape) != tuple(source.shape):

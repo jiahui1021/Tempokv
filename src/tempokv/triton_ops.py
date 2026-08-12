@@ -1228,6 +1228,11 @@ def decode(
     parameters = packed.cross_kv.to(output.device)
     if parameters.layered:
         return None
+    if parameters.factored and not parameters.history_length:
+        # The no-history kernel projects per-head inside itself and has no way
+        # to read a factored map.  The recurrent kernel reads the projection
+        # that cross_projection already built, so it needs no special case.
+        return None
     if parameters.history_length > 2 and not parameters.history_diagonal:
         # A dense per-lag matrix needs one full-width tile per lag, which does
         # not fit the recurrent tiling.  The Torch decoder applies every lag.

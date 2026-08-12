@@ -311,8 +311,28 @@ class CrossKVParameters:
     history_weights: torch.Tensor | np.ndarray | None = None
     maximum_history_length: int | None = None
     active_history_length: int | None = None
+    # A factored projection replaces the per-head weight with one all-head map
+    # of rank r: [L, H*D, r] and [L, r, H*D].  It mixes heads, which the
+    # per-head map structurally cannot, and costs 2r/D of its arithmetic.
+    input_factor: torch.Tensor | np.ndarray | None = None
+    output_factor: torch.Tensor | np.ndarray | None = None
 
     def __post_init__(self) -> None:
+        if (self.input_factor is None) != (self.output_factor is None):
+            raise ValueError("a factored CrossKV map needs both factors")
+        if self.input_factor is not None:
+            left = _tensor(self.input_factor)
+            right = _tensor(self.output_factor)
+            if left.ndim != right.ndim or left.ndim not in (2, 3):
+                raise ValueError(
+                    "factors must have shape [W,r] and [r,W], or [L,W,r] and [L,r,W]"
+                )
+            if left.shape[-1] != right.shape[-2]:
+                raise ValueError("factor ranks disagree")
+            if left.shape[-2] != right.shape[-1]:
+                raise ValueError("factor widths disagree")
+            object.__setattr__(self, "input_factor", left)
+            object.__setattr__(self, "output_factor", right)
         weight = _tensor(self.weight)
         bias = _tensor(self.bias)
         if weight.ndim not in (3, 4) or weight.shape[-1] != weight.shape[-2]:
@@ -484,6 +504,15 @@ class CrossKVParameters:
         return "dense" if self.history_weights.ndim == dense_dimensions else "diagonal"
 
     @property
+    def factored(self) -> bool:
+        """Whether Cross(K) is an all-head low-rank map instead of per-head."""
+        return self.input_factor is not None
+
+    @property
+    def rank(self) -> int | None:
+        return None if self.input_factor is None else int(self.input_factor.shape[-1])
+
+    @property
     def history_diagonal(self) -> bool:
         """Whether V history uses one scalar coefficient per output channel."""
         return self.history_mode in ("diagonal", "shared_diagonal")
@@ -528,6 +557,12 @@ class CrossKVParameters:
             history_weights=self.history_weights[index],
             maximum_history_length=self.maximum_history_length,
             active_history_length=self.active_history_length,
+            input_factor=(
+                None if self.input_factor is None else self.input_factor[index]
+            ),
+            output_factor=(
+                None if self.output_factor is None else self.output_factor[index]
+            ),
         )
 
     def to(self, device: torch.device | str) -> "CrossKVParameters":
@@ -549,6 +584,8 @@ class CrossKVParameters:
             self.history_weights.to(resolved_device),
             self.maximum_history_length,
             self.active_history_length,
+            None if self.input_factor is None else self.input_factor.to(resolved_device),
+            None if self.output_factor is None else self.output_factor.to(resolved_device),
         )
 
     def save(self, path: str | Path) -> None:
@@ -557,6 +594,14 @@ class CrossKVParameters:
             kind=np.asarray("cross_kv"),
             weight=self.weight.cpu().numpy(),
             bias=self.bias.cpu().numpy(),
+            **(
+                {}
+                if self.input_factor is None
+                else {
+                    "input_factor": self.input_factor.cpu().numpy(),
+                    "output_factor": self.output_factor.cpu().numpy(),
+                }
+            ),
             history_weights=self.history_weights.cpu().numpy(),
             history_length=np.asarray(self.max_history_length, dtype=np.int32),
             history_mode=np.asarray(self.history_mode),
@@ -628,6 +673,9 @@ class CrossKVParameters:
                 coordinate_system,
                 history_weights,
                 maximum_history_length,
+                None,
+                data["input_factor"] if "input_factor" in data else None,
+                data["output_factor"] if "output_factor" in data else None,
             )
             if "history_mode" in data:
                 if declared_history_mode != parameters.history_mode:
