@@ -723,16 +723,22 @@ def decode_tensor(
             raise RuntimeError(
                 "legacy direct Cross+V-history decoding does not support Triton"
             )
+    # Only the recurrent kernel consumes a precomputed projection; the
+    # no-history kernel projects internally, so computing it eagerly there
+    # would do the same GEMM twice.
+    needs_projection = (
+        packed.predictor_kind == "cross_kv"
+        and packed.cross_kv is not None
+        and source is not None
+        and len(packed.unit_lengths) > 1
+    )
     projection = (
         cross_projection(
             source,
             packed.cross_kv,
             matmul_precision=packed.cross_matmul_precision,
         )
-        if packed.predictor_kind == "cross_kv"
-        and packed.cross_kv is not None
-        and source is not None
-        and len(packed.unit_lengths) > 1
+        if needs_projection and packed.cross_kv.history_length > 0
         else None
     )
     if use_triton and packed.anchor_quant.is_cuda and not legacy_torch_cross:
@@ -790,6 +796,12 @@ def decode_tensor(
         else [output[:, :, :anchor_length]]
     )
     del anchor
+    if needs_projection and projection is None:
+        projection = cross_projection(
+            source,
+            packed.cross_kv,
+            matmul_precision=packed.cross_matmul_precision,
+        )
     offset = anchor_length
     residual_offset = 0
     for unit_length in packed.unit_lengths[1:]:
