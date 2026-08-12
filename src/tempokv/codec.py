@@ -201,30 +201,16 @@ def cross_projection(
         raise ValueError("CrossKV parameters do not match cache heads/head dimension")
     batch, heads, tokens, dim = source.shape
     with _cuda_matmul_precision(source.device, matmul_precision):
-        if parameters.factored:
-            # One all-head map through a rank-r bottleneck.  The intermediate
-            # is [tokens, r] rather than [tokens, heads*dim], so this saves
-            # bandwidth as well as arithmetic.
-            left = parameters.input_factor.to(device=source.device, dtype=torch.float32)
-            right = parameters.output_factor.to(
-                device=source.device, dtype=torch.float32
-            )
-            flat = source.permute(0, 2, 1, 3).reshape(batch, tokens, heads * dim)
-            prediction = torch.matmul(torch.matmul(flat.float(), left), right)
-            prediction = prediction.reshape(batch, tokens, heads, dim).permute(
-                0, 2, 1, 3
-            )
-        else:
-            # Head-major and contiguous: the cache read is usually a strided
-            # view, and matmul would otherwise materialize its own copy.
-            head_major = source.permute(1, 0, 2, 3).to(
-                dtype=torch.float32, memory_format=torch.contiguous_format
-            )
-            prediction = torch.matmul(head_major, weight[:, None, :, :])
-            # A span-sized FP32 buffer is large; release the source copy before
-            # the bias pass so two of them never coexist.
-            del head_major
-            prediction = prediction.permute(1, 0, 2, 3)
+        # Head-major and contiguous: the cache read is usually a strided
+        # view, and matmul would otherwise materialize its own copy.
+        head_major = source.permute(1, 0, 2, 3).to(
+            dtype=torch.float32, memory_format=torch.contiguous_format
+        )
+        prediction = torch.matmul(head_major, weight[:, None, :, :])
+        # A span-sized FP32 buffer is large; release the source copy before
+        # the bias pass so two of them never coexist.
+        del head_major
+        prediction = prediction.permute(1, 0, 2, 3)
     prediction = prediction.contiguous()
     prediction.add_(bias.view(1, heads, 1, dim))
     return prediction
@@ -256,14 +242,8 @@ def predict_cross_kv(
             raise ValueError("reconstructed K and V history must be on the same device")
     weight = parameters.weight.to(source.device)
     bias = parameters.bias.to(source.device)
-    if not parameters.factored and (
-        source.shape[1] != weight.shape[0] or source.shape[-1] != weight.shape[-1]
-    ):
+    if source.shape[1] != weight.shape[0] or source.shape[-1] != weight.shape[-1]:
         raise ValueError("CrossKV parameters do not match cache heads/head dimension")
-    if parameters.factored and projection is None:
-        raise ValueError(
-            "a factored CrossKV map is projected by cross_projection first"
-        )
     with _cuda_matmul_precision(source.device, matmul_precision):
         if projection is not None:
             if tuple(projection.shape) != tuple(source.shape):
@@ -730,40 +710,21 @@ def decode_tensor(
                 "reconstructed K dtype must match the packed V reconstruction dtype "
                 f"{stored_dtype}, got {source.dtype}"
             )
-    legacy_torch_cross = (
-        packed.compatibility_mode == "legacy"
-        and packed.predictor_kind == "cross_kv"
-        and packed.cross_kv is not None
-        and packed.cross_kv.history_length > 0
-    )
     # Legacy mode picks its decode route deliberately, so a silent PyTorch
     # fallback would hide both a correctness and a throughput regression.
-    legacy_strict = packed.compatibility_mode == "legacy" and not legacy_torch_cross
-    effective_strict_triton = strict_triton or legacy_strict
-    if use_triton and packed.anchor_quant.is_cuda and legacy_torch_cross:
-        if strict_triton:
-            raise RuntimeError(
-                "legacy direct Cross+V-history decoding does not support Triton"
-            )
-    # Only the recurrent kernel consumes a precomputed projection; the
-    # no-history kernel projects internally, so computing it eagerly there
-    # would do the same GEMM twice.
+    effective_strict_triton = (
+        strict_triton or packed.compatibility_mode == "legacy"
+    )
+    # Every Triton route projects Cross(K) inside its own kernel, so the
+    # batched projection is built only if the Torch decoder is reached.
     needs_projection = (
         packed.predictor_kind == "cross_kv"
         and packed.cross_kv is not None
         and source is not None
         and len(packed.unit_lengths) > 1
     )
-    projection = (
-        cross_projection(
-            source,
-            packed.cross_kv,
-            matmul_precision=packed.cross_matmul_precision,
-        )
-        if needs_projection and packed.cross_kv.history_length > 0
-        else None
-    )
-    if use_triton and packed.anchor_quant.is_cuda and not legacy_torch_cross:
+    projection = None
+    if use_triton and packed.anchor_quant.is_cuda:
         try:
             from .triton_ops import decode as decode_triton
 
@@ -773,7 +734,6 @@ def decode_tensor(
                 output_dtype=output_dtype,
                 output_tensor=output_tensor,
                 output_layout=output_layout,
-                projection=projection,
             )
             if accelerated is not None:
                 return accelerated

@@ -994,113 +994,6 @@ def fit_legacy_cross_kv(
 
 
 @torch.no_grad()
-def fit_legacy_cross_kv_low_rank(
-    reconstructed_keys: torch.Tensor,
-    values: torch.Tensor,
-    *,
-    rank: int,
-    ridge: float = 0.1,
-    stride: int | None = None,
-    layer_ids: tuple[int, ...] | None = None,
-) -> CrossKVParameters:
-    """Fit one rank-``r`` Cross map over all heads, per layer.
-
-    Reduced-rank regression, not an SVD of the dense solution: the truncation
-    happens in the whitened space so it minimizes prediction error rather than
-    the distance between two matrices.  The result can beat the per-head map it
-    replaces, because a per-head map cannot mix heads at all.
-    """
-    _check_pair(
-        reconstructed_keys, values, minimum_dimensions=4, layout="[L, ..., T, H, D]"
-    )
-    if isinstance(rank, bool) or int(rank) != rank or int(rank) <= 0:
-        raise ValueError(f"rank must be a positive integer, got {rank!r}")
-    rank = int(rank)
-    ridge = _check_scalar("ridge", ridge)
-    stride = _check_stride(stride)
-    work_device = (
-        torch.device("cpu")
-        if reconstructed_keys.device.type == "mps"
-        else reconstructed_keys.device
-    )
-    layers = int(values.shape[0])
-    heads = int(values.shape[-2])
-    dim = int(values.shape[-1])
-    width = heads * dim
-    if rank > width:
-        raise ValueError(f"rank {rank} exceeds the all-head width {width}")
-    identity = torch.eye(width, dtype=torch.float64, device=work_device)
-
-    inputs: list[torch.Tensor] = []
-    outputs: list[torch.Tensor] = []
-    biases: list[torch.Tensor] = []
-    for layer in range(layers):
-        gram = torch.zeros(width, width, dtype=torch.float64, device=work_device)
-        cross = torch.zeros_like(gram)
-        sum_x = torch.zeros(width, dtype=torch.float64, device=work_device)
-        sum_y = torch.zeros_like(sum_x)
-        count = 0
-        for key_record, value_record in zip(
-            _legacy_layer_records(reconstructed_keys, layer),
-            _legacy_layer_records(values, layer),
-            strict=True,
-        ):
-            x = (
-                key_record[:, 1:]
-                .detach()
-                .to(work_device)
-                .reshape(-1, heads, dim)
-                .movedim(-2, -2)
-                .reshape(-1, width)
-                .double()
-            )
-            y = (
-                value_record[:, 1:]
-                .detach()
-                .to(work_device)
-                .reshape(-1, heads, dim)
-                .reshape(-1, width)
-                .double()
-            )
-            count += int(x.shape[0])
-            sum_x.add_(x.sum(dim=0))
-            sum_y.add_(y.sum(dim=0))
-            gram.add_(x.T @ x)
-            cross.add_(x.T @ y)
-        if count <= 0:
-            raise ValueError(f"no V fitting samples for layer {layer}")
-        mean_x = sum_x / count
-        mean_y = sum_y / count
-        centered_gram = gram - count * torch.outer(mean_x, mean_x)
-        centered_cross = cross - count * torch.outer(mean_x, mean_y)
-        penalty = ridge * torch.diagonal(centered_gram).mean().clamp_min(1e-12)
-        system = centered_gram + penalty * identity
-        dense = torch.linalg.solve(system, centered_cross)
-        # Whiten, truncate, unwhiten: the rank-r map closest in prediction.
-        root = torch.linalg.cholesky(system)
-        left, singular, right = torch.linalg.svd(root.T @ dense, full_matrices=False)
-        keep = min(rank, int(singular.shape[0]))
-        factor_in = torch.linalg.solve_triangular(
-            root.T, left[:, :keep] * singular[:keep], upper=True
-        )
-        factor_out = right[:keep]
-        inputs.append(factor_in.float())
-        outputs.append(factor_out.float())
-        biases.append(
-            (mean_y - (mean_x @ factor_in) @ factor_out).float().reshape(heads, dim)
-        )
-
-    return CrossKVParameters(
-        weight=torch.zeros(layers, heads, dim, dim, dtype=torch.float32),
-        bias=torch.stack(biases).to(values.device).contiguous(),
-        stride=stride,
-        layer_ids=layer_ids,
-        input_factor=torch.stack(inputs).to(values.device).contiguous(),
-        output_factor=torch.stack(outputs).to(values.device).contiguous(),
-    )
-
-
-@torch.no_grad()
 def fit_temporal_layers(
     reconstructed: torch.Tensor,
     target: torch.Tensor,
@@ -2171,23 +2064,12 @@ def _fit_legacy_predictors(
             signature=signature,
             coordinate_system=coordinate_system,
         )
-    cross = (
-        fit_legacy_cross_kv_low_rank(
-            reconstructed_keys,
-            values,
-            rank=config.cross_rank,
-            ridge=cross_ridge,
-            stride=config.stride,
-            layer_ids=layer_ids,
-        )
-        if config.cross_rank is not None
-        else fit_legacy_cross_kv(
-            reconstructed_keys,
-            values,
-            ridge=cross_ridge,
-            stride=config.stride,
-            layer_ids=layer_ids,
-        )
+    cross = fit_legacy_cross_kv(
+        reconstructed_keys,
+        values,
+        ridge=cross_ridge,
+        stride=config.stride,
+        layer_ids=layer_ids,
     )
     if config.v_history_length:
         cross = fit_legacy_temporal_v_alpha(
