@@ -178,6 +178,42 @@ def predict_temporal(
     return prediction
 
 
+def cross_projection(
+    source: torch.Tensor,
+    parameters: CrossKVParameters,
+    *,
+    matmul_precision: str = "tf32",
+) -> torch.Tensor:
+    """Project a whole reconstructed-K span through Cross(K) in one GEMM.
+
+    The projection depends only on K, so every unit's prediction is known
+    before the V recurrence starts.  Computing them per unit issues one small
+    matmul per unit inside the sequential loop and recomputes the projection of
+    a unit that the history term needs again; one batched call over the span
+    replaces both.  Encoder and decoder must call this the same way, otherwise
+    the residual is quantized against a prediction the decoder cannot rebuild.
+    """
+    if parameters.layered:
+        raise ValueError("select one layer before using CrossKV parameters")
+    weight = parameters.weight.to(source.device)
+    bias = parameters.bias.to(source.device)
+    if source.shape[1] != weight.shape[0] or source.shape[-1] != weight.shape[-1]:
+        raise ValueError("CrossKV parameters do not match cache heads/head dimension")
+    with _cuda_matmul_precision(source.device, matmul_precision):
+        # Head-major and contiguous: the cache read is usually a strided view,
+        # and matmul would otherwise materialize its own copy.
+        head_major = source.permute(1, 0, 2, 3).to(
+            dtype=torch.float32, memory_format=torch.contiguous_format
+        )
+        prediction = torch.matmul(head_major, weight[:, None, :, :])
+        # A span-sized FP32 buffer is large; release the source copy before
+        # the bias pass so two of them never coexist.
+        del head_major
+    prediction = prediction.permute(1, 0, 2, 3)
+    prediction.add_(bias.view(1, source.shape[1], 1, source.shape[-1]))
+    return prediction
+
+
 def predict_cross_kv(
     source: torch.Tensor,
     parameters: CrossKVParameters,
@@ -186,8 +222,13 @@ def predict_cross_kv(
     # Defaults follow CodecConfig so an implicit call keeps native semantics.
     matmul_precision: str = "tf32",
     legacy: bool = False,
+    projection: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Predict V from current reconstructed K and newest-to-oldest V history."""
+    """Predict V from current reconstructed K and newest-to-oldest V history.
+
+    ``projection`` supplies ``Cross(K)+bias`` computed for this unit ahead of
+    time by :func:`cross_projection`; the recurrence then costs no GEMM at all.
+    """
     if parameters.layered:
         raise ValueError("select one layer before using CrossKV parameters")
     resolved_history = () if history is None else tuple(history)
@@ -202,7 +243,11 @@ def predict_cross_kv(
     if source.shape[1] != weight.shape[0] or source.shape[-1] != weight.shape[-1]:
         raise ValueError("CrossKV parameters do not match cache heads/head dimension")
     with _cuda_matmul_precision(source.device, matmul_precision):
-        if legacy:
+        if projection is not None:
+            if tuple(projection.shape) != tuple(source.shape):
+                raise ValueError("projection must cover exactly this unit")
+            prediction = projection if legacy else projection.clone()
+        elif legacy:
             prediction = torch.matmul(
                 source.float().permute(1, 0, 2, 3),
                 weight[:, None, :, :],
@@ -376,6 +421,17 @@ def _encode(
         else [reconstruction[:, :, :stride]]
     )
     del anchor_rebuilt
+    # Cross(K) depends only on K, so the whole span is projected once here
+    # instead of once per unit inside the sequential residual loop.
+    projection = (
+        cross_projection(
+            source,
+            cross_kv,
+            matmul_precision=config.cross_matmul_precision,
+        )
+        if predictor_kind == "cross_kv" and cross_kv is not None and source is not None
+        else None
+    )
     residual_sequence = sequence - stride
     packed_width = width if bits == 8 else width // (8 // bits)
     scale_width = width // config.group_size
@@ -437,6 +493,7 @@ def _encode(
                 [item[:, :, :unit_length] for item in history],
                 matmul_precision=config.cross_matmul_precision,
                 legacy=config.fit_mode == "legacy",
+                projection=projection[:, :, offset : offset + unit_length],
             )
         if config.fit_mode == "legacy":
             residual_input = current.float() - prediction
@@ -666,6 +723,18 @@ def decode_tensor(
             raise RuntimeError(
                 "legacy direct Cross+V-history decoding does not support Triton"
             )
+    projection = (
+        cross_projection(
+            source,
+            packed.cross_kv,
+            matmul_precision=packed.cross_matmul_precision,
+        )
+        if packed.predictor_kind == "cross_kv"
+        and packed.cross_kv is not None
+        and source is not None
+        and len(packed.unit_lengths) > 1
+        else None
+    )
     if use_triton and packed.anchor_quant.is_cuda and not legacy_torch_cross:
         try:
             from .triton_ops import decode as decode_triton
@@ -676,6 +745,7 @@ def decode_tensor(
                 output_dtype=output_dtype,
                 output_tensor=output_tensor,
                 output_layout=output_layout,
+                projection=projection,
             )
             if accelerated is not None:
                 return accelerated
@@ -739,6 +809,7 @@ def decode_tensor(
                 [item[:, :, :unit_length] for item in history],
                 matmul_precision=packed.cross_matmul_precision,
                 legacy=packed.compatibility_mode == "legacy",
+                projection=projection[:, :, offset : offset + unit_length],
             )
         end = residual_offset + unit_length
         zero_point = (

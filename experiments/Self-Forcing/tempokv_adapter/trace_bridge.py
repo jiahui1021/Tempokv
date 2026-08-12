@@ -39,6 +39,11 @@ def _nonnegative_env(name: str, default: int) -> int:
     return parsed
 
 
+# Pre-RoPE K and V feed the predictors; rotated Q and K feed the attention
+# objective.  All four are sampled at the same token positions.
+_TRACE_KINDS = ("k_pre_rope", "v", "q_post_rope", "k_post_rope")
+
+
 def _sample_projection(
     tensor: torch.Tensor,
     *,
@@ -201,6 +206,9 @@ def install(runtime_root: str | Path) -> type:
                 block.self_attn.v.register_forward_hook(
                     self._trace_projection_hook(layer_index, "v")
                 )
+                block.self_attn.tempokv_trace_recorder = self._trace_rope_recorder(
+                    layer_index
+                )
 
         def _apply_trace_rope_precision(self) -> None:
             if self.kv_cache1 is None:
@@ -268,6 +276,32 @@ def install(runtime_root: str | Path) -> type:
 
             return capture
 
+        def _trace_rope_recorder(self, layer_index: int):
+            def record(
+                query_post_rope: torch.Tensor,
+                key_post_rope: torch.Tensor,
+            ) -> None:
+                if not self._trace_enabled:
+                    return
+                for kind, tensor in (
+                    ("q_post_rope", query_post_rope),
+                    ("k_post_rope", key_post_rope),
+                ):
+                    if tensor.ndim == 4:
+                        tensor = tensor.reshape(
+                            tensor.shape[0], tensor.shape[1], -1
+                        )
+                    sampled, token_indices = _sample_projection(
+                        tensor, tokens_per_frame=tokens_per_frame
+                    )
+                    if not np.array_equal(self._trace_token_indices, token_indices):
+                        raise RuntimeError(
+                            "Self-Forcing trace token samples do not match"
+                        )
+                    self._trace_layers.setdefault(layer_index, {})[kind] = sampled
+
+            return record
+
         def _trace_generator_end(
             self,
             module: torch.nn.Module,
@@ -300,8 +334,11 @@ def install(runtime_root: str | Path) -> type:
                 raise RuntimeError("clean Self-Forcing pass did not capture token indices")
 
             first = self._trace_layers[0]
-            if set(first) != {"k_pre_rope", "v"}:
-                raise RuntimeError("clean Self-Forcing pass did not capture both K and V")
+            if set(first) != set(_TRACE_KINDS):
+                raise RuntimeError(
+                    "clean Self-Forcing pass captured "
+                    f"{sorted(first)} instead of {list(_TRACE_KINDS)}"
+                )
             frames = first["k_pre_rope"].shape[1]
             block_end = self._trace_start + frames * _FRAME_SEQ_LENGTH
             if self._trace_sequence_start is None:
@@ -321,23 +358,21 @@ def install(runtime_root: str | Path) -> type:
 
             for layer_index in range(_LAYERS):
                 arrays = self._trace_layers[layer_index]
-                if set(arrays) != {"k_pre_rope", "v"}:
+                if set(arrays) != set(_TRACE_KINDS):
                     raise RuntimeError(
-                        f"layer {layer_index} did not capture both clean K and V"
+                        f"layer {layer_index} captured {sorted(arrays)} instead "
+                        f"of {list(_TRACE_KINDS)}"
                     )
-                keys = arrays["k_pre_rope"]
-                values = arrays["v"]
-                if keys.shape != values.shape:
+                shapes = {arrays[kind].shape for kind in _TRACE_KINDS}
+                if len(shapes) != 1:
                     raise ValueError(
-                        f"layer {layer_index} K/V shapes differ: "
-                        f"{keys.shape} vs {values.shape}"
+                        f"layer {layer_index} captured mismatched shapes: {shapes}"
                     )
                 sequence = self._trace_sequence_layers.setdefault(
-                    layer_index,
-                    {"k_pre_rope": [], "v": []},
+                    layer_index, {kind: [] for kind in _TRACE_KINDS}
                 )
-                sequence["k_pre_rope"].append(keys)
-                sequence["v"].append(values)
+                for kind in _TRACE_KINDS:
+                    sequence[kind].append(arrays[kind])
             self._trace_sequence_end = block_end
 
         def _write_trace_event(self) -> None:
@@ -355,22 +390,25 @@ def install(runtime_root: str | Path) -> type:
             sequence_end = self._trace_sequence_end
             rank = int(os.environ.get("RANK", "0"))
             rank_dir = output_root / f"rank_{rank:03d}"
-            combined: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+            combined: dict[int, dict[str, np.ndarray]] = {}
             total_frames: int | None = None
             for layer_index in range(_LAYERS):
                 arrays = self._trace_sequence_layers[layer_index]
-                keys = np.concatenate(arrays["k_pre_rope"], axis=1)
-                values = np.concatenate(arrays["v"], axis=1)
-                if keys.shape != values.shape:
+                merged = {
+                    kind: np.concatenate(arrays[kind], axis=1)
+                    for kind in _TRACE_KINDS
+                }
+                shapes = {value.shape for value in merged.values()}
+                if len(shapes) != 1:
                     raise ValueError(
-                        f"layer {layer_index} K/V shapes differ: "
-                        f"{keys.shape} vs {values.shape}"
+                        f"layer {layer_index} captured mismatched shapes: {shapes}"
                     )
+                frames = int(merged["k_pre_rope"].shape[1])
                 if total_frames is None:
-                    total_frames = int(keys.shape[1])
-                elif total_frames != int(keys.shape[1]):
+                    total_frames = frames
+                elif total_frames != frames:
                     raise ValueError("trace layers contain different frame counts")
-                combined[layer_index] = (keys, values)
+                combined[layer_index] = merged
             assert total_frames is not None
             if sequence_end - sequence_start != total_frames * _FRAME_SEQ_LENGTH:
                 raise ValueError("trace token range does not match captured frames")
@@ -398,11 +436,13 @@ def install(runtime_root: str | Path) -> type:
                 temporary_dir.mkdir(parents=True, exist_ok=False)
                 try:
                     for layer_index in range(_LAYERS):
-                        keys, values = combined[layer_index]
-                        np.savez_compressed(
+                        merged = combined[layer_index]
+                        np.savez(
                             temporary_dir / f"layer_{layer_index:02d}.npz",
-                            k_pre_rope=keys[:, frame_start:frame_end],
-                            v=values[:, frame_start:frame_end],
+                            **{
+                                kind: merged[kind][:, frame_start:frame_end]
+                                for kind in _TRACE_KINDS
+                            },
                             layer_index=np.asarray(layer_index, dtype=np.int32),
                             token_indices=token_indices,
                             head_indices=np.arange(_HEADS, dtype=np.int32),

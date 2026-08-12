@@ -24,7 +24,7 @@
 #   TRACE_DIR      该模型的 trace 目录（默认 data/self-forcing/trace）
 #   TRACE_FILE     合并后的拟合输入（默认 <TRACE_DIR>/clean_trace.npz）
 #   MODEL_CONFIG   Self-Forcing 配置（默认使用仓库内置的 self_forcing_dmd.yaml）
-#   NUM_GPUS       采集用 GPU 数量（默认 1）
+#   NUM_GPUS       采集用 GPU 数量（默认 1；多卡按 prompt 分片，数据与单卡一致）
 #   LEGACY_PROTOCOL  使用 legacy 原始拟合数据协议（0/1，默认 1）
 #   TRACE_FRAMES   每个 prompt 生成的 latent 帧数（legacy 固定 51）
 #   TRACE_TOKENS_PER_FRAME  每帧抽取的 token 数（legacy 固定 8）
@@ -88,7 +88,6 @@ if [[ "$LEGACY_PROTOCOL" == "1" ]]; then
   [[ "$TRACE_FRAMES" == "51" ]] || die "LEGACY_PROTOCOL 要求 TRACE_FRAMES=51"
   [[ "$TRACE_TOKENS_PER_FRAME" == "8" ]] || \
     die "LEGACY_PROTOCOL 要求 TRACE_TOKENS_PER_FRAME=8"
-  [[ "$NUM_GPUS" == "1" ]] || die "LEGACY_PROTOCOL 要求 NUM_GPUS=1"
   [[ "$BASE_SEED" == "0" ]] || die "LEGACY_PROTOCOL 要求 BASE_SEED=0"
 fi
 

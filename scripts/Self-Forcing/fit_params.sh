@@ -24,6 +24,7 @@
 #   ITERATIONS     拟合迭代次数（默认 2）
 #   TEMPORAL_RIDGE / CROSS_RIDGE / V_HISTORY_RIDGE / MAX_GAIN
 #                  拟合正则与增益（legacy 模式默认 1.0/0.1/0.0/1.0）
+#   ATTENTION_STEPS  attention 目标精调的步长候选（空格分隔；留空则不精调）
 #   FIT_DEVICE     拟合设备（默认 auto，有 CUDA 时自动使用 GPU）
 #   OVERWRITE      已存在参数时覆盖（0/1，默认 0）
 #   DRY_RUN        只打印命令不执行（0/1，默认 0）
@@ -102,6 +103,11 @@ fit_command=(
   --stride 1560
   --coordinate-system pre_rope_normalized
 )
+if [[ -n "${ATTENTION_STEPS:-}" ]]; then
+  # Word splitting is intended: the flag takes a list of candidate step sizes.
+  # shellcheck disable=SC2206
+  fit_command+=(--attention-steps ${ATTENTION_STEPS})
+fi
 [[ -n "${K_HISTORY_LENGTH:-}" ]] && fit_command+=(--k-history-length "$K_HISTORY_LENGTH")
 [[ -n "${V_HISTORY_LENGTH:-}" ]] && fit_command+=(--v-history-length "$V_HISTORY_LENGTH")
 

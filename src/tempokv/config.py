@@ -144,9 +144,9 @@ class CodecConfig:
                 raise ValueError(
                     "legacy fitting does not use shared maximum-history parameters"
                 )
-            if self.v_history_length not in (0, 1):
+            if not 0 <= self.v_history_length <= 5:
                 raise ValueError(
-                    "legacy fitting supports V history length 0 or 1"
+                    "legacy fitting supports V history length 0 through 5"
                 )
             if self.cross_matmul_precision != "ieee":
                 raise ValueError(

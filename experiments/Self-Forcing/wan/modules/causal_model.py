@@ -257,6 +257,12 @@ class CausalWanSelfAttention(nn.Module):
                 local_end_index,
                 source_tensor=k_all,
             )
+            recorder = getattr(self, "tempokv_trace_recorder", None)
+            if recorder is not None:
+                # The attention objective needs the rotated Q and K the model
+                # actually used.  The newly written tokens are the tail of the
+                # rotated cache read, so no RoPE is recomputed for the trace.
+                recorder(roped_query, absolute_k[:, -num_new_tokens:])
             x = attention(roped_query, absolute_k, v_all)
             _set_cache_index(kv_cache, "global_end_index", current_end)
             _set_cache_index(kv_cache, "local_end_index", local_end_index)

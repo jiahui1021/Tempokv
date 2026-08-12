@@ -74,6 +74,7 @@ class CausalInferencePipeline(torch.nn.Module):
         return_latents: bool = False,
         profile: bool = False,
         low_memory: bool = False,
+        decode_output: bool = True,
     ) -> torch.Tensor:
         """
         Perform inference on the given noise and text prompts.
@@ -309,9 +310,15 @@ class CausalInferencePipeline(torch.nn.Module):
             init_time = init_start.elapsed_time(init_end)
             vae_start.record()
 
-        # Step 4: Decode the output
-        video = self.vae.decode_to_pixel(output, use_cache=False)
-        video.mul_(0.5).add_(0.5).clamp_(0, 1)
+        # Step 4: Decode the output.  Trace collection throws the pixels away,
+        # so it skips the VAE entirely instead of paying for a full decode.
+        if decode_output:
+            video = self.vae.decode_to_pixel(output, use_cache=False)
+            video.mul_(0.5).add_(0.5).clamp_(0, 1)
+        else:
+            if profile:
+                raise ValueError("profile=True requires decode_output=True")
+            video = None
 
         if profile:
             # End VAE timing and synchronize CUDA

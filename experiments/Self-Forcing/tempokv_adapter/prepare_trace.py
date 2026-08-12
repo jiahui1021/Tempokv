@@ -20,6 +20,9 @@ _LEGACY_EVENT_STARTS = (0, 37440) * _LEGACY_PROMPT_COUNT
 _LEGACY_EVENT_ENDS = (37440, 74880) * _LEGACY_PROMPT_COUNT
 _LEGACY_TRACE_SHAPE = (30, 2 * _LEGACY_PROMPT_COUNT, 1, 8, 24, 12, 128)
 _LEGACY_TRACE_PROTOCOL = f"direct_v_{_LEGACY_PROMPT_COUNT}p_51f_8t_24x2_v1"
+# Rotated Q and K are present only in traces collected for the attention
+# objective.  They are stored together or not at all.
+_ATTENTION_KINDS = ("q_post_rope", "k_post_rope")
 
 
 def _event_directories(root: Path) -> list[Path]:
@@ -49,13 +52,13 @@ def _event(
     event_dir: Path,
     *,
     legacy_protocol: bool = False,
-) -> tuple[np.ndarray, np.ndarray, dict[str, object]]:
+) -> tuple[dict[str, np.ndarray], dict[str, object]]:
     files = sorted(event_dir.glob("layer_*.npz"))
     if len(files) != 30:
         raise ValueError(f"{event_dir} must contain exactly 30 layer files")
-    keys = []
-    values = []
+    captured: dict[str, list[np.ndarray]] = {"keys": [], "values": []}
     seen_layers = []
+    attention_kinds: tuple[str, ...] | None = None
     event_metadata: dict[str, object] | None = None
     for path in files:
         with np.load(path, allow_pickle=False) as data:
@@ -72,9 +75,23 @@ def _event(
             missing = sorted(required - set(data.files))
             if missing:
                 raise ValueError(f"{path} is missing arrays: {', '.join(missing)}")
+            present = tuple(
+                kind for kind in _ATTENTION_KINDS if kind in data.files
+            )
+            if attention_kinds is None:
+                attention_kinds = present
+            elif attention_kinds != present:
+                raise ValueError(
+                    f"{event_dir} layer files disagree on rotated Q/K presence"
+                )
+            if present and len(present) != len(_ATTENTION_KINDS):
+                raise ValueError(
+                    f"{path} must contain both {' and '.join(_ATTENTION_KINDS)}"
+                )
             layer = int(np.asarray(data["layer_index"]).item())
             key = np.asarray(data["k_pre_rope"])
             value = np.asarray(data["v"])
+            rotated = {kind: np.asarray(data[kind]) for kind in present}
             token_indices = np.asarray(data["token_indices"])
             head_indices = np.asarray(data["head_indices"])
             tokens_start = int(np.asarray(data["tokens_start"]).item())
@@ -119,25 +136,26 @@ def _event(
         # every production event and the original B/P axes so fitting can
         # replay record-by-record FP64 accumulation in the original order.
         batch, frames, samples, heads, width = key.shape
-        if legacy_protocol:
-            keys.append(key.transpose(0, 2, 1, 3, 4))
-            values.append(value.transpose(0, 2, 1, 3, 4))
-        else:
-            keys.append(
-                key.transpose(0, 2, 1, 3, 4).reshape(
-                    -1, frames, heads, width
+
+        def store(name: str, array: np.ndarray) -> None:
+            if array.shape != key.shape:
+                raise ValueError(
+                    f"{path} {name} shape {array.shape} does not match K"
                 )
+            moved = array.transpose(0, 2, 1, 3, 4)
+            captured.setdefault(name, []).append(
+                moved if legacy_protocol else moved.reshape(-1, frames, heads, width)
             )
-            values.append(
-                value.transpose(0, 2, 1, 3, 4).reshape(
-                    -1, frames, heads, width
-                )
-            )
+
+        store("keys", key)
+        store("values", value)
+        for kind, array in rotated.items():
+            store(kind, array)
         seen_layers.append(layer)
     if seen_layers != list(range(30)):
         raise ValueError(f"{event_dir} layer indices must be 0 through 29")
     assert event_metadata is not None
-    return np.stack(keys), np.stack(values), event_metadata
+    return {name: np.stack(parts) for name, parts in captured.items()}, event_metadata
 
 
 def convert_trace_root(
@@ -149,20 +167,23 @@ def convert_trace_root(
     root = root.expanduser().resolve()
     if not root.is_dir():
         raise FileNotFoundError(f"trace directory does not exist: {root}")
-    key_events = []
-    value_events = []
+    events: dict[str, list[np.ndarray]] = {}
     expected_tail = None
     expected_protocol = None
     event_starts: list[int] = []
     event_ends: list[int] = []
     event_directories = _event_directories(root)
-    if legacy_protocol and {
-        directory.parent.name for directory in event_directories
-    } != {"rank_000"}:
-        raise ValueError("legacy trace collection requires rank_000 only")
+    # Multi-GPU collection is safe: inference re-seeds per prompt from the
+    # global prompt index, so a prompt yields the same noise on any rank.  The
+    # events are ordered by rank and then by event index, which changes only
+    # the order records are summed in, never the set of records.
     for event_dir in event_directories:
-        keys, values, metadata = _event(event_dir, legacy_protocol=legacy_protocol)
-        tail = keys.shape[1:] if legacy_protocol else keys.shape[2:]
+        arrays, metadata = _event(event_dir, legacy_protocol=legacy_protocol)
+        tail = (
+            arrays["keys"].shape[1:]
+            if legacy_protocol
+            else arrays["keys"].shape[2:]
+        )
         if expected_tail is None:
             expected_tail = tail
         elif tail != expected_tail:
@@ -177,14 +198,15 @@ def convert_trace_root(
             raise ValueError("all trace events must use matching sampling metadata")
         event_starts.append(int(metadata["tokens_start"]))
         event_ends.append(int(metadata["tokens_end"]))
-        key_events.append(keys)
-        value_events.append(values)
-    if legacy_protocol:
-        keys = np.stack(key_events, axis=1)
-        values = np.stack(value_events, axis=1)
-    else:
-        keys = np.concatenate(key_events, axis=1)
-        values = np.concatenate(value_events, axis=1)
+        if events and set(events) != set(arrays):
+            raise ValueError("trace events do not capture the same arrays")
+        for name, array in arrays.items():
+            events.setdefault(name, []).append(array)
+    merge = np.stack if legacy_protocol else np.concatenate
+    merged = {
+        name: merge(parts, axis=1) for name, parts in events.items()
+    }
+    keys = merged["keys"]
     assert expected_protocol is not None
     frame_counts = [
         (end - start) // int(expected_protocol["frame_seq_length"])
@@ -216,8 +238,7 @@ def convert_trace_root(
     # file, and every fitting run pays the decompression again.
     np.savez(
         output,
-        keys=keys,
-        values=values,
+        **merged,
         layer_ids=np.arange(30, dtype=np.int32),
         stride=np.asarray(1560, dtype=np.int32),
         coordinate_system=np.asarray("pre_rope_normalized"),
@@ -235,7 +256,7 @@ def convert_trace_root(
         frame_seq_length=np.asarray(
             expected_protocol["frame_seq_length"], dtype=np.int32
         ),
-        trace_event_count=np.asarray(len(key_events), dtype=np.int32),
+        trace_event_count=np.asarray(len(event_starts), dtype=np.int32),
         prompt_count=np.asarray(
             _LEGACY_PROMPT_COUNT if legacy_protocol else 0, dtype=np.int32
         ),
@@ -255,8 +276,9 @@ def convert_trace_root(
         "status": "complete",
         "source": str(root),
         "output": str(output),
-        "events": len(key_events),
+        "events": len(event_starts),
         "legacy_protocol": legacy_protocol,
+        "arrays": sorted(merged),
         "shape": list(keys.shape),
     }
     print(json.dumps(report, indent=2, ensure_ascii=False))

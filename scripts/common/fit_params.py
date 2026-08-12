@@ -24,7 +24,7 @@ if SOURCE_ROOT.is_dir() and str(SOURCE_ROOT) not in sys.path:
     sys.path.insert(0, str(SOURCE_ROOT))
 
 from tempokv.config import CodecConfig  # noqa: E402
-from tempokv.fitting import fit_predictors  # noqa: E402
+from tempokv.fitting import fit_predictors, refine_attention  # noqa: E402
 
 
 CODEC_FIELDS = {field.name for field in fields(CodecConfig)}
@@ -34,6 +34,8 @@ CODEC_FIELDS = {field.name for field in fields(CodecConfig)}
 # writes the metadata checked below.
 LEGACY_PROMPT_COUNT = 12
 LEGACY_TRACE_PROTOCOL = f"direct_v_{LEGACY_PROMPT_COUNT}p_51f_8t_24x2_v1"
+# The attention objective needs the rotated Q and K the model actually used.
+ATTENTION_ARRAYS = ("q_post_rope", "k_post_rope")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -108,6 +110,19 @@ def build_parser() -> argparse.ArgumentParser:
         "--k-predictor-mode", choices=("layer_head", "shared")
     )
     parser.add_argument("--v-predictor-mode", choices=("cross_kv", "temporal"))
+    parser.add_argument(
+        "--attention-steps",
+        type=float,
+        nargs="*",
+        help="step sizes tried along the attention gradient direction; omit to "
+        "skip the refinement",
+    )
+    parser.add_argument(
+        "--attention-layer-chunk",
+        type=int,
+        default=4,
+        help="layers per refinement chunk; bounds memory without changing results",
+    )
     parser.add_argument("--fit-mode", choices=("native", "legacy"))
     parser.add_argument(
         "--use-triton", action=argparse.BooleanOptionalAction, default=None
@@ -157,7 +172,13 @@ def _load_trace(
     *,
     keys_name: str,
     values_name: str,
-) -> tuple[torch.Tensor, torch.Tensor, tuple[int, ...] | None, dict[str, object]]:
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    tuple[int, ...] | None,
+    dict[str, object],
+    dict[str, torch.Tensor],
+]:
     try:
         with np.load(path, allow_pickle=False) as archive:
             missing = [name for name in (keys_name, values_name) if name not in archive]
@@ -165,6 +186,12 @@ def _load_trace(
                 raise ValueError(f"trace is missing arrays: {', '.join(missing)}")
             keys_array = np.array(archive[keys_name], copy=True)
             values_array = np.array(archive[values_name], copy=True)
+            # Present only in traces collected for the attention objective.
+            rotated = {
+                name: torch.from_numpy(np.array(archive[name], copy=True))
+                for name in ATTENTION_ARRAYS
+                if name in archive
+            }
             layer_ids_array = (
                 np.array(archive["layer_ids"], copy=True) if "layer_ids" in archive else None
             )
@@ -248,7 +275,7 @@ def _load_trace(
         layer_ids = tuple(int(item) for item in layer_ids_array)
         if len(set(layer_ids)) != len(layer_ids):
             raise ValueError("layer_ids must be unique")
-    return keys, values, layer_ids, metadata
+    return keys, values, layer_ids, metadata, rotated
 
 
 def _fit_device(name: str) -> torch.device:
@@ -311,7 +338,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "utf-8"
         )
     ).hexdigest()
-    keys, values, layer_ids, trace_metadata = _load_trace(
+    keys, values, layer_ids, trace_metadata, rotated = _load_trace(
         args.trace,
         keys_name=args.keys_name,
         values_name=args.values_name,
@@ -407,6 +434,31 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         layer_ids=layer_ids,
         coordinate_system=coordinate_system,
     )
+    refinement = None
+    if args.attention_steps:
+        missing = [name for name in ATTENTION_ARRAYS if name not in rotated]
+        if missing:
+            raise ValueError(
+                f"attention refinement needs {', '.join(missing)} in the trace; "
+                "recollect it with the current trace bridge"
+            )
+        if config.v_predictor_mode != "temporal":
+            raise ValueError(
+                "attention refinement currently refines temporal K and V "
+                "predictors; set v_predictor_mode=temporal"
+            )
+        temporal, cross, refinement = refine_attention(
+            keys,
+            values,
+            rotated["q_post_rope"].to(device=device, dtype=keys.dtype),
+            rotated["k_post_rope"].to(device=device, dtype=keys.dtype),
+            temporal,
+            cross,
+            config,
+            step_sizes=tuple(args.attention_steps),
+            max_gain=args.max_gain,
+            layer_chunk=args.attention_layer_chunk,
+        )
     if device.type == "cuda":
         torch.cuda.synchronize(device)
         peak_fit_allocated = int(torch.cuda.max_memory_allocated(device))
@@ -491,6 +543,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "peak_gpu_allocated_bytes": peak_fit_allocated,
             "peak_gpu_reserved_bytes": peak_fit_reserved,
         },
+        "attention_refinement": refinement,
         "parameters": {
             "v_predictor_mode": config.v_predictor_mode,
             "temporal_weight_shape": list(temporal.history_weights.shape),

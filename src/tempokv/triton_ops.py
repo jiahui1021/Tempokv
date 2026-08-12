@@ -758,15 +758,13 @@ def _cross_kv_history_persistent_decode_kernel(
     quant_ptr,
     scale_ptr,
     zero_ptr,
-    source_ptr,
-    weight_ptr,
+    prediction_ptr,
     history_weight_ptr,
-    bias_ptr,
     output_ptr,
-    source_stride_b,
-    source_stride_h,
-    source_stride_s,
-    source_stride_d,
+    prediction_stride_b,
+    prediction_stride_h,
+    prediction_stride_s,
+    prediction_stride_d,
     output_stride_b,
     output_stride_h,
     output_stride_s,
@@ -797,52 +795,41 @@ def _cross_kv_history_persistent_decode_kernel(
     token = tl.program_id(1) * block_s + tl.arange(0, block_s)
     channel = tl.program_id(2) * block_d + tl.arange(0, block_d)
     input_channel = tl.arange(0, block_k)
-    bias = tl.load(
-        bias_ptr + head * width + channel,
-        mask=channel < width,
-        other=0.0,
-    ).to(tl.float32)
     if history_diagonal:
+        # Shared history reuses one coefficient set for every lag; the plain
+        # diagonal map carries one set per lag.
         history_weight_one = tl.load(
             history_weight_ptr + head * width + channel,
             mask=channel < width,
             other=0.0,
         ).to(tl.float32)
-        if history_length > 1 and not history_shared:
-            history_weight_two = tl.load(
-                history_weight_ptr + (heads + head) * width + channel,
-                mask=channel < width,
-                other=0.0,
-            ).to(tl.float32)
+        diagonal_weights = []
+        if not history_shared:
+            for lag in range(history_length):
+                diagonal_weights.append(
+                    tl.load(
+                        history_weight_ptr
+                        + (lag * heads + head) * width
+                        + channel,
+                        mask=channel < width,
+                        other=0.0,
+                    ).to(tl.float32)
+                )
 
-    previous_token = (start_unit - 1) * stride + token
     if history_diagonal:
         history_channel = channel
     else:
         history_channel = input_channel
-    previous_offset = _strided_bhsd_offsets(
-        batch_head,
-        previous_token,
-        history_channel,
-        heads,
-        output_stride_b,
-        output_stride_h,
-        output_stride_s,
-        output_stride_d,
-    )
-    previous_one = tl.load(
-        output_ptr + previous_offset,
-        mask=(token[:, None] < stride)
-        & (previous_token[:, None] < sequence)
-        & (history_channel[None, :] < width),
-        other=0.0,
-    ).to(tl.float32)
-    if history_length > 1:
-        if start_unit > 1:
-            previous_two_token = (start_unit - 2) * stride + token
-            previous_two_offset = _strided_bhsd_offsets(
+    # Newest-to-oldest reconstructed units feeding the recurrence.  start_unit
+    # is a compile-time constant, so units before the span resolve to zeros
+    # without a runtime branch.
+    history_values = []
+    for lag in range(1, history_length + 1):
+        if start_unit >= lag:
+            previous_token = (start_unit - lag) * stride + token
+            previous_offset = _strided_bhsd_offsets(
                 batch_head,
-                previous_two_token,
+                previous_token,
                 history_channel,
                 heads,
                 output_stride_b,
@@ -850,15 +837,17 @@ def _cross_kv_history_persistent_decode_kernel(
                 output_stride_s,
                 output_stride_d,
             )
-            previous_two = tl.load(
-                output_ptr + previous_two_offset,
-                mask=(token[:, None] < stride)
-                & (previous_two_token[:, None] < sequence)
-                & (history_channel[None, :] < width),
-                other=0.0,
-            ).to(tl.float32)
+            history_values.append(
+                tl.load(
+                    output_ptr + previous_offset,
+                    mask=(token[:, None] < stride)
+                    & (previous_token[:, None] < sequence)
+                    & (history_channel[None, :] < width),
+                    other=0.0,
+                ).to(tl.float32)
+            )
         else:
-            previous_two = tl.zeros((block_s, block_d), tl.float32)
+            history_values.append(tl.zeros((block_s, block_d), tl.float32))
 
     for chunk_index in tl.static_range(0, chunk_units):
         unit_index = start_unit + chunk_index
@@ -912,94 +901,51 @@ def _cross_kv_history_persistent_decode_kernel(
                 unsigned - ((1 << (bits - 1)) - 1)
             ).to(tl.float32) * scale
 
-        source_offset = _strided_bhsd_offsets(
+        # Cross(K) + bias was projected for the whole span in one batched
+        # GEMM before this launch, so the recurrence only reads it back.
+        prediction_offset = _strided_bhsd_offsets(
             batch_head,
             current_token,
-            input_channel,
+            channel,
             heads,
-            source_stride_b,
-            source_stride_h,
-            source_stride_s,
-            source_stride_d,
+            prediction_stride_b,
+            prediction_stride_h,
+            prediction_stride_s,
+            prediction_stride_d,
         )
-        source = tl.load(
-            source_ptr + source_offset,
-            mask=(token[:, None] < stride)
-            & (current_token[:, None] < sequence)
-            & (input_channel[None, :] < width),
-            other=0.0,
+        prediction = tl.load(
+            prediction_ptr + prediction_offset, mask=valid, other=0.0
         ).to(tl.float32)
-        weight_offset = (
-            head * width * width
-            + input_channel[:, None] * width
-            + channel[None, :]
-        )
-        weight = tl.load(
-            weight_ptr + weight_offset,
-            mask=(input_channel[:, None] < width)
-            & (channel[None, :] < width),
-            other=0.0,
-        ).to(tl.float32)
-        prediction = tl.dot(
-            source,
-            weight,
-            out_dtype=tl.float32,
-            input_precision=cross_input_precision,
-        )
-        prediction += bias[None, :]
 
         if history_shared:
-            history_order = 1
-            if history_length > 1:
-                if unit_index > 1:
-                    history_order = 2
-            prediction += previous_one * (
-                history_weight_one[None, :] / history_order
-            )
-            if history_length > 1:
-                if unit_index > 1:
-                    prediction += previous_two * (
-                        history_weight_one[None, :] / history_order
-                    )
+            history_order = min(unit_index, history_length)
+            for lag in range(history_order):
+                prediction += history_values[lag] * (
+                    history_weight_one[None, :] / history_order
+                )
         elif history_diagonal:
-            prediction += previous_one * history_weight_one[None, :]
+            for lag in range(history_length):
+                if unit_index > lag:
+                    prediction += (
+                        history_values[lag] * diagonal_weights[lag][None, :]
+                    )
         else:
-            history_weight_one_offset = (
-                head * width * width
-                + input_channel[:, None] * width
-                + channel[None, :]
-            )
-            history_weight_one = tl.load(
-                history_weight_ptr + history_weight_one_offset,
-                mask=(input_channel[:, None] < width)
-                & (channel[None, :] < width),
-                other=0.0,
-            ).to(tl.float32)
-            prediction += tl.dot(
-                previous_one,
-                history_weight_one,
-                out_dtype=tl.float32,
-                input_precision=cross_input_precision,
-            )
-        if history_length > 1 and not history_shared:
-            if unit_index > 1:
-                if history_diagonal:
-                    prediction += previous_two * history_weight_two[None, :]
-                else:
-                    history_weight_two_offset = (
-                        (heads + head) * width * width
+            for lag in range(history_length):
+                if unit_index > lag:
+                    dense_offset = (
+                        (lag * heads + head) * width * width
                         + input_channel[:, None] * width
                         + channel[None, :]
                     )
-                    history_weight_two = tl.load(
-                        history_weight_ptr + history_weight_two_offset,
+                    dense_weight = tl.load(
+                        history_weight_ptr + dense_offset,
                         mask=(input_channel[:, None] < width)
                         & (channel[None, :] < width),
                         other=0.0,
                     ).to(tl.float32)
                     prediction += tl.dot(
-                        previous_two,
-                        history_weight_two,
+                        history_values[lag],
+                        dense_weight,
                         out_dtype=tl.float32,
                         input_precision=cross_input_precision,
                     )
@@ -1017,9 +963,7 @@ def _cross_kv_history_persistent_decode_kernel(
             output_stride_d,
         )
         tl.store(output_ptr + output_offset, current, mask=valid)
-        if history_length > 1:
-            previous_two = previous_one
-        previous_one = current
+        history_values = [current] + history_values[: history_length - 1]
 
 
 def _ceil_div(left: int, right: int) -> int:
@@ -1104,6 +1048,7 @@ def decode(
     output_dtype: torch.dtype,
     output_tensor: torch.Tensor | None = None,
     output_layout: str = "BSHD",
+    projection: torch.Tensor | None = None,
 ) -> torch.Tensor | None:
     """Fused GPU prediction and residual decode for TempoKV's two runtime routes."""
     if not _supported(packed, source):
@@ -1283,9 +1228,25 @@ def decode(
     parameters = packed.cross_kv.to(output.device)
     if parameters.layered:
         return None
+    if parameters.history_length > 2 and not parameters.history_diagonal:
+        # A dense per-lag matrix needs one full-width tile per lag, which does
+        # not fit the recurrent tiling.  The Torch decoder applies every lag.
+        return None
     source_stride_b, source_stride_h, source_stride_s, source_stride_d = (
         source.stride()
     )
+    if parameters.history_length:
+        if projection is None:
+            raise ValueError(
+                "CrossKV history decoding needs the batched Cross(K) projection"
+            )
+        projection = projection.contiguous()
+        (
+            projection_stride_b,
+            projection_stride_h,
+            projection_stride_s,
+            projection_stride_d,
+        ) = projection.stride()
     weight = parameters.weight.contiguous()
     history_weight = (
         parameters.history_weights.contiguous()
@@ -1335,15 +1296,13 @@ def decode(
                     quant,
                     scale,
                     zero,
-                    source,
-                    weight,
+                    projection,
                     history_weight,
-                    bias,
                     output,
-                    source_stride_b,
-                    source_stride_h,
-                    source_stride_s,
-                    source_stride_d,
+                    projection_stride_b,
+                    projection_stride_h,
+                    projection_stride_s,
+                    projection_stride_d,
                     output_stride_b,
                     output_stride_h,
                     output_stride_s,

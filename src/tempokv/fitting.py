@@ -10,11 +10,17 @@ from __future__ import annotations
 from contextlib import contextmanager
 import hashlib
 import math
-from dataclasses import replace
-from typing import Iterator
+from dataclasses import dataclass, replace
+from typing import Iterator, Sequence
 
 import torch
 
+from .attention_objective import (
+    normalized_errors,
+    objective_terms,
+    phase_score,
+    temporal_rollout,
+)
 from .codec import _cuda_matmul_precision
 from .config import CodecConfig
 from .parameters import CrossKVParameters, TemporalParameters
@@ -23,7 +29,15 @@ from .quantization import (
     dequantize_symmetric,
     quantize_asymmetric,
     quantize_symmetric,
+    roundtrip,
 )
+
+
+_SCALE_DTYPES = {
+    "float32": torch.float32,
+    "float16": torch.float16,
+    "bfloat16": torch.bfloat16,
+}
 
 
 def _check_scalar(name: str, value: float, *, positive: bool = False) -> float:
@@ -130,6 +144,254 @@ def _solve(system: torch.Tensor, rhs: torch.Tensor, *, regularized: bool) -> tor
         torch.linalg.pinv(system, rtol=_pinv_rtol(system.dtype)),
         rhs.unsqueeze(-1),
     ).squeeze(-1)
+
+
+
+def _project_gain(weight: torch.Tensor, max_gain: float) -> None:
+    """Cap each channel's summed absolute history gain, in place."""
+    gain = weight.abs().sum(dim=1, keepdim=True).clamp_min(1e-20)
+    weight.mul_(torch.clamp(max_gain / gain, max=1.0))
+
+
+def _objective_sums(
+    keys: torch.Tensor,
+    values: torch.Tensor,
+    query_post_rope: torch.Tensor,
+    key_post_rope: torch.Tensor,
+    key_weight: torch.Tensor,
+    key_bias: torch.Tensor,
+    value_weight: torch.Tensor,
+    value_bias: torch.Tensor,
+    *,
+    config: CodecConfig,
+    layer_chunk: int,
+    backward: bool,
+) -> torch.Tensor:
+    """Accumulate the six objective sums over the trace, one layer chunk at a time.
+
+    Chunking bounds the rollout activations kept for backward.  The V and K
+    parameters are shared across layers, so summing chunk gradients is exactly
+    the gradient of the whole trace.
+    """
+    totals = torch.zeros(6, dtype=torch.float64, device=keys.device)
+    layer_count = int(keys.shape[0])
+    for start in range(0, layer_count, layer_chunk):
+        stop = min(start + layer_chunk, layer_count)
+        rebuilt_key = temporal_rollout(
+            keys[start:stop], key_weight, key_bias, bits=config.k_bits, config=config
+        )
+        rebuilt_value = temporal_rollout(
+            values[start:stop],
+            value_weight,
+            value_bias,
+            bits=config.v_bits,
+            config=config,
+        )
+        terms = objective_terms(
+            clean_key=keys[start:stop],
+            clean_value=values[start:stop],
+            rebuilt_key=rebuilt_key,
+            rebuilt_value=rebuilt_value,
+            query_post_rope=query_post_rope[start:stop],
+            key_post_rope=key_post_rope[start:stop],
+        )
+        if backward:
+            # Denominators are constants, so scaling here matches the phase
+            # loss without keeping the whole trace's graph alive at once.
+            (terms.key_error + terms.value_error + terms.attention_error).backward(
+                retain_graph=False
+            )
+        totals = totals + torch.stack(
+            [term.detach().double() for term in terms.as_tuple()]
+        )
+    return totals
+
+
+@dataclass(frozen=True, slots=True)
+class PhaseResult:
+    """What one refinement phase did and why."""
+
+    tensor: str
+    accepted: bool
+    step_size: float | None
+    start_score: float
+    best_score: float
+    errors: dict[str, float]
+
+
+@torch.no_grad()
+def _evaluate(
+    keys: torch.Tensor,
+    values: torch.Tensor,
+    query_post_rope: torch.Tensor,
+    key_post_rope: torch.Tensor,
+    parameters: dict[str, torch.Tensor],
+    *,
+    config: CodecConfig,
+    layer_chunk: int,
+) -> dict[str, float]:
+    sums = _objective_sums(
+        keys,
+        values,
+        query_post_rope,
+        key_post_rope,
+        parameters["key_weight"],
+        parameters["key_bias"],
+        parameters["value_weight"],
+        parameters["value_bias"],
+        config=config,
+        layer_chunk=layer_chunk,
+        backward=False,
+    )
+    return normalized_errors(sums)
+
+
+def refine_attention(
+    keys: torch.Tensor,
+    values: torch.Tensor,
+    query_post_rope: torch.Tensor,
+    key_post_rope: torch.Tensor,
+    key_parameters: TemporalParameters,
+    value_parameters: TemporalParameters,
+    config: CodecConfig,
+    *,
+    step_sizes: Sequence[float] = (0.01,),
+    max_gain: float = 1.0,
+    layer_chunk: int = 4,
+) -> tuple[TemporalParameters, TemporalParameters, dict[str, object]]:
+    """Refine least-squares predictors against the attention output.
+
+    One phase per tensor, each taking a single gradient direction: the residual
+    is quantized with a straight-through gradient, so the direction is only
+    trustworthy near the current parameters.  Rather than iterate on an
+    approximation that decays as the parameters move, the phase evaluates a few
+    step sizes along that one direction and keeps the best that passes the
+    guardrail.  A phase that improves nothing leaves its tensor untouched.
+    """
+    if not step_sizes:
+        raise ValueError("refinement needs at least one step size")
+    for step in step_sizes:
+        if not math.isfinite(step) or step <= 0.0:
+            raise ValueError(f"step sizes must be positive and finite, got {step}")
+    if layer_chunk <= 0:
+        raise ValueError("layer_chunk must be positive")
+    max_gain = _check_scalar("max_gain", max_gain, positive=True)
+
+    current = {
+        "key_weight": key_parameters.history_weights.detach().clone(),
+        "key_bias": key_parameters.history_bias.detach().clone(),
+        "value_weight": value_parameters.history_weights.detach().clone(),
+        "value_bias": value_parameters.history_bias.detach().clone(),
+    }
+    baseline = _evaluate(
+        keys,
+        values,
+        query_post_rope,
+        key_post_rope,
+        current,
+        config=config,
+        layer_chunk=layer_chunk,
+    )
+
+    phases: list[PhaseResult] = []
+    errors = baseline
+    for tensor in ("key", "value"):
+        weight_name, bias_name = f"{tensor}_weight", f"{tensor}_bias"
+        start_score = phase_score(errors, baseline, tensor=tensor)
+        weight = current[weight_name].clone().requires_grad_(True)
+        bias = current[bias_name].clone().requires_grad_(True)
+        _objective_sums(
+            keys,
+            values,
+            query_post_rope,
+            key_post_rope,
+            **{
+                **{name: current[name] for name in current},
+                weight_name: weight,
+                bias_name: bias,
+            },
+            config=config,
+            layer_chunk=layer_chunk,
+            backward=True,
+        )
+        if weight.grad is None or bias.grad is None:
+            raise ValueError(f"{tensor} refinement produced no gradient")
+        if not (
+            torch.isfinite(weight.grad).all() and torch.isfinite(bias.grad).all()
+        ):
+            raise ValueError(f"{tensor} refinement produced a non-finite gradient")
+        weight_direction = -weight.grad.sign()
+        bias_direction = -bias.grad.sign()
+
+        best: tuple[float, float, dict[str, float], torch.Tensor, torch.Tensor] | None
+        best = None
+        for step in step_sizes:
+            candidate_weight = current[weight_name] + step * weight_direction
+            _project_gain(candidate_weight, max_gain)
+            candidate_bias = current[bias_name] + step * bias_direction
+            candidate = {
+                **current,
+                weight_name: candidate_weight,
+                bias_name: candidate_bias,
+            }
+            candidate_errors = _evaluate(
+                keys,
+                values,
+                query_post_rope,
+                key_post_rope,
+                candidate,
+                config=config,
+                layer_chunk=layer_chunk,
+            )
+            score = phase_score(candidate_errors, baseline, tensor=tensor)
+            regressed = any(
+                candidate_errors[name] > errors[name] + 1e-12
+                for name in (f"{tensor}_nmse", "attention_nmse")
+            )
+            if regressed or score >= start_score:
+                continue
+            if best is None or score < best[0]:
+                best = (score, step, candidate_errors, candidate_weight, candidate_bias)
+
+        if best is None:
+            phases.append(
+                PhaseResult(tensor, False, None, start_score, start_score, errors)
+            )
+            continue
+        score, step, errors, weight_value, bias_value = best
+        current[weight_name] = weight_value
+        current[bias_name] = bias_value
+        phases.append(PhaseResult(tensor, True, step, start_score, score, errors))
+
+    report = {
+        "baseline": baseline,
+        "final": errors,
+        "step_sizes": [float(step) for step in step_sizes],
+        "phases": [
+            {
+                "tensor": phase.tensor,
+                "outcome": "attention_refined" if phase.accepted else "guardrail_fallback",
+                "step_size": phase.step_size,
+                "start_score": phase.start_score,
+                "score": phase.best_score,
+                **{f"final_{name}": value for name, value in phase.errors.items()},
+            }
+            for phase in phases
+        ],
+    }
+    return (
+        replace(
+            key_parameters,
+            history_weights=current["key_weight"],
+            history_bias=current["key_bias"],
+        ),
+        replace(
+            value_parameters,
+            history_weights=current["value_weight"],
+            history_bias=current["value_bias"],
+        ),
+        report,
+    )
 
 
 @torch.no_grad()
@@ -1124,40 +1386,13 @@ def _quantization_roundtrip(
     symmetric: bool,
 ) -> torch.Tensor:
     """Quantize/dequantize arbitrary ``[..., H, D]`` trace slices."""
-    original_shape = value.shape
-    head_count, dim = map(int, original_shape[-2:])
-    packed_layout = value.float().reshape(-1, head_count, 1, dim)
-    scale_dtype = {
-        "float32": torch.float32,
-        "float16": torch.float16,
-        "bfloat16": torch.bfloat16,
-    }[config.scale_dtype]
-    if symmetric:
-        quant, scale = quantize_symmetric(
-            packed_layout, bits, config.group_size, scale_dtype
-        )
-        rebuilt = dequantize_symmetric(
-            quant,
-            scale,
-            bits,
-            config.group_size,
-            dim,
-            torch.float32,
-        )
-    else:
-        quant, scale, zero_point = quantize_asymmetric(
-            packed_layout, bits, config.group_size, scale_dtype
-        )
-        rebuilt = dequantize_asymmetric(
-            quant,
-            scale,
-            zero_point,
-            bits,
-            config.group_size,
-            dim,
-            torch.float32,
-        )
-    return rebuilt.reshape(original_shape)
+    return roundtrip(
+        value,
+        bits=bits,
+        group_size=config.group_size,
+        scale_dtype=_SCALE_DTYPES[config.scale_dtype],
+        symmetric=symmetric,
+    )
 
 
 def _reconstruct_temporal_trace(
@@ -1499,7 +1734,13 @@ def fit_legacy_temporal_v_alpha(
     ridge: float = 0.0,
     gain_limit: float = 1.0,
 ) -> CrossKVParameters:
-    """Fit the legacy diagonal ``Cross(K_t) + alpha * Vhat_(t-1)`` term."""
+    """Fit the legacy diagonal ``Cross(K_t) + sum_lag alpha_lag * Vhat_(t-lag)``.
+
+    One coefficient per lag, head and channel.  With several lags the
+    coefficients are coupled, so they are solved together over the frames where
+    every lag is available; a single lag keeps its closed-form ratio so the
+    validated VH1 fit is untouched.
+    """
     _check_pair(
         reconstructed_keys,
         clean_values,
@@ -1508,8 +1749,9 @@ def fit_legacy_temporal_v_alpha(
     )
     if not cross.layered:
         raise ValueError("legacy temporal V fitting requires layered CrossKV parameters")
-    if config.v_history_length != 1:
-        raise ValueError("legacy temporal V alpha requires v_history_length=1")
+    history_length = int(config.v_history_length)
+    if history_length < 1:
+        raise ValueError("legacy temporal V history fitting requires v_history_length >= 1")
     if isinstance(rounds, bool) or int(rounds) != rounds or int(rounds) <= 0:
         raise ValueError("rounds must be a positive integer")
     rounds = int(rounds)
@@ -1524,6 +1766,7 @@ def fit_legacy_temporal_v_alpha(
         raise ValueError("CrossKV parameters do not match the trace layout")
     alpha = torch.zeros(
         layer_count,
+        history_length,
         heads,
         dim,
         dtype=torch.float32,
@@ -1538,7 +1781,7 @@ def fit_legacy_temporal_v_alpha(
             bias=bias,
             stride=cross.stride,
             layer_ids=cross.layer_ids,
-            history_weights=alpha[:, None],
+            history_weights=alpha,
         )
         rebuilt_values = _reconstruct_cross_kv_trace(
             reconstructed_keys,
@@ -1551,13 +1794,21 @@ def fit_legacy_temporal_v_alpha(
             clean_values.device, config.cross_matmul_precision
         ):
             for layer in range(layer_count):
-                numerator = torch.zeros(
+                cross_terms = torch.zeros(
                     heads,
                     dim,
+                    history_length,
                     dtype=torch.float64,
                     device=clean_values.device,
                 )
-                denominator = torch.zeros_like(numerator)
+                gram = torch.zeros(
+                    heads,
+                    dim,
+                    history_length,
+                    history_length,
+                    dtype=torch.float64,
+                    device=clean_values.device,
+                )
                 key_records = _legacy_layer_records(reconstructed_keys, layer)
                 clean_records = _legacy_layer_records(clean_values, layer)
                 rebuilt_records = _legacy_layer_records(rebuilt_values, layer)
@@ -1567,24 +1818,62 @@ def fit_legacy_temporal_v_alpha(
                     rebuilt_records,
                     strict=True,
                 ):
+                    frames = int(clean_record.shape[1])
                     current_cross = torch.einsum(
                         "...hi,hij->...hj",
-                        key_record[:, 1:].float(),
+                        key_record[:, history_length:].float(),
                         weight[layer],
                     ) + bias[layer]
-                    x = rebuilt_record[:, :-1].double()
-                    y = (clean_record[:, 1:].float() - current_cross).double()
-                    reduce_axes = tuple(range(x.ndim - 2))
-                    numerator.add_((x * y).sum(dim=reduce_axes))
-                    denominator.add_((x * x).sum(dim=reduce_axes))
-                penalty = ridge * denominator.mean(dim=-1, keepdim=True)
-                fitted = torch.where(
-                    denominator + penalty > 1e-20,
-                    numerator / (denominator + penalty).clamp_min(1e-20),
-                    torch.zeros_like(numerator),
-                )
+                    target = (
+                        clean_record[:, history_length:].float() - current_cross
+                    ).double()
+                    lagged = [
+                        rebuilt_record[
+                            :, history_length - lag : frames - lag
+                        ].double()
+                        for lag in range(1, history_length + 1)
+                    ]
+                    reduce_axes = tuple(range(target.ndim - 2))
+                    for index, previous in enumerate(lagged):
+                        cross_terms[..., index].add_(
+                            (previous * target).sum(dim=reduce_axes)
+                        )
+                        for other in range(index, history_length):
+                            product = (previous * lagged[other]).sum(
+                                dim=reduce_axes
+                            )
+                            gram[..., index, other].add_(product)
+                            if other != index:
+                                gram[..., other, index].add_(product)
+                # Ridge scales with the per-head average history energy, as
+                # the single-lag fit did: average over lags, then channels.
+                diagonal = torch.diagonal(gram, dim1=-2, dim2=-1)
+                penalty = ridge * diagonal.mean(dim=-1).mean(
+                    dim=-1, keepdim=True
+                ).clamp_min(0.0)
+                if history_length == 1:
+                    # One lag is an independent ratio per channel; keep the
+                    # closed form so the validated VH1 fit does not move.
+                    denominator = gram[..., 0, 0] + penalty
+                    fitted = torch.where(
+                        denominator > 1e-20,
+                        cross_terms[..., 0] / denominator.clamp_min(1e-20),
+                        torch.zeros_like(denominator),
+                    ).unsqueeze(-1)
+                else:
+                    identity = torch.eye(
+                        history_length,
+                        dtype=torch.float64,
+                        device=clean_values.device,
+                    )
+                    system = gram + (
+                        penalty.clamp_min(1e-20)[..., None, None] * identity
+                    )
+                    fitted = torch.linalg.solve(
+                        system, cross_terms.unsqueeze(-1)
+                    ).squeeze(-1)
                 next_alpha.append(
-                    fitted.float().clamp(-gain_limit, gain_limit)
+                    fitted.permute(2, 0, 1).float().clamp(-gain_limit, gain_limit)
                 )
         alpha = torch.stack(next_alpha).to(clean_values.device)
 
@@ -1593,7 +1882,7 @@ def fit_legacy_temporal_v_alpha(
         bias=bias,
         stride=cross.stride,
         layer_ids=cross.layer_ids,
-        history_weights=alpha[:, None].contiguous(),
+        history_weights=alpha.contiguous(),
     )
 
 

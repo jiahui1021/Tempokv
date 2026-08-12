@@ -75,7 +75,8 @@ bash scripts/Self-Forcing/collect_trace.sh
 prompt、每条 51 个 latent 帧、每帧 8 个 token。每条 prompt 保存两个独立的
 24 帧记录并分别重置历史，末尾 3 帧不进入拟合。保存全部 30 层和 12 个
 attention head。K 来自 `norm_k` 输出，坐标为 normalized、pre-RoPE；V 来自同
-一次 clean attention 计算。采集过程不启用 TempoKV。
+一次 clean attention 计算。同时记录模型实际用于注意力的旋转后 Q/K——直接取运行时
+算好的张量，不重算 RoPE——供拟合阶段的 attention 目标使用。采集过程不启用 TempoKV。
 
 常用覆盖项：
 
@@ -102,8 +103,10 @@ python experiments/Self-Forcing/tempokv_adapter/prepare_trace.py \
 合并文件包含：
 
 ```text
-keys                 [30,24,1,8,24,12,128]
-values               [30,24,1,8,24,12,128]
+keys                 [30,24,1,8,24,12,128]   pre-RoPE K
+values               [30,24,1,8,24,12,128]   V
+q_post_rope          [30,24,1,8,24,12,128]   旋转后的 Q（attention 目标用）
+k_post_rope          [30,24,1,8,24,12,128]   旋转后的 K（attention 目标用）
 layer_ids            [0..29]
 stride               1560
 coordinate_system    pre_rope_normalized

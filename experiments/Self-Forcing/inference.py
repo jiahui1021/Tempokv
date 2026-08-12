@@ -314,6 +314,7 @@ for i, batch_data in enumerate(dataloader):
         return_latents=True,
         initial_latent=initial_latent,
         low_memory=low_memory,
+        decode_output=not args.skip_video_save,
     )
     torch.cuda.synchronize(device)
     generation_seconds = time.perf_counter() - generation_start

@@ -120,3 +120,35 @@ def dequantize_asymmetric(
     groups = quant.reshape(*quant.shape[:-1], -1, group_size)
     result = (groups - zero_point.float().unsqueeze(-1)) * scale.float().unsqueeze(-1)
     return result.reshape(*quant.shape).to(output_dtype)
+
+
+def roundtrip(
+    value: torch.Tensor,
+    *,
+    bits: int,
+    group_size: int,
+    scale_dtype: torch.dtype,
+    symmetric: bool,
+) -> torch.Tensor:
+    """Quantize then dequantize an arbitrary ``[..., H, D]`` slice.
+
+    The quantizers take packed ``[B,H,S,D]`` caches; trace and rollout code
+    works on single frames, so reshape around them here instead of in every
+    caller.
+    """
+    original_shape = value.shape
+    head_count, dim = map(int, original_shape[-2:])
+    packed = value.float().reshape(-1, head_count, 1, dim)
+    if symmetric:
+        quant, scale = quantize_symmetric(packed, bits, group_size, scale_dtype)
+        rebuilt = dequantize_symmetric(
+            quant, scale, bits, group_size, dim, torch.float32
+        )
+    else:
+        quant, scale, zero_point = quantize_asymmetric(
+            packed, bits, group_size, scale_dtype
+        )
+        rebuilt = dequantize_asymmetric(
+            quant, scale, zero_point, bits, group_size, dim, torch.float32
+        )
+    return rebuilt.reshape(original_shape)

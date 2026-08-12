@@ -13,5 +13,6 @@
   "k_predictor_mode": "shared",
   "fit_mode": "legacy",
   "use_triton": true,
-  "strict_triton": false
+  "strict_triton": false,
+  "v_predictor_mode": "cross_kv"
 }
