@@ -172,7 +172,13 @@ def _validate_parameters(k_path: Path, v_path: Path, config) -> dict[str, object
         raise ValueError(
             "Causal Forcing K/V parameters must share a current parameter_set_id"
         )
-    if temporal.layer_ids != cross.layer_ids:
+    # A shared (layer_ids=None) K predictor covers every layer; only when both
+    # sides are layered must their layer sets agree.
+    if (
+        temporal.layer_ids is not None
+        and cross.layer_ids is not None
+        and temporal.layer_ids != cross.layer_ids
+    ):
         raise ValueError("Causal Forcing K and V parameters cover different layers")
     if temporal.stride != config.stride or cross.stride != config.stride:
         raise ValueError("parameter stride does not match the codec config")
