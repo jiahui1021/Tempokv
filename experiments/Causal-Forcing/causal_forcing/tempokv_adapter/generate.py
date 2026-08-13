@@ -398,12 +398,15 @@ def _require_tempokv_activity(report: dict[str, object]) -> None:
         )
 
 
-def _require_direct_persistent_routes(routes: dict[str, object]) -> None:
+def _require_direct_persistent_routes(
+    routes: dict[str, object], v_predictor_mode: str
+) -> None:
     """Reject a nominally accelerated run that missed the production kernels."""
-    required = (
-        "temporal_persistent_direct",
-        "cross_kv_persistent_direct",
-    )
+    # The temporal V predictor never decodes a Cross(K) tensor, so it produces
+    # only the temporal persistent route.
+    required = ["temporal_persistent_direct"]
+    if v_predictor_mode != "temporal":
+        required.append("cross_kv_persistent_direct")
     missing = [name for name in required if int(routes.get(name) or 0) <= 0]
     if missing:
         raise RuntimeError(
@@ -630,7 +633,9 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             tempokv_report = _merge_tempokv_reports(ranks)
             _require_tempokv_activity(tempokv_report)
             if not args.allow_triton_fallback:
-                _require_direct_persistent_routes(performance["decode_routes"])
+                _require_direct_persistent_routes(
+                    performance["decode_routes"], config.v_predictor_mode
+                )
             report["tempokv"] = tempokv_report
             (paths["run"] / "tempokv_report.json").write_text(
                 json.dumps(tempokv_report, indent=2, ensure_ascii=False) + "\n",

@@ -39,6 +39,17 @@ def _positive_env(name: str, default: int) -> int:
     return parsed
 
 
+def _nonnegative_env(name: str, default: int) -> int:
+    value = os.environ.get(name, str(default))
+    try:
+        parsed = int(value)
+    except ValueError as error:
+        raise ValueError(f"{name} must be an integer, got {value!r}") from error
+    if parsed < 0:
+        raise ValueError(f"{name} must not be negative, got {parsed}")
+    return parsed
+
+
 def _sample_projection(
     tensor: torch.Tensor,
     *,
@@ -46,6 +57,7 @@ def _sample_projection(
     num_heads: int,
     head_dim: int,
     tokens_per_frame: int,
+    legacy: bool = False,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Take the same spatial positions from every frame of one projection.
 
@@ -74,11 +86,22 @@ def _sample_projection(
             f"{frame_seq_length}"
         )
     frame_count = sequence // frame_seq_length
-    token_indices = torch.div(
-        torch.arange(tokens_per_frame, device=tensor.device) * frame_seq_length,
-        tokens_per_frame,
-        rounding_mode="floor",
-    )
+    if legacy:
+        # The legacy fitting protocol records a fixed set of spatial positions
+        # spread over both ends of a frame (rounded linspace), matching the
+        # reference sampler in scripts/common/fit_params.py.
+        token_indices = torch.linspace(
+            0,
+            frame_seq_length - 1,
+            steps=tokens_per_frame,
+            device=tensor.device,
+        ).round().long().unique()
+    else:
+        token_indices = torch.div(
+            torch.arange(tokens_per_frame, device=tensor.device) * frame_seq_length,
+            tokens_per_frame,
+            rounding_mode="floor",
+        )
     sampled = (
         tensor.detach()
         .reshape(batch, frame_count, frame_seq_length, num_heads, head_dim)
@@ -103,6 +126,7 @@ def install(runtime_root: str | Path | None = None) -> type:
     tokens_per_frame = _positive_env(
         "TEMPOKV_TRACE_TOKENS_PER_FRAME", DEFAULT_TOKENS_PER_FRAME
     )
+    event_frames = _nonnegative_env("TEMPOKV_TRACE_EVENT_FRAMES", 0)
 
     pipeline_package = importlib.import_module("causal_forcing.pipeline")
     pipeline_module = importlib.import_module(
@@ -175,6 +199,7 @@ def install(runtime_root: str | Path | None = None) -> type:
                     num_heads=self.num_heads,
                     head_dim=self.head_dim,
                     tokens_per_frame=tokens_per_frame,
+                    legacy=event_frames > 0,
                 )
                 if self._latest_token_indices is None:
                     self._latest_token_indices = token_indices
@@ -283,60 +308,99 @@ def install(runtime_root: str | Path | None = None) -> type:
             )
             rank = int(os.environ.get("RANK", "0"))
             rank_dir = output_root / f"rank_{rank:03d}"
-            event_name = (
-                f"event_{self._trace_event_index:06d}_frames_"
-                f"{self._sequence_start}_{self._sequence_end}"
-            )
-            event_dir = rank_dir / event_name
-            temporary_dir = rank_dir / f".{event_name}.tmp-{os.getpid()}"
-            if event_dir.exists():
-                raise FileExistsError(f"trace event already exists: {event_dir}")
-            temporary_dir.mkdir(parents=True, exist_ok=False)
 
-            try:
-                for layer_index in range(layers):
-                    arrays = self._sequence[layer_index]
-                    keys = np.concatenate(arrays["k_pre_rope"], axis=1)
-                    values = np.concatenate(arrays["v"], axis=1)
-                    if keys.shape != values.shape:
-                        raise ValueError(
-                            f"layer {layer_index} K/V shapes differ: "
-                            f"{keys.shape} vs {values.shape}"
-                        )
-                    np.savez_compressed(
-                        temporary_dir / f"layer_{layer_index:02d}.npz",
-                        k_pre_rope=keys,
-                        v=values,
-                        layer_index=np.asarray(layer_index, dtype=np.int32),
-                        num_layers=np.asarray(layers, dtype=np.int32),
-                        num_heads=np.asarray(self.num_heads, dtype=np.int32),
-                        head_dim=np.asarray(self.head_dim, dtype=np.int32),
-                        token_indices=token_indices,
-                        head_indices=np.arange(self.num_heads, dtype=np.int32),
-                        global_start_frame=np.asarray(
-                            self._sequence_start, dtype=np.int64
-                        ),
-                        global_end_frame=np.asarray(
-                            self._sequence_end, dtype=np.int64
-                        ),
-                        trace_stride=np.asarray(self.frame_seq_length, dtype=np.int32),
-                        frame_seq_length=np.asarray(
-                            self.frame_seq_length, dtype=np.int32
-                        ),
-                        coordinate_system=np.asarray("pre_rope_normalized"),
-                        cross_source_kind=np.asarray("normalized"),
-                        generation_mode=np.asarray(generation_mode),
-                        num_frame_per_block=np.asarray(
-                            self.num_frame_per_block, dtype=np.int32
-                        ),
-                        is_clean_refresh=np.asarray(True),
+            # Concatenate the whole captured rollout per layer, then slice it
+            # into fixed-size events.  Native collection keeps the rollout as a
+            # single frame-range event; legacy collection
+            # (TEMPOKV_TRACE_EVENT_FRAMES=24) cuts it into 24-frame records
+            # named by their absolute token range.
+            merged: dict[int, dict[str, np.ndarray]] = {}
+            for layer_index in range(layers):
+                arrays = self._sequence[layer_index]
+                keys = np.concatenate(arrays["k_pre_rope"], axis=1)
+                values = np.concatenate(arrays["v"], axis=1)
+                if keys.shape != values.shape:
+                    raise ValueError(
+                        f"layer {layer_index} K/V shapes differ: "
+                        f"{keys.shape} vs {values.shape}"
                     )
-                temporary_dir.replace(event_dir)
-                self._trace_event_index += 1
-                self._reset_sequence()
-            except BaseException:
-                shutil.rmtree(temporary_dir, ignore_errors=True)
-                raise
+                merged[layer_index] = {"k_pre_rope": keys, "v": values}
+
+            total_frames = merged[0]["k_pre_rope"].shape[1]
+            frames_per_event = event_frames or total_frames
+            complete_events = total_frames // frames_per_event
+
+            for event_offset in range(complete_events):
+                frame_start = event_offset * frames_per_event
+                frame_end = frame_start + frames_per_event
+                global_start_frame = self._sequence_start + frame_start
+                global_end_frame = self._sequence_start + frame_end
+                if event_frames:
+                    tokens_start = global_start_frame * self.frame_seq_length
+                    tokens_end = global_end_frame * self.frame_seq_length
+                    event_name = (
+                        f"event_{self._trace_event_index:06d}_tokens_"
+                        f"{tokens_start}_{tokens_end}"
+                    )
+                else:
+                    event_name = (
+                        f"event_{self._trace_event_index:06d}_frames_"
+                        f"{self._sequence_start}_{self._sequence_end}"
+                    )
+                event_dir = rank_dir / event_name
+                temporary_dir = rank_dir / f".{event_name}.tmp-{os.getpid()}"
+                if event_dir.exists():
+                    raise FileExistsError(f"trace event already exists: {event_dir}")
+                temporary_dir.mkdir(parents=True, exist_ok=False)
+
+                try:
+                    for layer_index in range(layers):
+                        keys = merged[layer_index]["k_pre_rope"][
+                            :, frame_start:frame_end
+                        ]
+                        values = merged[layer_index]["v"][:, frame_start:frame_end]
+                        np.savez_compressed(
+                            temporary_dir / f"layer_{layer_index:02d}.npz",
+                            k_pre_rope=keys,
+                            v=values,
+                            layer_index=np.asarray(layer_index, dtype=np.int32),
+                            num_layers=np.asarray(layers, dtype=np.int32),
+                            num_heads=np.asarray(self.num_heads, dtype=np.int32),
+                            head_dim=np.asarray(self.head_dim, dtype=np.int32),
+                            token_indices=token_indices,
+                            head_indices=np.arange(self.num_heads, dtype=np.int32),
+                            global_start_frame=np.asarray(
+                                global_start_frame, dtype=np.int64
+                            ),
+                            global_end_frame=np.asarray(
+                                global_end_frame, dtype=np.int64
+                            ),
+                            tokens_start=np.asarray(
+                                global_start_frame * self.frame_seq_length,
+                                dtype=np.int64,
+                            ),
+                            tokens_end=np.asarray(
+                                global_end_frame * self.frame_seq_length,
+                                dtype=np.int64,
+                            ),
+                            trace_stride=np.asarray(self.frame_seq_length, dtype=np.int32),
+                            frame_seq_length=np.asarray(
+                                self.frame_seq_length, dtype=np.int32
+                            ),
+                            coordinate_system=np.asarray("pre_rope_normalized"),
+                            cross_source_kind=np.asarray("normalized"),
+                            generation_mode=np.asarray(generation_mode),
+                            num_frame_per_block=np.asarray(
+                                self.num_frame_per_block, dtype=np.int32
+                            ),
+                            is_clean_refresh=np.asarray(True),
+                        )
+                    temporary_dir.replace(event_dir)
+                    self._trace_event_index += 1
+                except BaseException:
+                    shutil.rmtree(temporary_dir, ignore_errors=True)
+                    raise
+            self._reset_sequence()
 
         def _reset_sequence(self) -> None:
             self._capturing = False

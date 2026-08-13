@@ -64,7 +64,13 @@ if [[ "$trace_dir" == "/" ]]; then
   die "TRACE_DIR 不能是文件系统根目录"
 fi
 
-TRACE_FRAMES="${TRACE_FRAMES:-21}"
+LEGACY_PROTOCOL="${LEGACY_PROTOCOL:-0}"
+if [[ "$LEGACY_PROTOCOL" == "1" ]]; then
+  default_trace_frames=51
+else
+  default_trace_frames=21
+fi
+TRACE_FRAMES="${TRACE_FRAMES:-$default_trace_frames}"
 TRACE_TOKENS_PER_FRAME="${TRACE_TOKENS_PER_FRAME:-8}"
 NUM_GPUS="${NUM_GPUS:-1}"
 BASE_SEED="${BASE_SEED:-0}"
@@ -75,6 +81,7 @@ USE_EMA="${USE_EMA:-0}"
 check_flag OVERWRITE
 check_flag DRY_RUN
 check_flag USE_EMA
+check_flag LEGACY_PROTOCOL
 check_int TRACE_FRAMES "$frames_per_block"
 (( TRACE_FRAMES % frames_per_block == 0 )) || \
   die "TRACE_FRAMES 必须是 $frames_per_block 的倍数（当前值：${TRACE_FRAMES}）"
@@ -83,11 +90,22 @@ check_int TRACE_TOKENS_PER_FRAME 1
   die "TRACE_TOKENS_PER_FRAME 必须 <= 1560（当前值：${TRACE_TOKENS_PER_FRAME}）"
 check_int NUM_GPUS 1
 check_int BASE_SEED 0
+if [[ "$LEGACY_PROTOCOL" == "1" ]]; then
+  [[ "$TRACE_FRAMES" == "51" ]] || die "LEGACY_PROTOCOL 要求 TRACE_FRAMES=51（当前值：${TRACE_FRAMES}）"
+  [[ "$TRACE_TOKENS_PER_FRAME" == "8" ]] || die "LEGACY_PROTOCOL 要求 TRACE_TOKENS_PER_FRAME=8（当前值：${TRACE_TOKENS_PER_FRAME}）"
+  [[ "$BASE_SEED" == "0" ]] || die "LEGACY_PROTOCOL 要求 BASE_SEED=0（当前值：${BASE_SEED}）"
+  [[ "$NUM_GPUS" == "1" ]] || die "LEGACY_PROTOCOL 要求 NUM_GPUS=1（多卡 seed 扰动会导致 event 顺序不一致）"
+fi
 
-trace_command=(
+trace_environment=(
   env
   "TEMPOKV_TRACE_DIR=$raw_trace_dir"
   "TEMPOKV_TRACE_TOKENS_PER_FRAME=$TRACE_TOKENS_PER_FRAME"
+)
+[[ "$LEGACY_PROTOCOL" == "1" ]] && trace_environment+=("TEMPOKV_TRACE_EVENT_FRAMES=24")
+
+trace_command=(
+  "${trace_environment[@]}"
   "$python_bin" -m torch.distributed.run
   --standalone
   "--nproc_per_node=$NUM_GPUS"
@@ -104,12 +122,14 @@ trace_command=(
   --seed "$BASE_SEED"
   --save_with_index
 )
+[[ "$LEGACY_PROTOCOL" == "1" ]] && trace_command+=(--local_attn_size 180)
 [[ "$USE_EMA" == "1" ]] && trace_command+=(--use_ema)
 
 merge_command=(
   "$python_bin" "$adapter_root/prepare_trace.py"
   "$raw_trace_dir" "$trace_file"
 )
+[[ "$LEGACY_PROTOCOL" == "1" ]] && merge_command+=(--legacy-protocol)
 
 if [[ "$DRY_RUN" == "1" ]]; then
   printf '[collect_trace] 干跑模式：打印将要执行的命令，不执行\n'
@@ -128,6 +148,20 @@ fi
 [[ -f "$checkpoint" ]] || die "CHECKPOINT 不存在：$checkpoint"
 [[ -d "$model_root" ]] || die "MODEL_ROOT 不存在：$model_root"
 [[ -f "$prompts" ]] || die "PROMPTS 不存在：$prompts"
+if [[ "$LEGACY_PROTOCOL" == "1" ]]; then
+  "$python_bin" - "$prompts" "$project_root/assets/moviegen128.txt" <<'PY'
+from pathlib import Path
+import sys
+
+PROMPT_COUNT = 12
+actual = Path(sys.argv[1]).read_text(encoding="utf-8").splitlines()
+reference = Path(sys.argv[2]).read_text(encoding="utf-8").splitlines()[:PROMPT_COUNT]
+if len(actual) != PROMPT_COUNT or any(not line.strip() for line in actual):
+    raise SystemExit("LEGACY_PROTOCOL 的 PROMPTS 必须恰好包含 12 条非空 prompt")
+if actual != reference:
+    raise SystemExit("LEGACY_PROTOCOL 的 PROMPTS 必须是 moviegen128.txt 的前 12 条")
+PY
+fi
 
 if [[ "$OVERWRITE" != "1" ]]; then
   if [[ -e "$trace_file" ]]; then

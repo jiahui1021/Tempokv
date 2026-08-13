@@ -299,13 +299,26 @@ def install(runtime_root: str | Path | None = None) -> type:
 
 
 def _predictor_parameter_bytes(codec: TempoKVCodec) -> int:
-    tensors = (
-        codec.temporal.history_weights,
-        codec.temporal.history_bias,
-        codec.cross_kv.weight,
-        codec.cross_kv.bias,
-        codec.cross_kv.history_weights,
-    )
+    temporal = codec.temporal
+    v = codec.v_parameters
+    if codec.predicts_v_from_key:
+        # CrossKV V: a Cross(K) map plus optional V history.
+        tensors = (
+            temporal.history_weights,
+            temporal.history_bias,
+            v.weight,
+            v.bias,
+            v.history_weights,
+        )
+    else:
+        # Temporal V: the V predictor reads its own history, so it carries the
+        # same temporal history tensors as K and no Cross(K) map.
+        tensors = (
+            temporal.history_weights,
+            temporal.history_bias,
+            v.history_weights,
+            v.history_bias,
+        )
     return sum(
         tensor.numel() * tensor.element_size()
         for tensor in tensors
