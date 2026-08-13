@@ -23,67 +23,30 @@ class TemporalParameters:
     codec_signature: str | None = None
     parameter_set_id: str | None = None
     coordinate_system: str | None = None
-    maximum_history_length: int | None = None
-    active_history_length: int | None = None
 
     def __post_init__(self) -> None:
         weights = _tensor(self.history_weights)
         bias = _tensor(self.history_bias)
-        maximum_history_length = self.maximum_history_length
-        active_history_length = self.active_history_length
-        if maximum_history_length is not None:
-            if (
-                isinstance(maximum_history_length, bool)
-                or int(maximum_history_length) != maximum_history_length
-                or not 1 <= int(maximum_history_length) <= 8
-            ):
-                raise ValueError(
-                    "maximum_history_length must be an integer from 1 to 8"
-                )
-            maximum_history_length = int(maximum_history_length)
-            if weights.ndim not in (2, 3) or tuple(bias.shape) != tuple(weights.shape):
-                raise ValueError(
-                    "shared temporal weights and bias must have shape [H,D] "
-                    "or [L,H,D]"
-                )
-            if active_history_length is None:
-                active_history_length = maximum_history_length
-            if (
-                isinstance(active_history_length, bool)
-                or int(active_history_length) != active_history_length
-                or not 1 <= int(active_history_length) <= maximum_history_length
-            ):
-                raise ValueError(
-                    "active_history_length must be between 1 and "
-                    "maximum_history_length"
-                )
-            active_history_length = int(active_history_length)
-            layered = weights.ndim == 3
+        if weights.ndim not in (3, 4, 5):
+            raise ValueError(
+                "history_weights must have shape [P,P,D], [P,P,H,D], "
+                "or [L,P,P,H,D]"
+            )
+        history_axis = 1 if weights.ndim == 5 else 0
+        history = int(weights.shape[history_axis])
+        if history < 1 or weights.shape[history_axis + 1] != history:
+            raise ValueError("history_weights must be square in its first two axes")
+        if weights.ndim == 3:
+            expected_bias = (history, weights.shape[-1])
+        elif weights.ndim == 4:
+            expected_bias = (history, weights.shape[-2], weights.shape[-1])
         else:
-            if active_history_length is not None:
-                raise ValueError(
-                    "active_history_length is only valid for shared temporal parameters"
-                )
-            if weights.ndim not in (3, 4, 5):
-                raise ValueError(
-                    "history_weights must have shape [P,P,D], [P,P,H,D], "
-                    "or [L,P,P,H,D]"
-                )
-            history_axis = 1 if weights.ndim == 5 else 0
-            history = int(weights.shape[history_axis])
-            if history < 1 or weights.shape[history_axis + 1] != history:
-                raise ValueError("history_weights must be square in its first two axes")
-            if weights.ndim == 3:
-                expected_bias = (history, weights.shape[-1])
-            elif weights.ndim == 4:
-                expected_bias = (history, weights.shape[-2], weights.shape[-1])
-            else:
-                expected_bias = (
-                    weights.shape[0], history, weights.shape[-2], weights.shape[-1]
-                )
-            if tuple(bias.shape) != expected_bias:
-                raise ValueError(f"history_bias must have shape {expected_bias}")
-            layered = weights.ndim == 5
+            expected_bias = (
+                weights.shape[0], history, weights.shape[-2], weights.shape[-1]
+            )
+        if tuple(bias.shape) != expected_bias:
+            raise ValueError(f"history_bias must have shape {expected_bias}")
+        layered = weights.ndim == 5
         if self.stride is not None and int(self.stride) <= 0:
             raise ValueError("stride must be positive")
         layer_ids = self.layer_ids
@@ -99,8 +62,6 @@ class TemporalParameters:
         object.__setattr__(self, "history_weights", weights)
         object.__setattr__(self, "history_bias", bias)
         object.__setattr__(self, "layer_ids", layer_ids)
-        object.__setattr__(self, "maximum_history_length", maximum_history_length)
-        object.__setattr__(self, "active_history_length", active_history_length)
         if self.codec_signature is not None and not str(self.codec_signature):
             raise ValueError("codec_signature must be non-empty")
         if self.parameter_set_id is not None and not str(self.parameter_set_id):
@@ -110,66 +71,34 @@ class TemporalParameters:
 
     @property
     def history_length(self) -> int:
-        if self.shared_history:
-            assert self.active_history_length is not None
-            return self.active_history_length
         return int(
             self.history_weights.shape[1]
             if self.layered
             else self.history_weights.shape[0]
         )
-
-    @property
-    def max_history_length(self) -> int:
-        if self.shared_history:
-            assert self.maximum_history_length is not None
-            return self.maximum_history_length
-        return int(
-            self.history_weights.shape[1]
-            if self.layered
-            else self.history_weights.shape[0]
-        )
-
-    @property
-    def shared_history(self) -> bool:
-        return self.maximum_history_length is not None
-
-    @property
-    def history_mode(self) -> str:
-        return "shared" if self.shared_history else "independent"
 
     @property
     def per_head(self) -> bool:
-        return True if self.shared_history else self.history_weights.ndim == 4
+        return self.history_weights.ndim == 4
 
     @property
     def layered(self) -> bool:
-        return (
-            self.history_weights.ndim == 3
-            if self.shared_history
-            else self.history_weights.ndim == 5
-        )
+        return self.history_weights.ndim == 5
 
     def with_history_length(self, history_length: int | None) -> "TemporalParameters":
+        """Assert a requested history length matches the fitted one.
+
+        Parameters carry exactly the history they were fitted for, so this only
+        checks agreement; it is kept as a method because the codec resolves a
+        configured length against whatever the parameter file provides.
+        """
         if history_length is None:
             return self
-        if not self.shared_history:
-            if history_length != self.history_length:
-                raise ValueError(
-                    "independent temporal parameters require their fitted history length"
-                )
-            return self
-        return TemporalParameters(
-            self.history_weights,
-            self.history_bias,
-            self.stride,
-            self.layer_ids,
-            self.codec_signature,
-            self.parameter_set_id,
-            self.coordinate_system,
-            self.maximum_history_length,
-            history_length,
-        )
+        if history_length != self.history_length:
+            raise ValueError(
+                "temporal parameters require their fitted history length"
+            )
+        return self
 
     def for_layer(self, layer: int) -> "TemporalParameters":
         if not self.layered:
@@ -188,8 +117,6 @@ class TemporalParameters:
             codec_signature=self.codec_signature,
             parameter_set_id=self.parameter_set_id,
             coordinate_system=self.coordinate_system,
-            maximum_history_length=self.maximum_history_length,
-            active_history_length=self.active_history_length,
         )
 
     def to(self, device: torch.device | str) -> "TemporalParameters":
@@ -207,8 +134,6 @@ class TemporalParameters:
             self.codec_signature,
             self.parameter_set_id,
             self.coordinate_system,
-            self.maximum_history_length,
-            self.active_history_length,
         )
 
     def save(self, path: str | Path) -> None:
@@ -217,12 +142,7 @@ class TemporalParameters:
             kind=np.asarray("temporal"),
             history_weights=self.history_weights.cpu().numpy(),
             history_bias=self.history_bias.cpu().numpy(),
-            history_length=np.asarray(self.max_history_length, dtype=np.int32),
-            history_mode=np.asarray(self.history_mode),
-            maximum_history_length=np.asarray(
-                self.max_history_length if self.shared_history else -1,
-                dtype=np.int32,
-            ),
+            history_length=np.asarray(self.history_length, dtype=np.int32),
             stride=np.asarray(-1 if self.stride is None else self.stride, dtype=np.int32),
             layer_ids=np.asarray(
                 [] if self.layer_ids is None else self.layer_ids, dtype=np.int32
@@ -262,19 +182,19 @@ class TemporalParameters:
                 and str(np.asarray(data["coordinate_system"]).item())
                 else None
             )
+            # Reject a file from the withdrawn shared-history format by name.
+            # Its weights are [H,D] rather than [P,P,D], so the shape check
+            # below would otherwise report a confusing dimension error instead
+            # of saying that the file has to be refitted.
             history_mode = (
                 str(np.asarray(data["history_mode"]).item())
                 if "history_mode" in data
                 else "independent"
             )
-            if history_mode not in ("independent", "shared"):
-                raise ValueError(f"unknown temporal history_mode {history_mode!r}")
-            maximum_history_length = None
-            if history_mode == "shared":
-                maximum_history_length = (
-                    int(np.asarray(data["maximum_history_length"]).item())
-                    if "maximum_history_length" in data
-                    else int(np.asarray(data["history_length"]).item())
+            if history_mode != "independent":
+                raise ValueError(
+                    f"temporal history_mode {history_mode!r} is no longer "
+                    "supported; refit the parameters with the current fitter"
                 )
             parameters = cls(
                 data["history_weights"],
@@ -284,13 +204,12 @@ class TemporalParameters:
                 codec_signature,
                 parameter_set_id,
                 coordinate_system,
-                maximum_history_length,
             )
             if "history_length" in data:
                 declared_history_length = int(
                     np.asarray(data["history_length"]).item()
                 )
-                if declared_history_length != parameters.max_history_length:
+                if declared_history_length != parameters.history_length:
                     raise ValueError(
                         "history_length does not match the history_weights array"
                     )
@@ -309,8 +228,6 @@ class CrossKVParameters:
     parameter_set_id: str | None = None
     coordinate_system: str | None = None
     history_weights: torch.Tensor | np.ndarray | None = None
-    maximum_history_length: int | None = None
-    active_history_length: int | None = None
 
     def __post_init__(self) -> None:
         weight = _tensor(self.weight)
@@ -320,13 +237,7 @@ class CrossKVParameters:
         expected_bias = tuple(weight.shape[:-2]) + (weight.shape[-1],)
         if tuple(bias.shape) != expected_bias:
             raise ValueError(f"bias must have shape {expected_bias}")
-        maximum_history_length = self.maximum_history_length
-        active_history_length = self.active_history_length
         if self.history_weights is None:
-            if maximum_history_length is not None:
-                raise ValueError(
-                    "shared CrossKV parameters require one history weight map"
-                )
             if weight.ndim == 3:
                 history_weights = weight.new_empty(
                     (0, weight.shape[0], weight.shape[-2], weight.shape[-1])
@@ -343,83 +254,51 @@ class CrossKVParameters:
                 )
         else:
             history_weights = _tensor(self.history_weights)
-        if maximum_history_length is not None:
-            if (
-                isinstance(maximum_history_length, bool)
-                or int(maximum_history_length) != maximum_history_length
-                or not 0 <= int(maximum_history_length) <= 5
-            ):
-                raise ValueError(
-                    "maximum_history_length must be an integer from 0 to 5"
-                )
-            maximum_history_length = int(maximum_history_length)
-            if tuple(history_weights.shape) != tuple(bias.shape):
-                raise ValueError(
-                    "shared CrossKV history_weights must have shape [H,D] "
-                    "or [L,H,D] matching bias"
-                )
-            if active_history_length is None:
-                active_history_length = maximum_history_length
-            if (
-                isinstance(active_history_length, bool)
-                or int(active_history_length) != active_history_length
-                or not 0 <= int(active_history_length) <= maximum_history_length
-            ):
-                raise ValueError(
-                    "active_history_length must be between 0 and "
-                    "maximum_history_length"
-                )
-            active_history_length = int(active_history_length)
+        if weight.ndim == 3:
+            valid_dense_history = (
+                history_weights.ndim == 4
+                and tuple(history_weights.shape[1:]) == tuple(weight.shape)
+            )
+            valid_diagonal_history = (
+                history_weights.ndim == 3
+                and tuple(history_weights.shape[1:]) == tuple(bias.shape)
+            )
+            history_axis = 0
         else:
-            if active_history_length is not None:
-                raise ValueError(
-                    "active_history_length is only valid for shared CrossKV parameters"
+            valid_dense_history = (
+                history_weights.ndim == 5
+                and history_weights.shape[0] == weight.shape[0]
+                and tuple(history_weights.shape[2:]) == tuple(weight.shape[1:])
+            )
+            valid_diagonal_history = (
+                history_weights.ndim == 4
+                and history_weights.shape[0] == weight.shape[0]
+                and tuple(history_weights.shape[2:]) == tuple(bias.shape[1:])
+            )
+            history_axis = 1
+        if not (valid_dense_history or valid_diagonal_history):
+            expected_dense = (
+                f"[P,{weight.shape[0]},{weight.shape[-1]},{weight.shape[-1]}]"
+                if weight.ndim == 3
+                else (
+                    f"[{weight.shape[0]},P,{weight.shape[1]},"
+                    f"{weight.shape[-1]},{weight.shape[-1]}]"
                 )
-            if weight.ndim == 3:
-                valid_dense_history = (
-                    history_weights.ndim == 4
-                    and tuple(history_weights.shape[1:]) == tuple(weight.shape)
-                )
-                valid_diagonal_history = (
-                    history_weights.ndim == 3
-                    and tuple(history_weights.shape[1:]) == tuple(bias.shape)
-                )
-                history_axis = 0
-            else:
-                valid_dense_history = (
-                    history_weights.ndim == 5
-                    and history_weights.shape[0] == weight.shape[0]
-                    and tuple(history_weights.shape[2:]) == tuple(weight.shape[1:])
-                )
-                valid_diagonal_history = (
-                    history_weights.ndim == 4
-                    and history_weights.shape[0] == weight.shape[0]
-                    and tuple(history_weights.shape[2:]) == tuple(bias.shape[1:])
-                )
-                history_axis = 1
-            if not (valid_dense_history or valid_diagonal_history):
-                expected_dense = (
-                    f"[P,{weight.shape[0]},{weight.shape[-1]},{weight.shape[-1]}]"
-                    if weight.ndim == 3
-                    else (
-                        f"[{weight.shape[0]},P,{weight.shape[1]},"
-                        f"{weight.shape[-1]},{weight.shape[-1]}]"
-                    )
-                )
-                expected_diagonal = (
-                    f"[P,{weight.shape[0]},{weight.shape[-1]}]"
-                    if weight.ndim == 3
-                    else f"[{weight.shape[0]},P,{weight.shape[1]},{weight.shape[-1]}]"
-                )
-                raise ValueError(
-                    "history_weights must have dense shape "
-                    f"{expected_dense} or diagonal shape {expected_diagonal}"
-                )
-            history_length = int(history_weights.shape[history_axis])
-            if not 0 <= history_length <= 5:
-                raise ValueError(
-                    "history_weights must contain between 0 and 5 V history maps"
-                )
+            )
+            expected_diagonal = (
+                f"[P,{weight.shape[0]},{weight.shape[-1]}]"
+                if weight.ndim == 3
+                else f"[{weight.shape[0]},P,{weight.shape[1]},{weight.shape[-1]}]"
+            )
+            raise ValueError(
+                "history_weights must have dense shape "
+                f"{expected_dense} or diagonal shape {expected_diagonal}"
+            )
+        history_length = int(history_weights.shape[history_axis])
+        if not 0 <= history_length <= 5:
+            raise ValueError(
+                "history_weights must contain between 0 and 5 V history maps"
+            )
         if self.stride is not None and int(self.stride) <= 0:
             raise ValueError("stride must be positive")
         layer_ids = self.layer_ids
@@ -436,8 +315,6 @@ class CrossKVParameters:
         object.__setattr__(self, "bias", bias)
         object.__setattr__(self, "history_weights", history_weights)
         object.__setattr__(self, "layer_ids", layer_ids)
-        object.__setattr__(self, "maximum_history_length", maximum_history_length)
-        object.__setattr__(self, "active_history_length", active_history_length)
         if self.codec_signature is not None and not str(self.codec_signature):
             raise ValueError("codec_signature must be non-empty")
         if self.parameter_set_id is not None and not str(self.parameter_set_id):
@@ -451,62 +328,30 @@ class CrossKVParameters:
 
     @property
     def history_length(self) -> int:
-        if self.shared_history:
-            assert self.active_history_length is not None
-            return self.active_history_length
         return int(
             self.history_weights.shape[1]
             if self.layered
             else self.history_weights.shape[0]
         )
-
-    @property
-    def max_history_length(self) -> int:
-        if self.shared_history:
-            assert self.maximum_history_length is not None
-            return self.maximum_history_length
-        return int(
-            self.history_weights.shape[1]
-            if self.layered
-            else self.history_weights.shape[0]
-        )
-
-    @property
-    def shared_history(self) -> bool:
-        return self.maximum_history_length is not None
 
     @property
     def history_mode(self) -> str:
         """Return the V history parameter layout."""
-        if self.shared_history:
-            return "shared_diagonal"
         dense_dimensions = 5 if self.layered else 4
         return "dense" if self.history_weights.ndim == dense_dimensions else "diagonal"
 
     @property
     def history_diagonal(self) -> bool:
         """Whether V history uses one scalar coefficient per output channel."""
-        return self.history_mode in ("diagonal", "shared_diagonal")
+        return self.history_mode == "diagonal"
 
     def with_history_length(self, history_length: int) -> "CrossKVParameters":
-        if not self.shared_history:
-            if history_length != self.history_length:
-                raise ValueError(
-                    "independent CrossKV parameters require their fitted history length"
-                )
-            return self
-        return CrossKVParameters(
-            self.weight,
-            self.bias,
-            self.stride,
-            self.layer_ids,
-            self.codec_signature,
-            self.parameter_set_id,
-            self.coordinate_system,
-            self.history_weights,
-            self.maximum_history_length,
-            history_length,
-        )
+        """Assert a requested V history length matches the fitted one."""
+        if history_length != self.history_length:
+            raise ValueError(
+                "CrossKV parameters require their fitted history length"
+            )
+        return self
 
     def for_layer(self, layer: int) -> "CrossKVParameters":
         if not self.layered:
@@ -526,8 +371,6 @@ class CrossKVParameters:
             parameter_set_id=self.parameter_set_id,
             coordinate_system=self.coordinate_system,
             history_weights=self.history_weights[index],
-            maximum_history_length=self.maximum_history_length,
-            active_history_length=self.active_history_length,
         )
 
     def to(self, device: torch.device | str) -> "CrossKVParameters":
@@ -547,8 +390,6 @@ class CrossKVParameters:
             self.parameter_set_id,
             self.coordinate_system,
             self.history_weights.to(resolved_device),
-            self.maximum_history_length,
-            self.active_history_length,
         )
 
     def save(self, path: str | Path) -> None:
@@ -558,12 +399,10 @@ class CrossKVParameters:
             weight=self.weight.cpu().numpy(),
             bias=self.bias.cpu().numpy(),
             history_weights=self.history_weights.cpu().numpy(),
-            history_length=np.asarray(self.max_history_length, dtype=np.int32),
+            history_length=np.asarray(self.history_length, dtype=np.int32),
+            # dense vs diagonal is a real layout difference the decoder routes
+            # on, so it stays recorded and is checked back on load.
             history_mode=np.asarray(self.history_mode),
-            maximum_history_length=np.asarray(
-                self.max_history_length if self.shared_history else -1,
-                dtype=np.int32,
-            ),
             stride=np.asarray(-1 if self.stride is None else self.stride, dtype=np.int32),
             layer_ids=np.asarray(
                 [] if self.layer_ids is None else self.layer_ids, dtype=np.int32
@@ -611,12 +450,13 @@ class CrossKVParameters:
                 if "history_mode" in data
                 else None
             )
-            maximum_history_length = None
+            # Name the withdrawn shared-history layout explicitly: its history
+            # weights are [H,D], so the constructor would otherwise reject them
+            # as a malformed diagonal map instead of asking for a refit.
             if declared_history_mode == "shared_diagonal":
-                maximum_history_length = (
-                    int(np.asarray(data["maximum_history_length"]).item())
-                    if "maximum_history_length" in data
-                    else int(np.asarray(data["history_length"]).item())
+                raise ValueError(
+                    "shared_diagonal V history is no longer supported; refit "
+                    "the parameters with the current fitter"
                 )
             parameters = cls(
                 data["weight"],
@@ -627,10 +467,8 @@ class CrossKVParameters:
                 parameter_set_id,
                 coordinate_system,
                 history_weights,
-                maximum_history_length,
-                None,
             )
-            if "history_mode" in data:
+            if declared_history_mode is not None:
                 if declared_history_mode != parameters.history_mode:
                     raise ValueError(
                         "history_mode does not match the history_weights array"
@@ -639,7 +477,7 @@ class CrossKVParameters:
                 declared_history_length = int(
                     np.asarray(data["history_length"]).item()
                 )
-                if declared_history_length != parameters.max_history_length:
+                if declared_history_length != parameters.history_length:
                     raise ValueError(
                         "history_length does not match the history_weights array"
                     )

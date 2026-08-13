@@ -13,7 +13,7 @@
 #   CHECKPOINT=/models/causal_forcing/chunkwise/causal_ode.pt \
 #   MODEL_ROOT=/models/Wan2.1-T2V-1.3B \
 #   PROMPTS=assets/generation_prompts.txt \
-#   CONFIG=configs/causal_forcing_int4.json \
+#   CONFIG=configs/causal_forcing.json \
 #   FRAMES=81 \
 #   bash scripts/Causal-Forcing/generate.sh
 #
@@ -37,6 +37,7 @@
 #   NUM_GPUS         torchrun 使用的 GPU 数（默认 1）
 #   LOCAL_ATTN_SIZE  局部注意力窗口（默认 -1，即全序列）
 #   USE_EMA          是否读取 checkpoint 的 generator_ema（默认 0，官方权重只有 generator）
+#   BITS / K_BITS / V_BITS  位宽 override（2/4/8；默认读取 CONFIG）
 #   K_HISTORY_LENGTH / V_HISTORY_LENGTH  历史帧数（默认读取 CONFIG）
 #
 set -euo pipefail
@@ -46,11 +47,13 @@ source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)/_common.sh"
 
 K_HISTORY_LENGTH="$(resolve_history K_HISTORY_LENGTH KH)"
 V_HISTORY_LENGTH="$(resolve_history V_HISTORY_LENGTH VH)"
+K_BITS="$(resolve_bits K_BITS)"
+V_BITS="$(resolve_bits V_BITS)"
 mode="${MODE:-tempokv}"
 
 case "$mode" in
   tempokv|bf16) ;;
-  *) die "MODE 必须是 tempokv 或 bf16（当前值：$mode）" ;;
+  *) die "MODE 必须是 tempokv 或 bf16（当前值：${mode}）" ;;
 esac
 
 require_env CHECKPOINT MODEL_ROOT PROMPTS
@@ -62,7 +65,7 @@ generation_mode="${GENERATION_MODE:-chunkwise}"
 case "$generation_mode" in
   chunkwise) num_frame_per_block=3 ;;
   framewise) num_frame_per_block=1 ;;
-  *) die "GENERATION_MODE 必须是 chunkwise 或 framewise（当前值：$generation_mode）" ;;
+  *) die "GENERATION_MODE 必须是 chunkwise 或 framewise（当前值：${generation_mode}）" ;;
 esac
 
 runtime_root="$project_root/experiments/Causal-Forcing"
@@ -73,9 +76,30 @@ else
 fi
 
 if [[ "$mode" == "tempokv" ]]; then
-  parameter_name="${PARAM_NAME:-$(codec_slug "$(resolve_path "$CONFIG")" "${K_HISTORY_LENGTH:-}" "${V_HISTORY_LENGTH:-}")}"
+  parameter_name="${PARAM_NAME:-$(codec_slug "$(resolve_path "$CONFIG")" "${K_HISTORY_LENGTH:-}" "${V_HISTORY_LENGTH:-}" "${K_BITS:-}" "${V_BITS:-}" "" "${V_PREDICTOR:-}")}"
   param_dir="$(resolve_path "${PARAM_DIR:-data/causal-forcing/params/$generation_mode/$parameter_name}")"
   result_label="$parameter_name"
+  v_predictor_mode="$("$python_bin" - "$(resolve_path "$CONFIG")" <<'PY'
+import json
+import sys
+
+config = json.load(open(sys.argv[1], encoding="utf-8"))
+print(config.get("codec", config).get("v_predictor_mode", "cross_kv"))
+PY
+  )"
+  # V_PREDICTOR overrides the config so one file covers both predictors.
+  if [[ -n "${V_PREDICTOR:-}" ]]; then
+    case "$V_PREDICTOR" in
+      cross_kv|temporal) ;;
+      *) die "V_PREDICTOR 必须是 cross_kv 或 temporal（当前值：${V_PREDICTOR}）" ;;
+    esac
+    v_predictor_mode="$V_PREDICTOR"
+  fi
+  if [[ "$v_predictor_mode" == "temporal" ]]; then
+    v_artifact_name="v_temporal.npz"
+  else
+    v_artifact_name="v_cross_kv.npz"
+  fi
 else
   param_dir=""
   result_label="bf16"
@@ -116,11 +140,11 @@ if (( (FRAMES + 3) % period != 0 )); then
 fi
 if [[ -n "${K_HISTORY_LENGTH:-}" ]]; then
   check_int K_HISTORY_LENGTH 1
-  (( K_HISTORY_LENGTH <= 8 )) || die "K_HISTORY_LENGTH 必须 <= 8（当前值：$K_HISTORY_LENGTH）"
+  (( K_HISTORY_LENGTH <= 8 )) || die "K_HISTORY_LENGTH 必须 <= 8（当前值：${K_HISTORY_LENGTH}）"
 fi
 if [[ -n "${V_HISTORY_LENGTH:-}" ]]; then
   check_int V_HISTORY_LENGTH 0
-  (( V_HISTORY_LENGTH <= 5 )) || die "V_HISTORY_LENGTH 必须 <= 5（当前值：$V_HISTORY_LENGTH）"
+  (( V_HISTORY_LENGTH <= 5 )) || die "V_HISTORY_LENGTH 必须 <= 5（当前值：${V_HISTORY_LENGTH}）"
 fi
 if [[ -n "${SPAN_FRAMES:-}" ]]; then
   check_int SPAN_FRAMES 2
@@ -147,10 +171,13 @@ if [[ "$mode" == "tempokv" ]]; then
   generate_command+=(
     --config "$(resolve_path "$CONFIG")"
     --k-params "$param_dir/k_temporal.npz"
-    --v-params "$param_dir/v_cross_kv.npz"
+    --v-params "$param_dir/$v_artifact_name"
   )
   [[ -n "${K_HISTORY_LENGTH:-}" ]] && generate_command+=(--k-history-length "$K_HISTORY_LENGTH")
   [[ -n "${V_HISTORY_LENGTH:-}" ]] && generate_command+=(--v-history-length "$V_HISTORY_LENGTH")
+  [[ -n "${K_BITS:-}" ]] && generate_command+=(--k-bits "$K_BITS")
+  [[ -n "${V_BITS:-}" ]] && generate_command+=(--v-bits "$V_BITS")
+  [[ -n "${V_PREDICTOR:-}" ]] && generate_command+=(--v-predictor-mode "$V_PREDICTOR")
   [[ -n "${SPAN_FRAMES:-}" ]] && generate_command+=(--span-frames "$SPAN_FRAMES")
 fi
 

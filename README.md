@@ -79,11 +79,84 @@ pip install -e ".[cuda,self-forcing,self-forcing-train]"
 Self-Forcing 与 LongCat 对 `diffusers`、`transformers` 和 `av` 的版本要求不同，
 建议分别使用独立的虚拟环境。
 
-仓库提供 `configs/int2.json` 和 `configs/int4.json`。每一种
-`k_history_length`、`v_history_length` 与位宽组合都需要一套对应的拟合参数，
-参数目录名会带上这三者（如 `legacy-kh3-vh1-int4`），互不覆盖。INT2 默认
-`kh=2`、`vh=1`，INT4 默认 `kh=3`、`vh=1`；命令行用 `KH=` / `VH=` 覆盖即可（等价于长名
-`K_HISTORY_LENGTH` / `V_HISTORY_LENGTH`，两个都设且不同会报错）。
+## 配置
+
+`configs/` 每个模型一个文件，位宽、历史长度和解码器都是命令行 override，不需要为
+每种组合各存一个文件：
+
+```text
+configs/
+├── self_forcing.json             Self-Forcing（legacy 拟合，复现参考实现）
+├── causal_forcing.json           Causal Forcing（native 拟合）
+├── causal_forcing_temporal_v.json  Causal Forcing + temporal V 预测器
+├── longcat.json                  LongCat，CP=1
+├── longcat_temporal_v.json       LongCat CP=1 + temporal V 预测器
+├── longcat_cp2.json              LongCat，CP=2（stride 780）
+└── longcat_cp4.json              LongCat，CP=4（stride 390）
+```
+
+每个文件**只写出赋予它身份的字段**，其余取 [`CodecConfig`](src/tempokv/config.py)
+的默认值（`anchor_bits=4`、`group_size=64`、`residual_mode=asymmetric`、
+`scale_dtype`/`reconstruction_dtype=bfloat16`、`stride=1560`），所以两个配置的差别
+一眼可见——`longcat_cp2.json` 与 `longcat.json` 只差一行 `stride`。
+
+### 命令行 override
+
+| 变量 | 作用 | 适用 |
+|---|---|---|
+| `BITS` | 同时设 K/V 位宽（2/4/8） | 全部 |
+| `K_BITS` / `V_BITS` | 分别设，用于混合精度 | 全部 |
+| `KH` / `VH` | K/V 历史长度（长名 `K_HISTORY_LENGTH` / `V_HISTORY_LENGTH`） | 全部 |
+| `V_PREDICTOR` | V 预测器：`cross_kv` 或 `temporal` | 全部 |
+| `TORCH_DECODER=1` | 用 PyTorch 参考解码器而不是 Triton | Self-Forcing |
+
+`BITS` 与 `K_BITS`/`V_BITS` 设成不同值会直接报错，而不是悄悄取一个。所以
+INT2 只需要 `BITS=2`，不需要另一个配置文件：
+
+```bash
+CONFIG=configs/self_forcing.json BITS=2 KH=2 bash scripts/Self-Forcing/fit_params.sh
+```
+
+V 预测器同理，Self-Forcing 的基础配置已经是 legacy，所以直接切即可：
+
+```bash
+CONFIG=configs/self_forcing.json V_PREDICTOR=temporal bash scripts/Self-Forcing/fit_params.sh
+```
+
+**temporal V 有一个约束**：它目前只有 legacy 拟合路径能产出（`fitting.py` 的
+`temporal_v_obstacle` 是这条规则的唯一出处）。只有 Self-Forcing 的基础配置本身就是
+legacy，所以只有它能靠 `V_PREDICTOR` 双向切换；Causal Forcing 与 LongCat 的基础配置
+是 native，temporal 要走各自的 `*_temporal_v.json`——那些文件带着整套 legacy 开关，
+这是它们作为独立文件保留的原因。在 native 配置上单独设 `V_PREDICTOR=temporal` 会在
+读 trace 之前就报错并说明怎么改。
+
+实际可用组合：
+
+| 模型 | `cross_kv` | `temporal` |
+|---|---|---|
+| Self-Forcing | `self_forcing.json`（默认） | 同一文件 + `V_PREDICTOR=temporal` |
+| Causal Forcing | `causal_forcing.json` | `causal_forcing_temporal_v.json` |
+| LongCat CP=1 | `longcat.json` | `longcat_temporal_v.json` |
+| LongCat CP=2/4 | `longcat_cp2/cp4.json` | **不支持** |
+
+LongCat 的 CP=2/4 用不了 temporal V 不是接线缺失，而是硬约束：legacy 拟合要求
+`stride=1560`，而 CP=2/4 的 local stride 是 780 / 390。要支持它得先让 native fitter
+也能产出 temporal V 参数。
+
+### 参数目录名
+
+每一种位宽、历史长度、predictor 结构与 stride 的组合都需要各自的一套拟合参数，
+目录名把它们全部编码进去，互不覆盖：
+
+```text
+legacy-kh3-vh1-int4        Self-Forcing 默认
+legacy-kh2-vh1-int2        BITS=2 KH=2
+kh2-vh1-int4               Causal Forcing / LongCat CP=1 默认
+kh2-vt1-int4               temporal V 预测器（vt 而不是 vh）
+kh2-vh1-int4-s780          LongCat CP=2（stride 进 signature，必须独立拟合）
+kh2-vh1-k2-v4              K/V 位宽不同
+```
+
 `residual_mode=symmetric` 且位宽为 2 时使用的是 `-1, 0, 1` 三个量化值；默认的
 `residual_mode=asymmetric` 才使用 2 bit 的四个编码值。
 
@@ -122,21 +195,18 @@ python experiments/Self-Forcing/tempokv_adapter/prepare_trace.py \
 ### 2. 拟合一套参数
 
 ```bash
-CONFIG=configs/int2.json \
+CONFIG=configs/self_forcing.json \
 KH=2 \
 VH=1 \
 bash scripts/Self-Forcing/fit_params.sh
 ```
 
-默认输出：
+默认输出（`BITS=2` 时是 `legacy-kh2-vh1-int2`）：
 
 ```text
-data/self-forcing/params/legacy-kh2-vh1-int2/k_temporal.npz
-data/self-forcing/params/legacy-kh2-vh1-int2/v_cross_kv.npz
+data/self-forcing/params/legacy-kh2-vh1-int4/k_temporal.npz
+data/self-forcing/params/legacy-kh2-vh1-int4/v_cross_kv.npz
 ```
-
-K/V 使用不同位宽时，目录名会明确写出两者，例如
-`kh2-vh1-k2-v4`，避免 `K2/V2` 与 `K2/V4` 覆盖到同一个目录。
 
 ### 3. 使用 TempoKV 生成
 
@@ -144,7 +214,7 @@ K/V 使用不同位宽时，目录名会明确写出两者，例如
 CHECKPOINT=/models/self_forcing_dmd.pt \
 WAN_MODEL_DIR=/models/Wan2.1-T2V-1.3B \
 PROMPTS=assets/generation_prompts.txt \
-CONFIG=configs/int2.json \
+CONFIG=configs/self_forcing.json \
 KH=2 \
 VH=1 \
 FRAMES=717 \
@@ -216,7 +286,7 @@ denoising step 的 current K/V 不入 trace。
 ### 2. 拟合一套参数
 
 ```bash
-CONFIG=configs/causal_forcing_int4.json \
+CONFIG=configs/causal_forcing.json \
 bash scripts/Causal-Forcing/fit_params.sh
 ```
 
@@ -227,7 +297,7 @@ data/causal-forcing/params/chunkwise/kh2-vh1-int4/k_temporal.npz
 data/causal-forcing/params/chunkwise/kh2-vh1-int4/v_cross_kv.npz
 ```
 
-INT2 只需要换 `configs/causal_forcing_int2.json`，目录名会自动带上位宽。
+INT2 加 `BITS=2` 即可，目录名会自动带上位宽。
 
 ### 3. 使用 TempoKV 生成
 
@@ -235,7 +305,7 @@ INT2 只需要换 `configs/causal_forcing_int2.json`，目录名会自动带上�
 CHECKPOINT=checkpoints/causal_forcing/chunkwise/causal_forcing.pt \
 MODEL_ROOT=checkpoints/causal_forcing/wan2.1-t2v-1.3b \
 PROMPTS=assets/generation_prompts.txt \
-CONFIG=configs/causal_forcing_int4.json \
+CONFIG=configs/causal_forcing.json \
 bash scripts/Causal-Forcing/run_tempokv.sh
 ```
 
@@ -312,7 +382,7 @@ Parallel rank 的 metadata 一致，因此 `CONTEXT_PARALLEL_SIZE=1/2/4`
 ### 2. 拟合一套参数
 
 ```bash
-CONFIG=configs/longcat_int4.json \
+CONFIG=configs/longcat.json \
 bash scripts/LongCat/fit_params.sh
 ```
 
@@ -326,7 +396,7 @@ data/longcat/params/kh2-vh1-int4/v_cross_kv.npz
 换配置时目录名会自动带上位宽，INT4 与 INT2 不会互相覆盖：
 
 ```bash
-CONFIG=configs/longcat_int2.json \
+CONFIG=configs/longcat.json \
 bash scripts/LongCat/fit_params.sh    # -> data/longcat/params/kh2-vh1-int2
 ```
 
@@ -337,7 +407,7 @@ bash scripts/LongCat/fit_params.sh    # -> data/longcat/params/kh2-vh1-int2
 
 ```bash
 CHECKPOINT_DIR=/models/LongCat-Video \
-CONFIG=configs/longcat_int4.json \
+CONFIG=configs/longcat.json \
 K_PARAMS=data/longcat/params/kh2-vh1-int4/k_temporal.npz \
 V_PARAMS=data/longcat/params/kh2-vh1-int4/v_cross_kv.npz \
 PROMPT="a cinematic mountain road" \

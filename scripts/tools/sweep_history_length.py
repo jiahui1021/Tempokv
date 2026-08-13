@@ -65,7 +65,7 @@ from analyze_predictor import (  # noqa: E402
     reconstruct_k,
     reconstruct_v,
 )
-from tempokv.config import CodecConfig  # noqa: E402
+from tempokv.config import CodecConfig, config_from_mapping  # noqa: E402
 from tempokv.fitting import fit_predictors  # noqa: E402
 
 K_HISTORY_CHOICES = tuple(range(1, 9))
@@ -78,7 +78,7 @@ def _load_config(path: Path) -> CodecConfig:
         if len(payload) != 1:
             raise ValueError("'codec' must be the only top-level config object")
         payload = payload["codec"]
-    return CodecConfig(**payload)
+    return config_from_mapping(payload)
 
 
 def _int_list(raw: str, *, name: str, allowed: tuple[int, ...]) -> tuple[int, ...]:
@@ -395,12 +395,6 @@ def main(argv: list[str] | None = None) -> int:
     )
     device = _resolve_device(args.device)
     base = _load_config(args.config)
-    if base.k_max_history_length is not None or base.v_max_history_length is not None:
-        parser.error(
-            "this sweep fits dedicated parameters per history length; remove "
-            "k_max_history_length / v_max_history_length from the config, or "
-            "vary the length at runtime with shared parameters instead"
-        )
 
     keys, values = load_trace(
         args.trace,

@@ -738,10 +738,10 @@ class LongCatTempoKVBridge:
                         f"{name} parameters use stride {parameters.stride}, while "
                         f"the codec uses {self.codec.config.stride}"
                     )
-                if not parameters.layered and not parameters.shared_history:
+                if not parameters.layered:
                     raise ValueError(
                         f"{name} parameters must be layered for a multi-layer "
-                        "LongCat model or use shared history parameters"
+                        "LongCat model"
                     )
                 if parameters.layered and parameters.layer_ids != expected_layers:
                     raise ValueError(
@@ -1282,6 +1282,7 @@ def install_longcat_bridge(
     v_parameters_path: str | Path | None = None,
     triton_cache: str | Path | None = None,
     codec: TempoKVCodec | None = None,
+    codec_overrides: Mapping[str, Any] | None = None,
     mode: str = "tempokv",
     trace_dir: str | Path | None = None,
     max_trace_spatial_positions: int = DEFAULT_TRACE_SPATIAL_POSITIONS,
@@ -1306,7 +1307,11 @@ def install_longcat_bridge(
                 "v_parameters_path when codec is not supplied"
             )
         codec = load_codec(
-            paths[0], paths[1], paths[2], triton_cache=triton_cache
+            paths[0],
+            paths[1],
+            paths[2],
+            triton_cache=triton_cache,
+            overrides=codec_overrides,
         )
     resolved_spec = spec or LongCatRuntimeSpec()
     bridge = LongCatTempoKVBridge(

@@ -72,6 +72,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--v-params", type=Path)
     parser.add_argument("--k-history-length", type=int, choices=range(1, 9))
     parser.add_argument("--v-history-length", type=int, choices=range(0, 6))
+    # Overrides so one config per model covers every bit width, instead of one
+    # committed config per combination.
+    parser.add_argument(
+        "--v-predictor-mode",
+        choices=("cross_kv", "temporal"),
+        help="predict V from reconstructed K (cross_kv) or from its own history",
+    )
+    parser.add_argument("--k-bits", type=int, choices=(2, 4, 8))
+    parser.add_argument("--v-bits", type=int, choices=(2, 4, 8))
     parser.add_argument(
         "--model-config",
         type=Path,
@@ -122,7 +131,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _load_config(path: Path):
-    from tempokv.config import CodecConfig
+    from tempokv.config import config_from_mapping
 
     payload = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(payload, dict):
@@ -131,7 +140,7 @@ def _load_config(path: Path):
         if len(payload) != 1 or not isinstance(payload["codec"], dict):
             raise ValueError("'codec' must be the only top-level config object")
         payload = payload["codec"]
-    return CodecConfig(**payload)
+    return config_from_mapping(payload)
 
 
 def _validate_parameters(k_path: Path, v_path: Path, config) -> dict[str, object]:
@@ -139,31 +148,15 @@ def _validate_parameters(k_path: Path, v_path: Path, config) -> dict[str, object
     from tempokv.parameters import CrossKVParameters, TemporalParameters
 
     temporal = TemporalParameters.load(k_path)
-    cross = CrossKVParameters.load(v_path)
-    if temporal.shared_history != cross.shared_history:
-        raise ValueError(
-            "Causal Forcing K and V parameters must use the same history mode"
-        )
-    signature_config = config
-    if temporal.shared_history:
-        signature_config = replace(
-            config,
-            k_max_history_length=(
-                config.k_max_history_length
-                if config.k_max_history_length is not None
-                else temporal.max_history_length
-            ),
-            v_max_history_length=(
-                config.v_max_history_length
-                if config.v_max_history_length is not None
-                else cross.max_history_length
-            ),
-        )
-    expected_signature = (
-        signature_config.shared_format_signature()
-        if temporal.shared_history
-        else signature_config.format_signature()
+    # The temporal V predictor reads its own reconstructed V history, so its
+    # parameters are a TemporalParameters set rather than a Cross(K) map.
+    temporal_v = config.v_predictor_mode == "temporal"
+    cross = (
+        TemporalParameters.load(v_path)
+        if temporal_v
+        else CrossKVParameters.load(v_path)
     )
+    expected_signature = config.format_signature()
     if (
         temporal.codec_signature != expected_signature
         or cross.codec_signature != expected_signature
@@ -193,14 +186,27 @@ def _validate_parameters(k_path: Path, v_path: Path, config) -> dict[str, object
             "cache distribution differ"
         )
     codec = TempoKVCodec(temporal, cross, config)
-    heads, head_dim = tuple(int(item) for item in cross.weight.shape[-3:-1])
-    parameter_tensors = (
-        temporal.history_weights,
-        temporal.history_bias,
-        cross.weight,
-        cross.bias,
-        cross.history_weights,
-    )
+    if temporal_v:
+        # Legacy fitting is the only source of temporal V parameters, and it
+        # pools every layer and head, so neither file carries a head axis: the
+        # head count is simply not knowable from the parameters here.
+        heads = None
+        head_dim = int(temporal.history_weights.shape[-1])
+        parameter_tensors = (
+            temporal.history_weights,
+            temporal.history_bias,
+            cross.history_weights,
+            cross.history_bias,
+        )
+    else:
+        heads, head_dim = tuple(int(item) for item in cross.weight.shape[-3:-1])
+        parameter_tensors = (
+            temporal.history_weights,
+            temporal.history_bias,
+            cross.weight,
+            cross.bias,
+            cross.history_weights,
+        )
     predictor_parameter_bytes = sum(
         tensor.numel() * tensor.element_size()
         for tensor in parameter_tensors
@@ -209,12 +215,13 @@ def _validate_parameters(k_path: Path, v_path: Path, config) -> dict[str, object
     return {
         "k_params": str(k_path),
         "v_params": str(v_path),
-        "layers": len(temporal.layer_ids),
+        "layers": None if temporal.layer_ids is None else len(temporal.layer_ids),
         "heads": heads,
         "head_dimension": head_dim,
         "k_history_length": codec.temporal.history_length,
-        "v_history_length": codec.cross_kv.history_length,
-        "v_history_diagonal": cross.history_diagonal,
+        "v_history_length": codec.v_parameters.history_length,
+        "v_predictor_mode": config.v_predictor_mode,
+        "v_history_diagonal": False if temporal_v else cross.history_diagonal,
         "predictor_parameter_bytes": predictor_parameter_bytes,
         "stride": config.stride,
         "coordinate_system": EXPECTED_COORDINATE_SYSTEM,
@@ -491,6 +498,9 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             for name, value in (
                 ("k_history_length", args.k_history_length),
                 ("v_history_length", args.v_history_length),
+                ("k_bits", args.k_bits),
+                ("v_bits", args.v_bits),
+                ("v_predictor_mode", args.v_predictor_mode),
             )
             if value is not None
         }

@@ -1,0 +1,7 @@
+{
+  "k_bits": 4,
+  "v_bits": 4,
+  "stride": 390,
+  "k_history_length": 2,
+  "v_history_length": 1
+}

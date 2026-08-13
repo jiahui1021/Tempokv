@@ -5,10 +5,13 @@ set -euo pipefail
 # shellcheck source=scripts/LongCat/_common.sh
 source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)/_common.sh"
 
+K_BITS="$(resolve_bits K_BITS)"
+V_BITS="$(resolve_bits V_BITS)"
+
 mode="${MODE:-tempokv}"
 case "$mode" in
   tempokv|bf16) ;;
-  *) die "MODE 必须是 tempokv 或 bf16（当前值：$mode）" ;;
+  *) die "MODE 必须是 tempokv 或 bf16（当前值：${mode}）" ;;
 esac
 
 require_env CHECKPOINT_DIR
@@ -72,6 +75,9 @@ args=(
 [[ "$OFFLOAD_KV_CACHE" == "1" ]] && args+=(--offload_kv_cache) || args+=(--no_offload_kv_cache)
 [[ "$ENABLE_COMPILE" == "1" ]] && args+=(--enable_compile)
 [[ -n "${CACHE_STRIDE:-}" ]] && args+=(--stride "$CACHE_STRIDE")
+[[ -n "${K_BITS:-}" ]] && args+=(--k-bits "$K_BITS")
+[[ -n "${V_BITS:-}" ]] && args+=(--v-bits "$V_BITS")
+[[ -n "${V_PREDICTOR:-}" ]] && args+=(--v-predictor-mode "$V_PREDICTOR")
 [[ -n "${TRITON_CACHE:-}" ]] && args+=(--triton-cache "$(resolve_path "$TRITON_CACHE")")
 if [[ "$mode" == "tempokv" ]]; then
   args+=(

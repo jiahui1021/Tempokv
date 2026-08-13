@@ -1039,345 +1039,6 @@ def fit_temporal_layers(
     )
 
 
-@torch.no_grad()
-def fit_shared_temporal_layers(
-    reconstructions: dict[int, torch.Tensor],
-    target: torch.Tensor,
-    *,
-    maximum_history_length: int,
-    ridge: float = 0.0,
-    max_gain: float = 1.0,
-    stride: int | None = None,
-    layer_ids: tuple[int, ...] | None = None,
-) -> TemporalParameters:
-    """Fit one per-channel K map jointly across all active history lengths."""
-    if (
-        isinstance(maximum_history_length, bool)
-        or int(maximum_history_length) != maximum_history_length
-        or not 1 <= int(maximum_history_length) <= 8
-    ):
-        raise ValueError("maximum_history_length must be an integer from 1 to 8")
-    maximum_history_length = int(maximum_history_length)
-    expected_lengths = set(range(1, maximum_history_length + 1))
-    if set(reconstructions) != expected_lengths:
-        raise ValueError(
-            "reconstructions must contain every history length from 1 through "
-            f"{maximum_history_length}"
-        )
-    checked_reconstructions: set[int] = set()
-    for reconstruction in reconstructions.values():
-        if id(reconstruction) in checked_reconstructions:
-            continue
-        checked_reconstructions.add(id(reconstruction))
-        _check_pair(
-            reconstruction,
-            target,
-            minimum_dimensions=4,
-            layout="[L, ..., T, H, D]",
-        )
-    ridge = _check_scalar("ridge", ridge)
-    max_gain = _check_scalar("max_gain", max_gain, positive=True)
-    stride = _check_stride(stride)
-    layer_count = int(target.shape[0])
-    frame_count = int(target.shape[-3])
-    if maximum_history_length >= frame_count:
-        raise ValueError("maximum_history_length must be smaller than T")
-
-    work_device, compute_dtype = _compute_device_and_dtype(target)
-    fitted_weights: list[torch.Tensor] = []
-    fitted_biases: list[torch.Tensor] = []
-    for layer in range(layer_count):
-        target_layer = target[layer].detach().to(
-            device=work_device, dtype=compute_dtype
-        )
-        head_count, dim = map(int, target_layer.shape[-2:])
-        sums = [
-            torch.zeros(head_count, dim, dtype=compute_dtype, device=work_device)
-            for _ in range(4)
-        ]
-        sum_x, sum_y, sum_xx, sum_xy = sums
-        observation_count = 0
-        converted_histories: dict[int, torch.Tensor] = {}
-        for history_length, reconstruction in sorted(reconstructions.items()):
-            history_layer = converted_histories.get(id(reconstruction))
-            if history_layer is None:
-                history_layer = reconstruction[layer].detach().to(
-                    device=work_device, dtype=compute_dtype
-                )
-                converted_histories[id(reconstruction)] = history_layer
-
-            # Form every frame's decoder-visible mean together.  On GPU this
-            # avoids launching several tiny operations for each frame.
-            aggregate = history_layer[..., :-1, :, :].clone()
-            for lag in range(2, history_length + 1):
-                aggregate[..., lag - 1 :, :, :].add_(
-                    history_layer[..., :-lag, :, :]
-                )
-            order = torch.arange(
-                1,
-                frame_count,
-                dtype=compute_dtype,
-                device=work_device,
-            ).clamp_max_(history_length)
-            order_shape = (1,) * (aggregate.ndim - 3) + (
-                frame_count - 1,
-                1,
-                1,
-            )
-            aggregate.div_(order.view(order_shape))
-            current_target = target_layer[..., 1:, :, :]
-            reduce_dimensions = tuple(range(aggregate.ndim - 2))
-            sum_x.add_(aggregate.sum(dim=reduce_dimensions))
-            sum_y.add_(current_target.sum(dim=reduce_dimensions))
-            sum_xx.add_((aggregate * aggregate).sum(dim=reduce_dimensions))
-            sum_xy.add_((aggregate * current_target).sum(dim=reduce_dimensions))
-            observation_count += math.prod(aggregate.shape[:-2]) or 1
-            del aggregate
-
-        x_mean = sum_x / observation_count
-        y_mean = sum_y / observation_count
-        gram = sum_xx - sum_x * x_mean
-        rhs = sum_xy - sum_x * y_mean
-        scale = gram
-        penalty = ridge * scale.clamp_min(torch.finfo(compute_dtype).eps)
-        system = gram + penalty
-        numerator = rhs + penalty
-        coefficient = torch.where(
-            system.abs() > torch.finfo(compute_dtype).eps,
-            numerator / system,
-            torch.zeros_like(system),
-        )
-        coefficient.clamp_(min=-max_gain, max=max_gain)
-        intercept = y_mean - x_mean * coefficient
-        fitted_weights.append(coefficient)
-        fitted_biases.append(intercept)
-
-    return TemporalParameters(
-        history_weights=torch.stack(fitted_weights)
-        .to(device=target.device, dtype=torch.float32)
-        .contiguous(),
-        history_bias=torch.stack(fitted_biases)
-        .to(device=target.device, dtype=torch.float32)
-        .contiguous(),
-        stride=stride,
-        layer_ids=layer_ids,
-        maximum_history_length=maximum_history_length,
-    )
-
-
-@torch.no_grad()
-def fit_shared_cross_kv(
-    reconstructed_keys: dict[int, torch.Tensor],
-    values: torch.Tensor,
-    reconstructed_values: dict[tuple[int, int], torch.Tensor],
-    *,
-    maximum_v_history_length: int,
-    ridge: float = 0.0,
-    stride: int | None = None,
-    layer_ids: tuple[int, ...] | None = None,
-) -> CrossKVParameters:
-    """Fit one V-history map across every requested reconstructed K/V trace."""
-    if (
-        isinstance(maximum_v_history_length, bool)
-        or int(maximum_v_history_length) != maximum_v_history_length
-        or not 0 <= int(maximum_v_history_length) <= 5
-    ):
-        raise ValueError("maximum_v_history_length must be an integer from 0 to 5")
-    maximum_v_history_length = int(maximum_v_history_length)
-    if not reconstructed_keys:
-        raise ValueError("reconstructed_keys must not be empty")
-    expected_pairs = {
-        (k_history, v_history)
-        for k_history in reconstructed_keys
-        for v_history in range(maximum_v_history_length + 1)
-    }
-    if set(reconstructed_values) != expected_pairs:
-        raise ValueError("reconstructed_values does not cover every K/V history pair")
-    checked_keys: set[int] = set()
-    for tensor in reconstructed_keys.values():
-        if id(tensor) in checked_keys:
-            continue
-        checked_keys.add(id(tensor))
-        _check_pair(tensor, values, minimum_dimensions=4, layout="[L, ..., T, H, D]")
-    checked_values: set[int] = set()
-    for tensor in reconstructed_values.values():
-        if id(tensor) in checked_values:
-            continue
-        checked_values.add(id(tensor))
-        _check_pair(tensor, values, minimum_dimensions=4, layout="[L, ..., T, H, D]")
-    ridge = _check_scalar("ridge", ridge)
-    stride = _check_stride(stride)
-    layer_count = int(values.shape[0])
-    frame_count = int(values.shape[-3])
-    work_device, compute_dtype = _compute_device_and_dtype(values)
-
-    fitted_key_weights: list[torch.Tensor] = []
-    fitted_history_weights: list[torch.Tensor] = []
-    fitted_biases: list[torch.Tensor] = []
-    for layer in range(layer_count):
-        target_layer = values[layer].detach().to(
-            device=work_device, dtype=compute_dtype
-        )
-        head_count, dim = map(int, target_layer.shape[-2:])
-        sum_key = torch.zeros(head_count, dim, dtype=compute_dtype, device=work_device)
-        sum_history = torch.zeros_like(sum_key)
-        sum_target = torch.zeros_like(sum_key)
-        key_gram_raw = torch.zeros(
-            head_count, dim, dim, dtype=compute_dtype, device=work_device
-        )
-        key_rhs_raw = torch.zeros_like(key_gram_raw)
-        cross_raw = torch.zeros_like(key_gram_raw)
-        history_gram_raw = torch.zeros_like(sum_key)
-        history_rhs_raw = torch.zeros_like(sum_key)
-        observation_count = 0
-        target_observations = target_layer[..., 1:, :, :].reshape(
-            -1, head_count, dim
-        ).permute(1, 0, 2)
-        converted_histories: dict[int, torch.Tensor] = {}
-
-        for k_history, key_trace in sorted(reconstructed_keys.items()):
-            key_layer = key_trace[layer].detach().to(
-                device=work_device, dtype=compute_dtype
-            )
-            key_observations = key_layer[..., 1:, :, :].reshape(
-                -1, head_count, dim
-            ).permute(1, 0, 2)
-            count = int(key_observations.shape[1])
-            variant_count = maximum_v_history_length + 1
-            observation_count += count * variant_count
-
-            # K and the target repeat for every V-history choice.  Their large
-            # D x D moments only need to be calculated once.
-            sum_key.add_(key_observations.sum(dim=1), alpha=variant_count)
-            sum_target.add_(target_observations.sum(dim=1), alpha=variant_count)
-            key_gram_raw.add_(
-                torch.matmul(
-                    key_observations.transpose(-2, -1), key_observations
-                ),
-                alpha=variant_count,
-            )
-            key_rhs_raw.add_(
-                torch.matmul(
-                    key_observations.transpose(-2, -1), target_observations
-                ),
-                alpha=variant_count,
-            )
-
-            # The zero-history variant contributes zero to all history
-            # moments.  Positive lengths are combined across every frame.
-            for v_history in range(1, maximum_v_history_length + 1):
-                history_trace = reconstructed_values[(k_history, v_history)]
-                history_layer = converted_histories.get(id(history_trace))
-                if history_layer is None:
-                    history_layer = history_trace[layer].detach().to(
-                        device=work_device, dtype=compute_dtype
-                    )
-                    converted_histories[id(history_trace)] = history_layer
-                history = history_layer[..., :-1, :, :].clone()
-                for lag in range(2, v_history + 1):
-                    history[..., lag - 1 :, :, :].add_(
-                        history_layer[..., :-lag, :, :]
-                    )
-                order = torch.arange(
-                    1,
-                    frame_count,
-                    dtype=compute_dtype,
-                    device=work_device,
-                ).clamp_max_(v_history)
-                order_shape = (1,) * (history.ndim - 3) + (
-                    frame_count - 1,
-                    1,
-                    1,
-                )
-                history.div_(order.view(order_shape))
-                history_observations = history.reshape(
-                    -1, head_count, dim
-                ).permute(1, 0, 2)
-                sum_history.add_(history_observations.sum(dim=1))
-                cross_raw.add_(
-                    torch.einsum(
-                        "hni,hno->hoi",
-                        key_observations,
-                        history_observations,
-                    )
-                )
-                history_gram_raw.add_((history_observations**2).sum(dim=1))
-                history_rhs_raw.add_(
-                    (history_observations * target_observations).sum(dim=1)
-                )
-                del history, history_observations
-            del key_layer
-
-        key_mean = sum_key / observation_count
-        history_mean = sum_history / observation_count
-        target_mean = sum_target / observation_count
-        key_gram = key_gram_raw - observation_count * torch.einsum(
-            "hi,hj->hij", key_mean, key_mean
-        )
-        key_rhs = key_rhs_raw - observation_count * torch.einsum(
-            "hi,ho->hio", key_mean, target_mean
-        )
-        cross_gram = cross_raw - observation_count * torch.einsum(
-            "ho,hi->hoi", history_mean, key_mean
-        )
-        history_gram = history_gram_raw - observation_count * history_mean.square()
-        history_rhs = history_rhs_raw - observation_count * history_mean * target_mean
-
-        key_energy = key_gram.diagonal(dim1=-2, dim2=-1).sum(dim=-1)
-        scale = (key_energy + history_gram.mean(dim=-1)) / (dim + 1)
-        penalty = ridge * scale.clamp_min(torch.finfo(compute_dtype).eps)
-        identity = torch.eye(dim, dtype=compute_dtype, device=work_device)
-        key_system = key_gram + penalty[:, None, None] * identity
-        block_rhs = torch.cat((key_rhs, cross_gram.transpose(-2, -1)), dim=-1)
-        if ridge > 0.0:
-            block_solution = torch.linalg.solve(key_system, block_rhs)
-        else:
-            block_solution = torch.matmul(
-                torch.linalg.pinv(
-                    key_system, rtol=_pinv_rtol(compute_dtype)
-                ),
-                block_rhs,
-            )
-        inverse_key_rhs = block_solution[..., :dim].transpose(-2, -1)
-        inverse_cross = block_solution[..., dim:].transpose(-2, -1)
-        schur_system = history_gram + penalty[:, None] - torch.einsum(
-            "hoi,hoi->ho", cross_gram, inverse_cross
-        )
-        schur_rhs = history_rhs - torch.einsum(
-            "hoi,hoi->ho", cross_gram, inverse_key_rhs
-        )
-        history_weight = torch.where(
-            schur_system.abs() > torch.finfo(compute_dtype).eps,
-            schur_rhs / schur_system,
-            torch.zeros_like(schur_system),
-        )
-        key_weight_by_output = inverse_key_rhs - (
-            inverse_cross * history_weight[..., None]
-        )
-        bias = target_mean - torch.einsum(
-            "hi,hoi->ho", key_mean, key_weight_by_output
-        )
-        bias.sub_(history_mean * history_weight)
-        fitted_key_weights.append(key_weight_by_output.transpose(-2, -1))
-        fitted_history_weights.append(history_weight)
-        fitted_biases.append(bias)
-
-    return CrossKVParameters(
-        weight=torch.stack(fitted_key_weights)
-        .to(device=values.device, dtype=torch.float32)
-        .contiguous(),
-        bias=torch.stack(fitted_biases)
-        .to(device=values.device, dtype=torch.float32)
-        .contiguous(),
-        stride=stride,
-        layer_ids=layer_ids,
-        history_weights=torch.stack(fitted_history_weights)
-        .to(device=values.device, dtype=torch.float32)
-        .contiguous(),
-        maximum_history_length=maximum_v_history_length,
-    )
-
-
 def _quantization_roundtrip(
     value: torch.Tensor,
     *,
@@ -1412,13 +1073,7 @@ def _reconstruct_temporal_trace(
     frame_count = int(clean_keys.shape[-3])
     head_count = int(clean_keys.shape[-2])
     dim = int(clean_keys.shape[-1])
-    if parameters.shared_history:
-        expected_tail = (head_count, dim)
-        if tuple(parameters.history_weights.shape[-2:]) != expected_tail:
-            raise ValueError(
-                "shared temporal parameters do not match trace heads/head dimension"
-            )
-    elif parameters.per_head:
+    if parameters.per_head:
         if tuple(parameters.history_weights.shape[-2:]) != (head_count, dim):
             raise ValueError(
                 "per-head temporal parameters do not match trace heads/head dimension"
@@ -1469,60 +1124,43 @@ def _reconstruct_temporal_trace(
     )
     temporal_weight = parameters.history_weights.to(clean_keys.device)
     temporal_bias = parameters.history_bias.to(clean_keys.device)
-    if parameters.shared_history:
-        shared_shape = layered_shape if parameters.layered else per_head_shape
-        temporal_weight = temporal_weight.view(shared_shape)
-        temporal_bias = temporal_bias.view(shared_shape)
-        scaled_temporal_weights = tuple(
-            temporal_weight / order
-            for order in range(1, parameters.history_length + 1)
-        )
     for frame in range(1, frame_count):
         order = min(frame, parameters.history_length)
-        if parameters.shared_history:
-            prediction = torch.zeros_like(
-                clean_keys[..., frame, :, :], dtype=torch.float32
-            )
-            for lag in range(1, order + 1):
-                prediction.add_(rebuilt[..., frame - lag, :, :])
-            prediction.mul_(scaled_temporal_weights[order - 1])
-            prediction.add_(temporal_bias)
+        if parameters.layered:
+            bias = temporal_bias[:, order - 1].view(layered_shape)
+            selected = temporal_weight[:, order - 1, :order]
+            coefficient_shape = layered_shape
+        elif parameters.per_head:
+            bias = temporal_bias[order - 1].view(per_head_shape)
+            selected = temporal_weight[order - 1, :order]
+            coefficient_shape = per_head_shape
         else:
-            if parameters.layered:
-                bias = temporal_bias[:, order - 1].view(layered_shape)
-                selected = temporal_weight[:, order - 1, :order]
-                coefficient_shape = layered_shape
-            elif parameters.per_head:
-                bias = temporal_bias[order - 1].view(per_head_shape)
-                selected = temporal_weight[order - 1, :order]
-                coefficient_shape = per_head_shape
-            else:
-                bias = temporal_bias[order - 1].view(channel_shape)
-                selected = temporal_weight[order - 1, :order]
-                coefficient_shape = channel_shape
-            prediction = torch.zeros_like(
-                clean_keys[..., frame, :, :], dtype=torch.float32
+            bias = temporal_bias[order - 1].view(channel_shape)
+            selected = temporal_weight[order - 1, :order]
+            coefficient_shape = channel_shape
+        prediction = torch.zeros_like(
+            clean_keys[..., frame, :, :], dtype=torch.float32
+        )
+        for lag in range(1, order + 1):
+            coefficient = (
+                selected[..., lag - 1, :, :]
+                if parameters.layered
+                else selected[lag - 1]
             )
-            for lag in range(1, order + 1):
-                coefficient = (
-                    selected[..., lag - 1, :, :]
-                    if parameters.layered
-                    else selected[lag - 1]
+            coefficient = coefficient.view(coefficient_shape)
+            if legacy_math:
+                prediction = prediction + (
+                    rebuilt[..., frame - lag, :, :].float() * coefficient
                 )
-                coefficient = coefficient.view(coefficient_shape)
-                if legacy_math:
-                    prediction = prediction + (
-                        rebuilt[..., frame - lag, :, :].float() * coefficient
-                    )
-                else:
-                    prediction.add_(
-                        rebuilt[..., frame - lag, :, :] * coefficient
-                    )
-            prediction = (
-                prediction + bias
-                if legacy_math
-                else prediction.add_(bias)
-            )
+            else:
+                prediction.add_(
+                    rebuilt[..., frame - lag, :, :] * coefficient
+                )
+        prediction = (
+            prediction + bias
+            if legacy_math
+            else prediction.add_(bias)
+        )
         residual = clean_keys[..., frame, :, :].float() - prediction
         residual_rebuilt = _quantization_roundtrip(
             residual,
@@ -1679,34 +1317,25 @@ def _reconstruct_cross_kv_trace(
                 )
                 prediction.add_(bias)
             order = min(frame, parameters.history_length)
-            if parameters.shared_history and order:
-                scale = 1.0 / order
-                for lag in range(1, order + 1):
-                    prediction.addcmul_(
-                        rebuilt[..., frame - lag, :, :],
-                        history_weights.view(broadcast_shape),
-                        value=scale,
+            for lag in range(1, order + 1):
+                if parameters.history_diagonal:
+                    history_term = (
+                        history_weights[:, lag - 1].view(broadcast_shape)
+                        * rebuilt[..., frame - lag, :, :].float()
                     )
-            else:
-                for lag in range(1, order + 1):
-                    if parameters.history_diagonal:
-                        history_term = (
-                            history_weights[:, lag - 1].view(broadcast_shape)
-                            * rebuilt[..., frame - lag, :, :].float()
+                    prediction = (
+                        prediction + history_term
+                        if legacy_math
+                        else prediction.add_(history_term)
+                    )
+                else:
+                    prediction.add_(
+                        torch.einsum(
+                            "l...hi,lhij->l...hj",
+                            rebuilt[..., frame - lag, :, :].float(),
+                            history_weights[:, lag - 1],
                         )
-                        prediction = (
-                            prediction + history_term
-                            if legacy_math
-                            else prediction.add_(history_term)
-                        )
-                    else:
-                        prediction.add_(
-                            torch.einsum(
-                                "l...hi,lhij->l...hj",
-                                rebuilt[..., frame - lag, :, :].float(),
-                                history_weights[:, lag - 1],
-                            )
-                        )
+                    )
             residual = clean_values[..., frame, :, :].float() - prediction
             residual_rebuilt = _quantization_roundtrip(
                 residual,
@@ -1913,8 +1542,6 @@ def _stamp_parameter_identity(
         signature,
         parameter_set_id,
         coordinate_system,
-        temporal.maximum_history_length,
-        temporal.active_history_length,
     )
     if isinstance(cross, TemporalParameters):
         return stamped_k, TemporalParameters(
@@ -1925,8 +1552,6 @@ def _stamp_parameter_identity(
             signature,
             parameter_set_id,
             coordinate_system,
-            cross.maximum_history_length,
-            cross.active_history_length,
         )
     return stamped_k, CrossKVParameters(
         cross.weight,
@@ -1937,8 +1562,6 @@ def _stamp_parameter_identity(
         parameter_set_id,
         coordinate_system,
         cross.history_weights,
-        cross.maximum_history_length,
-        cross.active_history_length,
     )
 
 
@@ -2089,186 +1712,21 @@ def _fit_legacy_predictors(
     )
 
 
-def _fit_shared_predictors(
-    keys: torch.Tensor,
-    values: torch.Tensor,
-    *,
-    config: CodecConfig,
-    maximum_k_history_length: int,
-    maximum_v_history_length: int,
-    iterations: int,
-    temporal_ridge: float,
-    cross_ridge: float,
-    max_gain: float,
-    layer_ids: tuple[int, ...] | None,
-    coordinate_system: str | None,
-) -> tuple[TemporalParameters, CrossKVParameters]:
-    """Fit compact shared maps against every supported runtime history length."""
-    layer_count = int(keys.shape[0])
-    head_count = int(keys.shape[-2])
-    dim = int(keys.shape[-1])
-    signature = config.shared_format_signature()
-    temporal = TemporalParameters(
-        history_weights=torch.ones(
-            layer_count,
-            head_count,
-            dim,
-            dtype=torch.float32,
-            device=keys.device,
-        ),
-        history_bias=torch.zeros(
-            layer_count,
-            head_count,
-            dim,
-            dtype=torch.float32,
-            device=keys.device,
-        ),
-        stride=config.stride,
-        layer_ids=layer_ids,
-        codec_signature=signature,
-        maximum_history_length=maximum_k_history_length,
-    )
+def temporal_v_obstacle(config: CodecConfig) -> str | None:
+    """Explain why this config cannot fit a temporal V predictor, or return None.
 
-    def reconstruct_keys(
-        parameters: TemporalParameters,
-    ) -> dict[int, torch.Tensor]:
-        """Roll out the exact decoder-visible K state for every active K history."""
-        return {
-            history_length: _reconstruct_temporal_trace(
-                keys,
-                parameters.with_history_length(history_length),
-                replace(config, k_history_length=history_length),
-            )
-            for history_length in range(1, maximum_k_history_length + 1)
-        }
-
-    for _ in range(iterations):
-        # A shared coefficient map is used with different closed-loop states at
-        # runtime.  Fitting every active length from the maximum-length rollout
-        # would silently train kh1/kh2 on a state that they never see at decode.
-        reconstructed_keys = reconstruct_keys(temporal)
-        fitted_temporal = fit_shared_temporal_layers(
-            reconstructed_keys,
-            keys,
-            maximum_history_length=maximum_k_history_length,
-            ridge=temporal_ridge,
-            max_gain=max_gain,
-            stride=config.stride,
-            layer_ids=layer_ids,
+    The codec *decodes* temporal V under any fitting mode, but only the legacy
+    fitter produces those parameters; a native fit would silently return CrossKV
+    parameters that the codec then rejects.  Callers use this to fail before
+    loading a trace, so the rule lives here rather than in each entry point.
+    """
+    if config.v_predictor_mode == "temporal" and config.fit_mode != "legacy":
+        return (
+            "v_predictor_mode=temporal is currently fitted only by "
+            "fit_mode=legacy; use a legacy config (k_predictor_mode=shared, "
+            "cross_matmul_precision=ieee) or switch to v_predictor_mode=cross_kv"
         )
-        temporal = TemporalParameters(
-            history_weights=fitted_temporal.history_weights,
-            history_bias=fitted_temporal.history_bias,
-            stride=fitted_temporal.stride,
-            layer_ids=fitted_temporal.layer_ids,
-            codec_signature=signature,
-            maximum_history_length=maximum_k_history_length,
-        )
-        del reconstructed_keys
-
-    reconstructed_keys = reconstruct_keys(temporal)
-
-    # Start from the same K-only regression as the legacy fitter.  Wrapping a
-    # zero shared history map avoids allocating a full zero V trace.  The
-    # maximum-length K state is only an initializer; every K history is used in
-    # the shared CrossKV refit below.
-    reconstructed_key = reconstructed_keys[maximum_k_history_length]
-    initial_cross = fit_cross_kv(
-        reconstructed_key[..., 1:, :, :],
-        values[..., 1:, :, :],
-        ridge=cross_ridge,
-        stride=config.stride,
-        layer_ids=layer_ids,
-    )
-    cross = CrossKVParameters(
-        initial_cross.weight,
-        initial_cross.bias,
-        initial_cross.stride,
-        initial_cross.layer_ids,
-        signature,
-        history_weights=torch.zeros(
-            layer_count,
-            head_count,
-            dim,
-            device=keys.device,
-            dtype=torch.float32,
-        ),
-        maximum_history_length=maximum_v_history_length,
-    )
-
-    # Fit at least once even for vh0.  For positive V histories, each (kh, vh)
-    # pair must be reconstructed from its own K state and active V history;
-    # reusing only the maximum-length rollout makes the resulting parameters
-    # inconsistent with the runtime state they are meant to decode.
-    for _ in range(max(1, iterations)):
-        reconstructed_values = {
-            (k_history, v_history): _reconstruct_cross_kv_trace(
-                reconstructed_keys[k_history],
-                values,
-                cross.with_history_length(v_history),
-                replace(
-                    config,
-                    k_history_length=k_history,
-                    v_history_length=v_history,
-                ),
-            )
-            for k_history in reconstructed_keys
-            for v_history in range(maximum_v_history_length + 1)
-        }
-        fitted_cross = fit_shared_cross_kv(
-            reconstructed_keys,
-            values,
-            reconstructed_values,
-            maximum_v_history_length=maximum_v_history_length,
-            ridge=cross_ridge,
-            stride=config.stride,
-            layer_ids=layer_ids,
-        )
-        cross = CrossKVParameters(
-            weight=fitted_cross.weight,
-            bias=fitted_cross.bias,
-            stride=fitted_cross.stride,
-            layer_ids=fitted_cross.layer_ids,
-            codec_signature=signature,
-            history_weights=fitted_cross.history_weights,
-            maximum_history_length=maximum_v_history_length,
-        )
-        del reconstructed_values
-
-    identity = hashlib.sha256()
-    identity.update(signature.encode("utf-8"))
-    identity.update((coordinate_system or "unspecified").encode("utf-8"))
-    for tensor in (
-        temporal.history_weights,
-        temporal.history_bias,
-        cross.weight,
-        cross.history_weights,
-        cross.bias,
-    ):
-        identity.update(tensor.detach().cpu().contiguous().numpy().tobytes())
-    parameter_set_id = identity.hexdigest()
-    temporal = TemporalParameters(
-        temporal.history_weights,
-        temporal.history_bias,
-        temporal.stride,
-        temporal.layer_ids,
-        signature,
-        parameter_set_id,
-        coordinate_system,
-        maximum_k_history_length,
-    )
-    cross = CrossKVParameters(
-        cross.weight,
-        cross.bias,
-        cross.stride,
-        cross.layer_ids,
-        signature,
-        parameter_set_id,
-        coordinate_system,
-        cross.history_weights,
-        maximum_v_history_length,
-    )
-    return temporal, cross
+    return None
 
 
 @torch.no_grad()
@@ -2365,59 +1823,6 @@ def _fit_predictors(
     # rather than after a full closed-loop K fit.
     if v_history_mode not in ("dense", "diagonal"):
         raise ValueError("v_history_mode must be 'dense' or 'diagonal'")
-    shared_history = (
-        resolved.k_max_history_length is not None
-        or resolved.v_max_history_length is not None
-    )
-    if shared_history:
-        maximum_k_history_length = (
-            resolved.k_max_history_length
-            if resolved.k_max_history_length is not None
-            else (
-                history_length
-                if history_length is not None
-                else resolved.k_history_length or 3
-            )
-        )
-        maximum_v_history_length = (
-            resolved.v_max_history_length
-            if resolved.v_max_history_length is not None
-            else resolved.v_history_length
-        )
-        if (
-            history_length is not None
-            and history_length != maximum_k_history_length
-        ):
-            raise ValueError(
-                "history_length does not match config.k_max_history_length"
-            )
-        frame_count = int(keys.shape[-3])
-        if maximum_k_history_length >= frame_count:
-            raise ValueError(
-                "k_max_history_length must be smaller than the trace frame count"
-            )
-        if maximum_v_history_length >= frame_count:
-            raise ValueError(
-                "v_max_history_length must be smaller than the trace frame count"
-            )
-        shared_config = replace(
-            resolved,
-            k_max_history_length=maximum_k_history_length,
-            v_max_history_length=maximum_v_history_length,
-        )
-        return _fit_shared_predictors(
-            keys,
-            values,
-            config=shared_config,
-            maximum_k_history_length=maximum_k_history_length,
-            maximum_v_history_length=maximum_v_history_length,
-            iterations=iterations,
-            temporal_ridge=temporal_ridge,
-            cross_ridge=cross_ridge,
-            max_gain=max_gain,
-            layer_ids=layer_ids,
-            coordinate_system=coordinate_system,
-        )
     configured_k_history = resolved.k_history_length
     if history_length is None:
         history_length = 3 if configured_k_history is None else configured_k_history
@@ -2444,16 +1849,15 @@ def _fit_predictors(
         raise ValueError(
             "config.v_history_length must be smaller than the trace frame count"
         )
-    if resolved.v_predictor_mode == "temporal" and resolved.fit_mode != "legacy":
-        # The codec decodes temporal V at any scale, but only the legacy fitter
-        # produces temporal V parameters.  Say so here rather than let the
-        # native fitters return CrossKV parameters the codec will reject.
-        raise ValueError(
-            "v_predictor_mode=temporal is currently fitted only by "
-            "fit_mode=legacy"
-        )
+    unfittable = temporal_v_obstacle(resolved)
+    if unfittable is not None:
+        raise ValueError(unfittable)
     if resolved.fit_mode == "legacy":
-        if resolved.v_history_length and v_history_mode != "diagonal":
+        if (
+            resolved.v_predictor_mode == "cross_kv"
+            and resolved.v_history_length
+            and v_history_mode != "diagonal"
+        ):
             raise ValueError(
                 "legacy VH1 fitting requires v_history_mode='diagonal'"
             )
@@ -2624,8 +2028,7 @@ __all__ = [
     "fit_cross_kv_parameters",
     "fit_closed_loop",
     "fit_predictors",
-    "fit_shared_cross_kv",
-    "fit_shared_temporal_layers",
+    "temporal_v_obstacle",
     "fit_temporal",
     "fit_temporal_layers",
     "fit_temporal_parameters",

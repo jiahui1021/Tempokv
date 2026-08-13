@@ -44,12 +44,67 @@ def _write_metrics(
     temporary.replace(path)
 
 
+def _write_profile(
+    profile_dir: Path,
+    *,
+    rank: int,
+    profile,
+    instrumentation: dict[str, str],
+    decode_routes: dict[str, int],
+    wall_seconds: float,
+    gpu_name: str,
+) -> None:
+    profile_dir = profile_dir.expanduser().resolve()
+    profile_dir.mkdir(parents=True, exist_ok=True)
+    payload = profile.report()
+    payload.update(
+        {
+            "rank": rank,
+            "gpu_name": gpu_name,
+            "wall_seconds": wall_seconds,
+            "instrumentation": instrumentation,
+            "decode_routes": decode_routes,
+        }
+    )
+    path = profile_dir / f"rank-{rank}.json"
+    temporary = profile_dir / f"rank-{rank}.json.tmp"
+    temporary.write_text(
+        json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    temporary.replace(path)
+
+
+def _install_profile(device_index: int | None):
+    """Bracket the hot path with CUDA-event sections for one worker.
+
+    The targets live in modules that ``inference.py`` imports on its own, so they
+    are imported here first: a BF16 baseline run installs no bridge and would
+    otherwise have nothing to patch yet.
+    """
+    import importlib
+
+    import torch
+
+    from tempokv.profiling import RuntimeProfile, install
+
+    importlib.import_module("utils.wan_wrapper")
+    importlib.import_module("pipeline.causal_inference")
+    device = None if device_index is None else torch.device("cuda", device_index)
+    profile = RuntimeProfile(device)
+    return profile, install(profile)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Run one distributed Self-Forcing inference worker."
     )
     parser.add_argument(
         "--mode", choices=("tempokv", "bf16", "trace"), default="tempokv"
+    )
+    parser.add_argument(
+        "--profile",
+        type=Path,
+        help="write a per-section CUDA-event runtime breakdown to this directory",
     )
     parser.add_argument("arguments", nargs=argparse.REMAINDER)
     args = parser.parse_args(argv)
@@ -86,6 +141,8 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     started = time.perf_counter()
     generation_wall_seconds: float | None = None
+    profile = None
+    instrumentation: dict[str, str] = {}
     try:
         if args.mode == "tempokv":
             cache_root = os.environ.get("TEMPOKV_TRITON_CACHE")
@@ -103,6 +160,10 @@ def main(argv: Sequence[str] | None = None) -> int:
 
             install(runtime_root)
             arguments.append("--skip_video_save")
+        if args.profile is not None:
+            profile, instrumentation = _install_profile(
+                cuda_device if cuda_available else None
+            )
         sys.argv = [str(inference), *arguments]
         runtime_namespace = runpy.run_path(str(inference), run_name="__main__")
         measured = (
@@ -141,6 +202,21 @@ def main(argv: Sequence[str] | None = None) -> int:
                 decode_routes = route_report()
             except Exception:
                 pass
+        if profile is not None:
+            # A profile that fails to serialize must not lose the generation it
+            # measured, so the metrics write below still runs.
+            try:
+                _write_profile(
+                    args.profile,
+                    rank=rank,
+                    profile=profile,
+                    instrumentation=instrumentation,
+                    decode_routes=decode_routes,
+                    wall_seconds=wall_seconds,
+                    gpu_name=gpu_name,
+                )
+            except OSError as error:
+                print(f"[worker] could not write profile: {error}", file=sys.stderr)
         if metrics_dir is not None:
             try:
                 _write_metrics(

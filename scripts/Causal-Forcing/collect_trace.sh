@@ -42,7 +42,7 @@ generation_mode="${GENERATION_MODE:-chunkwise}"
 case "$generation_mode" in
   chunkwise) frames_per_block=3 ;;
   framewise) frames_per_block=1 ;;
-  *) die "GENERATION_MODE 必须是 chunkwise 或 framewise（当前值：$generation_mode）" ;;
+  *) die "GENERATION_MODE 必须是 chunkwise 或 framewise（当前值：${generation_mode}）" ;;
 esac
 
 runtime_root="$project_root/experiments/Causal-Forcing"
@@ -77,10 +77,10 @@ check_flag DRY_RUN
 check_flag USE_EMA
 check_int TRACE_FRAMES "$frames_per_block"
 (( TRACE_FRAMES % frames_per_block == 0 )) || \
-  die "TRACE_FRAMES 必须是 $frames_per_block 的倍数（当前值：$TRACE_FRAMES）"
+  die "TRACE_FRAMES 必须是 $frames_per_block 的倍数（当前值：${TRACE_FRAMES}）"
 check_int TRACE_TOKENS_PER_FRAME 1
 (( TRACE_TOKENS_PER_FRAME <= 1560 )) || \
-  die "TRACE_TOKENS_PER_FRAME 必须 <= 1560（当前值：$TRACE_TOKENS_PER_FRAME）"
+  die "TRACE_TOKENS_PER_FRAME 必须 <= 1560（当前值：${TRACE_TOKENS_PER_FRAME}）"
 check_int NUM_GPUS 1
 check_int BASE_SEED 0
 
@@ -131,12 +131,12 @@ fi
 
 if [[ "$OVERWRITE" != "1" ]]; then
   if [[ -e "$trace_file" ]]; then
-    die "已存在拟合输入：$trace_file。设置 OVERWRITE=1 覆盖，或换一个 TRACE_FILE。"
+    die "已存在拟合输入：${trace_file}。设置 OVERWRITE=1 覆盖，或换一个 TRACE_FILE。"
   fi
   if [[ -d "$raw_trace_dir" ]]; then
     existing="$(find "$raw_trace_dir" -type f -name 'layer_*.npz' -print -quit)"
     if [[ -n "$existing" ]]; then
-      die "已存在逐层 trace：$existing。设置 OVERWRITE=1 覆盖，或换一个 TRACE_DIR。"
+      die "已存在逐层 trace：${existing}。设置 OVERWRITE=1 覆盖，或换一个 TRACE_DIR。"
     fi
   fi
 fi

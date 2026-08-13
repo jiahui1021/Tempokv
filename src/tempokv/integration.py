@@ -5,7 +5,9 @@ import os
 from pathlib import Path
 
 from .codec import TempoKVCodec
-from .config import CodecConfig
+from typing import Any, Mapping
+
+from .config import CodecConfig, config_from_mapping
 from .parameters import (
     CrossKVParameters,
     TemporalParameters,
@@ -29,11 +31,7 @@ def check_parameters_match_config(
     Hand-built parameters carry no stamp; those are left alone, since there is
     nothing to compare against.
     """
-    expected = (
-        config.shared_format_signature()
-        if temporal.shared_history
-        else config.format_signature()
-    )
+    expected = config.format_signature()
     for name, parameters in (("K", temporal), ("V", cross_kv)):
         signature = parameters.codec_signature
         if signature is not None and signature != expected:
@@ -42,8 +40,6 @@ def check_parameters_match_config(
                 f"run is configured as {expected!r}; refit them or point at the "
                 "parameter directory that matches this config"
             )
-    if temporal.shared_history != cross_kv.shared_history:
-        raise ValueError("K and V parameters must use the same history sharing mode")
     if temporal.parameter_set_id != cross_kv.parameter_set_id:
         # One stamped and one unstamped file means a freshly fitted parameter
         # was paired with a leftover from an older run. Both being unstamped is
@@ -70,8 +66,15 @@ def load_codec(
     v_parameters_path: str | Path,
     *,
     triton_cache: str | Path | None = None,
+    overrides: Mapping[str, Any] | None = None,
 ) -> TempoKVCodec:
-    """Load a model-ready codec from JSON and fitted parameter files."""
+    """Load a model-ready codec from JSON and fitted parameter files.
+
+    ``overrides`` replaces individual codec settings after the file is read, so
+    one committed config can serve every bit width instead of needing a second
+    file per combination.  The override participates in the codec signature, so
+    a mismatched parameter directory still fails the check below.
+    """
     with Path(config_path).open("r", encoding="utf-8") as handle:
         payload = json.load(handle)
     if not isinstance(payload, dict):
@@ -80,7 +83,9 @@ def load_codec(
         if len(payload) != 1 or not isinstance(payload["codec"], dict):
             raise ValueError("'codec' must be the only top-level config object")
         payload = payload["codec"]
-    config = CodecConfig(**payload)
+    if overrides:
+        payload = {**payload, **overrides}
+    config = config_from_mapping(payload)
     if config.use_triton:
         configure_triton_cache(triton_cache)
     temporal = TemporalParameters.load(k_parameters_path)

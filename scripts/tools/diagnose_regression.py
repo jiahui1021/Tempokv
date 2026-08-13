@@ -12,7 +12,7 @@ later stages inherit the earlier stage's damage and are not independent evidence
 
     python scripts/tools/diagnose_regression.py \
         --trace runs/.../self_forcing_trace.npz \
-        --config configs/int4.json \
+        --config configs/self_forcing.json \
         --k-params <params>/k_temporal.npz \
         --v-params <params>/v_cross_kv.npz
 """
@@ -108,20 +108,13 @@ def main() -> None:
     cross_kv = CrossKVParameters.load(args.v_params)
 
     print("=== parameter identity ===")
-    print(f"  K history_mode      : {temporal.history_mode}")
     print(f"  K weights shape     : {tuple(temporal.history_weights.shape)}")
-    print(f"  K history_length    : {temporal.history_length}"
-          f" (max {temporal.max_history_length})")
+    print(f"  K history_length    : {temporal.history_length}")
     print(f"  K per_head          : {temporal.per_head}")
     print(f"  V history_mode      : {cross_kv.history_mode}")
-    print(f"  V history_length    : {cross_kv.history_length}"
-          f" (max {cross_kv.max_history_length})")
+    print(f"  V history_length    : {cross_kv.history_length}")
     print(f"  coordinate_system   : {temporal.coordinate_system}")
     print(f"  codec_signature     : {temporal.codec_signature}")
-    if temporal.shared_history:
-        print("  !! shared history: prediction collapses to w*mean(history)+b,")
-        print("     which has no legacy counterpart and loses per-lag structure.")
-        print("     Refit without --k-max-history-length for a legacy comparison.")
 
     # The fitter caps each channel's L1 gain across lags at --max-gain. A cap
     # of 1.0 forbids extrapolation (lag-1 above 1 against negative higher
@@ -131,10 +124,7 @@ def main() -> None:
     # -3 whenever a head axis is present and -2 otherwise.  `per_head` cannot be
     # used here because it only reads correctly after a layer is selected.
     weights = temporal.history_weights
-    if temporal.shared_history:
-        gains = weights.abs()  # one coefficient per channel, no lag axis
-    else:
-        gains = weights.abs().sum(dim=-3 if weights.ndim >= 4 else -2)
+    gains = weights.abs().sum(dim=-3 if weights.ndim >= 4 else -2)
     for threshold in (1.0,):
         at_cap = (gains >= threshold - 1e-6).float().mean().item()
         print(f"  fitted L1 gain      : max {gains.max().item():.3f}, "

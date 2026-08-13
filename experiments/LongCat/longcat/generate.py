@@ -76,7 +76,31 @@ def _parser() -> argparse.ArgumentParser:
             "1560 for CP=1 or runtime validation for CP>1"
         ),
     )
+    # Bit width is an override rather than a second committed config.  Stride
+    # deliberately is not: --stride above is cross-checked against the config to
+    # catch a CP degree paired with the wrong cache geometry, and overriding the
+    # config from the same flag would make that check compare a value with
+    # itself.
+    parser.add_argument("--k-bits", type=int, choices=(2, 4, 8))
+    parser.add_argument("--v-bits", type=int, choices=(2, 4, 8))
+    parser.add_argument(
+        "--v-predictor-mode",
+        choices=("cross_kv", "temporal"),
+        help="predict V from reconstructed K (cross_kv) or from its own history",
+    )
     return parser
+
+
+def _codec_overrides(known) -> dict[str, object]:
+    return {
+        name: value
+        for name, value in (
+            ("k_bits", known.k_bits),
+            ("v_bits", known.v_bits),
+            ("v_predictor_mode", known.v_predictor_mode),
+        )
+        if value is not None
+    }
 
 
 def _option_value(arguments: list[str], name: str) -> str | None:
@@ -282,6 +306,7 @@ def run(argv: Sequence[str] | None = None) -> int:
         if known.config is None or known.k_params is None or known.v_params is None:
             parser.error("tempokv mode requires --config, --k-params, and --v-params")
         bridge = install_longcat_bridge(
+            codec_overrides=_codec_overrides(known),
             config_path=known.config,
             k_parameters_path=known.k_params,
             v_parameters_path=known.v_params,

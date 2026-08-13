@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import Literal
 import warnings
 
@@ -137,16 +137,6 @@ def predict_temporal(
     if parameters.layered:
         raise ValueError("select one layer before using temporal parameters")
     order = min(len(history), parameters.history_length)
-    if parameters.shared_history:
-        prediction = torch.zeros_like(history[0], dtype=torch.float32)
-        for previous in history[:order]:
-            prediction.add_(previous)
-        prediction.mul_(
-            parameters.history_weights.to(history[0].device)[None, :, None, :]
-            / order
-        )
-        prediction.add_(parameters.history_bias.to(history[0].device)[None, :, None, :])
-        return prediction
     weights = parameters.history_weights[order - 1, :order].to(history[0].device)
     bias = parameters.history_bias[order - 1].to(history[0].device)
     prediction = torch.zeros_like(history[0], dtype=torch.float32)
@@ -260,17 +250,7 @@ def predict_cross_kv(
         else:
             prediction = torch.matmul(source.float(), weight)
             prediction.add_(bias[None, :, None, :])
-        if parameters.shared_history and order:
-            history_weight = parameters.history_weights.to(source.device)
-            scale = 1.0 / order
-            for previous in resolved_history[:order]:
-                prediction.addcmul_(
-                    previous,
-                    history_weight[None, :, None, :],
-                    value=scale,
-                )
-        else:
-            for lag, previous in enumerate(resolved_history[:order]):
+        for lag, previous in enumerate(resolved_history[:order]):
                 history_weight = parameters.history_weights[lag].to(source.device)
                 if parameters.history_diagonal:
                     if legacy:
@@ -867,48 +847,11 @@ class TempoKVCodec:
                 f"v_predictor_mode={self.config.v_predictor_mode} requires V "
                 f"parameters of type {expected}, got {type(cross_kv).__name__}"
             )
-        if temporal.shared_history != cross_kv.shared_history:
-            raise ValueError("K and V parameters must use the same history sharing mode")
-        if temporal.shared_history:
-            if (
-                self.config.k_max_history_length is not None
-                and temporal.max_history_length != self.config.k_max_history_length
-            ):
-                raise ValueError(
-                    "K parameters do not match config.k_max_history_length"
-                )
-            if (
-                self.config.v_max_history_length is not None
-                and cross_kv.max_history_length != self.config.v_max_history_length
-            ):
-                raise ValueError(
-                    "V parameters do not match config.v_max_history_length"
-                )
-            # The maxima describe the fitted parameter set, not the active
-            # runtime choice.  Fill omitted maxima from the files so callers
-            # only need to override k_history_length/v_history_length.
-            self.config = replace(
-                self.config,
-                k_max_history_length=temporal.max_history_length,
-                v_max_history_length=cross_kv.max_history_length,
-            )
-        elif (
-            self.config.k_max_history_length is not None
-            or self.config.v_max_history_length is not None
-        ):
-            raise ValueError(
-                "history maxima require shared K and V parameter files; refit "
-                "the predictors with the current config"
-            )
         temporal = temporal.with_history_length(self.config.k_history_length)
         cross_kv = cross_kv.with_history_length(self.config.v_history_length)
         self.temporal = temporal
         self.v_parameters = cross_kv
-        expected_signature = (
-            self.config.shared_format_signature()
-            if temporal.shared_history
-            else self.config.format_signature()
-        )
+        expected_signature = self.config.format_signature()
         for name, parameters in (("K", self.temporal), ("V", self.v_parameters)):
             signature = parameters.codec_signature
             if signature is not None and signature != expected_signature:

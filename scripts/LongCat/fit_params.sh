@@ -3,18 +3,20 @@
 # fit_params.sh — 只拟合 TempoKV 参数（读 trace，不采集、不合并）
 #
 # 读取 collect_trace.sh 合并出的 clean_trace.npz，调用通用的
-# scripts/common/fit_params.py 拟合 k_temporal.npz 与 v_cross_kv.npz。
+# scripts/common/fit_params.py 拟合 k_temporal.npz 与 V 参数
+#（v_cross_kv.npz 或 v_temporal.npz，取决于 v_predictor_mode）。
 #
 # 输出目录默认从 CONFIG 推导（与 Self-Forcing、Causal Forcing 一致），因此
 # INT4 与 INT2 不会互相覆盖。
 #
 # 用法：
-#   CONFIG=configs/longcat_int4.json \
+#   CONFIG=configs/longcat.json \
 #   bash scripts/LongCat/fit_params.sh
 #
 # 常用可选变量：
 #   TRACE_FILE / TRACE  拟合输入（默认 data/longcat/trace/clean_trace.npz）
 #   OUTPUT_DIR          输出目录（默认 data/longcat/params/<参数方案>）
+#   BITS / K_BITS / V_BITS  位宽 override（2/4/8；默认读取 CONFIG）
 #   K_HISTORY_LENGTH / V_HISTORY_LENGTH  历史长度（默认读取 CONFIG），可简写 KH / VH
 #   PARAM_NAME          直接指定参数方案目录名
 #   FIT_DEVICE          拟合设备（默认 auto：有 CUDA 就用 GPU，否则回退 CPU 并告警）
@@ -30,11 +32,20 @@ source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)/_common.sh"
 
 K_HISTORY_LENGTH="$(resolve_history K_HISTORY_LENGTH KH)"
 V_HISTORY_LENGTH="$(resolve_history V_HISTORY_LENGTH VH)"
+K_BITS="$(resolve_bits K_BITS)"
+V_BITS="$(resolve_bits V_BITS)"
+# V_PREDICTOR overrides the config so one file covers both predictors.
+if [[ -n "${V_PREDICTOR:-}" ]]; then
+  case "$V_PREDICTOR" in
+    cross_kv|temporal) ;;
+    *) die "V_PREDICTOR 必须是 cross_kv 或 temporal（当前值：${V_PREDICTOR}）" ;;
+  esac
+fi
 
 # collect_trace.sh 写出的是 TRACE_FILE；TRACE 是本脚本的旧名字，继续支持。
 trace="$(resolve_path "${TRACE_FILE:-${TRACE:-data/longcat/trace/clean_trace.npz}}")"
-config="$(resolve_path "${CONFIG:-configs/longcat_int4.json}")"
-parameter_name="${PARAM_NAME:-$(codec_slug "$config" "${K_HISTORY_LENGTH:-}" "${V_HISTORY_LENGTH:-}")}"
+config="$(resolve_path "${CONFIG:-configs/longcat.json}")"
+parameter_name="${PARAM_NAME:-$(codec_slug "$config" "${K_HISTORY_LENGTH:-}" "${V_HISTORY_LENGTH:-}" "${K_BITS:-}" "${V_BITS:-}" "" "${V_PREDICTOR:-}")}"
 output_dir="$(resolve_path "${OUTPUT_DIR:-data/longcat/params/$parameter_name}")"
 
 if [[ "$output_dir" == "/" ]]; then
@@ -65,6 +76,9 @@ fit_command=(
 )
 [[ -n "${K_HISTORY_LENGTH:-}" ]] && fit_command+=(--k-history-length "$K_HISTORY_LENGTH")
 [[ -n "${V_HISTORY_LENGTH:-}" ]] && fit_command+=(--v-history-length "$V_HISTORY_LENGTH")
+[[ -n "${K_BITS:-}" ]] && fit_command+=(--k-bits "$K_BITS")
+[[ -n "${V_BITS:-}" ]] && fit_command+=(--v-bits "$V_BITS")
+[[ -n "${V_PREDICTOR:-}" ]] && fit_command+=(--v-predictor-mode "$V_PREDICTOR")
 
 if [[ "$DRY_RUN" == "1" ]]; then
   printf '[fit_params] 干跑模式：打印将要执行的命令，不执行\n'
@@ -74,6 +88,6 @@ if [[ "$DRY_RUN" == "1" ]]; then
   exit 0
 fi
 
-[[ -f "$trace" ]] || die "TRACE_FILE 不存在：$trace（先跑 collect_trace.sh）"
+[[ -f "$trace" ]] || die "TRACE_FILE 不存在：${trace}（先跑 collect_trace.sh）"
 
 exec "${fit_command[@]}" "$@"

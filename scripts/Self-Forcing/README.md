@@ -116,7 +116,7 @@ cross_source_kind    normalized
 ## 2. 拟合参数
 
 ```bash
-CONFIG=configs/int2.json \
+CONFIG=configs/self_forcing.json \
 KH=2 \
 VH=1 \
 bash scripts/Self-Forcing/fit_params.sh
@@ -143,7 +143,7 @@ data/self-forcing/params/legacy-kh2-vh1-int2/v_cross_kv.npz
 CHECKPOINT=/models/self_forcing_dmd.pt \
 WAN_MODEL_DIR=/models/Wan2.1-T2V-1.3B \
 PROMPTS=assets/generation_prompts.txt \
-CONFIG=configs/int2.json \
+CONFIG=configs/self_forcing.json \
 KH=2 \
 VH=1 \
 FRAMES=717 \
@@ -201,6 +201,19 @@ CPU 拟合同时会把方程降到 float64，比看上去慢得多，所以回�
 
 `K_HISTORY_LENGTH` / `V_HISTORY_LENGTH` 可以简写成 `KH` / `VH`，效果相同；
 两个名字都设置且取值不同会直接报错。不设置时读 `CONFIG` 里的值（默认 `kh=2`、`vh=1`）。
+
+位宽是命令行 override，不是单独的配置文件：`BITS=2` 同时设 K/V，
+`K_BITS` / `V_BITS` 分别设（混合精度用）。`BITS` 与某一侧设成不同值会直接报错。
+位宽会进入参数目录名，所以 INT2 与 INT4 的参数互不覆盖。
+
+`V_PREDICTOR=cross_kv|temporal` 切换 V 预测器，也不需要单独的配置文件；它会同时
+决定参数目录名（`vh1` 与 `vt1`）和参数文件名（`v_cross_kv.npz` 与 `v_temporal.npz`），
+两者不会互相覆盖。注意 temporal V 目前只有 legacy 拟合路径能产出，所以在 native
+配置上单独设它会在读 trace 之前就报错并说明原因。
+
+`TORCH_DECODER=1` 用 PyTorch 参考解码器代替 Triton，用来做数值对照；它同时关掉
+强制 Triton 的检查，所以不需要再配 `ALLOW_TRITON_FALLBACK`。两者共用同一套拟合
+参数——解码器是运行时开关，不进 codec signature。
 
 ## 历史帧数敏感性实验
 

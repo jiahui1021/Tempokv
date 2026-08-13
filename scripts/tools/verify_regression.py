@@ -18,7 +18,7 @@ read as a delta against it.
 
     python scripts/tools/verify_regression.py \
         --trace runs/.../self_forcing_trace.npz \
-        --config configs/int4.json \
+        --config configs/self_forcing.json \
         --k-history-length 3 --v-history-length 1 \
         --workdir runs/verify-kh3-vh1-int4
 
@@ -127,12 +127,8 @@ def _gain_saturation(k_params: Path) -> dict:
 
     parameters = TemporalParameters.load(k_params)
     weights = parameters.history_weights
-    if parameters.shared_history:
-        gains = weights.abs()
-    else:
-        gains = weights.abs().sum(dim=-3 if weights.ndim >= 4 else -2)
+    gains = weights.abs().sum(dim=-3 if weights.ndim >= 4 else -2)
     return {
-        "history_mode": parameters.history_mode,
         "max_l1_gain": float(gains.max()),
         "fraction_at_or_above_one": float((gains >= 1.0 - 1e-6).float().mean()),
     }

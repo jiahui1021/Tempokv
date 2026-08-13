@@ -23,8 +23,12 @@ SOURCE_ROOT = PROJECT_ROOT / "src"
 if SOURCE_ROOT.is_dir() and str(SOURCE_ROOT) not in sys.path:
     sys.path.insert(0, str(SOURCE_ROOT))
 
-from tempokv.config import CodecConfig  # noqa: E402
-from tempokv.fitting import fit_predictors, refine_attention  # noqa: E402
+from tempokv.config import CodecConfig, config_from_mapping  # noqa: E402
+from tempokv.fitting import (  # noqa: E402
+    fit_predictors,
+    refine_attention,
+    temporal_v_obstacle,
+)
 
 
 CODEC_FIELDS = {field.name for field in fields(CodecConfig)}
@@ -60,11 +64,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="legacy K history override; prefer k_history_length in the config",
     )
     parser.add_argument(
-        "--k-max-history-length",
-        type=int,
-        help="fit one shared K parameter set usable from 1 through this length",
-    )
-    parser.add_argument(
         "--v-history-mode",
         choices=("dense", "diagonal"),
         default="dense",
@@ -94,12 +93,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--group-size", type=int)
     parser.add_argument("--stride", type=int)
     parser.add_argument("--v-history-length", type=int, choices=range(0, 6))
-    parser.add_argument(
-        "--v-max-history-length",
-        type=int,
-        choices=range(0, 6),
-        help="fit one shared V parameter set usable from 0 through this length",
-    )
     parser.add_argument("--residual-mode", choices=("symmetric", "asymmetric"))
     parser.add_argument("--scale-dtype", choices=("float32", "float16", "bfloat16"))
     parser.add_argument(
@@ -162,9 +155,15 @@ def _codec_config(args: argparse.Namespace) -> CodecConfig:
         if override is not None:
             values[name] = override
     try:
-        return CodecConfig(**values)
+        config = config_from_mapping(values)
     except (TypeError, ValueError) as error:
         raise ValueError(f"invalid codec config: {error}") from error
+    # Fail before the trace is read: loading one takes minutes, and this
+    # combination can never produce parameters.
+    unfittable = temporal_v_obstacle(config)
+    if unfittable is not None:
+        raise ValueError(unfittable)
+    return config
 
 
 def _load_trace(
@@ -419,11 +418,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         history_length=(
             args.history_length
             if args.history_length is not None
-            else (
-                config.k_max_history_length
-                if config.k_max_history_length is not None
-                else config.k_history_length
-            )
+            else config.k_history_length
         ),
         iterations=args.iterations,
         temporal_ridge=temporal_ridge,
@@ -509,16 +504,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "codec_config_sha256": config_sha256,
         "fit": {
             # Keep the old report key while exposing the clearer config name.
-            "history_length": temporal.max_history_length,
+            "history_length": temporal.history_length,
             "k_history_length": temporal.with_history_length(
                 config.k_history_length
             ).history_length,
-            "k_max_history_length": temporal.max_history_length,
-            "k_history_mode": (
-                "shared"
-                if config.k_predictor_mode == "shared"
-                else temporal.history_mode
-            ),
+            "k_predictor_mode": config.k_predictor_mode,
             "iterations": int(args.iterations),
             "temporal_ridge": float(temporal_ridge),
             "cross_ridge": float(cross_ridge),
@@ -526,8 +516,13 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "v_history_length": cross.with_history_length(
                 config.v_history_length
             ).history_length,
-            "v_max_history_length": cross.max_history_length,
-            "v_history_mode": cross.history_mode,
+            # The temporal V predictor has no dense/diagonal distinction; it
+            # reads its own reconstructed V history instead of a Cross(K) map.
+            "v_history_mode": (
+                "temporal"
+                if config.v_predictor_mode == "temporal"
+                else cross.history_mode
+            ),
             "max_gain": float(args.max_gain),
             "coordinate_system": coordinate_system,
             "trace_metadata": trace_metadata,

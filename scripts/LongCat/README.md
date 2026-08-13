@@ -36,7 +36,7 @@ Parallel rank 的 metadata 一致。因此 `CONTEXT_PARALLEL_SIZE=1/2/4` 可以�
 ## 拟合参数
 
 ```bash
-CONFIG=configs/longcat_int4.json \
+CONFIG=configs/longcat.json \
 bash scripts/LongCat/fit_params.sh
 ```
 
@@ -48,7 +48,7 @@ data/longcat/params/kh2-vh1-int4/v_cross_kv.npz
 ```
 
 目录名由 `CONFIG` 推导（与 Self-Forcing、Causal Forcing 一致），换成
-`configs/longcat_int2.json` 会写到 `kh2-vh1-int2`，不会覆盖 INT4。
+`configs/longcat.json` 会写到 `kh2-vh1-int2`，不会覆盖 INT4。
 `K_HISTORY_LENGTH` / `V_HISTORY_LENGTH` 会同时影响目录名和拟合参数。
 拟合输入用 `TRACE_FILE`，与 `collect_trace.sh` 的输出变量同名。
 
@@ -66,7 +66,7 @@ bash scripts/LongCat/run_bf16.sh
 
 ```bash
 CHECKPOINT_DIR=/models/LongCat-Video \
-CONFIG=configs/longcat_int4.json \
+CONFIG=configs/longcat.json \
 K_PARAMS=data/longcat/params/kh2-vh1-int4/k_temporal.npz \
 V_PARAMS=data/longcat/params/kh2-vh1-int4/v_cross_kv.npz \
 PROMPT="a cinematic mountain road" \
@@ -92,6 +92,15 @@ CPU 拟合同时会把方程降到 float64，比看上去慢得多，所以回�
 
 `K_HISTORY_LENGTH` / `V_HISTORY_LENGTH` 可以简写成 `KH` / `VH`，效果相同；
 两个名字都设置且取值不同会直接报错。不设置时读 `CONFIG` 里的值（默认 `kh=2`、`vh=1`）。
+
+位宽是命令行 override，不是单独的配置文件：`BITS=2` 同时设 K/V，
+`K_BITS` / `V_BITS` 分别设（混合精度用）。`BITS` 与某一侧设成不同值会直接报错。
+位宽会进入参数目录名，所以 INT2 与 INT4 的参数互不覆盖。
+
+`V_PREDICTOR=cross_kv|temporal` 切换 V 预测器，也不需要单独的配置文件；它会同时
+决定参数目录名（`vh1` 与 `vt1`）和参数文件名（`v_cross_kv.npz` 与 `v_temporal.npz`），
+两者不会互相覆盖。注意 temporal V 目前只有 legacy 拟合路径能产出，所以在 native
+配置上单独设它会在读 trace 之前就报错并说明原因。
 
 ## 历史帧数敏感性实验
 

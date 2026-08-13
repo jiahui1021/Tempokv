@@ -31,7 +31,7 @@ SOURCE_ROOT = PROJECT_ROOT / "src"
 if SOURCE_ROOT.is_dir() and str(SOURCE_ROOT) not in sys.path:
     sys.path.insert(0, str(SOURCE_ROOT))
 
-from tempokv.config import CodecConfig  # noqa: E402
+from tempokv.config import CodecConfig, config_from_mapping  # noqa: E402
 from tempokv.fitting import _quantization_roundtrip  # noqa: E402
 from tempokv.parameters import CrossKVParameters, TemporalParameters  # noqa: E402
 
@@ -42,7 +42,7 @@ def _load_config(path: Path) -> CodecConfig:
         if len(payload) != 1:
             raise ValueError("'codec' must be the only top-level config object")
         payload = payload["codec"]
-    return CodecConfig(**payload)
+    return config_from_mapping(payload)
 
 
 def reconstruct_k(
@@ -215,7 +215,7 @@ def main() -> None:
         type=Path,
         default=Path("data/self-forcing/trace/clean_trace.npz"),
     )
-    parser.add_argument("--config", type=Path, default=Path("configs/int2.json"))
+    parser.add_argument("--config", type=Path, default=Path("configs/self_forcing.json"))
     parameter_root = Path("data/self-forcing/params/kh2-vh2-int2")
     parser.add_argument(
         "--k-params", type=Path, default=parameter_root / "k_temporal.npz"

@@ -8,7 +8,8 @@
 scripts/Causal-Forcing/
 ├── download_models.sh   下载 Wan2.1 base 与 Causal Forcing 权重
 ├── collect_trace.sh     采集 clean K/V trace 并合并成拟合输入
-├── fit_params.sh        调用通用拟合器产出 k_temporal.npz / v_cross_kv.npz
+├── fit_params.sh        调用通用拟合器产出 k_temporal.npz 与 V 参数
+│                       （v_cross_kv.npz 或 v_temporal.npz，取决于 v_predictor_mode）
 ├── run_bf16.sh          BF16 基线
 ├── run_tempokv.sh       TempoKV 生成
 └── generate.sh          run_bf16.sh / run_tempokv.sh 的共同实现
@@ -34,18 +35,18 @@ PROMPTS=assets/fit_prompts.txt \
 bash scripts/Causal-Forcing/collect_trace.sh
 
 # 拟合 INT4
-CONFIG=configs/causal_forcing_int4.json \
+CONFIG=configs/causal_forcing.json \
 bash scripts/Causal-Forcing/fit_params.sh
 
 # TempoKV 生成
 CHECKPOINT=checkpoints/causal_forcing/chunkwise/causal_forcing.pt \
 MODEL_ROOT=checkpoints/causal_forcing/wan2.1-t2v-1.3b \
 PROMPTS=assets/generation_prompts.txt \
-CONFIG=configs/causal_forcing_int4.json \
+CONFIG=configs/causal_forcing.json \
 bash scripts/Causal-Forcing/run_tempokv.sh
 ```
 
-INT2 只需要换 `configs/causal_forcing_int2.json` 与对应的参数目录。
+INT2 只需要换 `configs/causal_forcing.json` 与对应的参数目录。
 
 ## 公共变量
 
@@ -80,7 +81,7 @@ checkpoint、训练方式和 cache 分布不同，**必须重新采 trace 重新
 ```text
 data/causal-forcing/
 ├── trace/<模式>/{raw,output,clean_trace.npz}
-└── params/<模式>/<参数方案>/{k_temporal.npz,v_cross_kv.npz}
+└── params/<模式>/<参数方案>/{k_temporal.npz,v_cross_kv.npz 或 v_temporal.npz}
 
 results/causal_forcing/<模式>/<量化标签>/
 ├── videos/
@@ -131,6 +132,15 @@ CPU 拟合同时会把方程降到 float64，比看上去慢得多，所以回�
 
 `K_HISTORY_LENGTH` / `V_HISTORY_LENGTH` 可以简写成 `KH` / `VH`，效果相同；
 两个名字都设置且取值不同会直接报错。不设置时读 `CONFIG` 里的值（默认 `kh=2`、`vh=1`）。
+
+位宽是命令行 override，不是单独的配置文件：`BITS=2` 同时设 K/V，
+`K_BITS` / `V_BITS` 分别设（混合精度用）。`BITS` 与某一侧设成不同值会直接报错。
+位宽会进入参数目录名，所以 INT2 与 INT4 的参数互不覆盖。
+
+`V_PREDICTOR=cross_kv|temporal` 切换 V 预测器，也不需要单独的配置文件；它会同时
+决定参数目录名（`vh1` 与 `vt1`）和参数文件名（`v_cross_kv.npz` 与 `v_temporal.npz`），
+两者不会互相覆盖。注意 temporal V 目前只有 legacy 拟合路径能产出，所以在 native
+配置上单独设它会在读 trace 之前就报错并说明原因。
 
 ## 历史帧数敏感性实验
 

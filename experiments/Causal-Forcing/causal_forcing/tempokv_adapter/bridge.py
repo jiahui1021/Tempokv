@@ -179,8 +179,11 @@ def install(runtime_root: str | Path | None = None) -> type:
                 )
             if config.reconstruction_dtype != "bfloat16":
                 raise ValueError("Causal Forcing requires bfloat16 reconstruction")
+            # The temporal V predictor has no Cross(K) map, so the diagonal
+            # requirement applies only to the CrossKV route.
             if (
-                getattr(config, "v_history_length", 0)
+                getattr(config, "v_predictor_mode", "cross_kv") != "temporal"
+                and getattr(config, "v_history_length", 0)
                 and not self.tempokv_codec.cross_kv.history_diagonal
             ):
                 raise ValueError(

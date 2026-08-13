@@ -14,8 +14,6 @@ from .fitting import (
     fit_closed_loop,
     fit_cross_kv,
     fit_predictors,
-    fit_shared_cross_kv,
-    fit_shared_temporal_layers,
     fit_temporal,
     fit_temporal_layers,
 )
@@ -40,8 +38,6 @@ __all__ = [
     "fit_cross_kv",
     "fit_closed_loop",
     "fit_predictors",
-    "fit_shared_cross_kv",
-    "fit_shared_temporal_layers",
     "fit_temporal",
     "fit_temporal_layers",
     "check_parameters_match_config",

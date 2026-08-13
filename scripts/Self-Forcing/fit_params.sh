@@ -8,17 +8,18 @@
 # --k-history-length / --v-history-length 显式指定，用不同 --output-dir 区分。
 #
 # 用法（所有参数都用环境变量传入）：
-#   CONFIG=configs/int2.json \
+#   CONFIG=configs/self_forcing.json \
 #   KH=2 \
 #   VH=1 \
 #   bash scripts/Self-Forcing/fit_params.sh
 #
 # 必需变量：
-#   CONFIG      codec 配置 JSON（如 configs/int2.json）
+#   CONFIG      codec 配置 JSON（如 configs/self_forcing.json）
 #
 # 常用可选变量：
 #   TRACE_FILE      拟合输入（默认 data/self-forcing/trace/clean_trace.npz）
 #   OUTPUT_DIR      输出目录（默认 data/self-forcing/params/<参数方案>）
+#   BITS / K_BITS / V_BITS  位宽 override（2/4/8；默认读取 CONFIG）
 #   K_HISTORY_LENGTH  K 历史长度（默认读取 CONFIG）
 #   V_HISTORY_LENGTH  V 历史长度（默认读取 CONFIG）
 #   ITERATIONS     拟合迭代次数（默认 2）
@@ -37,12 +38,14 @@ source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)/_common.sh"
 
 K_HISTORY_LENGTH="$(resolve_history K_HISTORY_LENGTH KH)"
 V_HISTORY_LENGTH="$(resolve_history V_HISTORY_LENGTH VH)"
+K_BITS="$(resolve_bits K_BITS)"
+V_BITS="$(resolve_bits V_BITS)"
 
 require_env CONFIG
 
 trace_file="$(resolve_path "${TRACE_FILE:-data/self-forcing/trace/clean_trace.npz}")"
 config_path="$(resolve_path "$CONFIG")"
-parameter_name="${PARAM_NAME:-$(codec_slug "$config_path" "${K_HISTORY_LENGTH:-}" "${V_HISTORY_LENGTH:-}")}"
+parameter_name="${PARAM_NAME:-$(codec_slug "$config_path" "${K_HISTORY_LENGTH:-}" "${V_HISTORY_LENGTH:-}" "${K_BITS:-}" "${V_BITS:-}" "" "${V_PREDICTOR:-}")}"
 output_dir="$(resolve_path "${OUTPUT_DIR:-data/self-forcing/params/$parameter_name}")"
 v_predictor_mode="$("$python_bin" - "$config_path" <<'PY'
 import json
@@ -52,6 +55,14 @@ config = json.load(open(sys.argv[1], encoding="utf-8"))
 print(config.get("codec", config).get("v_predictor_mode", "cross_kv"))
 PY
 )"
+# V_PREDICTOR overrides the config so one file covers both predictors.
+if [[ -n "${V_PREDICTOR:-}" ]]; then
+  case "$V_PREDICTOR" in
+    cross_kv|temporal) ;;
+    *) die "V_PREDICTOR 必须是 cross_kv 或 temporal（当前值：${V_PREDICTOR}）" ;;
+  esac
+  v_predictor_mode="$V_PREDICTOR"
+fi
 if [[ "$v_predictor_mode" == "temporal" ]]; then
   v_artifact_name="v_temporal.npz"
 else
@@ -110,6 +121,9 @@ if [[ -n "${ATTENTION_STEPS:-}" ]]; then
 fi
 [[ -n "${K_HISTORY_LENGTH:-}" ]] && fit_command+=(--k-history-length "$K_HISTORY_LENGTH")
 [[ -n "${V_HISTORY_LENGTH:-}" ]] && fit_command+=(--v-history-length "$V_HISTORY_LENGTH")
+[[ -n "${K_BITS:-}" ]] && fit_command+=(--k-bits "$K_BITS")
+[[ -n "${V_BITS:-}" ]] && fit_command+=(--v-bits "$V_BITS")
+[[ -n "${V_PREDICTOR:-}" ]] && fit_command+=(--v-predictor-mode "$V_PREDICTOR")
 
 if [[ "$DRY_RUN" == "1" ]]; then
   printf '[fit_params] 干跑模式：打印将要执行的命令，不执行\n'
@@ -125,7 +139,7 @@ fi
 if [[ "$OVERWRITE" != "1" ]]; then
   for artifact in "$output_dir/k_temporal.npz" "$output_dir/$v_artifact_name"; do
     if [[ -e "$artifact" ]]; then
-      die "已存在参数：$artifact。设置 OVERWRITE=1 覆盖，或换一个 OUTPUT_DIR。"
+      die "已存在参数：${artifact}。设置 OVERWRITE=1 覆盖，或换一个 OUTPUT_DIR。"
     fi
   done
 fi

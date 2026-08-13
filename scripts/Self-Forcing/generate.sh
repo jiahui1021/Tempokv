@@ -13,7 +13,7 @@
 #   CHECKPOINT=/models/self_forcing_dmd.pt \
 #   WAN_MODEL_DIR=/models/Wan2.1-T2V-1.3B \
 #   PROMPTS=assets/generation_prompts.txt \
-#   CONFIG=configs/int2.json \
+#   CONFIG=configs/self_forcing.json \
 #   KH=2 \
 #   VH=1 \
 #   FRAMES=717 \
@@ -35,7 +35,12 @@
 #   NUM_GPUS        torchrun 使用的 GPU 数（默认 1）
 #   K_HISTORY_LENGTH  K 使用的历史帧数（1 到 8；默认读取 CONFIG）
 #   V_HISTORY_LENGTH  V 使用的历史帧数（0 到 2；默认读取 CONFIG）
+#   BITS            K/V 位宽（2/4/8；默认读取 CONFIG）；K_BITS / V_BITS 可分别设
+#   TORCH_DECODER   用 PyTorch 参考解码器代替 Triton，0 或 1（默认 0）
 #   BENCHMARK       要求本次完整生成且不允许跳过已有视频，0 或 1（默认 0）
+#   PROFILE         记录每段 CUDA-event 耗时分解，0 或 1（默认 0）；结果写入
+#                   $OUTPUT_DIR/profile/rank-N.json，用
+#                   scripts/tools/profile_tempokv_runtime.py 查看
 #   TEMPOKV_PERSISTENT_UNITS_PER_LAUNCH  单次持续解码帧数（默认 16；范围 1 到 16）
 #
 set -euo pipefail
@@ -45,6 +50,8 @@ source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)/_common.sh"
 
 K_HISTORY_LENGTH="$(resolve_history K_HISTORY_LENGTH KH)"
 V_HISTORY_LENGTH="$(resolve_history V_HISTORY_LENGTH VH)"
+K_BITS="$(resolve_bits K_BITS)"
+V_BITS="$(resolve_bits V_BITS)"
 script_dir="$self_forcing_dir"
 mode="${MODE:-tempokv}"
 
@@ -53,7 +60,7 @@ mode="${MODE:-tempokv}"
 case "$mode" in
   tempokv) ;;
   bf16) ;;
-  *) die "MODE 必须是 tempokv 或 bf16（当前值：$mode）" ;;
+  *) die "MODE 必须是 tempokv 或 bf16（当前值：${mode}）" ;;
 esac
 
 require_env CHECKPOINT WAN_MODEL_DIR PROMPTS
@@ -64,7 +71,7 @@ fi
 # ---------- 目录 ----------
 
 if [[ "$mode" == "tempokv" ]]; then
-  parameter_name="${PARAM_NAME:-$(codec_slug "$(resolve_path "$CONFIG")" "${K_HISTORY_LENGTH:-}" "${V_HISTORY_LENGTH:-}")}"
+  parameter_name="${PARAM_NAME:-$(codec_slug "$(resolve_path "$CONFIG")" "${K_HISTORY_LENGTH:-}" "${V_HISTORY_LENGTH:-}" "${K_BITS:-}" "${V_BITS:-}" "" "${V_PREDICTOR:-}")}"
   param_dir="$(resolve_path "${PARAM_DIR:-data/self-forcing/params/$parameter_name}")"
   result_label="$parameter_name"
   v_predictor_mode="$("$python_bin" - "$(resolve_path "$CONFIG")" <<'PY'
@@ -75,6 +82,14 @@ config = json.load(open(sys.argv[1], encoding="utf-8"))
 print(config.get("codec", config).get("v_predictor_mode", "cross_kv"))
 PY
 )"
+  # V_PREDICTOR overrides the config so one file covers both predictors.
+  if [[ -n "${V_PREDICTOR:-}" ]]; then
+    case "$V_PREDICTOR" in
+      cross_kv|temporal) ;;
+      *) die "V_PREDICTOR 必须是 cross_kv 或 temporal（当前值：${V_PREDICTOR}）" ;;
+    esac
+    v_predictor_mode="$V_PREDICTOR"
+  fi
   if [[ "$v_predictor_mode" == "temporal" ]]; then
     v_artifact_name="v_temporal.npz"
   else
@@ -104,11 +119,15 @@ DRY_RUN="${DRY_RUN:-0}"
 ALLOW_TRITON_FALLBACK="${ALLOW_TRITON_FALLBACK:-0}"
 SKIP_EXISTING="${SKIP_EXISTING:-1}"
 BENCHMARK="${BENCHMARK:-0}"
+PROFILE="${PROFILE:-0}"
+TORCH_DECODER="${TORCH_DECODER:-0}"
 
 check_flag DRY_RUN
 check_flag ALLOW_TRITON_FALLBACK
 check_flag SKIP_EXISTING
 check_flag BENCHMARK
+check_flag PROFILE
+check_flag TORCH_DECODER
 check_int FRAMES 1
 check_int NUM_SAMPLES 1
 check_int SEED 0
@@ -123,11 +142,11 @@ if (( (FRAMES + 3) % 12 != 0 )); then
 fi
 if [[ -n "${K_HISTORY_LENGTH:-}" ]]; then
   check_int K_HISTORY_LENGTH 1
-  (( K_HISTORY_LENGTH <= 8 )) || die "K_HISTORY_LENGTH 必须 <= 8（当前值：$K_HISTORY_LENGTH）"
+  (( K_HISTORY_LENGTH <= 8 )) || die "K_HISTORY_LENGTH 必须 <= 8（当前值：${K_HISTORY_LENGTH}）"
 fi
 if [[ -n "${V_HISTORY_LENGTH:-}" ]]; then
   check_int V_HISTORY_LENGTH 0
-  (( V_HISTORY_LENGTH <= 5 )) || die "V_HISTORY_LENGTH 必须 <= 5（当前值：$V_HISTORY_LENGTH）"
+  (( V_HISTORY_LENGTH <= 5 )) || die "V_HISTORY_LENGTH 必须 <= 5（当前值：${V_HISTORY_LENGTH}）"
 fi
 
 latent_frames=$(( (FRAMES + 3) / 4 ))
@@ -158,6 +177,10 @@ if [[ "$mode" == "tempokv" ]]; then
   )
   [[ -n "${K_HISTORY_LENGTH:-}" ]] && generate_command+=(--k-history-length "$K_HISTORY_LENGTH")
   [[ -n "${V_HISTORY_LENGTH:-}" ]] && generate_command+=(--v-history-length "$V_HISTORY_LENGTH")
+  [[ -n "${K_BITS:-}" ]] && generate_command+=(--k-bits "$K_BITS")
+  [[ -n "${V_BITS:-}" ]] && generate_command+=(--v-bits "$V_BITS")
+  [[ -n "${V_PREDICTOR:-}" ]] && generate_command+=(--v-predictor-mode "$V_PREDICTOR")
+  [[ "$TORCH_DECODER" == "1" ]] && generate_command+=(--torch-decoder)
 fi
 
 [[ -n "${MODEL_CONFIG:-}" ]] && generate_command+=(--model-config "$(resolve_path "$MODEL_CONFIG")")
@@ -166,6 +189,7 @@ fi
 [[ "$ALLOW_TRITON_FALLBACK" == "1" ]] && generate_command+=(--allow-triton-fallback)
 [[ "$SKIP_EXISTING" == "1" ]] && generate_command+=(--skip-existing)
 [[ "$BENCHMARK" == "1" ]] && generate_command+=(--benchmark)
+[[ "$PROFILE" == "1" ]] && generate_command+=(--profile)
 [[ "$DRY_RUN" == "1" ]] && generate_command+=(--dry-run)
 
 export FORCING_WAN_MODEL_DIR="$(resolve_path "$WAN_MODEL_DIR")"

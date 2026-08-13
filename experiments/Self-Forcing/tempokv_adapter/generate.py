@@ -69,6 +69,20 @@ def build_parser() -> argparse.ArgumentParser:
         choices=range(0, 6),
         help="number of reconstructed V frames used by the predictor",
     )
+    # Overrides so one config per model covers every bit width and decoder,
+    # instead of one committed config per combination.
+    parser.add_argument(
+        "--v-predictor-mode",
+        choices=("cross_kv", "temporal"),
+        help="predict V from reconstructed K (cross_kv) or from its own history",
+    )
+    parser.add_argument("--k-bits", type=int, choices=(2, 4, 8))
+    parser.add_argument("--v-bits", type=int, choices=(2, 4, 8))
+    parser.add_argument(
+        "--torch-decoder",
+        action="store_true",
+        help="decode with the PyTorch reference path instead of Triton",
+    )
     parser.add_argument("--model-config", type=Path)
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--prompts", type=Path, required=True)
@@ -93,6 +107,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--skip-existing", action="store_true")
     parser.add_argument(
+        "--profile",
+        action="store_true",
+        help="record a per-section CUDA-event runtime breakdown for this run",
+    )
+    parser.add_argument(
         "--benchmark",
         action="store_true",
         help="require a fresh, complete generation with no skipped samples",
@@ -102,7 +121,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _load_config(path: Path):
-    from tempokv.config import CodecConfig
+    from tempokv.config import config_from_mapping
 
     payload = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(payload, dict):
@@ -111,7 +130,7 @@ def _load_config(path: Path):
         if len(payload) != 1 or not isinstance(payload["codec"], dict):
             raise ValueError("'codec' must be the only top-level config object")
         payload = payload["codec"]
-    return CodecConfig(**payload)
+    return config_from_mapping(payload)
 
 
 def _validate_parameters(
@@ -127,33 +146,7 @@ def _validate_parameters(
         if temporal_v
         else CrossKVParameters.load(v_path)
     )
-    if temporal.shared_history != cross.shared_history:
-        raise ValueError(
-            "Self-Forcing K and V parameters must use the same history parameter mode"
-        )
-    signature_config = config
-    if temporal.shared_history:
-        # Shared parameter files carry their fitted maxima.  Allow a runtime
-        # config to omit those maxima, matching TempoKVCodec's parameter-driven
-        # fallback, while still rejecting an explicitly mismatched config.
-        signature_config = replace(
-            config,
-            k_max_history_length=(
-                config.k_max_history_length
-                if config.k_max_history_length is not None
-                else temporal.max_history_length
-            ),
-            v_max_history_length=(
-                config.v_max_history_length
-                if config.v_max_history_length is not None
-                else cross.max_history_length
-            ),
-        )
-    expected_signature = (
-        signature_config.shared_format_signature()
-        if temporal.shared_history
-        else signature_config.format_signature()
-    )
+    expected_signature = config.format_signature()
     if (
         temporal.codec_signature != expected_signature
         or cross.codec_signature != expected_signature
@@ -206,12 +199,6 @@ def _validate_parameters(
                 "legacy K parameters must be shared across all layers "
                 "and heads"
             )
-    elif temporal.shared_history:
-        if tuple(temporal.history_weights.shape) != (30, 12, 128):
-            raise ValueError(
-                "shared K parameters must contain one coefficient for each of "
-                "30 layers, 12 heads, and 128 channels"
-            )
     elif config.k_history_length is not None:
         expected_k_history_shape = (
             30,
@@ -247,12 +234,6 @@ def _validate_parameters(
             )
     elif tuple(cross.weight.shape[-3:]) != (12, 128, 128):
         raise ValueError("V parameters must contain 12 heads with 128x128 weights")
-    elif cross.shared_history:
-        if tuple(cross.history_weights.shape) != (30, 12, 128):
-            raise ValueError(
-                "shared V history parameters must contain one coefficient for "
-                "each of 30 layers, 12 heads, and 128 channels"
-            )
     elif config.v_history_length:
         expected_v_history_shape = (30, config.v_history_length, 12, 128)
         if tuple(cross.history_weights.shape) != expected_v_history_shape:
@@ -291,14 +272,8 @@ def _validate_parameters(
         "head_dimension": 128,
         "history_length": codec.temporal.history_length,
         "k_history_length": codec.temporal.history_length,
-        "k_max_history_length": temporal.max_history_length,
-        "k_history_mode": (
-            "shared"
-            if config.k_predictor_mode == "shared"
-            else temporal.history_mode
-        ),
+        "k_predictor_mode": config.k_predictor_mode,
         "v_history_length": codec.v_parameters.history_length,
-        "v_max_history_length": cross.max_history_length,
         "v_history_mode": (
             "temporal"
             if temporal_v
@@ -336,6 +311,10 @@ def _generation_command(
         str(Path(__file__).with_name("worker.py")),
         "--mode",
         args.mode,
+    ]
+    if args.profile:
+        command.extend(("--profile", str(paths["profile"])))
+    command += [
         "--",
         "--config_path",
         str(paths["model_config"]),
@@ -445,6 +424,29 @@ def _load_worker_metrics(
     }
 
 
+def _load_worker_profiles(
+    profile_dir: Path, expected_ranks: int
+) -> list[dict[str, object]]:
+    """Read the per-rank runtime breakdown written by an instrumented worker.
+
+    A rank that produced no profile is an error rather than an empty entry: the
+    Stage 0 decision gate compares section shares, and a silently missing rank
+    would move every share.
+    """
+    profiles: list[dict[str, object]] = []
+    for expected_rank in range(expected_ranks):
+        path = profile_dir / f"rank-{expected_rank}.json"
+        if not path.is_file():
+            raise RuntimeError(
+                f"missing runtime profile for rank {expected_rank}: {path}"
+            )
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict) or "sections" not in payload:
+            raise RuntimeError(f"invalid runtime profile for rank {expected_rank}")
+        profiles.append(payload)
+    return profiles
+
+
 def _video_summary_entries(videos_dir: Path) -> list[dict[str, object]]:
     summary_path = videos_dir / "summary.json"
     if not summary_path.is_file():
@@ -527,6 +529,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         "model_config": model_config.expanduser().resolve(),
         "run": args.output_dir.expanduser().resolve(),
         "videos": args.output_dir.expanduser().resolve() / "videos",
+        "profile": args.output_dir.expanduser().resolve() / "profile",
         "runtime_config": args.output_dir.expanduser().resolve()
         / "runtime_config.json",
     }
@@ -597,16 +600,20 @@ def run(args: argparse.Namespace) -> dict[str, object]:
     parameters = None
     if args.mode == "tempokv":
         config = _load_config(paths["config"])
-        history_overrides = {
+        overrides = {
             name: value
             for name, value in (
                 ("k_history_length", args.k_history_length),
                 ("v_history_length", args.v_history_length),
+                ("k_bits", args.k_bits),
+                ("v_bits", args.v_bits),
+                ("v_predictor_mode", args.v_predictor_mode),
+                ("use_triton", False if args.torch_decoder else None),
             )
             if value is not None
         }
-        if history_overrides:
-            config = replace(config, **history_overrides)
+        if overrides:
+            config = replace(config, **overrides)
         if config.stride != 1560:
             raise ValueError("Self-Forcing requires stride=1560")
         if 128 % config.group_size:
@@ -658,7 +665,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
     environment = os.environ.copy()
     if args.mode == "tempokv":
         runtime_payload = asdict(config)
-        if not args.allow_triton_fallback:
+        if not args.allow_triton_fallback and not args.torch_decoder:
             runtime_payload["use_triton"] = True
             runtime_payload["strict_triton"] = True
         paths["runtime_config"].write_text(
@@ -699,6 +706,10 @@ def run(args: argparse.Namespace) -> dict[str, object]:
     for rank in range(args.num_gpus):
         (metrics_dir / f"rank-{rank}.json").unlink(missing_ok=True)
     environment["SELF_FORCING_METRICS_DIR"] = str(metrics_dir)
+    if args.profile:
+        paths["profile"].mkdir(parents=True, exist_ok=True)
+        for rank in range(args.num_gpus):
+            (paths["profile"] / f"rank-{rank}.json").unlink(missing_ok=True)
     started = time.perf_counter()
     completed = subprocess.run(
         generation_command,
@@ -712,6 +723,10 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             completed.returncode, generation_command
         )
     performance = _load_worker_metrics(metrics_dir, args.num_gpus)
+    if args.profile:
+        report["runtime_profile"] = _load_worker_profiles(
+            paths["profile"], args.num_gpus
+        )
     video_entries = _video_summary_entries(paths["videos"])
     batch_entries = _batch_summary_entries(paths["videos"])
     if not video_entries:
@@ -739,6 +754,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
     if (
         args.mode == "tempokv"
         and not args.allow_triton_fallback
+        and not args.torch_decoder
         and generated_entries
     ):
         required_routes = (
