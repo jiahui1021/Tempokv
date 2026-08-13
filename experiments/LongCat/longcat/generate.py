@@ -235,15 +235,14 @@ def _enforce_accelerated_codec(bridge: object) -> None:
     codec.config = replace(config, use_triton=True, strict_triton=True)
 
 
-def _require_direct_persistent_routes(report: dict[str, object]) -> None:
+def _require_direct_persistent_routes(report: dict[str, object], codec: object) -> None:
     """Reject production runs that missed LongCat's fused direct decoders."""
     routes = report.get("decode_routes")
     if not isinstance(routes, dict):
         raise RuntimeError("LongCat TempoKV report did not include decode routes")
-    required = (
-        "temporal_persistent_direct_bhsd",
-        "cross_kv_persistent_direct_bhsd",
-    )
+    required = ["temporal_persistent_direct_bhsd"]
+    if getattr(codec, "predicts_v_from_key", False):
+        required.append("cross_kv_persistent_direct_bhsd")
     missing = [name for name in required if int(routes.get(name) or 0) <= 0]
     if missing:
         raise RuntimeError(
@@ -417,7 +416,7 @@ def run(argv: Sequence[str] | None = None) -> int:
     if known.mode == "tempokv":
         _require_tempokv_activity(report)
         if not known.allow_triton_fallback:
-            _require_direct_persistent_routes(report)
+            _require_direct_persistent_routes(report, codec=bridge.codec)
     report_path = (
         Path(runtime_args.output_dir).expanduser().resolve()
         / f"tempokv_bridge_report_rank_{rank:05d}.json"

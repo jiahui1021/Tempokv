@@ -52,23 +52,29 @@ if [[ -n "${MODEL_CONFIG:-}" ]]; then
 else
   model_config="$runtime_root/configs/causal_forcing_dmd_$generation_mode.yaml"
 fi
+LEGACY_PROTOCOL="${LEGACY_PROTOCOL:-1}"
+if [[ "$LEGACY_PROTOCOL" == "1" ]]; then
+  default_trace_frames=51
+else
+  default_trace_frames=21
+fi
+# The legacy protocol has its own trace layout, so it defaults to a separate
+# directory instead of overwriting the native one.
+if [[ "$LEGACY_PROTOCOL" == "1" ]]; then
+  default_trace_dir="data/causal-forcing/trace/${generation_mode}_legacy"
+else
+  default_trace_dir="data/causal-forcing/trace/$generation_mode"
+fi
 checkpoint="$(resolve_path "$CHECKPOINT")"
 model_root="$(resolve_path "$MODEL_ROOT")"
 prompts="$(resolve_path "$PROMPTS")"
-trace_dir="$(resolve_path "${TRACE_DIR:-data/causal-forcing/trace/$generation_mode}")"
+trace_dir="$(resolve_path "${TRACE_DIR:-$default_trace_dir}")"
 trace_file="$(resolve_path "${TRACE_FILE:-$trace_dir/clean_trace.npz}")"
 raw_trace_dir="$trace_dir/raw"
 trace_output_dir="$trace_dir/output"
 
 if [[ "$trace_dir" == "/" ]]; then
   die "TRACE_DIR 不能是文件系统根目录"
-fi
-
-LEGACY_PROTOCOL="${LEGACY_PROTOCOL:-0}"
-if [[ "$LEGACY_PROTOCOL" == "1" ]]; then
-  default_trace_frames=51
-else
-  default_trace_frames=21
 fi
 TRACE_FRAMES="${TRACE_FRAMES:-$default_trace_frames}"
 TRACE_TOKENS_PER_FRAME="${TRACE_TOKENS_PER_FRAME:-8}"

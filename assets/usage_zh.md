@@ -97,8 +97,7 @@ bash scripts/Self-Forcing/run_bf16.sh
 bash scripts/Causal-Forcing/download_models.sh
 ```
 
-默认下载到 `checkpoints/causal_forcing/`，含 Wan2.1-T2V-1.3B base 与
-chunk-wise / frame-wise 两个权重。权重不进入 Git。
+默认下载到 `checkpoints/causal_forcing/`，含 Wan2.1-T2V-1.3B base 与chunk-wise / frame-wise 两个权重
 
 ### 1. 采集并合并 clean trace
 
@@ -109,19 +108,20 @@ PROMPTS=assets/fit_prompts.txt \
 bash scripts/Causal-Forcing/collect_trace.sh
 ```
 
-输出 `data/causal-forcing/trace/chunkwise/{raw/,clean_trace.npz}`。只采
+输出 `data/causal-forcing/trace/chunkwise_legacy/{raw/,clean_trace.npz}`。只采
 clean/context refresh 留下的 pre-RoPE normalized K 与 raw V，4 次 noisy
 denoising step 不入 trace。
+
 
 ### 2. 拟合参数
 
 ```bash
-CONFIG=configs/native.json \
+CONFIG=configs/legacy.json \
 bash scripts/Causal-Forcing/fit_params.sh
 ```
 
-输出 `data/causal-forcing/params/chunkwise/kh2-vh1-int4/`。INT2 加 `BITS=2`
-即可，目录名自动带位宽。
+输出 `data/causal-forcing/params/chunkwise/kh2-vh1-int4/`。INT2 加 `BITS=2` 即可
+
 
 ### 3. TempoKV 生成
 
@@ -129,14 +129,10 @@ bash scripts/Causal-Forcing/fit_params.sh
 CHECKPOINT=checkpoints/causal_forcing/chunkwise/causal_forcing.pt \
 MODEL_ROOT=checkpoints/causal_forcing/wan2.1-t2v-1.3b \
 PROMPTS=assets/generation_prompts.txt \
-CONFIG=configs/native.json \
+CONFIG=configs/legacy.json \
 bash scripts/Causal-Forcing/run_tempokv.sh
 ```
 
-会写出 `tempokv_report.json`；`encode_key_calls`、`encode_value_calls`、
-`decode_tensor_calls`、`finalized_frames` 任何一个为 0 都会让本次运行直接失败，
-避免"视频正常生成但其实没走 TempoKV"。显存峰值看 `peak_resident_total_bytes`
-（含尚未打包的 BF16 帧），只看压缩后的字节会低估。
 
 ### 4. BF16 对照
 
@@ -147,7 +143,6 @@ PROMPTS=assets/generation_prompts.txt \
 bash scripts/Causal-Forcing/run_bf16.sh
 ```
 
-详细说明见 [scripts/Causal-Forcing/README.md](../scripts/Causal-Forcing/README.md)。
 
 ## LongCat
 
@@ -155,7 +150,7 @@ bash scripts/Causal-Forcing/run_bf16.sh
 
 ```bash
 CHECKPOINT_DIR=/models/LongCat-Video \
-PROMPT="a cinematic mountain road" \
+PROMPTS=assets/fit_prompts.txt \
 bash scripts/LongCat/collect_trace.sh
 ```
 
@@ -186,7 +181,7 @@ bash scripts/LongCat/run_tempokv.sh
 
 ```bash
 CHECKPOINT_DIR=/models/LongCat-Video \
-PROMPT="a cinematic mountain road" \
+PROMPTS=Tempokv/assets/moviegen128.txt \
 bash scripts/LongCat/run_bf16.sh
 ```
 

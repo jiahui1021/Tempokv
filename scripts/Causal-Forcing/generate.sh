@@ -79,12 +79,19 @@ if [[ "$mode" == "tempokv" ]]; then
   parameter_name="${PARAM_NAME:-$(codec_slug "$(resolve_path "$CONFIG")" "${K_HISTORY_LENGTH:-}" "${V_HISTORY_LENGTH:-}" "${K_BITS:-}" "${V_BITS:-}" "" "${V_PREDICTOR:-}")}"
   param_dir="$(resolve_path "${PARAM_DIR:-data/causal-forcing/params/$generation_mode/$parameter_name}")"
   result_label="$parameter_name"
+  # The legacy config defaults to temporal V, so its unset v_predictor_mode is
+  # reported as "temporal" rather than the global cross_kv default.
   v_predictor_mode="$("$python_bin" - "$(resolve_path "$CONFIG")" <<'PY'
 import json
 import sys
 
 config = json.load(open(sys.argv[1], encoding="utf-8"))
-print(config.get("codec", config).get("v_predictor_mode", "cross_kv"))
+config = config.get("codec", config)
+fit_mode = config.get("fit_mode", "native")
+v_predictor = config.get("v_predictor_mode")
+if v_predictor is None:
+    v_predictor = "temporal" if fit_mode == "legacy" else "cross_kv"
+print(v_predictor)
 PY
   )"
   # V_PREDICTOR overrides the config so one file covers both predictors.

@@ -112,18 +112,12 @@ if v_history is None:
     if v_history is None:
         v_history = 0
 
-# Legacy and native fits are not interchangeable, so they must not share a
-# parameter directory.  Native configs carry no prefix, so existing directory
-# names are unchanged.
-mode_label = "legacy-" if config.get("fit_mode") == "legacy" else ""
 k_label = f"kh{int(k_history)}"
-# The V segment records the predictor structure: parameters fitted for the
-# temporal V predictor are not interchangeable with CrossKV ones.
-v_predictor = sys.argv[7] or config.get(
-    "v_predictor_mode", DEFAULT_V_PREDICTOR_MODE
-)
-v_prefix = "vt" if v_predictor == "temporal" else "vh"
-v_label = f"{v_prefix}{int(v_history)}"
+# The V segment records history length only; the V predictor structure
+# (cross_kv vs temporal) is deliberately not part of the directory name so
+# both fit under a single kh{N}-vh{M} name.  The parameter files themselves
+# still distinguish v_cross_kv.npz from v_temporal.npz.
+v_label = f"vh{int(v_history)}"
 if k_bits == v_bits:
     precision_label = f"int{k_bits}"
 else:
@@ -134,6 +128,6 @@ else:
 # parameters.  Without this segment every CP degree wrote to one directory and
 # silently overwrote the others.
 stride_label = "" if stride == DEFAULT_STRIDE else f"-s{stride}"
-print(f"{mode_label}{k_label}-{v_label}-{precision_label}{stride_label}")
+print(f"{k_label}-{v_label}-{precision_label}{stride_label}")
 SLUGPY
 }

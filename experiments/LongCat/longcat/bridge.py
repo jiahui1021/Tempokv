@@ -181,8 +181,10 @@ def decode_kv_cache(
         return k_cache, v_cache
     if k_cache.predictor_kind != "temporal":
         raise ValueError("LongCat K cache must use temporal TempoKV prediction")
-    if v_cache.predictor_kind != "cross_kv":
-        raise ValueError("LongCat V cache must use CrossKV TempoKV prediction")
+    if v_cache.predictor_kind not in ("cross_kv", "temporal"):
+        raise ValueError(
+            "LongCat V cache must use cross_kv or temporal TempoKV prediction"
+        )
     if isinstance(k_cache, PackedTensorSpanSet) != isinstance(v_cache, PackedTensorSpanSet):
         raise TypeError("LongCat K and V span formats must match")
     if isinstance(k_cache, PackedTensorSpanSet):
@@ -306,7 +308,7 @@ def validate_cache_layout(
         raise ValueError("LongCat returned an empty KV cache")
     for name, parameters in (
         ("K", codec.temporal),
-        ("V", codec.cross_kv),
+        ("V", codec.v_parameters),
     ):
         if parameters.coordinate_system != resolved_spec.coordinate_system:
             raise ValueError(
@@ -542,7 +544,9 @@ def encode_kv_cache_spans(
                     sum(item.shape[2] for item in value_spans),
                     value_spans[0].shape[3],
                 ),
-                predictor_kind="cross_kv",
+                predictor_kind=(
+                    "cross_kv" if codec.predicts_v_from_key else "temporal"
+                ),
                 spans=value_spans,
             ),
         )
@@ -1010,13 +1014,22 @@ class LongCatTempoKVBridge:
         """Return a serializable summary of bridge activity for one rank."""
         predictor_parameter_bytes = 0
         if self.codec is not None:
-            parameters = (
-                self.codec.temporal.history_weights,
-                self.codec.temporal.history_bias,
-                self.codec.cross_kv.weight,
-                self.codec.cross_kv.history_weights,
-                self.codec.cross_kv.bias,
-            )
+            v_parameters = self.codec.v_parameters
+            if self.codec.predicts_v_from_key:
+                parameters = (
+                    self.codec.temporal.history_weights,
+                    self.codec.temporal.history_bias,
+                    v_parameters.weight,
+                    v_parameters.history_weights,
+                    v_parameters.bias,
+                )
+            else:
+                parameters = (
+                    self.codec.temporal.history_weights,
+                    self.codec.temporal.history_bias,
+                    v_parameters.history_weights,
+                    v_parameters.history_bias,
+                )
             predictor_parameter_bytes = sum(
                 int(parameter.numel() * parameter.element_size())
                 for parameter in parameters

@@ -44,21 +44,36 @@ case "$generation_mode" in
   *) die "GENERATION_MODE 必须是 chunkwise 或 framewise（当前值：${generation_mode}）" ;;
 esac
 
-trace_file="$(resolve_path "${TRACE_FILE:-data/causal-forcing/trace/$generation_mode/clean_trace.npz}")"
 config_path="$(resolve_path "$CONFIG")"
-parameter_name="${PARAM_NAME:-$(codec_slug "$config_path" "${K_HISTORY_LENGTH:-}" "${V_HISTORY_LENGTH:-}" "${K_BITS:-}" "${V_BITS:-}" "" "${V_PREDICTOR:-}")}"
-output_dir="$(resolve_path "${OUTPUT_DIR:-data/causal-forcing/params/$generation_mode/$parameter_name}")"
 # One interpreter launch for both switches the rest of this script needs.
+# The legacy config defaults to temporal V, so its unset v_predictor_mode is
+# reported as "temporal" rather than the global cross_kv default.
 read -r fit_mode v_predictor_mode <<<"$("$python_bin" - "$config_path" <<'PY'
 import json
 import sys
 
 config = json.load(open(sys.argv[1], encoding="utf-8"))
 config = config.get("codec", config)
-print(config.get("fit_mode", "native"), config.get("v_predictor_mode", "cross_kv"))
+fit_mode = config.get("fit_mode", "native")
+v_predictor = config.get("v_predictor_mode")
+if v_predictor is None:
+    v_predictor = "temporal" if fit_mode == "legacy" else "cross_kv"
+print(fit_mode, v_predictor)
 PY
 )"
-# V_PREDICTOR overrides the config so one file covers both predictors.
+# The legacy protocol collects into its own directory, so the default trace
+# file follows the config's fit mode.
+if [[ "$fit_mode" == "legacy" ]]; then
+  default_trace_file="data/causal-forcing/trace/${generation_mode}_legacy/clean_trace.npz"
+else
+  default_trace_file="data/causal-forcing/trace/$generation_mode/clean_trace.npz"
+fi
+trace_file="$(resolve_path "${TRACE_FILE:-$default_trace_file}")"
+parameter_name="${PARAM_NAME:-$(codec_slug "$config_path" "${K_HISTORY_LENGTH:-}" "${V_HISTORY_LENGTH:-}" "${K_BITS:-}" "${V_BITS:-}" "" "${V_PREDICTOR:-}")}"
+output_dir="$(resolve_path "${OUTPUT_DIR:-data/causal-forcing/params/$generation_mode/$parameter_name}")"
+# V_PREDICTOR overrides the config so one file covers both predictors.  The
+# legacy config defaults to temporal V, so nothing needs to be set on the
+# command line for the recommended path.
 if [[ -n "${V_PREDICTOR:-}" ]]; then
   case "$V_PREDICTOR" in
     cross_kv|temporal) ;;
