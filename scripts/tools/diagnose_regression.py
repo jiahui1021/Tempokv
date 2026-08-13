@@ -12,7 +12,7 @@ later stages inherit the earlier stage's damage and are not independent evidence
 
     python scripts/tools/diagnose_regression.py \
         --trace runs/.../self_forcing_trace.npz \
-        --config configs/self_forcing.json \
+        --config configs/legacy.json \
         --k-params <params>/k_temporal.npz \
         --v-params <params>/v_cross_kv.npz
 """

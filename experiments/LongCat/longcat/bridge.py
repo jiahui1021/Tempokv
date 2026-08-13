@@ -720,9 +720,10 @@ class LongCatTempoKVBridge:
             )
         if self.codec is not None:
             expected_layers = tuple(range(self.spec.num_layers))
+            temporal_v = not self.codec.predicts_v_from_key
             for name, parameters in (
                 ("temporal K", self.codec.temporal),
-                ("CrossKV V", self.codec.cross_kv),
+                ("temporal V" if temporal_v else "CrossKV V", self.codec.v_parameters),
             ):
                 if (
                     parameters.coordinate_system
@@ -754,20 +755,37 @@ class LongCatTempoKVBridge:
                     "temporal K parameters do not match LongCat head dimension "
                     f"{self.spec.head_dim}"
                 )
-            if temporal.per_head and temporal.history_weights.shape[-2] != self.spec.num_heads:
+            if (
+                temporal.layered or temporal.per_head
+            ) and temporal.history_weights.shape[-2] != self.spec.num_heads:
                 raise ValueError(
                     "temporal K parameters do not match LongCat head count "
                     f"{self.spec.num_heads}"
                 )
-            cross = self.codec.cross_kv
-            if tuple(cross.weight.shape[-2:]) != (
-                self.spec.head_dim,
-                self.spec.head_dim,
-            ) or cross.weight.shape[-3] != self.spec.num_heads:
-                raise ValueError(
-                    "CrossKV V parameters do not match LongCat [heads, head_dim] "
-                    f"= [{self.spec.num_heads}, {self.spec.head_dim}]"
-                )
+            if temporal_v:
+                value = self.codec.v_parameters
+                if value.history_weights.shape[-1] != self.spec.head_dim:
+                    raise ValueError(
+                        "temporal V parameters do not match LongCat head "
+                        f"dimension {self.spec.head_dim}"
+                    )
+                if (
+                    value.layered or value.per_head
+                ) and value.history_weights.shape[-2] != self.spec.num_heads:
+                    raise ValueError(
+                        "temporal V parameters do not match LongCat head count "
+                        f"{self.spec.num_heads}"
+                    )
+            else:
+                cross = self.codec.cross_kv
+                if tuple(cross.weight.shape[-2:]) != (
+                    self.spec.head_dim,
+                    self.spec.head_dim,
+                ) or cross.weight.shape[-3] != self.spec.num_heads:
+                    raise ValueError(
+                        "CrossKV V parameters do not match LongCat [heads, head_dim] "
+                        f"= [{self.spec.num_heads}, {self.spec.head_dim}]"
+                    )
         for index, block_wrapper in enumerate(blocks):
             block = _unwrap_compiled_module(block_wrapper)
             attention = getattr(block, "attn", None)

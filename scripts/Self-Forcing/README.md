@@ -116,7 +116,7 @@ cross_source_kind    normalized
 ## 2. 拟合参数
 
 ```bash
-CONFIG=configs/self_forcing.json \
+CONFIG=configs/legacy.json \
 KH=2 \
 VH=1 \
 bash scripts/Self-Forcing/fit_params.sh
@@ -143,7 +143,7 @@ data/self-forcing/params/legacy-kh2-vh1-int2/v_cross_kv.npz
 CHECKPOINT=/models/self_forcing_dmd.pt \
 WAN_MODEL_DIR=/models/Wan2.1-T2V-1.3B \
 PROMPTS=assets/generation_prompts.txt \
-CONFIG=configs/self_forcing.json \
+CONFIG=configs/legacy.json \
 KH=2 \
 VH=1 \
 FRAMES=717 \

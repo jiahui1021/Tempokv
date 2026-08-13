@@ -8,13 +8,13 @@
 # --k-history-length / --v-history-length 显式指定，用不同 --output-dir 区分。
 #
 # 用法（所有参数都用环境变量传入）：
-#   CONFIG=configs/self_forcing.json \
+#   CONFIG=configs/legacy.json \
 #   KH=2 \
 #   VH=1 \
 #   bash scripts/Self-Forcing/fit_params.sh
 #
 # 必需变量：
-#   CONFIG      codec 配置 JSON（如 configs/self_forcing.json）
+#   CONFIG      codec 配置 JSON（如 configs/legacy.json）
 #
 # 常用可选变量：
 #   TRACE_FILE      拟合输入（默认 data/self-forcing/trace/clean_trace.npz）

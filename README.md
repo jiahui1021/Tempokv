@@ -1,104 +1,97 @@
 # TempoKV
 
-TempoKV 使用时间预测与 CrossKV 预测压缩视频生成模型的 KV cache。仓库包含
-PyTorch 参考实现、可选 Triton 算子、参数拟合工具，以及 Self-Forcing、
-Causal Forcing 和 LongCat 的模型接入。
+TempoKV 使用时间预测与 CrossKV 预测压缩视频生成模型的 KV cache。仓库包含 PyTorch
+参考实现、可选 Triton 算子、参数拟合工具，以及 Self-Forcing、Causal Forcing 和
+LongCat 的模型接入。
 
 ## 目录
 
 ```text
 Tempokv/
-├── experiments/
-│   ├── Self-Forcing/          Self-Forcing 模型与推理代码
-│   ├── Causal-Forcing/        Causal Forcing 模型与推理代码
-│   └── LongCat/               LongCat 模型接入代码
-├── src/tempokv/               TempoKV 核心算法、参数格式与 Triton 算子
+├── experiments/               模型侧代码（Self-Forcing / Causal-Forcing / LongCat）
+├── src/tempokv/               核心算法、参数格式与 Triton 算子
 │   └── runtime/               因果视频模型共用的 KV cache、RoPE、流式编码与指标
-├── scripts/
-│   ├── Self-Forcing/          Self-Forcing 采集、拟合与生成入口
-│   ├── Causal-Forcing/        Causal Forcing 下载、采集、拟合与生成入口
-│   ├── LongCat/               LongCat 采集、拟合与生成入口
-│   ├── common/                多模型共用的参数拟合入口
-│   ├── evaluation/            视频质量评测
-│   └── tools/                 通用分析与流水线工具
-├── data/
-│   ├── self-forcing/
-│   │   ├── trace/             raw trace 与合并后的 clean trace
-│   │   └── params/            按参数方案分组的拟合参数
-│   ├── causal-forcing/
-│   │   ├── trace/<模式>/
-│   │   └── params/<模式>/
-│   └── longcat/
-│       ├── trace/
-│       └── params/
-├── configs/                   TempoKV 配置
+├── scripts/                   各模型入口、共用拟合入口、评测与分析工具
+├── configs/                   codec 配置
+├── data/                      可复用的 trace 与拟合参数
 └── results/                   生成视频、报告与评测结果
 ```
 
-目录职责固定：
-
-- `experiments/` 只保存模型侧代码。
-- `src/tempokv/` 只保存 TempoKV 自己的算法和算子；`src/tempokv/runtime/` 保存
-  Self-Forcing 与 Causal Forcing 共用的因果 KV cache 运行时。
-- `scripts/` 只保存最终调用入口与通用工具。
-- `data/` 保存可重复使用的 trace 和拟合参数。
-- `results/` 保存每次运行产生的视频与报告。
-
 ## 安装
 
-PyTorch 参考实现：
-
-```bash
-pip install -e .
-```
-
-NVIDIA GPU Triton 解码：
-
-```bash
-pip install -e ".[cuda]"
-```
-
-Self-Forcing 推理环境：
-
-```bash
-pip install -e ".[cuda,self-forcing]"
-```
-
-Causal Forcing 推理环境：
-
-```bash
-pip install -e ".[cuda,causal-forcing]"
-```
-
-如果还需要 Self-Forcing 训练工具，再安装：
-
-```bash
-pip install -e ".[cuda,self-forcing,self-forcing-train]"
-```
+| 用途 | 命令 |
+|---|---|
+| PyTorch 参考实现 | `pip install -e .` |
+| NVIDIA GPU Triton 解码 | `pip install -e ".[cuda]"` |
+| Self-Forcing 推理 | `pip install -e ".[cuda,self-forcing]"` |
+| Causal Forcing 推理 | `pip install -e ".[cuda,causal-forcing]"` |
+| LongCat 推理 | `pip install -e ".[cuda,longcat]"` |
+| 视频质量评测 | `pip install -e ".[metrics]"` |
 
 Self-Forcing 与 LongCat 对 `diffusers`、`transformers` 和 `av` 的版本要求不同，
 建议分别使用独立的虚拟环境。
 
+## 快速开始
+
+每个模型都是四步：采 trace → 拟合参数 → TempoKV 生成 → BF16 对照。完整变量说明见
+各自的使用说明，下面只列入口。
+
+| 模型 | 入口 | 使用说明 |
+|---|---|---|
+| Self-Forcing | `scripts/Self-Forcing/{collect_trace,fit_params,run_tempokv,run_bf16}.sh` | [说明](scripts/Self-Forcing/README.md) |
+| Causal Forcing | `scripts/Causal-Forcing/{download_models,collect_trace,fit_params,run_tempokv,run_bf16}.sh` | [说明](scripts/Causal-Forcing/README.md) |
+| LongCat | `scripts/LongCat/{collect_trace,fit_params,run_tempokv,run_bf16}.sh` | [说明](scripts/LongCat/README.md) |
+
+```bash
+# Self-Forcing 为例
+CHECKPOINT=/models/self_forcing_dmd.pt \
+WAN_MODEL_DIR=/models/Wan2.1-T2V-1.3B \
+PROMPTS=assets/fit_prompts.txt \
+bash scripts/Self-Forcing/collect_trace.sh
+
+CONFIG=configs/legacy.json bash scripts/Self-Forcing/fit_params.sh
+
+CHECKPOINT=... WAN_MODEL_DIR=... PROMPTS=assets/generation_prompts.txt \
+CONFIG=configs/legacy.json FRAMES=717 \
+bash scripts/Self-Forcing/run_tempokv.sh
+```
+
+BF16 对照不读 TempoKV 配置或参数，默认与 TempoKV 生成相同帧数，所以耗时、显存和
+视频质量可以直接对照。两者都会在 `results/<模型>/` 写入视频与报告。
+
 ## 配置
 
-`configs/` 每个模型一个文件，位宽、历史长度和解码器都是命令行 override，不需要为
-每种组合各存一个文件：
+`configs/` 只有两个文件，对应两个**拟合家族**。其余全部是命令行 override，
+不需要为每种组合各存一个文件：
 
 ```text
 configs/
-├── self_forcing.json             Self-Forcing（legacy 拟合，复现参考实现）
-├── causal_forcing.json           Causal Forcing（native 拟合）
-├── causal_forcing_temporal_v.json  Causal Forcing + temporal V 预测器
-├── longcat.json                  LongCat，CP=1
-├── longcat_temporal_v.json       LongCat CP=1 + temporal V 预测器
-├── longcat_cp2.json              LongCat，CP=2（stride 780）
-└── longcat_cp4.json              LongCat，CP=4（stride 390）
+├── native.json    native 拟合（Causal Forcing、LongCat）
+└── legacy.json    legacy 拟合，复现参考实现（Self-Forcing）
 ```
 
-每个文件**只写出赋予它身份的字段**，其余取 [`CodecConfig`](src/tempokv/config.py)
-的默认值（`anchor_bits=4`、`group_size=64`、`residual_mode=asymmetric`、
-`scale_dtype`/`reconstruction_dtype=bfloat16`、`stride=1560`），所以两个配置的差别
-一眼可见——`longcat_cp2.json` 与 `longcat.json` 只差一行 `stride`。
+K 预测器的粒度是最显眼的差别：native 每层每头一套系数（`[L,P,P,H,D]`），legacy 把
+全部层和头池化成一套通道系数（`[P,P,D]`，参数量少 360 倍）。但 `fit_mode` 不只管
+K——它同时改 V 预测的累加顺序、编解码的 BF16 截断点，并强制 `strict_triton`，是一个
+**全局的逐位兼容模式**（目标是复现 QVG 参考实现），不是单纯的 K 预测器开关。它与
+`k_predictor_mode` 互为必需（legacy ⟺ shared K），所以是一个不可分的 bit，也是文件
+唯一需要编码的东西；legacy 另外钉死拟合控制参数（`iterations=2`、
+`temporal_ridge=1.0`、`cross_ridge=0.1`、`max_gain=1.0`），脚本按家族自动取默认值。
+其余字段取 [`CodecConfig`](src/tempokv/config.py) 的默认值（`anchor_bits=4`、
+`group_size=64`、`residual_mode=asymmetric`、
+`scale_dtype`/`reconstruction_dtype=bfloat16`、`stride=1560`）。
+
+### K 家族 × V 预测器：四种组合都可用
+
+两个轴独立，`V_PREDICTOR` 在任一家族下都成立：
+
+| | `V_PREDICTOR=cross_kv`（默认） | `V_PREDICTOR=temporal` |
+|---|---|---|
+| `native.json` | V = Cross(K) + 对角 V history | V 只读自己的 V history，`[L,P,P,H,D]` |
+| `legacy.json` | Cross(K) 仍是 per-layer per-head | V history 池化成 `[P,P,D]` |
+
+注意 legacy 池化的是 **K 与 temporal V**；它的 CrossKV V 仍然是 per-layer per-head。
+`v_predictor_mode=temporal` 需要 `v_history_length >= 1`——没有历史就没有可预测的东西。
 
 ### 命令行 override
 
@@ -108,40 +101,21 @@ configs/
 | `K_BITS` / `V_BITS` | 分别设，用于混合精度 | 全部 |
 | `KH` / `VH` | K/V 历史长度（长名 `K_HISTORY_LENGTH` / `V_HISTORY_LENGTH`） | 全部 |
 | `V_PREDICTOR` | V 预测器：`cross_kv` 或 `temporal` | 全部 |
+| `CACHE_STRIDE` | 本次运行的 local cache stride（CP>1 时用） | LongCat |
 | `TORCH_DECODER=1` | 用 PyTorch 参考解码器而不是 Triton | Self-Forcing |
 
-`BITS` 与 `K_BITS`/`V_BITS` 设成不同值会直接报错，而不是悄悄取一个。所以
-INT2 只需要 `BITS=2`，不需要另一个配置文件：
+冲突会直接报错，不会悄悄取一个：`BITS` 与 `K_BITS`/`V_BITS` 不一致，或 `KH` 与
+`K_HISTORY_LENGTH` 不一致，都会失败。
 
 ```bash
-CONFIG=configs/self_forcing.json BITS=2 KH=2 bash scripts/Self-Forcing/fit_params.sh
+CONFIG=configs/legacy.json BITS=2 bash scripts/Self-Forcing/fit_params.sh
+CONFIG=configs/legacy.json V_PREDICTOR=temporal bash scripts/Self-Forcing/fit_params.sh
+CONFIG=configs/native.json CACHE_STRIDE=780 bash scripts/LongCat/fit_params.sh
 ```
 
-V 预测器同理，Self-Forcing 的基础配置已经是 legacy，所以直接切即可：
-
-```bash
-CONFIG=configs/self_forcing.json V_PREDICTOR=temporal bash scripts/Self-Forcing/fit_params.sh
-```
-
-**temporal V 有一个约束**：它目前只有 legacy 拟合路径能产出（`fitting.py` 的
-`temporal_v_obstacle` 是这条规则的唯一出处）。只有 Self-Forcing 的基础配置本身就是
-legacy，所以只有它能靠 `V_PREDICTOR` 双向切换；Causal Forcing 与 LongCat 的基础配置
-是 native，temporal 要走各自的 `*_temporal_v.json`——那些文件带着整套 legacy 开关，
-这是它们作为独立文件保留的原因。在 native 配置上单独设 `V_PREDICTOR=temporal` 会在
-读 trace 之前就报错并说明怎么改。
-
-实际可用组合：
-
-| 模型 | `cross_kv` | `temporal` |
-|---|---|---|
-| Self-Forcing | `self_forcing.json`（默认） | 同一文件 + `V_PREDICTOR=temporal` |
-| Causal Forcing | `causal_forcing.json` | `causal_forcing_temporal_v.json` |
-| LongCat CP=1 | `longcat.json` | `longcat_temporal_v.json` |
-| LongCat CP=2/4 | `longcat_cp2/cp4.json` | **不支持** |
-
-LongCat 的 CP=2/4 用不了 temporal V 不是接线缺失，而是硬约束：legacy 拟合要求
-`stride=1560`，而 CP=2/4 的 local stride 是 780 / 390。要支持它得先让 native fitter
-也能产出 temporal V 参数。
+两个配置的历史长度都是 `kh2-vh1`，**不再按模型区分**。Self-Forcing 复现参考实现的
+KH3 要显式写 `KH=3`；Causal Forcing 与 LongCat 用 `native.json`，temporal V 直接加
+`V_PREDICTOR=temporal`。
 
 ### 参数目录名
 
@@ -149,313 +123,73 @@ LongCat 的 CP=2/4 用不了 temporal V 不是接线缺失，而是硬约束：l
 目录名把它们全部编码进去，互不覆盖：
 
 ```text
-legacy-kh3-vh1-int4        Self-Forcing 默认
-legacy-kh2-vh1-int2        BITS=2 KH=2
-kh2-vh1-int4               Causal Forcing / LongCat CP=1 默认
-kh2-vt1-int4               temporal V 预测器（vt 而不是 vh）
-kh2-vh1-int4-s780          LongCat CP=2（stride 进 signature，必须独立拟合）
+legacy-kh2-vh1-int4        legacy.json 默认
+legacy-kh3-vh1-int4        + KH=3（Self-Forcing 参考实现）
+legacy-kh2-vh1-int2        + BITS=2
+legacy-kh2-vt1-int4        + V_PREDICTOR=temporal（vt 而不是 vh）
+kh2-vh1-int4               native.json 默认
+kh2-vh1-int4-s780          + CACHE_STRIDE=780
 kh2-vh1-k2-v4              K/V 位宽不同
 ```
 
-`residual_mode=symmetric` 且位宽为 2 时使用的是 `-1, 0, 1` 三个量化值；默认的
-`residual_mode=asymmetric` 才使用 2 bit 的四个编码值。
-
-## Self-Forcing
-
-Self-Forcing 的 BF16、clean trace 和 TempoKV 使用同一份本地模型代码：
-`experiments/Self-Forcing/inference.py`。不需要 `MODEL_REPO`、`TRACE_RUNNER`
-或外部仓库。`CHECKPOINT` 与 `WAN_MODEL_DIR` 只负责指定本机模型权重。
-
-### 1. 采集并合并 clean trace
-
-```bash
-CHECKPOINT=/models/self_forcing_dmd.pt \
-WAN_MODEL_DIR=/models/Wan2.1-T2V-1.3B \
-PROMPTS=assets/fit_prompts.txt \
-bash scripts/Self-Forcing/collect_trace.sh
-```
-
-默认输出：
-
-```text
-data/self-forcing/trace/raw/
-data/self-forcing/trace/output/
-data/self-forcing/trace/clean_trace.npz
-```
-
-已有 raw trace 时只执行合并：
-
-```bash
-python experiments/Self-Forcing/tempokv_adapter/prepare_trace.py \
-  data/self-forcing/trace/raw \
-  data/self-forcing/trace/clean_trace.npz \
-  --legacy-protocol
-```
-
-### 2. 拟合一套参数
-
-```bash
-CONFIG=configs/self_forcing.json \
-KH=2 \
-VH=1 \
-bash scripts/Self-Forcing/fit_params.sh
-```
-
-默认输出（`BITS=2` 时是 `legacy-kh2-vh1-int2`）：
-
-```text
-data/self-forcing/params/legacy-kh2-vh1-int4/k_temporal.npz
-data/self-forcing/params/legacy-kh2-vh1-int4/v_cross_kv.npz
-```
-
-### 3. 使用 TempoKV 生成
-
-```bash
-CHECKPOINT=/models/self_forcing_dmd.pt \
-WAN_MODEL_DIR=/models/Wan2.1-T2V-1.3B \
-PROMPTS=assets/generation_prompts.txt \
-CONFIG=configs/self_forcing.json \
-KH=2 \
-VH=1 \
-FRAMES=717 \
-bash scripts/Self-Forcing/run_tempokv.sh
-```
-
-脚本会按配置自动选择 `data/self-forcing/params/<参数方案>/`。也可以用
-`PARAM_DIR` 指定其他参数目录。
-
-### 4. 生成 BF16 对照
-
-```bash
-CHECKPOINT=/models/self_forcing_dmd.pt \
-WAN_MODEL_DIR=/models/Wan2.1-T2V-1.3B \
-PROMPTS=assets/generation_prompts.txt \
-FRAMES=717 \
-bash scripts/Self-Forcing/run_bf16.sh
-```
-
-BF16 不读取 TempoKV 配置或参数。BF16 与 TempoKV 默认都生成 717 帧，保证
-耗时、显存和视频质量可以直接对照。717 帧对应 60 个生成 block，因此两种
-模式的进度条都显示 `60/60`。两种生成方式都会在 `results/self_forcing/`
-中写入视频、耗时和显存报告。
-
-完整变量说明见 [Self-Forcing 使用说明](scripts/Self-Forcing/README.md)。
-
-## Causal Forcing
-
-Causal Forcing 的模型、pipeline、VAE、scheduler 和 TempoKV 接入代码都位于
-`experiments/Causal-Forcing/`，入口位于 `scripts/Causal-Forcing/`。不需要 clone
-外部 `thu-ml/Causal-Forcing`，不需要外部 `PYTHONPATH`，权重由 `MODEL_ROOT` 与
-`CHECKPOINT` 指定。
-
-安装 Causal Forcing 依赖：
-
-```bash
-pip install -e ".[cuda,causal-forcing]"
-```
-
-### 0. 下载权重
-
-```bash
-bash scripts/Causal-Forcing/download_models.sh
-```
-
-默认下载到 `checkpoints/causal_forcing/`，包含 Wan2.1-T2V-1.3B base 与
-chunk-wise / frame-wise 两个 Causal Forcing 权重。权重不进入 Git。
-
-### 1. 采集并合并 clean trace
-
-```bash
-CHECKPOINT=checkpoints/causal_forcing/chunkwise/causal_forcing.pt \
-MODEL_ROOT=checkpoints/causal_forcing/wan2.1-t2v-1.3b \
-PROMPTS=assets/fit_prompts.txt \
-bash scripts/Causal-Forcing/collect_trace.sh
-```
-
-默认输出：
-
-```text
-data/causal-forcing/trace/chunkwise/raw/
-data/causal-forcing/trace/chunkwise/output/
-data/causal-forcing/trace/chunkwise/clean_trace.npz
-```
-
-只采 clean/context refresh 留下的 pre-RoPE normalized K 与 raw V，4 次 noisy
-denoising step 的 current K/V 不入 trace。
-
-### 2. 拟合一套参数
-
-```bash
-CONFIG=configs/causal_forcing.json \
-bash scripts/Causal-Forcing/fit_params.sh
-```
-
-默认输出：
-
-```text
-data/causal-forcing/params/chunkwise/kh2-vh1-int4/k_temporal.npz
-data/causal-forcing/params/chunkwise/kh2-vh1-int4/v_cross_kv.npz
-```
-
-INT2 加 `BITS=2` 即可，目录名会自动带上位宽。
-
-### 3. 使用 TempoKV 生成
-
-```bash
-CHECKPOINT=checkpoints/causal_forcing/chunkwise/causal_forcing.pt \
-MODEL_ROOT=checkpoints/causal_forcing/wan2.1-t2v-1.3b \
-PROMPTS=assets/generation_prompts.txt \
-CONFIG=configs/causal_forcing.json \
-bash scripts/Causal-Forcing/run_tempokv.sh
-```
-
-脚本按配置自动选择 `data/causal-forcing/params/<模式>/<参数方案>/`，也可以用
-`PARAM_DIR` 指定其他目录。生成结束会写出 `tempokv_report.json`；`encode_key_calls`、
-`encode_value_calls`、`decode_tensor_calls`、`finalized_frames` 任何一个为 0 都会
-让本次运行直接失败，避免"视频正常生成但其实没走 TempoKV"。
-
-### 4. 生成 BF16 对照
-
-```bash
-CHECKPOINT=checkpoints/causal_forcing/chunkwise/causal_forcing.pt \
-MODEL_ROOT=checkpoints/causal_forcing/wan2.1-t2v-1.3b \
-PROMPTS=assets/generation_prompts.txt \
-bash scripts/Causal-Forcing/run_bf16.sh
-```
-
-BF16 不读取 TempoKV 配置或参数。两种模式默认都生成 81 帧，耗时、显存和视频质量
-可以直接对照。
-
-### chunk-wise 与 frame-wise
-
-`GENERATION_MODE=framewise` 切换到 frame-wise 模型（`num_frame_per_block=1`），
-上面四步的命令完全不变，trace、参数和结果分别存放在 `framewise/` 子目录下，
-两种模式互不覆盖。两者共用同一套 cache 与 runtime，没有单独的算法分支。
-
-Causal Forcing 与 Self-Forcing 的 30 层 / 12 头 / D=128 / stride=1560 完全相同，
-但 checkpoint、训练方式和 cache 分布不同，**参数不能互相复用**，必须各自采 trace
-各自拟合。`run_tempokv.sh` 会检查参数文件的 `coordinate_system` 与 codec
-signature，用错参数会在加载模型之前直接失败。
-
-### 已接入范围
-
-已接入的是**标准 Causal Forcing 推理**（chunk-wise 与 frame-wise）的 BF16、
-trace、INT4/INT2 全流程。上游的 Rolling Forcing / long-video 扩展
-（`long_video/`）**尚未接入**，rolling eviction 与 sink 保留也未实现：cache 已经
-保存绝对帧位置和独立的 predictor span，为这些功能留了口子，但在实现之前
-`sink_size > 0` 与局部注意力窗口同时使用会直接报错，而不是给出与上游不同的结果。
-
-完整变量说明见 [Causal Forcing 使用说明](scripts/Causal-Forcing/README.md)。
-
-## LongCat
-
-LongCat 的模型、VAE、scheduler、Context Parallel 和 TempoKV 接入代码都位于
-`experiments/LongCat/`，入口位于 `scripts/LongCat/`。不需要 `LONGCAT_REPO`、
-外部 runner 或预先生成的 init 视频。模型权重由 `CHECKPOINT_DIR` 指定。
-
-安装 LongCat 依赖：
-
-```bash
-pip install -e ".[cuda,longcat]"
-```
-
-### 1. 采集并合并 clean trace
-
-```bash
-CHECKPOINT_DIR=/models/LongCat-Video \
-PROMPT="a cinematic mountain road" \
-bash scripts/LongCat/collect_trace.sh
-```
-
-默认输出：
-
-```text
-data/longcat/trace/raw/
-data/longcat/trace/output/
-data/longcat/trace/clean_trace.npz
-```
-
-合并阶段从 trace 文件里的 `trace_stride` 读取空间步长，并校验所有 Context
-Parallel rank 的 metadata 一致，因此 `CONTEXT_PARALLEL_SIZE=1/2/4`
-（对应 stride `1560/780/390`）都不需要改合并命令。
-
-### 2. 拟合一套参数
-
-```bash
-CONFIG=configs/longcat.json \
-bash scripts/LongCat/fit_params.sh
-```
-
-默认输出：
-
-```text
-data/longcat/params/kh2-vh1-int4/k_temporal.npz
-data/longcat/params/kh2-vh1-int4/v_cross_kv.npz
-```
-
-换配置时目录名会自动带上位宽，INT4 与 INT2 不会互相覆盖：
-
-```bash
-CONFIG=configs/longcat.json \
-bash scripts/LongCat/fit_params.sh    # -> data/longcat/params/kh2-vh1-int2
-```
-
-三个模型用同一套目录命名规则。参数文件会记录拟合时的 codec signature，加载时
-校验，用错位宽或用另一次拟合的半套参数都会直接报错而不是产出错误结果。
-
-### 3. 使用 TempoKV 生成
-
-```bash
-CHECKPOINT_DIR=/models/LongCat-Video \
-CONFIG=configs/longcat.json \
-K_PARAMS=data/longcat/params/kh2-vh1-int4/k_temporal.npz \
-V_PARAMS=data/longcat/params/kh2-vh1-int4/v_cross_kv.npz \
-PROMPT="a cinematic mountain road" \
-bash scripts/LongCat/run_tempokv.sh
-```
-
-默认输出到 `results/longcat/tempokv/`。
-
-### 4. 生成 BF16 对照
-
-```bash
-CHECKPOINT_DIR=/models/LongCat-Video \
-PROMPT="a cinematic mountain road" \
-bash scripts/LongCat/run_bf16.sh
-```
-
-默认输出到 `results/longcat/bf16/`。BF16 不读取 TempoKV 配置或参数。
-
-三种模式都先从 prompt 生成首段，再执行 video continuation。只有希望从已有视频
-继续生成时才设置 `INIT_VIDEO_PATH`。常用可选变量：`NUM_SEGMENTS`、
-`NUM_FRAMES`、`NUM_COND_FRAMES`、`NUM_INFERENCE_STEPS`、
-`CONTEXT_PARALLEL_SIZE`、`NUM_GPUS`、`SEED`、`OUTPUT_DIR`、`DRY_RUN`。
-
-完整变量说明见 [LongCat 使用说明](scripts/LongCat/README.md)。
+参数文件记录拟合时的 codec signature，加载时校验，用错位宽、用错 stride 或用另一次
+拟合的半套参数都会直接报错，而不是产出错误结果。
+
+### 两条约束
+
+**legacy 家族只接受 Self-Forcing 的 legacy trace 协议。**
+`scripts/common/fit_params.py` 会校验 `trace_layout=legacy_event_bpfhd_v1`、
+`trace_stride=1560` 和固定的 30 层张量形状，只有
+`experiments/Self-Forcing/tempokv_adapter/prepare_trace.py` 产出这种 trace。所以
+Causal Forcing 与 LongCat 只能走 native 家族——但 temporal V 在 native 下同样可用，
+不再受这条限制。
+
+**stride 随模型而变，不是常量。** 它是模型的 frame token 数（Self-Forcing /
+Causal Forcing 是 1560；LongCat 在 CP>1 时按 CP 度数切成 780 / 390），只是
+`CodecConfig` 的默认值恰好取了 1560。stride 进 codec signature，所以每个 stride
+要各自拟合；设错不会静默跑，bridge 会把 codec 的 stride 对着**从实际 cache 形状
+算出来的** `sequence // temporal_units` 比。
+
+## 各模型注意事项
+
+**Self-Forcing** 的 BF16、trace 与 TempoKV 共用 `experiments/Self-Forcing/inference.py`，
+不需要外部仓库。`FRAMES=717` 对应 60 个生成 block，两种模式的进度条都显示 `60/60`。
+
+**Causal Forcing** 用 `GENERATION_MODE=framewise` 切到 frame-wise 模型
+（`num_frame_per_block=1`），四步命令完全不变，trace、参数和结果分别存放在
+`framewise/` 子目录，两种模式互不覆盖。两者共用同一套 cache 与 runtime，没有单独的
+算法分支。
+
+它与 Self-Forcing 的 30 层 / 12 头 / D=128 / stride=1560 完全相同，但 checkpoint、
+训练方式和 cache 分布不同，**参数不能互相复用**，必须各自采 trace 各自拟合；
+`run_tempokv.sh` 会检查 `coordinate_system` 与 codec signature，用错参数在加载模型
+之前就失败。生成结束写出 `tempokv_report.json`，其中 `encode_key_calls`、
+`encode_value_calls`、`decode_tensor_calls`、`finalized_frames` 任一为 0 都会让本次
+运行直接失败，避免"视频正常生成但其实没走 TempoKV"。
+
+已接入的是**标准 Causal Forcing 推理**（chunk-wise 与 frame-wise）的 BF16、trace、
+INT4/INT2 全流程。上游的 Rolling Forcing / long-video 扩展（`long_video/`）**尚未
+接入**，rolling eviction 与 sink 保留也未实现：cache 已经保存绝对帧位置和独立的
+predictor span，为这些功能留了口子，但在实现之前 `sink_size > 0` 与局部注意力窗口
+同时使用会直接报错，而不是给出与上游不同的结果。
+
+**LongCat** 的模型、VAE、scheduler、Context Parallel 与 TempoKV 接入都在
+`experiments/LongCat/`，权重由 `CHECKPOINT_DIR` 指定，不需要外部 runner 或预生成的
+init 视频。
 
 ## 历史帧数敏感性实验
 
-三个模型都可以扫 K 与 V 的历史帧数，报告重建误差、attention 输出误差和预测项占比：
+扫 K 与 V 的历史帧数，报告重建误差、attention 输出误差和预测项占比：
 
 ```bash
-bash scripts/Self-Forcing/sweep_history.sh
-bash scripts/Causal-Forcing/sweep_history.sh      # GENERATION_MODE 分开存放
-bash scripts/LongCat/sweep_history.sh
-```
-
-先跑小规模确认能跑通：
-
-```bash
+bash scripts/Self-Forcing/sweep_history.sh          # 三个模型各有一个同名入口
 MAX_SAMPLES=64 MAX_FRAMES=8 LAYERS=0,15,29 \
-bash scripts/Self-Forcing/sweep_history.sh
+bash scripts/Self-Forcing/sweep_history.sh          # 先跑小规模确认能跑通
 ```
 
 K 扫 `k_history_length`（1 到 8），V 在 CrossKV 项之上再扫 `v_history_length`
-（0 到 5），并额外拆出 V 预测里 CrossKV 项与 history 项各自的能量占比——两项相关，
-所以并排报告而不是把总量切开。
-
-每个 vh 取值还会做一次 **CrossKV 项的留一消融**：把 V 预测里的 CrossKV 项或
-history 项从**已拟合好的**模型里去掉，看残差各涨多少。
+（0 到 5）。每个 vh 取值还会做一次 **CrossKV 项的留一消融**：把 V 预测里的 CrossKV
+项或 history 项从**已拟合好的**模型里去掉，看残差各涨多少。
 
 ```text
 vh       both  cross only  history only  cross buys  history buys
@@ -464,52 +198,63 @@ vh       both  cross only  history only  cross buys  history buys
 ```
 
 `cross buys` = 去掉 CrossKV 项后的残差减去两项都在时的残差，`history buys` 同理。
-这是**留一消融**而不是"不带该项重新拟合"，所以说的是该项在这个预测器里贡献了多少，
-不是"不用它训出来的模型能做到多好"。两项相关，所以两个残差不构成对总残差的分解。
+这是留一消融而不是"不带该项重新拟合"，所以说的是该项在这个预测器里贡献了多少；两项
+相关，所以两个残差不构成对总残差的分解。
 
-**每个取值都会重新拟合一次。** 非 shared 参数的历史长度在拟合时就固定了，拿一套
-参数改 N 得到的不是那个 N 的模型，只能靠重拟合来比较。位宽、group_size 和 stride
-由 `CONFIG` 固定，扫描过程中不变。
+**每个取值都会重新拟合一次**——非 shared 参数的历史长度在拟合时就固定了，拿一套
+参数改 N 得到的不是那个 N 的模型。拟合默认在 GPU 上跑（`FIT_DEVICE=auto`）；没有
+CUDA 时会回退 CPU 并告警，而 CPU 拟合同时降到 float64，比看上去慢得多，
+`FIT_DEVICE=cuda` 可以让它直接报错。
 
 三个模型共用 `scripts/common/sweep_history.sh`，变量说明见该文件头部。单点分析
 （不扫描、直接读已有参数）用 `scripts/tools/analyze_predictor.py`。
 
-拟合默认在 GPU 上跑（`FIT_DEVICE=auto`）。没有 CUDA 时会回退 CPU 并打出告警——
-CPU 拟合同时降到 float64，比看上去慢得多；`FIT_DEVICE=cuda` 可以让它直接报错
-而不是悄悄回退。
-
 ## 评测
 
 ```bash
-pip install -e ".[metrics]"
-
 python scripts/evaluation/evaluate_quality.py \
   results/self_forcing/bf16/videos \
-  results/self_forcing/kh2-vh1-int2/videos \
+  results/self_forcing/legacy-kh2-vh1-int4/videos \
   --device cuda \
-  --output results/self_forcing/evaluation/kh2-vh1-int2/quality.json
+  --output results/self_forcing/evaluation/quality.json
 ```
 
-`evaluate_quality.py` 在同一次配对解码中计算 pooled RGB PSNR、平均 SSIM、
-平均 LPIPS 和 2048 维 Inception frame FID。默认使用全部帧；smoke 可以用
-`--frame-stride`、`--max-frames` 和 `--fid-batch-size` 控制工作量。这里的 FID
-以同 prompt、同 seed 的 BF16 视频为 reference，衡量量化后帧分布偏移，不是生成视频
-相对真实数据集的标准 FID，也不替代时间一致性评测。
+在同一次配对解码中计算 pooled RGB PSNR、平均 SSIM、平均 LPIPS 和 2048 维 Inception
+frame FID。这里的 FID 以同 prompt、同 seed 的 BF16 视频为 reference，衡量量化后的帧
+分布偏移，**不是**生成视频相对真实数据集的标准 FID，也不替代时间一致性评测。
 
-对一个候选方法一键运行 quality/FID 和 BF16、候选各自的 VBench：
+一键跑 quality/FID 加 BF16 与候选各自的 VBench：
 
 ```bash
 BASELINE_DIR=results/self_forcing/bf16/videos \
-CANDIDATE_DIR=results/self_forcing/kh2-vh1-int2/videos \
-CANDIDATE_NAME=kh2-vh1-int2 \
+CANDIDATE_DIR=results/self_forcing/legacy-kh2-vh1-int4/videos \
+CANDIDATE_NAME=legacy-kh2-vh1-int4 \
 OUTPUT_DIR=results/self_forcing/evaluation \
 DEVICE=cuda \
 bash scripts/evaluation/evaluate_all.sh
 ```
 
-再次评测其他方法时只需更换 `CANDIDATE_DIR` 与 `CANDIDATE_NAME`。脚本根据视频
-清单和 VBench 配置指纹复用已经完成的 BF16 VBench；输入或配置变化会自动重算，
-`FORCE=1` 可以强制重算。可选变量还有 `FRAME_STRIDE`、`MAX_FRAMES`、
-`FID_BATCH_SIZE`、`LPIPS_NETWORK`、`VBENCH_MODE`、`VBENCH_DIMENSIONS`、
-`VBENCH_FULL_INFO`、`VBENCH_LOCAL_CHECKPOINTS` 和 `VBENCH_READ_FRAME`。
-`PROMPT_FILE` 如需使用，必须是覆盖当前视频文件名的 JSON 映射。
+脚本按视频清单与 VBench 配置指纹复用已完成的 BF16 VBench，输入或配置变化自动重算，
+`FORCE=1` 强制重算。其余可选变量见
+[`scripts/evaluation/evaluate_all.sh`](scripts/evaluation/evaluate_all.sh) 头部。
+
+## 性能分解
+
+加速工作从测量开始。给任意一次生成加上 `PROFILE=1`，会用 CUDA event 记录每一段的
+耗时，写到 `$OUTPUT_DIR/profile/rank-N.json`；记录 event 不做同步，插桩后的运行保持
+原来的 launch 模式。
+
+```bash
+PROFILE=1 CONFIG=configs/legacy.json ... bash scripts/Self-Forcing/run_tempokv.sh
+python scripts/tools/profile_tempokv_runtime.py results/self_forcing/legacy-kh2-vh1-int4
+```
+
+报告按调用树给出每段的 total、self（减去子段）与占 generation 的比例，分段包括
+`attention_kernel`、`rope`、`cache_read_k/v`、`decode_k/v`、`encode_k/v` 与
+`vae_decode`；同一段在不同父段下分别统计。`--baseline` 对比两次运行。BF16 对照同样
+支持 `PROFILE=1`，它没有 codec，所以 `decode_*` / `encode_*` 会列为未插桩而不是 0。
+
+kernel 级别的扫描用 `scripts/tools/benchmark_tempokv_kernels.py`：在生产 shape 下
+构造真实 packed span，逐配置对比 Torch decoder 确认数值正确，再报告 median/p90 延迟、
+峰值显存与寄存器/spill。microbenchmark 变快不等于端到端变快，结论要用完整 717 帧生成
+确认。

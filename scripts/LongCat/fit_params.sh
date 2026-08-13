@@ -10,7 +10,7 @@
 # INT4 与 INT2 不会互相覆盖。
 #
 # 用法：
-#   CONFIG=configs/longcat.json \
+#   CONFIG=configs/native.json \
 #   bash scripts/LongCat/fit_params.sh
 #
 # 常用可选变量：
@@ -44,8 +44,8 @@ fi
 
 # collect_trace.sh 写出的是 TRACE_FILE；TRACE 是本脚本的旧名字，继续支持。
 trace="$(resolve_path "${TRACE_FILE:-${TRACE:-data/longcat/trace/clean_trace.npz}}")"
-config="$(resolve_path "${CONFIG:-configs/longcat.json}")"
-parameter_name="${PARAM_NAME:-$(codec_slug "$config" "${K_HISTORY_LENGTH:-}" "${V_HISTORY_LENGTH:-}" "${K_BITS:-}" "${V_BITS:-}" "" "${V_PREDICTOR:-}")}"
+config="$(resolve_path "${CONFIG:-configs/native.json}")"
+parameter_name="${PARAM_NAME:-$(codec_slug "$config" "${K_HISTORY_LENGTH:-}" "${V_HISTORY_LENGTH:-}" "${K_BITS:-}" "${V_BITS:-}" "${CACHE_STRIDE:-}" "${V_PREDICTOR:-}")}"
 output_dir="$(resolve_path "${OUTPUT_DIR:-data/longcat/params/$parameter_name}")"
 
 if [[ "$output_dir" == "/" ]]; then
@@ -78,6 +78,7 @@ fit_command=(
 [[ -n "${V_HISTORY_LENGTH:-}" ]] && fit_command+=(--v-history-length "$V_HISTORY_LENGTH")
 [[ -n "${K_BITS:-}" ]] && fit_command+=(--k-bits "$K_BITS")
 [[ -n "${V_BITS:-}" ]] && fit_command+=(--v-bits "$V_BITS")
+[[ -n "${CACHE_STRIDE:-}" ]] && fit_command+=(--stride "$CACHE_STRIDE")
 [[ -n "${V_PREDICTOR:-}" ]] && fit_command+=(--v-predictor-mode "$V_PREDICTOR")
 
 if [[ "$DRY_RUN" == "1" ]]; then

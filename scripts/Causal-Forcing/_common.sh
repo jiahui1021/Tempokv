@@ -83,7 +83,15 @@ codec_slug() {
 import json
 import sys
 
-from tempokv.config import CodecConfig
+# Kept to the standard library on purpose: this runs on every fit and generate
+# invocation, and importing tempokv here would pull in torch just to build a
+# directory name.  tests/test_configs.py asserts these defaults still match
+# CodecConfig, so they cannot drift silently.
+DEFAULT_K_BITS = 2
+DEFAULT_V_BITS = 2
+DEFAULT_STRIDE = 1560
+DEFAULT_V_HISTORY_LENGTH = 0
+DEFAULT_V_PREDICTOR_MODE = "cross_kv"
 
 
 def override(index):
@@ -93,15 +101,14 @@ def override(index):
 
 config = json.load(open(sys.argv[1], encoding="utf-8"))
 config = config.get("codec", config)
-defaults = CodecConfig()
 
-k_bits = override(4) or int(config.get("k_bits", defaults.k_bits))
-v_bits = override(5) or int(config.get("v_bits", defaults.v_bits))
-stride = override(6) or int(config.get("stride", defaults.stride))
+k_bits = override(4) or int(config.get("k_bits", DEFAULT_K_BITS))
+v_bits = override(5) or int(config.get("v_bits", DEFAULT_V_BITS))
+stride = override(6) or int(config.get("stride", DEFAULT_STRIDE))
 k_history = override(2) or config.get("k_history_length") or 3
 v_history = override(3)
 if v_history is None:
-    v_history = config.get("v_history_length", defaults.v_history_length)
+    v_history = config.get("v_history_length", DEFAULT_V_HISTORY_LENGTH)
     if v_history is None:
         v_history = 0
 
@@ -113,7 +120,7 @@ k_label = f"kh{int(k_history)}"
 # The V segment records the predictor structure: parameters fitted for the
 # temporal V predictor are not interchangeable with CrossKV ones.
 v_predictor = sys.argv[7] or config.get(
-    "v_predictor_mode", defaults.v_predictor_mode
+    "v_predictor_mode", DEFAULT_V_PREDICTOR_MODE
 )
 v_prefix = "vt" if v_predictor == "temporal" else "vh"
 v_label = f"{v_prefix}{int(v_history)}"
@@ -126,7 +133,7 @@ else:
 # stride is part of the codec signature, so a context-parallel run fits its own
 # parameters.  Without this segment every CP degree wrote to one directory and
 # silently overwrote the others.
-stride_label = "" if stride == defaults.stride else f"-s{stride}"
+stride_label = "" if stride == DEFAULT_STRIDE else f"-s{stride}"
 print(f"{mode_label}{k_label}-{v_label}-{precision_label}{stride_label}")
 SLUGPY
 }

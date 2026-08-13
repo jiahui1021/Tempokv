@@ -94,6 +94,7 @@ preflight_args=(
   --context-parallel-size "$CONTEXT_PARALLEL_SIZE"
 )
 [[ -n "${CACHE_STRIDE:-}" ]] && preflight_args+=(--stride "$CACHE_STRIDE")
+[[ -n "${V_PREDICTOR:-}" ]] && preflight_args+=(--v-predictor-mode "$V_PREDICTOR")
 if [[ "$mode" == "tempokv" ]]; then
   preflight_args+=(
     --config "$(resolve_path "$CONFIG")"

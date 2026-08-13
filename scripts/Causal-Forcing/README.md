@@ -35,18 +35,18 @@ PROMPTS=assets/fit_prompts.txt \
 bash scripts/Causal-Forcing/collect_trace.sh
 
 # 拟合 INT4
-CONFIG=configs/causal_forcing.json \
+CONFIG=configs/native.json \
 bash scripts/Causal-Forcing/fit_params.sh
 
 # TempoKV 生成
 CHECKPOINT=checkpoints/causal_forcing/chunkwise/causal_forcing.pt \
 MODEL_ROOT=checkpoints/causal_forcing/wan2.1-t2v-1.3b \
 PROMPTS=assets/generation_prompts.txt \
-CONFIG=configs/causal_forcing.json \
+CONFIG=configs/native.json \
 bash scripts/Causal-Forcing/run_tempokv.sh
 ```
 
-INT2 只需要换 `configs/causal_forcing.json` 与对应的参数目录。
+INT2 只需要换 `configs/native.json` 与对应的参数目录。
 
 ## 公共变量
 

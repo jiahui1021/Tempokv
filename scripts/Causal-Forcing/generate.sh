@@ -13,7 +13,7 @@
 #   CHECKPOINT=/models/causal_forcing/chunkwise/causal_ode.pt \
 #   MODEL_ROOT=/models/Wan2.1-T2V-1.3B \
 #   PROMPTS=assets/generation_prompts.txt \
-#   CONFIG=configs/causal_forcing.json \
+#   CONFIG=configs/native.json \
 #   FRAMES=81 \
 #   bash scripts/Causal-Forcing/generate.sh
 #

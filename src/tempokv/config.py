@@ -98,6 +98,13 @@ class CodecConfig:
             )
         if self.v_predictor_mode not in {"cross_kv", "temporal"}:
             raise ValueError("v_predictor_mode must be cross_kv or temporal")
+        # The temporal V predictor reads only its own reconstructed history, so
+        # with no history it has nothing to predict from.  Say so here; both
+        # fitters would otherwise fail on a zero-length parameter axis.
+        if self.v_predictor_mode == "temporal" and self.v_history_length < 1:
+            raise ValueError(
+                "v_predictor_mode=temporal needs v_history_length >= 1"
+            )
         if self.fit_mode not in {"native", "legacy"}:
             raise ValueError("fit_mode must be native or legacy")
         if (
@@ -125,10 +132,17 @@ class CodecConfig:
             # tensor cores, which is worth measuring end to end.
             if self.k_bits != self.v_bits:
                 raise ValueError("legacy fitting requires matching K/V bits")
-            if self.anchor_bits != 4 or self.group_size != 64 or self.stride != 1560:
+            # anchor_bits and group_size fix the quantizer's bit layout, so the
+            # reference implementation is only reproduced at these values.
+            # stride is not one of them: it only decides where the encoder cuts
+            # units, and every legacy fitter merely records it, so pinning it
+            # here stated a parity requirement that does not exist.  The real
+            # limit sits in scripts/common/fit_params.py, which accepts only the
+            # Self-Forcing legacy trace protocol -- and that protocol pins
+            # trace_stride to 1560 itself.
+            if self.anchor_bits != 4 or self.group_size != 64:
                 raise ValueError(
-                    "legacy fitting requires anchor_bits=4, group_size=64, "
-                    "and stride=1560"
+                    "legacy fitting requires anchor_bits=4 and group_size=64"
                 )
             if self.residual_mode != "asymmetric":
                 raise ValueError("legacy fitting requires asymmetric residuals")

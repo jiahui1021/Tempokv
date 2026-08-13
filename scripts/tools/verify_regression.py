@@ -18,7 +18,7 @@ read as a delta against it.
 
     python scripts/tools/verify_regression.py \
         --trace runs/.../self_forcing_trace.npz \
-        --config configs/self_forcing.json \
+        --config configs/legacy.json \
         --k-history-length 3 --v-history-length 1 \
         --workdir runs/verify-kh3-vh1-int4
 

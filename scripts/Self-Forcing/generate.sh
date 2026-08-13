@@ -13,7 +13,7 @@
 #   CHECKPOINT=/models/self_forcing_dmd.pt \
 #   WAN_MODEL_DIR=/models/Wan2.1-T2V-1.3B \
 #   PROMPTS=assets/generation_prompts.txt \
-#   CONFIG=configs/self_forcing.json \
+#   CONFIG=configs/legacy.json \
 #   KH=2 \
 #   VH=1 \
 #   FRAMES=717 \

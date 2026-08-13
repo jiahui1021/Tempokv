@@ -10,7 +10,7 @@
 # 完全相同，checkpoint、训练方式和 cache 分布都不同，必须重新采 trace 重新拟合。
 #
 # 用法：
-#   CONFIG=configs/causal_forcing.json \
+#   CONFIG=configs/native.json \
 #   bash scripts/Causal-Forcing/fit_params.sh
 #
 # 必需变量：

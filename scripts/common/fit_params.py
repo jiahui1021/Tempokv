@@ -24,11 +24,7 @@ if SOURCE_ROOT.is_dir() and str(SOURCE_ROOT) not in sys.path:
     sys.path.insert(0, str(SOURCE_ROOT))
 
 from tempokv.config import CodecConfig, config_from_mapping  # noqa: E402
-from tempokv.fitting import (  # noqa: E402
-    fit_predictors,
-    refine_attention,
-    temporal_v_obstacle,
-)
+from tempokv.fitting import fit_predictors, refine_attention  # noqa: E402
 
 
 CODEC_FIELDS = {field.name for field in fields(CodecConfig)}
@@ -158,11 +154,6 @@ def _codec_config(args: argparse.Namespace) -> CodecConfig:
         config = config_from_mapping(values)
     except (TypeError, ValueError) as error:
         raise ValueError(f"invalid codec config: {error}") from error
-    # Fail before the trace is read: loading one takes minutes, and this
-    # combination can never produce parameters.
-    unfittable = temporal_v_obstacle(config)
-    if unfittable is not None:
-        raise ValueError(unfittable)
     return config
 
 

@@ -168,10 +168,13 @@ def _validate_parameters(
             raise ValueError("legacy K parameters must be shared across layers")
     elif temporal.layer_ids != EXPECTED_LAYER_IDS:
         raise ValueError("K parameters must contain layers 0 through 29")
-    if temporal_v:
+    # Both fitting families produce temporal V now: legacy pools every layer and
+    # head into one coefficient set, native keeps one per layer and head.
+    legacy_family = config.fit_mode == "legacy"
+    if temporal_v and legacy_family:
         if cross.layer_ids is not None:
             raise ValueError(
-                "temporal V parameters must be shared across layers"
+                "legacy temporal V parameters must be shared across layers"
             )
     elif cross.layer_ids != EXPECTED_LAYER_IDS:
         raise ValueError("V parameters must contain layers 0 through 29")
@@ -215,22 +218,24 @@ def _validate_parameters(
     elif tuple(temporal.history_weights.shape[-2:]) != (12, 128):
         raise ValueError("K parameters must contain 12 heads with dimension 128")
     if temporal_v:
-        # The temporal V predictor is shared across every layer and head, so
-        # its parameters carry no layer or head axis at all.
-        expected_v_shape = (
-            config.v_history_length,
-            config.v_history_length,
-            128,
-        )
-        if tuple(cross.history_weights.shape) != expected_v_shape:
+        order = config.v_history_length
+        if legacy_family:
+            # Legacy pools every layer and head, so the parameters carry
+            # neither axis.
+            expected_v_shape = (order, order, 128)
+            expected_v_bias_shape = (order, 128)
+        else:
+            expected_v_shape = (30, order, order, 12, 128)
+            expected_v_bias_shape = (30, order, 12, 128)
+        if (
+            tuple(cross.history_weights.shape) != expected_v_shape
+            or tuple(cross.history_bias.shape) != expected_v_bias_shape
+        ):
             raise ValueError(
-                "temporal V parameters must be shared across all layers and "
-                f"heads with shape {expected_v_shape}, got "
-                f"{tuple(cross.history_weights.shape)}"
-            )
-        if tuple(cross.history_bias.shape) != (config.v_history_length, 128):
-            raise ValueError(
-                "temporal V bias must be shared across all layers and heads"
+                f"temporal V parameters must have shape {expected_v_shape} with "
+                f"bias {expected_v_bias_shape}, got "
+                f"{tuple(cross.history_weights.shape)} and "
+                f"{tuple(cross.history_bias.shape)}"
             )
     elif tuple(cross.weight.shape[-3:]) != (12, 128, 128):
         raise ValueError("V parameters must contain 12 heads with 128x128 weights")

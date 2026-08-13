@@ -36,7 +36,7 @@ Parallel rank 的 metadata 一致。因此 `CONTEXT_PARALLEL_SIZE=1/2/4` 可以�
 ## 拟合参数
 
 ```bash
-CONFIG=configs/longcat.json \
+CONFIG=configs/native.json \
 bash scripts/LongCat/fit_params.sh
 ```
 
@@ -47,8 +47,8 @@ data/longcat/params/kh2-vh1-int4/k_temporal.npz
 data/longcat/params/kh2-vh1-int4/v_cross_kv.npz
 ```
 
-目录名由 `CONFIG` 推导（与 Self-Forcing、Causal Forcing 一致），换成
-`configs/longcat.json` 会写到 `kh2-vh1-int2`，不会覆盖 INT4。
+目录名由 `CONFIG` 与 override 共同推导（与 Self-Forcing、Causal Forcing 一致）。
+换位宽用 `BITS=2`，会写到 `kh2-vh1-int2`，不会覆盖 INT4。
 `K_HISTORY_LENGTH` / `V_HISTORY_LENGTH` 会同时影响目录名和拟合参数。
 拟合输入用 `TRACE_FILE`，与 `collect_trace.sh` 的输出变量同名。
 
@@ -66,7 +66,7 @@ bash scripts/LongCat/run_bf16.sh
 
 ```bash
 CHECKPOINT_DIR=/models/LongCat-Video \
-CONFIG=configs/longcat.json \
+CONFIG=configs/native.json \
 K_PARAMS=data/longcat/params/kh2-vh1-int4/k_temporal.npz \
 V_PARAMS=data/longcat/params/kh2-vh1-int4/v_cross_kv.npz \
 PROMPT="a cinematic mountain road" \
@@ -96,6 +96,11 @@ CPU 拟合同时会把方程降到 float64，比看上去慢得多，所以回�
 位宽是命令行 override，不是单独的配置文件：`BITS=2` 同时设 K/V，
 `K_BITS` / `V_BITS` 分别设（混合精度用）。`BITS` 与某一侧设成不同值会直接报错。
 位宽会进入参数目录名，所以 INT2 与 INT4 的参数互不覆盖。
+
+`CACHE_STRIDE` 指定本次运行的 local cache stride（CP>1 时按 CP 度数切分，例如
+CP=2 是 780）。它同时决定 codec 的 stride 和参数目录名的 `-sN` 段，所以不需要为每个
+CP 度数各存一个配置文件。设错不会静默跑：bridge 会对着从实际 cache 形状算出的
+stride 校验。
 
 `V_PREDICTOR=cross_kv|temporal` 切换 V 预测器，也不需要单独的配置文件；它会同时
 决定参数目录名（`vh1` 与 `vt1`）和参数文件名（`v_cross_kv.npz` 与 `v_temporal.npz`），
@@ -130,7 +135,8 @@ vh       both  cross only  history only  cross buys  history buys
 不是"不用它训出来的模型能做到多好"。两项相关，所以两个残差不构成对总残差的分解。
 
 **每个取值都会重新拟合一次。** 非 shared 参数的历史长度在拟合时就固定了，拿一套
-参数改 N 得到的不是那个 N 的模型。位宽、group_size 和 stride 由 `CONFIG` 固定。
+参数改 N 得到的不是那个 N 的模型。位宽用 `BITS` 覆盖，stride 用 `CACHE_STRIDE`
+覆盖，两者都会进目录名；`group_size` 由 `CONFIG` 固定。
 
 报告默认写到 `results/longcat/history_sweep.json`。变量说明见
 [scripts/common/sweep_history.sh](../common/sweep_history.sh)。

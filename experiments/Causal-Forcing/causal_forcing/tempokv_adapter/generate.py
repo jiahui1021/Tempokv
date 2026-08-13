@@ -187,11 +187,15 @@ def _validate_parameters(k_path: Path, v_path: Path, config) -> dict[str, object
         )
     codec = TempoKVCodec(temporal, cross, config)
     if temporal_v:
-        # Legacy fitting is the only source of temporal V parameters, and it
-        # pools every layer and head, so neither file carries a head axis: the
-        # head count is simply not knowable from the parameters here.
-        heads = None
+        # A native temporal V fit keeps one coefficient set per layer and head,
+        # so the geometry is readable; legacy pools both axes away and the head
+        # count is then simply not knowable from the parameters.
         head_dim = int(temporal.history_weights.shape[-1])
+        heads = (
+            int(temporal.history_weights.shape[-2])
+            if config.fit_mode != "legacy"
+            else None
+        )
         parameter_tensors = (
             temporal.history_weights,
             temporal.history_bias,

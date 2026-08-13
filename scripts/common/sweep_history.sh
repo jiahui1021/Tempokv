@@ -46,7 +46,7 @@ case "${MODEL:-}" in
   self-forcing)
     model_dir="Self-Forcing"
     default_trace="data/self-forcing/trace/clean_trace.npz"
-    default_config="configs/self_forcing.json"
+    default_config="configs/legacy.json"
     default_output="results/self_forcing/history_sweep.json"
     ;;
   causal-forcing)
@@ -61,13 +61,13 @@ case "${MODEL:-}" in
         ;;
     esac
     default_trace="data/causal-forcing/trace/$generation_mode/clean_trace.npz"
-    default_config="configs/causal_forcing.json"
+    default_config="configs/native.json"
     default_output="results/causal_forcing/$generation_mode/history_sweep.json"
     ;;
   longcat)
     model_dir="LongCat"
     default_trace="data/longcat/trace/clean_trace.npz"
-    default_config="configs/longcat.json"
+    default_config="configs/native.json"
     default_output="results/longcat/history_sweep.json"
     ;;
   *)

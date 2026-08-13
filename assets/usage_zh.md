@@ -54,7 +54,7 @@ bash scripts/Self-Forcing/collect_trace.sh
 ### 2. 拟合参数
 
 ```bash
-CONFIG=configs/self_forcing.json \
+CONFIG=configs/legacy.json \
 KH=2 \
 VH=1 \
 bash scripts/Self-Forcing/fit_params.sh
@@ -68,7 +68,7 @@ bash scripts/Self-Forcing/fit_params.sh
 CHECKPOINT=/models/self_forcing_dmd.pt \
 WAN_MODEL_DIR=/models/Wan2.1-T2V-1.3B \
 PROMPTS=assets/generation_prompts.txt \
-CONFIG=configs/self_forcing.json \
+CONFIG=configs/legacy.json \
 KH=2 \
 VH=1 \
 FRAMES=717 \
@@ -116,12 +116,12 @@ denoising step 不入 trace。
 ### 2. 拟合参数
 
 ```bash
-CONFIG=configs/causal_forcing.json \
+CONFIG=configs/native.json \
 bash scripts/Causal-Forcing/fit_params.sh
 ```
 
-输出 `data/causal-forcing/params/chunkwise/kh2-vh1-int4/`。INT2 换成
-`configs/causal_forcing.json` 即可，目录名自动带位宽。
+输出 `data/causal-forcing/params/chunkwise/kh2-vh1-int4/`。INT2 加 `BITS=2`
+即可，目录名自动带位宽。
 
 ### 3. TempoKV 生成
 
@@ -129,7 +129,7 @@ bash scripts/Causal-Forcing/fit_params.sh
 CHECKPOINT=checkpoints/causal_forcing/chunkwise/causal_forcing.pt \
 MODEL_ROOT=checkpoints/causal_forcing/wan2.1-t2v-1.3b \
 PROMPTS=assets/generation_prompts.txt \
-CONFIG=configs/causal_forcing.json \
+CONFIG=configs/native.json \
 bash scripts/Causal-Forcing/run_tempokv.sh
 ```
 
@@ -162,18 +162,18 @@ bash scripts/LongCat/collect_trace.sh
 ### 2. 拟合参数
 
 ```bash
-CONFIG=configs/longcat.json \
+CONFIG=configs/native.json \
 bash scripts/LongCat/fit_params.sh
 ```
 
-输出 `data/longcat/params/kh2-vh1-int4/`。换 `configs/longcat.json` 会写到
+输出 `data/longcat/params/kh2-vh1-int4/`。加 `BITS=2` 会写到
 `kh2-vh1-int2`，不会覆盖 INT4。
 
 ### 3. TempoKV 生成
 
 ```bash
 CHECKPOINT_DIR=/models/LongCat-Video \
-CONFIG=configs/longcat.json \
+CONFIG=configs/native.json \
 K_PARAMS=data/longcat/params/kh2-vh1-int4/k_temporal.npz \
 V_PARAMS=data/longcat/params/kh2-vh1-int4/v_cross_kv.npz \
 PROMPT="a cinematic mountain road" \

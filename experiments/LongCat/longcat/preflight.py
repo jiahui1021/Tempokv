@@ -111,10 +111,24 @@ def _read_codec_config(path: Path) -> tuple[dict[str, Any] | None, dict[str, obj
         config = CodecConfig(**payload)
     except (ImportError, TypeError, ValueError) as error:
         return None, _check(False, f"invalid TempoKV codec configuration: {error}", path=str(path))
-    stride = payload.get("stride")
-    if isinstance(stride, bool) or not isinstance(stride, int) or stride <= 0:
-        return None, _check(False, "config stride must be a positive integer", path=str(path))
-    return payload, _check(
+    # CodecConfig only rejects a non-positive stride, so a float or bool would
+    # survive it and then fail much later as a signature mismatch.
+    declared_stride = payload.get("stride")
+    if declared_stride is not None and (
+        isinstance(declared_stride, bool) or not isinstance(declared_stride, int)
+    ):
+        return None, _check(
+            False, "config stride must be an integer", path=str(path)
+        )
+    # Report the resolved settings rather than the literal file: a config only
+    # states what gives it an identity, so anything it omits comes from a
+    # CodecConfig default and that default is what the runtime uses.
+    resolved = {
+        **payload,
+        "stride": int(config.stride),
+        "v_predictor_mode": config.v_predictor_mode,
+    }
+    return resolved, _check(
         True,
         "valid codec configuration",
         path=str(path),
@@ -407,20 +421,18 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         if args.config is not None:
             codec_config, config_check = _read_codec_config(args.config)
             checks["codec_config"] = config_check
-            if codec_config is not None and args.stride is not None:
-                config_stride = int(codec_config["stride"])
-                checks["stride"] = _check(
-                    config_stride == args.stride,
-                    "CLI stride matches codec stride"
-                    if config_stride == args.stride
-                    else f"codec stride {config_stride} does not match CLI stride {args.stride}",
-                    config_stride=config_stride,
-                    requested_stride=args.stride,
-                )
-        expected_stride = (
-            int(codec_config["stride"])
+        # The parameter files must have been fitted for the stride this run will
+        # use, which is the override when one was given.
+        expected_stride = args.stride or (
+            int(codec_config["stride"]) if codec_config is not None else None
+        )
+        resolved_v_predictor = args.v_predictor_mode or (
+            codec_config.get("v_predictor_mode")
             if codec_config is not None
-            else args.stride
+            else None
+        )
+        expected_v_kind = (
+            "temporal" if resolved_v_predictor == "temporal" else "cross_kv"
         )
         parameter_checks = {
             "k_parameters": _parameter_file_check(
@@ -430,7 +442,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             ),
             "v_parameters": _parameter_file_check(
                 args.v_parameters,
-                expected_kind="cross_kv",
+                expected_kind=expected_v_kind,
                 expected_stride=expected_stride,
             ),
         }
@@ -473,6 +485,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--v-parameters", type=Path)
     parser.add_argument("--context-parallel-size", type=int, default=1)
     parser.add_argument("--stride", type=int)
+    # The V predictor decides which kind of parameter file to expect, and it
+    # is a command-line override, so preflight has to be told about it too.
+    parser.add_argument(
+        "--v-predictor-mode", choices=("cross_kv", "temporal")
+    )
     args = parser.parse_args(argv)
     if args.context_parallel_size <= 0:
         parser.error("--context-parallel-size must be positive")

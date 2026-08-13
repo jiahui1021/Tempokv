@@ -76,11 +76,10 @@ def _parser() -> argparse.ArgumentParser:
             "1560 for CP=1 or runtime validation for CP>1"
         ),
     )
-    # Bit width is an override rather than a second committed config.  Stride
-    # deliberately is not: --stride above is cross-checked against the config to
-    # catch a CP degree paired with the wrong cache geometry, and overriding the
-    # config from the same flag would make that check compare a value with
-    # itself.
+    # Bit width, stride and the V predictor are overrides rather than one
+    # committed config per combination.  --stride is safe to fold in because the
+    # bridge checks the codec stride against the stride it derives from the real
+    # cache shape, which no command line can talk it out of.
     parser.add_argument("--k-bits", type=int, choices=(2, 4, 8))
     parser.add_argument("--v-bits", type=int, choices=(2, 4, 8))
     parser.add_argument(
@@ -98,6 +97,7 @@ def _codec_overrides(known) -> dict[str, object]:
             ("k_bits", known.k_bits),
             ("v_bits", known.v_bits),
             ("v_predictor_mode", known.v_predictor_mode),
+            ("stride", known.stride),
         )
         if value is not None
     }
