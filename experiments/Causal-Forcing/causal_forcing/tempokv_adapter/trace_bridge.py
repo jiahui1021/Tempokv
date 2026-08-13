@@ -1,7 +1,9 @@
-"""Collect Causal Forcing clean K/V traces for TempoKV parameter fitting.
+"""Collect Causal Forcing clean traces for TempoKV parameter fitting.
 
 Only the state TempoKV will actually compress is sampled: the normalized
 **pre-RoPE** K and the raw V left behind by the clean/context refresh pass.
+The post-RoPE Q and reconstructed post-RoPE K used by attention are sampled at
+the same positions for optional attention-objective refinement.
 The four noisy denoising passes per block are never traced — fitting on them
 would match the predictor to a distribution the long-term cache never holds.
 
@@ -26,6 +28,7 @@ import torch
 
 
 DEFAULT_TOKENS_PER_FRAME = 8
+_TRACE_KINDS = ("k_pre_rope", "v", "q_post_rope", "k_post_rope")
 
 
 def _positive_env(name: str, default: int) -> int:
@@ -113,7 +116,7 @@ def _sample_projection(
 
 
 def install(runtime_root: str | Path | None = None) -> type:
-    """Install clean pre-RoPE K/V capture into the bundled Causal Forcing runtime."""
+    """Install clean K/V and attention-objective trace capture."""
     if runtime_root is not None:
         runtime_root = Path(runtime_root).resolve()
         if str(runtime_root) not in sys.path:
@@ -181,6 +184,9 @@ def install(runtime_root: str | Path | None = None) -> type:
                 block.self_attn.v.register_forward_hook(
                     self._capture(layer_index, "v")
                 )
+                block.self_attn.tempokv_trace_recorder = self._rope_recorder(
+                    layer_index
+                )
 
         # -- capture ------------------------------------------------------
 
@@ -208,6 +214,39 @@ def install(runtime_root: str | Path | None = None) -> type:
                 self._latest.setdefault(layer_index, {})[kind] = sampled
 
             return hook
+
+        def _rope_recorder(self, layer_index: int):
+            def record(
+                query_post_rope: torch.Tensor,
+                key_post_rope: torch.Tensor,
+            ) -> None:
+                if not self._capturing:
+                    return
+                for kind, tensor in (
+                    ("q_post_rope", query_post_rope),
+                    ("k_post_rope", key_post_rope),
+                ):
+                    if tensor.ndim == 4:
+                        tensor = tensor.reshape(tensor.shape[0], tensor.shape[1], -1)
+                    sampled, token_indices = _sample_projection(
+                        tensor,
+                        frame_seq_length=self.frame_seq_length,
+                        num_heads=self.num_heads,
+                        head_dim=self.head_dim,
+                        tokens_per_frame=tokens_per_frame,
+                        legacy=event_frames > 0,
+                    )
+                    if self._latest_token_indices is None:
+                        self._latest_token_indices = token_indices
+                    elif not np.array_equal(
+                        self._latest_token_indices, token_indices
+                    ):
+                        raise RuntimeError(
+                            "Causal Forcing trace token samples do not match"
+                        )
+                    self._latest.setdefault(layer_index, {})[kind] = sampled
+
+            return record
 
         # -- write-mode hooks ---------------------------------------------
 
@@ -266,27 +305,27 @@ def install(runtime_root: str | Path | None = None) -> type:
                 )
             for layer_index in range(layers):
                 arrays = self._latest[layer_index]
-                if set(arrays) != {"k_pre_rope", "v"}:
+                if set(arrays) != set(_TRACE_KINDS):
                     raise RuntimeError(
-                        f"layer {layer_index} did not capture both clean K and V"
+                        f"layer {layer_index} captured {sorted(arrays)} instead "
+                        f"of {list(_TRACE_KINDS)}"
+                    )
+                shapes = {arrays[kind].shape for kind in _TRACE_KINDS}
+                if len(shapes) != 1:
+                    raise ValueError(
+                        f"layer {layer_index} captured mismatched shapes: {shapes}"
                     )
                 keys = arrays["k_pre_rope"]
-                values = arrays["v"]
-                if keys.shape != values.shape:
-                    raise ValueError(
-                        f"layer {layer_index} K/V shapes differ: "
-                        f"{keys.shape} vs {values.shape}"
-                    )
                 if keys.shape[1] != num_frames:
                     raise RuntimeError(
                         f"layer {layer_index} captured {keys.shape[1]} frames but "
                         f"the pipeline finalized {num_frames}"
                     )
                 bucket = self._sequence.setdefault(
-                    layer_index, {"k_pre_rope": [], "v": []}
+                    layer_index, {kind: [] for kind in _TRACE_KINDS}
                 )
-                bucket["k_pre_rope"].append(keys)
-                bucket["v"].append(values)
+                for kind in _TRACE_KINDS:
+                    bucket[kind].append(arrays[kind])
             self._sequence_end = start_frame + num_frames
             self._latest = {}
             self._latest_token_indices = None
@@ -317,14 +356,16 @@ def install(runtime_root: str | Path | None = None) -> type:
             merged: dict[int, dict[str, np.ndarray]] = {}
             for layer_index in range(layers):
                 arrays = self._sequence[layer_index]
-                keys = np.concatenate(arrays["k_pre_rope"], axis=1)
-                values = np.concatenate(arrays["v"], axis=1)
-                if keys.shape != values.shape:
+                combined = {
+                    kind: np.concatenate(arrays[kind], axis=1)
+                    for kind in _TRACE_KINDS
+                }
+                shapes = {array.shape for array in combined.values()}
+                if len(shapes) != 1:
                     raise ValueError(
-                        f"layer {layer_index} K/V shapes differ: "
-                        f"{keys.shape} vs {values.shape}"
+                        f"layer {layer_index} captured mismatched shapes: {shapes}"
                     )
-                merged[layer_index] = {"k_pre_rope": keys, "v": values}
+                merged[layer_index] = combined
 
             total_frames = merged[0]["k_pre_rope"].shape[1]
             frames_per_event = event_frames or total_frames
@@ -355,14 +396,13 @@ def install(runtime_root: str | Path | None = None) -> type:
 
                 try:
                     for layer_index in range(layers):
-                        keys = merged[layer_index]["k_pre_rope"][
-                            :, frame_start:frame_end
-                        ]
-                        values = merged[layer_index]["v"][:, frame_start:frame_end]
-                        np.savez_compressed(
+                        arrays = merged[layer_index]
+                        np.savez(
                             temporary_dir / f"layer_{layer_index:02d}.npz",
-                            k_pre_rope=keys,
-                            v=values,
+                            **{
+                                kind: arrays[kind][:, frame_start:frame_end]
+                                for kind in _TRACE_KINDS
+                            },
                             layer_index=np.asarray(layer_index, dtype=np.int32),
                             num_layers=np.asarray(layers, dtype=np.int32),
                             num_heads=np.asarray(self.num_heads, dtype=np.int32),

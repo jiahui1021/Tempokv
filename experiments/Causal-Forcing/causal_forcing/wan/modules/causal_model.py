@@ -276,6 +276,11 @@ class CausalWanSelfAttention(nn.Module):
                 local_end_index,
                 source_tensor=k_all,
             )
+            recorder = getattr(self, "tempokv_trace_recorder", None)
+            if recorder is not None:
+                # Record the rotated tensors actually used by attention.  The
+                # newly written keys are the tail of the reconstructed cache.
+                recorder(roped_query, absolute_k[:, -num_new_tokens:])
             x = attention(roped_query, absolute_k, v_all)
             _set_cache_index(kv_cache, "global_end_index", current_end)
             _set_cache_index(kv_cache, "local_end_index", local_end_index)

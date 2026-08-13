@@ -40,6 +40,7 @@ REQUIRED_ARRAYS = {
     "generation_mode",
     "num_frame_per_block",
 }
+_ATTENTION_KINDS = ("q_post_rope", "k_post_rope")
 
 # One legacy fitting prompt produces two independent 24-frame records, so the
 # collected trace holds ``2 * _LEGACY_PROMPT_COUNT`` events.  Keep these in
@@ -85,7 +86,12 @@ def _event(
     event_dir: Path,
     *,
     legacy_protocol: bool = False,
-) -> tuple[np.ndarray, np.ndarray, dict[str, object]]:
+) -> tuple[
+    np.ndarray,
+    np.ndarray,
+    dict[str, np.ndarray],
+    dict[str, object],
+]:
     files = sorted(event_dir.glob("layer_*.npz"))
     if not files:
         raise ValueError(f"{event_dir} contains no layer trace files")
@@ -93,6 +99,8 @@ def _event(
         raise ValueError(f"{event_dir} must contain exactly 30 layer files")
     keys: list[np.ndarray] = []
     values: list[np.ndarray] = []
+    rotated: dict[str, list[np.ndarray]] = {}
+    attention_kinds: tuple[str, ...] | None = None
     seen_layers: list[int] = []
     metadata: dict[str, object] | None = None
     for path in files:
@@ -113,9 +121,23 @@ def _event(
             missing = sorted(required - set(data.files))
             if missing:
                 raise ValueError(f"{path} is missing arrays: {', '.join(missing)}")
+            present = tuple(
+                kind for kind in _ATTENTION_KINDS if kind in data.files
+            )
+            if attention_kinds is None:
+                attention_kinds = present
+            elif attention_kinds != present:
+                raise ValueError(
+                    f"{event_dir} layer files disagree on rotated Q/K presence"
+                )
+            if present and len(present) != len(_ATTENTION_KINDS):
+                raise ValueError(
+                    f"{path} must contain both {' and '.join(_ATTENTION_KINDS)}"
+                )
             layer = int(np.asarray(data["layer_index"]).item())
             key = np.asarray(data["k_pre_rope"])
             value = np.asarray(data["v"])
+            attention = {kind: np.asarray(data[kind]) for kind in present}
             if legacy_protocol:
                 current: dict[str, object] = {
                     "token_indices": tuple(
@@ -217,18 +239,27 @@ def _event(
         elif metadata != current:
             raise ValueError(f"{event_dir} layer trace metadata is inconsistent")
         _, frame_count, _, heads, width = key.shape
+
+        def move(array: np.ndarray, name: str) -> np.ndarray:
+            if array.shape != key.shape:
+                raise ValueError(
+                    f"{path} {name} shape {array.shape} does not match K"
+                )
+            moved = array.transpose(0, 2, 1, 3, 4)
+            if legacy_protocol:
+                return moved
+            return moved.reshape(-1, frame_count, heads, width)
+
         if legacy_protocol:
             # Preserve [B,P,F,H,D] so fitting can replay record-by-record.
-            keys.append(key.transpose(0, 2, 1, 3, 4))
-            values.append(value.transpose(0, 2, 1, 3, 4))
+            keys.append(move(key, "k_pre_rope"))
+            values.append(move(value, "v"))
         else:
             # [B,F,P,H,D] -> [B*P,F,H,D], keeping F as the temporal axis.
-            keys.append(
-                key.transpose(0, 2, 1, 3, 4).reshape(-1, frame_count, heads, width)
-            )
-            values.append(
-                value.transpose(0, 2, 1, 3, 4).reshape(-1, frame_count, heads, width)
-            )
+            keys.append(move(key, "k_pre_rope"))
+            values.append(move(value, "v"))
+        for kind, array in attention.items():
+            rotated.setdefault(kind, []).append(move(array, kind))
         seen_layers.append(layer)
     assert metadata is not None
     num_layers = 30 if legacy_protocol else int(metadata["num_layers"])
@@ -236,7 +267,12 @@ def _event(
         raise ValueError(
             f"{event_dir} layer indices must be 0 through {num_layers - 1}"
         )
-    return np.stack(keys), np.stack(values), metadata
+    return (
+        np.stack(keys),
+        np.stack(values),
+        {kind: np.stack(parts) for kind, parts in rotated.items()},
+        metadata,
+    )
 
 
 def convert_trace_root(
@@ -250,12 +286,16 @@ def convert_trace_root(
         raise FileNotFoundError(f"trace directory does not exist: {root}")
     key_events: list[np.ndarray] = []
     value_events: list[np.ndarray] = []
+    rotated_events: dict[str, list[np.ndarray]] = {}
+    expected_attention_kinds: set[str] | None = None
     event_starts: list[int] = []
     event_ends: list[int] = []
     expected_tail: tuple[int, ...] | None = None
     shared: dict[str, object] | None = None
     for event_dir in _event_directories(root, legacy_protocol=legacy_protocol):
-        keys, values, metadata = _event(event_dir, legacy_protocol=legacy_protocol)
+        keys, values, rotated, metadata = _event(
+            event_dir, legacy_protocol=legacy_protocol
+        )
         tail = keys.shape[1:] if legacy_protocol else keys.shape[2:]
         if expected_tail is None:
             expected_tail = tail
@@ -284,6 +324,13 @@ def convert_trace_root(
             raise ValueError("all trace events must use matching trace metadata")
         key_events.append(keys)
         value_events.append(values)
+        present_attention_kinds = set(rotated)
+        if expected_attention_kinds is None:
+            expected_attention_kinds = present_attention_kinds
+        elif expected_attention_kinds != present_attention_kinds:
+            raise ValueError("trace events do not capture the same rotated Q/K arrays")
+        for kind, array in rotated.items():
+            rotated_events.setdefault(kind, []).append(array)
     assert shared is not None
     if legacy_protocol:
         keys = np.stack(key_events, axis=1)
@@ -291,6 +338,10 @@ def convert_trace_root(
     else:
         keys = np.concatenate(key_events, axis=1)
         values = np.concatenate(value_events, axis=1)
+    merge = np.stack if legacy_protocol else np.concatenate
+    rotated = {
+        kind: merge(parts, axis=1) for kind, parts in rotated_events.items()
+    }
     output = output.expanduser().resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
 
@@ -322,6 +373,7 @@ def convert_trace_root(
             output,
             keys=keys,
             values=values,
+            **rotated,
             layer_ids=np.arange(30, dtype=np.int32),
             stride=np.asarray(1560, dtype=np.int32),
             coordinate_system=np.asarray("pre_rope_normalized"),
@@ -350,6 +402,7 @@ def convert_trace_root(
             output,
             keys=keys,
             values=values,
+            **rotated,
             layer_ids=np.arange(int(shared["num_layers"]), dtype=np.int32),
             stride=np.asarray(shared["trace_stride"], dtype=np.int32),
             coordinate_system=np.asarray("pre_rope_normalized"),
