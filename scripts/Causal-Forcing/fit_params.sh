@@ -18,11 +18,16 @@
 #
 # 常用可选变量：
 #   GENERATION_MODE  chunkwise（默认）或 framewise
-#   TRACE_FILE       拟合输入（默认 data/causal-forcing/trace/<模式>/clean_trace.npz）
+#   TRACE_FILE       拟合输入（默认按 CONFIG 选择 native/legacy trace 目录）
 #   OUTPUT_DIR       输出目录（默认 data/causal-forcing/params/<模式>/<参数方案>）
 #   BITS / K_BITS / V_BITS  位宽 override（2/4/8；默认读取 CONFIG）
 #   K_HISTORY_LENGTH / V_HISTORY_LENGTH  历史长度（默认读取 CONFIG）
 #   ITERATIONS / TEMPORAL_RIDGE / CROSS_RIDGE / V_HISTORY_RIDGE / MAX_GAIN
+#   ATTENTION_STEPS  每个 K/V phase 的最大 Adam 步数（留空则不精调）
+#   ATTENTION_LR / ATTENTION_PATIENCE / ATTENTION_MIN_RELATIVE_IMPROVEMENT
+#                    Adam 学习率、早停 patience 与最小相对改善
+#   ATTENTION_MAX_TOKENS  refinement 使用的 sampled token-track 上限
+#   ATTENTION_LAYER_CHUNK  refinement 每批层数（默认 4）
 #   FIT_DEVICE
 #   OVERWRITE / DRY_RUN / PYTHON_BIN
 #
@@ -45,22 +50,8 @@ case "$generation_mode" in
 esac
 
 config_path="$(resolve_path "$CONFIG")"
-# One interpreter launch for both switches the rest of this script needs.
-# The legacy config defaults to temporal V, so its unset v_predictor_mode is
-# reported as "temporal" rather than the global cross_kv default.
-read -r fit_mode v_predictor_mode <<<"$("$python_bin" - "$config_path" <<'PY'
-import json
-import sys
-
-config = json.load(open(sys.argv[1], encoding="utf-8"))
-config = config.get("codec", config)
-fit_mode = config.get("fit_mode", "native")
-v_predictor = config.get("v_predictor_mode")
-if v_predictor is None:
-    v_predictor = "temporal" if fit_mode == "legacy" else "cross_kv"
-print(fit_mode, v_predictor)
-PY
-)"
+[[ -f "$config_path" ]] || die "CONFIG 不存在：$config_path"
+read -r fit_mode v_predictor_mode <<<"$(resolve_codec_modes "$config_path" "${V_PREDICTOR:-}")"
 # The legacy protocol collects into its own directory, so the default trace
 # file follows the config's fit mode.
 if [[ "$fit_mode" == "legacy" ]]; then
@@ -69,18 +60,8 @@ else
   default_trace_file="data/causal-forcing/trace/$generation_mode/clean_trace.npz"
 fi
 trace_file="$(resolve_path "${TRACE_FILE:-$default_trace_file}")"
-parameter_name="${PARAM_NAME:-$(codec_slug "$config_path" "${K_HISTORY_LENGTH:-}" "${V_HISTORY_LENGTH:-}" "${K_BITS:-}" "${V_BITS:-}" "" "${V_PREDICTOR:-}")}"
+parameter_name="${PARAM_NAME:-$(codec_slug "$config_path" "${K_HISTORY_LENGTH:-}" "${V_HISTORY_LENGTH:-}" "${K_BITS:-}" "${V_BITS:-}" "" "$v_predictor_mode")}"
 output_dir="$(resolve_path "${OUTPUT_DIR:-data/causal-forcing/params/$generation_mode/$parameter_name}")"
-# V_PREDICTOR overrides the config so one file covers both predictors.  The
-# legacy config defaults to temporal V, so nothing needs to be set on the
-# command line for the recommended path.
-if [[ -n "${V_PREDICTOR:-}" ]]; then
-  case "$V_PREDICTOR" in
-    cross_kv|temporal) ;;
-    *) die "V_PREDICTOR 必须是 cross_kv 或 temporal（当前值：${V_PREDICTOR}）" ;;
-  esac
-  v_predictor_mode="$V_PREDICTOR"
-fi
 if [[ "$v_predictor_mode" == "temporal" ]]; then
   v_artifact_name="v_temporal.npz"
 else
@@ -104,12 +85,24 @@ CROSS_RIDGE="${CROSS_RIDGE:-0.1}"
 V_HISTORY_RIDGE="${V_HISTORY_RIDGE:-0.0}"
 MAX_GAIN="${MAX_GAIN:-1.0}"
 FIT_DEVICE="${FIT_DEVICE:-auto}"
+ATTENTION_LAYER_CHUNK="${ATTENTION_LAYER_CHUNK:-4}"
+ATTENTION_LR="${ATTENTION_LR:-0.001}"
+ATTENTION_PATIENCE="${ATTENTION_PATIENCE:-10}"
+ATTENTION_MIN_RELATIVE_IMPROVEMENT="${ATTENTION_MIN_RELATIVE_IMPROVEMENT:-0.0001}"
 OVERWRITE="${OVERWRITE:-0}"
 DRY_RUN="${DRY_RUN:-0}"
 
 check_flag OVERWRITE
 check_flag DRY_RUN
 check_int ITERATIONS 1
+check_int ATTENTION_LAYER_CHUNK 1
+if [[ -n "${ATTENTION_STEPS:-}" ]]; then
+  check_int ATTENTION_STEPS 1
+  check_int ATTENTION_PATIENCE 1
+  [[ -z "${ATTENTION_MAX_TOKENS:-}" ]] || check_int ATTENTION_MAX_TOKENS 1
+  [[ "$fit_mode" == "legacy" ]] || \
+    die "attention refinement 当前只支持 legacy/shared temporal K；V 可用 cross_kv 或 temporal"
+fi
 
 fit_command=(
   "$python_bin" "$project_root/scripts/common/fit_params.py"
@@ -127,12 +120,23 @@ fit_command=(
   # The runtime CrossKV decoder only accelerates a diagonal V history; a dense
   # per-lag matrix is refused by the bridge, so it must never be fitted here.
   --v-history-mode diagonal
+  --v-predictor-mode "$v_predictor_mode"
 )
+if [[ -n "${ATTENTION_STEPS:-}" ]]; then
+  fit_command+=(
+    --attention-steps "$ATTENTION_STEPS"
+    --attention-lr "$ATTENTION_LR"
+    --attention-patience "$ATTENTION_PATIENCE"
+    --attention-min-relative-improvement "$ATTENTION_MIN_RELATIVE_IMPROVEMENT"
+    --attention-layer-chunk "$ATTENTION_LAYER_CHUNK"
+  )
+  [[ -n "${ATTENTION_MAX_TOKENS:-}" ]] && \
+    fit_command+=(--attention-max-tokens "$ATTENTION_MAX_TOKENS")
+fi
 [[ -n "${K_HISTORY_LENGTH:-}" ]] && fit_command+=(--k-history-length "$K_HISTORY_LENGTH")
 [[ -n "${V_HISTORY_LENGTH:-}" ]] && fit_command+=(--v-history-length "$V_HISTORY_LENGTH")
 [[ -n "${K_BITS:-}" ]] && fit_command+=(--k-bits "$K_BITS")
 [[ -n "${V_BITS:-}" ]] && fit_command+=(--v-bits "$V_BITS")
-[[ -n "${V_PREDICTOR:-}" ]] && fit_command+=(--v-predictor-mode "$V_PREDICTOR")
 
 if [[ "$DRY_RUN" == "1" ]]; then
   printf '[fit_params] 干跑模式：打印将要执行的命令，不执行\n'

@@ -137,9 +137,9 @@ class CodecConfig:
             # stride is not one of them: it only decides where the encoder cuts
             # units, and every legacy fitter merely records it, so pinning it
             # here stated a parity requirement that does not exist.  The real
-            # limit sits in scripts/common/fit_params.py, which accepts only the
-            # Self-Forcing legacy trace protocol -- and that protocol pins
-            # trace_stride to 1560 itself.
+            # limit sits in scripts/common/fit_params.py, which accepts the
+            # fixed legacy event protocol produced by the Self-Forcing and
+            # Causal-Forcing trace bridges; that protocol pins stride to 1560.
             if self.anchor_bits != 4 or self.group_size != 64:
                 raise ValueError(
                     "legacy fitting requires anchor_bits=4 and group_size=64"

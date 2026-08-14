@@ -25,7 +25,11 @@
 #   ITERATIONS     拟合迭代次数（默认 2）
 #   TEMPORAL_RIDGE / CROSS_RIDGE / V_HISTORY_RIDGE / MAX_GAIN
 #                  拟合正则与增益（legacy 模式默认 1.0/0.1/0.0/1.0）
-#   ATTENTION_STEPS  attention 目标精调的步长候选（空格分隔；留空则不精调）
+#   ATTENTION_STEPS  每个 K/V phase 的最大 Adam 步数（留空则不精调）
+#   ATTENTION_LR / ATTENTION_PATIENCE / ATTENTION_MIN_RELATIVE_IMPROVEMENT
+#                    Adam 学习率、早停 patience 与最小相对改善
+#   ATTENTION_MAX_TOKENS  refinement 使用的 sampled token-track 上限
+#   ATTENTION_LAYER_CHUNK  attention refinement 每批层数（默认 4）
 #   FIT_DEVICE     拟合设备（默认 auto，有 CUDA 时自动使用 GPU）
 #   OVERWRITE      已存在参数时覆盖（0/1，默认 0）
 #   DRY_RUN        只打印命令不执行（0/1，默认 0）
@@ -92,12 +96,22 @@ CROSS_RIDGE="${CROSS_RIDGE:-0.1}"
 V_HISTORY_RIDGE="${V_HISTORY_RIDGE:-0.0}"
 MAX_GAIN="${MAX_GAIN:-1.0}"
 FIT_DEVICE="${FIT_DEVICE:-auto}"
+ATTENTION_LAYER_CHUNK="${ATTENTION_LAYER_CHUNK:-4}"
+ATTENTION_LR="${ATTENTION_LR:-0.001}"
+ATTENTION_PATIENCE="${ATTENTION_PATIENCE:-10}"
+ATTENTION_MIN_RELATIVE_IMPROVEMENT="${ATTENTION_MIN_RELATIVE_IMPROVEMENT:-0.0001}"
 OVERWRITE="${OVERWRITE:-0}"
 DRY_RUN="${DRY_RUN:-0}"
 
 check_flag OVERWRITE
 check_flag DRY_RUN
 check_int ITERATIONS 1
+check_int ATTENTION_LAYER_CHUNK 1
+if [[ -n "${ATTENTION_STEPS:-}" ]]; then
+  check_int ATTENTION_STEPS 1
+  check_int ATTENTION_PATIENCE 1
+  [[ -z "${ATTENTION_MAX_TOKENS:-}" ]] || check_int ATTENTION_MAX_TOKENS 1
+fi
 
 fit_command=(
   "$python_bin" "$project_root/scripts/common/fit_params.py"
@@ -115,9 +129,15 @@ fit_command=(
   --coordinate-system pre_rope_normalized
 )
 if [[ -n "${ATTENTION_STEPS:-}" ]]; then
-  # Word splitting is intended: the flag takes a list of candidate step sizes.
-  # shellcheck disable=SC2206
-  fit_command+=(--attention-steps ${ATTENTION_STEPS})
+  fit_command+=(
+    --attention-steps "$ATTENTION_STEPS"
+    --attention-lr "$ATTENTION_LR"
+    --attention-patience "$ATTENTION_PATIENCE"
+    --attention-min-relative-improvement "$ATTENTION_MIN_RELATIVE_IMPROVEMENT"
+    --attention-layer-chunk "$ATTENTION_LAYER_CHUNK"
+  )
+  [[ -n "${ATTENTION_MAX_TOKENS:-}" ]] && \
+    fit_command+=(--attention-max-tokens "$ATTENTION_MAX_TOKENS")
 fi
 [[ -n "${K_HISTORY_LENGTH:-}" ]] && fit_command+=(--k-history-length "$K_HISTORY_LENGTH")
 [[ -n "${V_HISTORY_LENGTH:-}" ]] && fit_command+=(--v-history-length "$V_HISTORY_LENGTH")

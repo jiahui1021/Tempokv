@@ -101,10 +101,31 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--v-predictor-mode", choices=("cross_kv", "temporal"))
     parser.add_argument(
         "--attention-steps",
+        type=int,
+        help="maximum Adam steps per K/V phase; omit to skip refinement",
+    )
+    parser.add_argument(
+        "--attention-lr",
         type=float,
-        nargs="*",
-        help="step sizes tried along the attention gradient direction; omit to "
-        "skip the refinement",
+        default=1e-3,
+        help="Adam learning rate (default: 1e-3)",
+    )
+    parser.add_argument(
+        "--attention-patience",
+        type=int,
+        default=10,
+        help="stop a phase after this many steps without material improvement",
+    )
+    parser.add_argument(
+        "--attention-max-tokens",
+        type=int,
+        help="deterministically cap flattened sampled token tracks during refinement",
+    )
+    parser.add_argument(
+        "--attention-min-relative-improvement",
+        type=float,
+        default=1e-4,
+        help="relative score improvement that resets patience (default: 1e-4)",
     )
     parser.add_argument(
         "--attention-layer-chunk",
@@ -303,8 +324,33 @@ def _fit_device(name: str) -> torch.device:
     return device
 
 
+def _limit_attention_tracks(
+    tensor: torch.Tensor, max_tokens: int | None
+) -> torch.Tensor:
+    """Flatten non-layer sample axes and keep a deterministic prefix."""
+    if max_tokens is None:
+        return tensor
+    if max_tokens <= 0:
+        raise ValueError("attention_max_tokens must be positive")
+    if tensor.ndim < 5:
+        raise ValueError(
+            "attention token limiting needs [L, ..., F, H, D] with a sample axis"
+        )
+    tracks = int(np.prod(tensor.shape[1:-3]))
+    flattened = tensor.reshape(
+        tensor.shape[0], tracks, tensor.shape[-3], tensor.shape[-2], tensor.shape[-1]
+    )
+    return flattened[:, : min(max_tokens, tracks)]
+
+
 def run(args: argparse.Namespace) -> dict[str, Any]:
     config = _codec_config(args)
+    if args.attention_steps is not None:
+        if config.fit_mode != "legacy" or config.k_predictor_mode != "shared":
+            raise ValueError(
+                "attention refinement currently requires legacy/shared "
+                "temporal K predictor"
+            )
     temporal_ridge = (
         1.0
         if args.temporal_ridge is None and config.fit_mode == "legacy"
@@ -420,28 +466,33 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         layer_ids=layer_ids,
         coordinate_system=coordinate_system,
     )
+    ls_temporal, ls_cross = temporal, cross
     refinement = None
-    if args.attention_steps:
+    if args.attention_steps is not None:
         missing = [name for name in ATTENTION_ARRAYS if name not in rotated]
         if missing:
             raise ValueError(
                 f"attention refinement needs {', '.join(missing)} in the trace; "
                 "recollect it with the current trace bridge"
             )
-        if config.v_predictor_mode != "temporal":
-            raise ValueError(
-                "attention refinement currently refines temporal K and V "
-                "predictors; set v_predictor_mode=temporal"
+        refinement_tensors = tuple(
+            _limit_attention_tracks(tensor, args.attention_max_tokens)
+            for tensor in (
+                keys,
+                values,
+                rotated["q_post_rope"].to(device=device, dtype=keys.dtype),
+                rotated["k_post_rope"].to(device=device, dtype=keys.dtype),
             )
+        )
         temporal, cross, refinement = refine_attention(
-            keys,
-            values,
-            rotated["q_post_rope"].to(device=device, dtype=keys.dtype),
-            rotated["k_post_rope"].to(device=device, dtype=keys.dtype),
+            *refinement_tensors,
             temporal,
             cross,
             config,
-            step_sizes=tuple(args.attention_steps),
+            steps=args.attention_steps,
+            learning_rate=args.attention_lr,
+            patience=args.attention_patience,
+            min_relative_improvement=args.attention_min_relative_improvement,
             max_gain=args.max_gain,
             layer_chunk=args.attention_layer_chunk,
         )
@@ -461,6 +512,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     # never be mistaken for a CrossKV one on disk.
     temporal_v = config.v_predictor_mode == "temporal"
     cross_path = output_dir / ("v_temporal.npz" if temporal_v else "v_cross_kv.npz")
+    ls_temporal_path = output_dir / "k_temporal_ls.npz"
+    ls_cross_path = output_dir / (
+        "v_temporal_ls.npz" if temporal_v else "v_cross_kv_ls.npz"
+    )
     report_path = output_dir / "fit_report.json"
     parameter_tensors = (
         (temporal.history_weights, temporal.history_bias,
@@ -479,6 +534,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     )
     temporal.save(temporal_path)
     cross.save(cross_path)
+    if refinement is not None:
+        ls_temporal.save(ls_temporal_path)
+        ls_cross.save(ls_cross_path)
     report = {
         "status": "fit_complete",
         "created_at": datetime.now(timezone.utc).isoformat(),
@@ -516,6 +574,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             ),
             "max_gain": float(args.max_gain),
             "coordinate_system": coordinate_system,
+            "attention_max_tokens": args.attention_max_tokens,
             "trace_metadata": trace_metadata,
             "device": str(device),
             "compute_dtype": (
@@ -552,6 +611,16 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "artifacts": {
             "k_temporal": temporal_path.name,
             "v_temporal" if temporal_v else "v_cross_kv": cross_path.name,
+            **(
+                {
+                    "k_temporal_ls": ls_temporal_path.name,
+                    (
+                        "v_temporal_ls" if temporal_v else "v_cross_kv_ls"
+                    ): ls_cross_path.name,
+                }
+                if refinement is not None
+                else {}
+            ),
         },
     }
     report_path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")

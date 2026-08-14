@@ -1,7 +1,7 @@
 # 设计：attention 目标拟合与 temporal-V 预测器
 
 日期：2026-08-12
-状态：已评审通过，待实现
+状态：已实现，待 GPU fitting / generation 验证
 
 ## 1. 背景
 
@@ -81,7 +81,7 @@ TempoKV 的 Self-Forcing legacy 模式经过多轮对齐后，质量仍与参考
 - `src/tempokv/fitting.py`：`fit_legacy_shared_temporal` 复用于 V（VH1 → `[1,1,128]`）；新增 `refine_attention()` 驱动交替相位、早停与 guardrail。
 - `experiments/Self-Forcing/tempokv_adapter/trace_bridge.py`：在与 k/v 相同的采样位置额外记录 `q_post_rope`、`k_post_rope`。
 - `experiments/Self-Forcing/tempokv_adapter/prepare_trace.py`：落盘两个新数组，协议串升版。
-- `scripts/common/fit_params.py`：新增 `--attention-steps` / `--attention-lr` / `--attention-max-tokens` / `--attention-patience`；报告写入每相位的接受或回退。
+- `scripts/common/fit_params.py`：提供 `--attention-steps` / `--attention-lr` / `--attention-max-tokens` / `--attention-patience` / `--attention-min-relative-improvement`；报告写入每相位的接受或回退、最佳步与实际步数。
 
 ## 6. 数据流
 
@@ -151,6 +151,7 @@ keys / values / q_post_rope / k_post_rope   各 [30, 24, 1, 8, 24, 12, 128]
 - rollout 在层与 event 维度上全并行，每个 Adam 步只有 24 次帧循环。
 - 显存通过**按层分块 + 梯度累加**控制；V 参数全层共享，梯度对层求和，因此分块与不分块在数学上等价。
 - 不使用随机 minibatch：同一份 trace 两次拟合必须得到完全一致的参数。
+- 实现同时支持 legacy/shared temporal K 搭配 temporal V 或 `CrossKV + V-history`；后者保留 aligned reconstructed-K 条件，并在 K phase 中通过 V prediction 路径传播 attention 梯度。
 
 ## 8. 参数文件与兼容性
 

@@ -32,6 +32,7 @@ bash scripts/Causal-Forcing/run_bf16.sh
 CHECKPOINT=checkpoints/causal_forcing/chunkwise/causal_forcing.pt \
 MODEL_ROOT=checkpoints/causal_forcing/wan2.1-t2v-1.3b \
 PROMPTS=assets/fit_prompts.txt \
+CONFIG=configs/native.json \
 bash scripts/Causal-Forcing/collect_trace.sh
 
 # 拟合 INT4
@@ -46,7 +47,7 @@ CONFIG=configs/native.json \
 bash scripts/Causal-Forcing/run_tempokv.sh
 ```
 
-INT2 只需要换 `configs/native.json` 与对应的参数目录。
+INT2 使用同一个配置并设置 `BITS=2`；参数目录会自动切换到 INT2 identity。
 
 ## 公共变量
 
@@ -66,6 +67,9 @@ INT2 只需要换 `configs/native.json` 与对应的参数目录。
 `GENERATION_MODE` 会同时决定 `num_frame_per_block`（chunkwise=3，framewise=1）、
 默认的模型配置文件，以及 trace / 参数 / 结果的子目录，两种模式互不覆盖。
 
+采 trace 时同样必须传 `CONFIG`：native family 写入 `trace/<模式>/`，legacy family 写入
+`trace/<模式>_legacy/`。手工设置 `LEGACY_PROTOCOL` 与 config family 冲突会直接报错。
+
 `FRAMES` 必须让视频帧精确对应完整的 latent block：chunkwise 要求
 `(FRAMES + 3) % 12 == 0`，framewise 要求 `(FRAMES + 3) % 4 == 0`。
 
@@ -81,6 +85,7 @@ checkpoint、训练方式和 cache 分布不同，**必须重新采 trace 重新
 ```text
 data/causal-forcing/
 ├── trace/<模式>/{raw,output,clean_trace.npz}
+├── trace/<模式>_legacy/{raw,output,clean_trace.npz}
 └── params/<模式>/<参数方案>/{k_temporal.npz,v_cross_kv.npz 或 v_temporal.npz}
 
 results/causal_forcing/<模式>/<量化标签>/
@@ -139,12 +144,34 @@ CPU 拟合同时会把方程降到 float64，比看上去慢得多，所以回�
 
 `V_PREDICTOR=cross_kv|temporal` 切换 V 预测器，也不需要单独的配置文件；它会同时
 决定参数目录名（`vh1` 与 `vt1`）和参数文件名（`v_cross_kv.npz` 与 `v_temporal.npz`），
-两者不会互相覆盖。注意 temporal V 目前只有 legacy 拟合路径能产出，所以在 native
-配置上单独设它会在读 trace 之前就报错并说明原因。
+两者不会互相覆盖。基础 native fitter 可以产出 temporal V；attention refinement 当前要求
+legacy/shared temporal K，V 可选 temporal 或 `CrossKV + V-history`。其他 K shape 会在读 trace
+前报错。
+
+## Attention proxy refinement
+
+`3340753` 起 Causal trace 同时保存采样位置的 post-RoPE Q/K。对 legacy/shared temporal K
+以及 temporal 或 CrossKV V，可在基础 closed-loop least-squares fitting 后启用可选 refinement：
+
+```bash
+CONFIG=configs/legacy.json ATTENTION_STEPS=100 ATTENTION_LR=0.001 \
+ATTENTION_PATIENCE=10 ATTENTION_LAYER_CHUNK=4 \
+bash scripts/Causal-Forcing/fit_params.sh
+```
+
+启用 refinement 时，同一输出目录会同时保存 refinement 前的 `k_temporal_ls.npz` 与
+`v_temporal_ls.npz` / `v_cross_kv_ls.npz`，常规文件名保存 refinement 后参数。
+每个 K/V phase 用 Adam 最小化归一化的 `0.5 * own reconstruction + 0.5 * attention`
+目标，按 phase 起点做非退化 guardrail，并用 patience 早停、保留最佳检查点。
+
+该目标把每个采样空间位置作为独立 record，只沿帧轴计算 recorded-Q SDPA；它不重放完整
+1560-token attention 或 backend mask，因此报告中称为 `recorded-Q temporal-track attention
+proxy`，不能等同完整模型 attention-output error。旧 KV-only trace 缺少 Q/K，需要重新采集。
 
 ## 历史帧数敏感性实验
 
-扫 K 与 V 的历史帧数，报告重建误差、attention 输出误差和预测项占比：
+扫 K 与 V 的历史帧数，报告重建误差、sampled temporal-track attention proxy 误差和
+预测项占比：
 
 ```bash
 MAX_SAMPLES=64 MAX_FRAMES=8 LAYERS=0,15,29 \

@@ -16,6 +16,7 @@ from typing import Iterator, Sequence
 import torch
 
 from .attention_objective import (
+    cross_kv_rollout,
     normalized_errors,
     objective_terms,
     phase_score,
@@ -162,16 +163,18 @@ def _objective_sums(
     key_bias: torch.Tensor,
     value_weight: torch.Tensor,
     value_bias: torch.Tensor,
+    value_history_weights: torch.Tensor | None = None,
     *,
     config: CodecConfig,
     layer_chunk: int,
-    backward: bool,
+    backward_tensor: str | None = None,
+    reference_sums: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Accumulate the six objective sums over the trace, one layer chunk at a time.
 
-    Chunking bounds the rollout activations kept for backward.  The V and K
-    parameters are shared across layers, so summing chunk gradients is exactly
-    the gradient of the whole trace.
+    Chunking bounds the rollout activations kept for backward.  Temporal
+    parameters are shared across layers while CrossKV parameters are sliced
+    with the trace; summing chunk gradients is the gradient of the whole trace.
     """
     totals = torch.zeros(6, dtype=torch.float64, device=keys.device)
     layer_count = int(keys.shape[0])
@@ -180,13 +183,30 @@ def _objective_sums(
         rebuilt_key = temporal_rollout(
             keys[start:stop], key_weight, key_bias, bits=config.k_bits, config=config
         )
-        rebuilt_value = temporal_rollout(
-            values[start:stop],
-            value_weight,
-            value_bias,
-            bits=config.v_bits,
-            config=config,
-        )
+        if config.v_predictor_mode == "temporal":
+            rebuilt_value = temporal_rollout(
+                values[start:stop],
+                value_weight,
+                value_bias,
+                bits=config.v_bits,
+                config=config,
+            )
+        else:
+            if value_history_weights is None:
+                raise ValueError("CrossKV refinement needs V history weights")
+            rebuilt_value = cross_kv_rollout(
+                rebuilt_key,
+                values[start:stop],
+                value_weight[start:stop] if value_weight.ndim == 4 else value_weight,
+                value_bias[start:stop] if value_bias.ndim == 3 else value_bias,
+                (
+                    value_history_weights[start:stop]
+                    if value_weight.ndim == 4
+                    else value_history_weights
+                ),
+                bits=config.v_bits,
+                config=config,
+            )
         terms = objective_terms(
             clean_key=keys[start:stop],
             clean_value=values[start:stop],
@@ -195,12 +215,28 @@ def _objective_sums(
             query_post_rope=query_post_rope[start:stop],
             key_post_rope=key_post_rope[start:stop],
         )
-        if backward:
-            # Denominators are constants, so scaling here matches the phase
-            # loss without keeping the whole trace's graph alive at once.
-            (terms.key_error + terms.value_error + terms.attention_error).backward(
-                retain_graph=False
+        if backward_tensor is not None:
+            if reference_sums is None:
+                raise ValueError("attention backward needs baseline reference sums")
+            if backward_tensor == "key":
+                own_error = terms.key_error
+                own_reference = reference_sums[1]
+            elif backward_tensor == "value":
+                own_error = terms.value_error
+                own_reference = reference_sums[3]
+            else:
+                raise ValueError("backward tensor must be key or value")
+            loss = 0.5 * own_error / own_reference.clamp_min(1e-12) + 0.5 * (
+                terms.attention_error
+                / reference_sums[5].clamp_min(1e-12)
             )
+            if not torch.isfinite(loss):
+                raise ValueError(
+                    f"{backward_tensor} refinement produced a non-finite loss"
+                )
+            # The denominators cover the full trace, so summing chunk
+            # gradients is exactly the gradient of the global objective.
+            loss.backward(retain_graph=False)
         totals = totals + torch.stack(
             [term.detach().double() for term in terms.as_tuple()]
         )
@@ -213,7 +249,8 @@ class PhaseResult:
 
     tensor: str
     accepted: bool
-    step_size: float | None
+    best_step: int | None
+    steps_run: int
     start_score: float
     best_score: float
     errors: dict[str, float]
@@ -239,9 +276,9 @@ def _evaluate(
         parameters["key_bias"],
         parameters["value_weight"],
         parameters["value_bias"],
+        parameters.get("value_history_weights"),
         config=config,
         layer_chunk=layer_chunk,
-        backward=False,
     )
     return normalized_errors(sums)
 
@@ -252,88 +289,147 @@ def refine_attention(
     query_post_rope: torch.Tensor,
     key_post_rope: torch.Tensor,
     key_parameters: TemporalParameters,
-    value_parameters: TemporalParameters,
+    value_parameters: TemporalParameters | CrossKVParameters,
     config: CodecConfig,
     *,
-    step_sizes: Sequence[float] = (0.01,),
+    steps: int = 100,
+    learning_rate: float = 1e-3,
+    patience: int = 10,
+    min_relative_improvement: float = 1e-4,
     max_gain: float = 1.0,
     layer_chunk: int = 4,
-) -> tuple[TemporalParameters, TemporalParameters, dict[str, object]]:
-    """Refine least-squares predictors against the attention output.
+) -> tuple[
+    TemporalParameters,
+    TemporalParameters | CrossKVParameters,
+    dict[str, object],
+]:
+    """Refine least-squares predictors with normalized attention-aware Adam.
 
-    One phase per tensor, each taking a single gradient direction: the residual
-    is quantized with a straight-through gradient, so the direction is only
-    trustworthy near the current parameters.  Rather than iterate on an
-    approximation that decays as the parameters move, the phase evaluates a few
-    step sizes along that one direction and keeps the best that passes the
-    guardrail.  A phase that improves nothing leaves its tensor untouched.
+    K and V are optimized in separate phases.  Each phase minimizes an equal
+    mixture of its own relative reconstruction SSE and relative attention-output
+    SSE, keeps the best guarded candidate, and falls back to its phase start if
+    no candidate improves both metrics.
     """
-    if not step_sizes:
-        raise ValueError("refinement needs at least one step size")
-    for step in step_sizes:
-        if not math.isfinite(step) or step <= 0.0:
-            raise ValueError(f"step sizes must be positive and finite, got {step}")
+    if steps <= 0:
+        raise ValueError("refinement steps must be positive")
+    learning_rate = _check_scalar("learning_rate", learning_rate, positive=True)
+    if patience <= 0:
+        raise ValueError("refinement patience must be positive")
+    if (
+        not math.isfinite(min_relative_improvement)
+        or min_relative_improvement < 0.0
+        or min_relative_improvement >= 1.0
+    ):
+        raise ValueError("min_relative_improvement must be finite and in [0, 1)")
     if layer_chunk <= 0:
         raise ValueError("layer_chunk must be positive")
     max_gain = _check_scalar("max_gain", max_gain, positive=True)
 
-    current = {
+    if config.v_predictor_mode == "temporal" and not isinstance(
+        value_parameters, TemporalParameters
+    ):
+        raise TypeError("temporal V refinement requires TemporalParameters")
+    if config.v_predictor_mode == "cross_kv" and not isinstance(
+        value_parameters, CrossKVParameters
+    ):
+        raise TypeError("CrossKV refinement requires CrossKVParameters")
+
+    current: dict[str, torch.Tensor] = {
         "key_weight": key_parameters.history_weights.detach().clone(),
         "key_bias": key_parameters.history_bias.detach().clone(),
-        "value_weight": value_parameters.history_weights.detach().clone(),
-        "value_bias": value_parameters.history_bias.detach().clone(),
     }
-    baseline = _evaluate(
+    if isinstance(value_parameters, TemporalParameters):
+        current.update(
+            value_weight=value_parameters.history_weights.detach().clone(),
+            value_bias=value_parameters.history_bias.detach().clone(),
+        )
+    else:
+        current.update(
+            value_weight=value_parameters.weight.detach().clone(),
+            value_bias=value_parameters.bias.detach().clone(),
+            value_history_weights=value_parameters.history_weights.detach().clone(),
+        )
+    baseline_sums = _objective_sums(
         keys,
         values,
         query_post_rope,
         key_post_rope,
-        current,
+        current["key_weight"],
+        current["key_bias"],
+        current["value_weight"],
+        current["value_bias"],
+        current.get("value_history_weights"),
         config=config,
         layer_chunk=layer_chunk,
     )
+    baseline = normalized_errors(baseline_sums)
 
     phases: list[PhaseResult] = []
     errors = baseline
     for tensor in ("key", "value"):
-        weight_name, bias_name = f"{tensor}_weight", f"{tensor}_bias"
+        parameter_names = [f"{tensor}_weight", f"{tensor}_bias"]
+        if tensor == "value" and "value_history_weights" in current:
+            parameter_names.append("value_history_weights")
         start_score = phase_score(errors, baseline, tensor=tensor)
-        weight = current[weight_name].clone().requires_grad_(True)
-        bias = current[bias_name].clone().requires_grad_(True)
-        _objective_sums(
-            keys,
-            values,
-            query_post_rope,
-            key_post_rope,
-            **{
-                **{name: current[name] for name in current},
-                weight_name: weight,
-                bias_name: bias,
-            },
-            config=config,
-            layer_chunk=layer_chunk,
-            backward=True,
-        )
-        if weight.grad is None or bias.grad is None:
-            raise ValueError(f"{tensor} refinement produced no gradient")
-        if not (
-            torch.isfinite(weight.grad).all() and torch.isfinite(bias.grad).all()
-        ):
-            raise ValueError(f"{tensor} refinement produced a non-finite gradient")
-        weight_direction = -weight.grad.sign()
-        bias_direction = -bias.grad.sign()
-
-        best: tuple[float, float, dict[str, float], torch.Tensor, torch.Tensor] | None
+        start_errors = errors
+        trainable = {
+            name: current[name].clone().requires_grad_(True)
+            for name in parameter_names
+        }
+        optimizer = torch.optim.Adam(trainable.values(), lr=learning_rate)
+        best: tuple[
+            float,
+            int,
+            dict[str, float],
+            dict[str, torch.Tensor],
+        ] | None
         best = None
-        for step in step_sizes:
-            candidate_weight = current[weight_name] + step * weight_direction
-            _project_gain(candidate_weight, max_gain)
-            candidate_bias = current[bias_name] + step * bias_direction
-            candidate = {
-                **current,
-                weight_name: candidate_weight,
-                bias_name: candidate_bias,
+        stale_steps = 0
+        steps_run = 0
+        for step in range(1, steps + 1):
+            steps_run = step
+            optimizer.zero_grad(set_to_none=True)
+            _objective_sums(
+                keys,
+                values,
+                query_post_rope,
+                key_post_rope,
+                **{
+                    **{name: current[name] for name in current},
+                    **trainable,
+                },
+                config=config,
+                layer_chunk=layer_chunk,
+                backward_tensor=tensor,
+                reference_sums=baseline_sums,
+            )
+            if any(parameter.grad is None for parameter in trainable.values()):
+                raise ValueError(f"{tensor} refinement produced no gradient")
+            if not all(
+                torch.isfinite(parameter.grad).all()
+                for parameter in trainable.values()
+                if parameter.grad is not None
+            ):
+                raise ValueError(
+                    f"{tensor} refinement produced a non-finite gradient"
+                )
+            optimizer.step()
+            gain_name = (
+                "key_weight"
+                if tensor == "key"
+                else (
+                    "value_weight"
+                    if isinstance(value_parameters, TemporalParameters)
+                    else "value_history_weights"
+                )
+            )
+            with torch.no_grad():
+                _project_gain(trainable[gain_name], max_gain)
+            candidate_values = {
+                name: parameter.detach().clone()
+                for name, parameter in trainable.items()
             }
+            candidate = {**current, **candidate_values}
             candidate_errors = _evaluate(
                 keys,
                 values,
@@ -345,33 +441,68 @@ def refine_attention(
             )
             score = phase_score(candidate_errors, baseline, tensor=tensor)
             regressed = any(
-                candidate_errors[name] > errors[name] + 1e-12
+                candidate_errors[name] > start_errors[name] + 1e-12
                 for name in (f"{tensor}_nmse", "attention_nmse")
             )
-            if regressed or score >= start_score:
-                continue
-            if best is None or score < best[0]:
-                best = (score, step, candidate_errors, candidate_weight, candidate_bias)
+            best_score = start_score if best is None else best[0]
+            relative_improvement = (best_score - score) / max(
+                abs(best_score), 1e-12
+            )
+            if not regressed and score < best_score:
+                best = (score, step, candidate_errors, candidate_values)
+                if relative_improvement >= min_relative_improvement:
+                    stale_steps = 0
+                else:
+                    stale_steps += 1
+            else:
+                stale_steps += 1
+            if stale_steps >= patience:
+                break
 
         if best is None:
             phases.append(
-                PhaseResult(tensor, False, None, start_score, start_score, errors)
+                PhaseResult(
+                    tensor,
+                    False,
+                    None,
+                    steps_run,
+                    start_score,
+                    start_score,
+                    errors,
+                )
             )
             continue
-        score, step, errors, weight_value, bias_value = best
-        current[weight_name] = weight_value
-        current[bias_name] = bias_value
-        phases.append(PhaseResult(tensor, True, step, start_score, score, errors))
+        score, best_step, errors, candidate_values = best
+        current.update(candidate_values)
+        phases.append(
+            PhaseResult(
+                tensor,
+                True,
+                best_step,
+                steps_run,
+                start_score,
+                score,
+                errors,
+            )
+        )
 
     report = {
         "baseline": baseline,
         "final": errors,
-        "step_sizes": [float(step) for step in step_sizes],
+        "optimizer": "adam",
+        "training_objective": "normalized_0.5_own_reconstruction_0.5_attention",
+        "selection_objective": "normalized_0.5_reconstruction_0.5_attention",
+        "objective_weights": {"reconstruction": 0.5, "attention": 0.5},
+        "steps": int(steps),
+        "learning_rate": float(learning_rate),
+        "patience": int(patience),
+        "min_relative_improvement": float(min_relative_improvement),
         "phases": [
             {
                 "tensor": phase.tensor,
                 "outcome": "attention_refined" if phase.accepted else "guardrail_fallback",
-                "step_size": phase.step_size,
+                "best_step": phase.best_step,
+                "steps_run": phase.steps_run,
                 "start_score": phase.start_score,
                 "score": phase.best_score,
                 **{f"final_{name}": value for name, value in phase.errors.items()},
@@ -379,19 +510,34 @@ def refine_attention(
             for phase in phases
         ],
     }
-    return (
-        replace(
-            key_parameters,
-            history_weights=current["key_weight"],
-            history_bias=current["key_bias"],
-        ),
+    refined_key = replace(
+        key_parameters,
+        history_weights=current["key_weight"],
+        history_bias=current["key_bias"],
+    )
+    refined_value = (
         replace(
             value_parameters,
             history_weights=current["value_weight"],
             history_bias=current["value_bias"],
-        ),
-        report,
+        )
+        if isinstance(value_parameters, TemporalParameters)
+        else replace(
+            value_parameters,
+            weight=current["value_weight"],
+            bias=current["value_bias"],
+            history_weights=current["value_history_weights"],
+        )
     )
+    refined_key, refined_value = _stamp_parameter_identity(
+        refined_key,
+        refined_value,
+        signature=config.format_signature(),
+        coordinate_system=(
+            key_parameters.coordinate_system or value_parameters.coordinate_system
+        ),
+    )
+    return refined_key, refined_value, report
 
 
 @torch.no_grad()

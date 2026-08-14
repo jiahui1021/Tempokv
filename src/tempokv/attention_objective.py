@@ -18,6 +18,7 @@ import torch
 import torch.nn.functional as F
 
 from .config import CodecConfig
+from .codec import _cuda_matmul_precision
 from .quantization import roundtrip
 
 
@@ -82,6 +83,120 @@ def temporal_rollout(
             prediction = prediction + (
                 reconstructed[-1 - lag] * weight[order - 1, lag].view(1, -1)
             )
+        residual = _round_trip(
+            target[..., frame, :, :] - prediction,
+            bits=bits,
+            config=config,
+            symmetric=config.residual_mode == "symmetric",
+        )
+        if detach_residual:
+            residual = residual.detach()
+        reconstructed.append((prediction + residual).to(torch.bfloat16).float())
+    return torch.stack(reconstructed, dim=-3)
+
+
+def cross_kv_rollout(
+    source: torch.Tensor,
+    target: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+    history_weights: torch.Tensor,
+    *,
+    bits: int,
+    config: CodecConfig,
+    detach_residual: bool = True,
+) -> torch.Tensor:
+    """Replay a CrossKV + reconstructed-V-history codec differentiably.
+
+    ``source`` is the decoder-visible reconstructed K trace and ``target`` is
+    clean V.  Layered parameters use ``[L,H,D,D]``, ``[L,H,D]``, and either
+    diagonal ``[L,P,H,D]`` or dense ``[L,P,H,D,D]`` history weights.  The
+    unlayered equivalents omit ``L``.  As in :func:`temporal_rollout`, the
+    quantized residual is refreshed at every frame but detached by default.
+    """
+    if source.shape != target.shape or target.ndim < 3:
+        raise ValueError("source and target must have matching [..., F, H, D] shapes")
+    layered = weight.ndim == 4
+    expected_weight_ndim = 4 if layered else 3
+    expected_bias_ndim = 3 if layered else 2
+    if weight.ndim != expected_weight_ndim or bias.ndim != expected_bias_ndim:
+        raise ValueError("CrossKV weight and bias layouts do not match")
+    if layered and int(source.shape[0]) != int(weight.shape[0]):
+        raise ValueError("layered CrossKV parameters do not match the trace")
+    if tuple(weight.shape[-3:-1]) != tuple(bias.shape[-2:]):
+        raise ValueError("CrossKV weight and bias head dimensions do not match")
+    if int(weight.shape[-1]) != int(target.shape[-1]):
+        raise ValueError("CrossKV parameters do not match the trace head dimension")
+
+    dense_history_ndim = 5 if layered else 4
+    diagonal_history_ndim = 4 if layered else 3
+    if history_weights.ndim not in {dense_history_ndim, diagonal_history_ndim}:
+        raise ValueError("CrossKV history weights must be diagonal or dense")
+    history_axis = 1 if layered else 0
+    history_length = int(history_weights.shape[history_axis])
+    frames = int(target.shape[-3])
+    if history_length >= frames:
+        raise ValueError("history length must be smaller than the frame count")
+
+    reconstructed = [
+        _round_trip(
+            target[..., 0, :, :],
+            bits=config.anchor_bits,
+            config=config,
+            symmetric=True,
+        ).to(torch.bfloat16).float()
+    ]
+    for frame in range(1, frames):
+        current_source = source[..., frame, :, :].float()
+        with _cuda_matmul_precision(source.device, config.cross_matmul_precision):
+            if layered:
+                prediction = torch.einsum(
+                    "l...hi,lhij->l...hj", current_source, weight
+                )
+                prediction = prediction + bias.view(
+                    bias.shape[0],
+                    *([1] * (prediction.ndim - 3)),
+                    bias.shape[-2],
+                    bias.shape[-1],
+                )
+            else:
+                prediction = torch.einsum("...hi,hij->...hj", current_source, weight)
+                prediction = prediction + bias.view(
+                    *([1] * (prediction.ndim - 2)),
+                    bias.shape[-2],
+                    bias.shape[-1],
+                )
+
+            order = min(frame, history_length)
+            for lag in range(order):
+                history_weight = (
+                    history_weights[:, lag] if layered else history_weights[lag]
+                )
+                previous = reconstructed[-1 - lag]
+                if history_weights.ndim == diagonal_history_ndim:
+                    if layered:
+                        contribution = previous * history_weight.view(
+                            history_weight.shape[0],
+                            *([1] * (previous.ndim - 3)),
+                            history_weight.shape[-2],
+                            history_weight.shape[-1],
+                        )
+                    else:
+                        contribution = previous * history_weight.view(
+                            *([1] * (previous.ndim - 2)),
+                            history_weight.shape[-2],
+                            history_weight.shape[-1],
+                        )
+                elif layered:
+                    contribution = torch.einsum(
+                        "l...hi,lhij->l...hj", previous.float(), history_weight
+                    )
+                else:
+                    contribution = torch.einsum(
+                        "...hi,hij->...hj", previous.float(), history_weight
+                    )
+                prediction = prediction + contribution
+
         residual = _round_trip(
             target[..., frame, :, :] - prediction,
             bits=bits,

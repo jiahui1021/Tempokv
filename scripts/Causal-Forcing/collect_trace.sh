@@ -21,12 +21,13 @@
 #   CHECKPOINT   Causal Forcing 模型权重
 #   MODEL_ROOT   Wan2.1-T2V-1.3B 目录
 #   PROMPTS      采集用 prompt 列表
+#   CONFIG       codec 配置；决定 native/legacy trace 协议与默认目录
 #
 # 常用可选变量：
 #   GENERATION_MODE  chunkwise（默认）或 framewise
 #   TRACE_DIR        trace 目录（默认 data/causal-forcing/trace/<模式>）
 #   TRACE_FILE       合并后的拟合输入（默认 <TRACE_DIR>/clean_trace.npz）
-#   TRACE_FRAMES     每个 prompt 生成的 latent 帧数（默认 21）
+#   TRACE_FRAMES     每个 prompt 生成的 latent 帧数（native 21，legacy 51）
 #   TRACE_TOKENS_PER_FRAME  每帧抽取的空间位置数（默认 8）
 #   NUM_GPUS / BASE_SEED / OVERWRITE / DRY_RUN
 #   USE_EMA          是否读取 checkpoint 的 generator_ema（默认 0，官方权重只有 generator）
@@ -36,7 +37,7 @@ set -euo pipefail
 # shellcheck source=scripts/Causal-Forcing/_common.sh
 source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)/_common.sh"
 
-require_env CHECKPOINT MODEL_ROOT PROMPTS
+require_env CHECKPOINT MODEL_ROOT PROMPTS CONFIG
 
 generation_mode="${GENERATION_MODE:-chunkwise}"
 case "$generation_mode" in
@@ -52,7 +53,15 @@ if [[ -n "${MODEL_CONFIG:-}" ]]; then
 else
   model_config="$runtime_root/configs/causal_forcing_dmd_$generation_mode.yaml"
 fi
-LEGACY_PROTOCOL="${LEGACY_PROTOCOL:-1}"
+config_path="$(resolve_path "$CONFIG")"
+[[ -f "$config_path" ]] || die "CONFIG 不存在：$config_path"
+read -r fit_mode _ <<<"$(resolve_codec_modes "$config_path" "${V_PREDICTOR:-}")"
+expected_legacy_protocol=0
+[[ "$fit_mode" == "legacy" ]] && expected_legacy_protocol=1
+if [[ -n "${LEGACY_PROTOCOL:-}" && "$LEGACY_PROTOCOL" != "$expected_legacy_protocol" ]]; then
+  die "LEGACY_PROTOCOL=$LEGACY_PROTOCOL 与 CONFIG 的 fit_mode=$fit_mode 冲突"
+fi
+LEGACY_PROTOCOL="$expected_legacy_protocol"
 if [[ "$LEGACY_PROTOCOL" == "1" ]]; then
   default_trace_frames=51
 else

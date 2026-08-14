@@ -73,6 +73,26 @@ check_int() {
   die "$name 必须是整数且 >= ${min}（当前值：${value}）"
 }
 
+resolve_codec_modes() {
+  local config_path="$1" v_predictor_override="${2:-}"
+  "$python_bin" - "$config_path" "$v_predictor_override" <<'MODEPY'
+import json
+import sys
+
+config = json.load(open(sys.argv[1], encoding="utf-8"))
+config = config.get("codec", config)
+fit_mode = config.get("fit_mode", "native")
+v_predictor = sys.argv[2] or config.get("v_predictor_mode")
+if v_predictor is None:
+    v_predictor = "temporal" if fit_mode == "legacy" else "cross_kv"
+if fit_mode not in {"native", "legacy"}:
+    raise SystemExit(f"unsupported fit_mode: {fit_mode}")
+if v_predictor not in {"cross_kv", "temporal"}:
+    raise SystemExit(f"unsupported v_predictor_mode: {v_predictor}")
+print(fit_mode, v_predictor)
+MODEPY
+}
+
 codec_slug() {
   local config_path="$1" k_override="${2:-}" v_override="${3:-}"
   local k_bits_override="${4:-}" v_bits_override="${5:-}" stride_override="${6:-}"
@@ -113,11 +133,15 @@ if v_history is None:
         v_history = 0
 
 k_label = f"kh{int(k_history)}"
-# The V segment records history length only; the V predictor structure
-# (cross_kv vs temporal) is deliberately not part of the directory name so
-# both fit under a single kh{N}-vh{M} name.  The parameter files themselves
-# still distinguish v_cross_kv.npz from v_temporal.npz.
-v_label = f"vh{int(v_history)}"
+# The fit family and V predictor are part of parameter identity; incompatible
+# predictors must never share a directory.
+fit_mode = config.get("fit_mode", "native")
+mode_label = "legacy-" if fit_mode == "legacy" else ""
+v_predictor = sys.argv[7] or config.get("v_predictor_mode")
+if v_predictor is None:
+    v_predictor = "temporal" if fit_mode == "legacy" else DEFAULT_V_PREDICTOR_MODE
+v_prefix = "vt" if v_predictor == "temporal" else "vh"
+v_label = f"{v_prefix}{int(v_history)}"
 if k_bits == v_bits:
     precision_label = f"int{k_bits}"
 else:
@@ -128,6 +152,6 @@ else:
 # parameters.  Without this segment every CP degree wrote to one directory and
 # silently overwrote the others.
 stride_label = "" if stride == DEFAULT_STRIDE else f"-s{stride}"
-print(f"{k_label}-{v_label}-{precision_label}{stride_label}")
+print(f"{mode_label}{k_label}-{v_label}-{precision_label}{stride_label}")
 SLUGPY
 }

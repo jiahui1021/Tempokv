@@ -52,11 +52,11 @@ data/self-forcing/
 │   ├── output/                      采集过程输出
 │   └── clean_trace.npz              合并后的拟合输入
 └── params/
-    ├── kh2-vh1-int2/
+    ├── legacy-kh2-vh1-int2/
     │   ├── k_temporal.npz
     │   └── v_cross_kv.npz
-    ├── kh2-vh1-k2-v4/              K/V 使用不同位宽时
-    ├── khshared3-vhshared2-int2/   shared-history 参数
+    ├── legacy-kh2-vh1-k2-v4/      K/V 使用不同位宽时
+    ├── legacy-kh3-vt1-int4/       temporal-V 兼容 preset
     └── <其他参数方案>/
 ```
 
@@ -71,7 +71,7 @@ PROMPTS=assets/fit_prompts.txt \
 bash scripts/Self-Forcing/collect_trace.sh
 ```
 
-默认使用 legacy 的 direct temporal-V 拟合协议：`assets/fit_prompts.txt` 中的 12 条
+默认使用固定的 legacy event trace 协议：`assets/fit_prompts.txt` 中的 12 条
 prompt、每条 51 个 latent 帧、每帧 8 个 token。每条 prompt 保存两个独立的
 24 帧记录并分别重置历史，末尾 3 帧不进入拟合。保存全部 30 层和 12 个
 attention head。K 来自 `norm_k` 输出，坐标为 normalized、pre-RoPE；V 来自同
@@ -132,10 +132,22 @@ data/self-forcing/params/legacy-kh2-vh1-int2/v_cross_kv.npz
 
 可用 `TRACE_FILE`、`PARAM_NAME` 或 `OUTPUT_DIR` 覆盖默认位置。
 
-如果配置中的 K/V 位宽不同，方案名会使用 `kh2-vh1-k2-v4` 这样的格式。shared
+如果配置中的 K/V 位宽不同，方案名会使用 `legacy-kh2-vh1-k2-v4` 这样的格式。shared
 参数会保留配置中的最大 history length，并可在运行时选择不超过该上限的历史长度。
 拟合目录同时写入 `fit_report.json`，其中包含 `codec_config_sha256`，用于确认
 参数来自哪一份 codec 配置。
+
+legacy temporal V 可在基础 fitting 后启用 sampled attention proxy refinement：
+
+```bash
+CONFIG=configs/legacy.json V_PREDICTOR=temporal \
+ATTENTION_STEPS=100 ATTENTION_LR=0.001 ATTENTION_PATIENCE=10 \
+ATTENTION_LAYER_CHUNK=4 \
+bash scripts/Self-Forcing/fit_params.sh
+```
+
+该目标使用 recorded post-RoPE Q/K，但每个采样空间位置独立、只沿帧轴做 SDPA；它不是完整
+1560-token backend attention 的重放。`fit_report.json` 会记录 refinement 是否启用及 phase 结果。
 
 ## 3. TempoKV 生成
 
@@ -208,8 +220,9 @@ CPU 拟合同时会把方程降到 float64，比看上去慢得多，所以回�
 
 `V_PREDICTOR=cross_kv|temporal` 切换 V 预测器，也不需要单独的配置文件；它会同时
 决定参数目录名（`vh1` 与 `vt1`）和参数文件名（`v_cross_kv.npz` 与 `v_temporal.npz`），
-两者不会互相覆盖。注意 temporal V 目前只有 legacy 拟合路径能产出，所以在 native
-配置上单独设它会在读 trace 之前就报错并说明原因。
+两者不会互相覆盖。native 与 legacy family 都能拟合 temporal V；但 sampled attention
+refinement 当前要求 legacy/shared temporal K，V 可选 temporal 或 `CrossKV + V-history`；
+其他 K predictor shape 会在读 trace 前报错。
 
 `TORCH_DECODER=1` 用 PyTorch 参考解码器代替 Triton，用来做数值对照；它同时关掉
 强制 Triton 的检查，所以不需要再配 `ALLOW_TRITON_FALLBACK`。两者共用同一套拟合
@@ -235,7 +248,7 @@ bash scripts/Self-Forcing/sweep_history.sh
 | 指标 | 含义 |
 |---|---|
 | 重建误差 | `\|\|rebuilt - clean\|\|² / \|\|clean\|\|²`，模型真正读到的 cache 的闭环误差 |
-| Attention 输出误差 | 同一份重建过 causal softmax 后的相对输出误差 |
+| Attention proxy 误差 | sampled token 各自沿帧轴做 recorded-Q SDPA 的相对输出误差；不是完整 1560-token backend attention |
 | 预测项占比 | `1 - \|\|clean - prediction\|\|² / \|\|clean\|\|²`，其补集就是量化器要花比特编的残差 |
 
 K 扫 `k_history_length`（1 到 8），V 在 CrossKV 项之上再扫 `v_history_length`

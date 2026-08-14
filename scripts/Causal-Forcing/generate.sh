@@ -76,32 +76,12 @@ else
 fi
 
 if [[ "$mode" == "tempokv" ]]; then
-  parameter_name="${PARAM_NAME:-$(codec_slug "$(resolve_path "$CONFIG")" "${K_HISTORY_LENGTH:-}" "${V_HISTORY_LENGTH:-}" "${K_BITS:-}" "${V_BITS:-}" "" "${V_PREDICTOR:-}")}"
+  config_path="$(resolve_path "$CONFIG")"
+  [[ -f "$config_path" ]] || die "CONFIG 不存在：$config_path"
+  read -r fit_mode v_predictor_mode <<<"$(resolve_codec_modes "$config_path" "${V_PREDICTOR:-}")"
+  parameter_name="${PARAM_NAME:-$(codec_slug "$config_path" "${K_HISTORY_LENGTH:-}" "${V_HISTORY_LENGTH:-}" "${K_BITS:-}" "${V_BITS:-}" "" "$v_predictor_mode")}"
   param_dir="$(resolve_path "${PARAM_DIR:-data/causal-forcing/params/$generation_mode/$parameter_name}")"
   result_label="$parameter_name"
-  # The legacy config defaults to temporal V, so its unset v_predictor_mode is
-  # reported as "temporal" rather than the global cross_kv default.
-  v_predictor_mode="$("$python_bin" - "$(resolve_path "$CONFIG")" <<'PY'
-import json
-import sys
-
-config = json.load(open(sys.argv[1], encoding="utf-8"))
-config = config.get("codec", config)
-fit_mode = config.get("fit_mode", "native")
-v_predictor = config.get("v_predictor_mode")
-if v_predictor is None:
-    v_predictor = "temporal" if fit_mode == "legacy" else "cross_kv"
-print(v_predictor)
-PY
-  )"
-  # V_PREDICTOR overrides the config so one file covers both predictors.
-  if [[ -n "${V_PREDICTOR:-}" ]]; then
-    case "$V_PREDICTOR" in
-      cross_kv|temporal) ;;
-      *) die "V_PREDICTOR 必须是 cross_kv 或 temporal（当前值：${V_PREDICTOR}）" ;;
-    esac
-    v_predictor_mode="$V_PREDICTOR"
-  fi
   if [[ "$v_predictor_mode" == "temporal" ]]; then
     v_artifact_name="v_temporal.npz"
   else
@@ -184,7 +164,7 @@ if [[ "$mode" == "tempokv" ]]; then
   [[ -n "${V_HISTORY_LENGTH:-}" ]] && generate_command+=(--v-history-length "$V_HISTORY_LENGTH")
   [[ -n "${K_BITS:-}" ]] && generate_command+=(--k-bits "$K_BITS")
   [[ -n "${V_BITS:-}" ]] && generate_command+=(--v-bits "$V_BITS")
-  [[ -n "${V_PREDICTOR:-}" ]] && generate_command+=(--v-predictor-mode "$V_PREDICTOR")
+  generate_command+=(--v-predictor-mode "$v_predictor_mode")
   [[ -n "${SPAN_FRAMES:-}" ]] && generate_command+=(--span-frames "$SPAN_FRAMES")
 fi
 

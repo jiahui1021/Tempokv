@@ -61,13 +61,14 @@ BF16 对照不读 TempoKV 配置或参数，默认与 TempoKV 生成相同帧数
 
 ## 配置
 
-`configs/` 只有两个文件，对应两个**拟合家族**。其余全部是命令行 override，
-不需要为每种组合各存一个文件：
+`configs/` 有两个 family 配置和一个显式兼容 preset。通常只需选择 family，
+位宽、历史长度与 V predictor 用命令行 override：
 
 ```text
 configs/
 ├── native.json    native 拟合（Causal Forcing、LongCat）
-└── legacy.json    legacy 拟合，复现参考实现（Self-Forcing）
+├── legacy.json    legacy/shared-K 拟合 family
+└── legacy_kh3_vt1_int4.json  KH3 + temporal-V 的完整兼容 preset
 ```
 
 K 预测器的粒度是最显眼的差别：native 每层每头一套系数（`[L,P,P,H,D]`），legacy 把
@@ -85,13 +86,16 @@ K——它同时改 V 预测的累加顺序、编解码的 BF16 截断点，并�
 
 两个轴独立，`V_PREDICTOR` 在任一家族下都成立：
 
-| | `V_PREDICTOR=cross_kv`（默认） | `V_PREDICTOR=temporal` |
+| | `V_PREDICTOR=cross_kv` | `V_PREDICTOR=temporal` |
 |---|---|---|
 | `native.json` | V = Cross(K) + 对角 V history | V 只读自己的 V history，`[L,P,P,H,D]` |
 | `legacy.json` | Cross(K) 仍是 per-layer per-head | V history 池化成 `[P,P,D]` |
 
 注意 legacy 池化的是 **K 与 temporal V**；它的 CrossKV V 仍然是 per-layer per-head。
 `v_predictor_mode=temporal` 需要 `v_history_length >= 1`——没有历史就没有可预测的东西。
+`legacy.json` 本身不钉死 V family：Self-Forcing wrapper 保持 CrossKV 默认，Causal-Forcing
+wrapper 为 attention-refinement 协议选择 temporal V。两者都会把解析后的 family 显式传给
+fitter/runtime，并编码进参数目录，不能共享参数。
 
 ### 命令行 override
 
@@ -103,6 +107,9 @@ K——它同时改 V 预测的累加顺序、编解码的 BF16 截断点，并�
 | `V_PREDICTOR` | V 预测器：`cross_kv` 或 `temporal` | 全部 |
 | `CACHE_STRIDE` | 本次运行的 local cache stride（CP>1 时用） | LongCat |
 | `TORCH_DECODER=1` | 用 PyTorch 参考解码器而不是 Triton | Self-Forcing |
+| `ATTENTION_STEPS` | 每个 K/V phase 的最大 Adam 步数；留空不精调 | Self-Forcing / Causal Forcing legacy family |
+| `ATTENTION_LR` / `ATTENTION_PATIENCE` | Adam 学习率与早停 patience | Self-Forcing / Causal Forcing legacy family |
+| `ATTENTION_LAYER_CHUNK` | refinement 每批处理的层数 | Self-Forcing / Causal Forcing |
 
 冲突会直接报错，不会悄悄取一个：`BITS` 与 `K_BITS`/`V_BITS` 不一致，或 `KH` 与
 `K_HISTORY_LENGTH` 不一致，都会失败。
@@ -113,9 +120,14 @@ CONFIG=configs/legacy.json V_PREDICTOR=temporal bash scripts/Self-Forcing/fit_pa
 CONFIG=configs/native.json CACHE_STRIDE=780 bash scripts/LongCat/fit_params.sh
 ```
 
-两个配置的历史长度都是 `kh2-vh1`，**不再按模型区分**。Self-Forcing 复现参考实现的
-KH3 要显式写 `KH=3`；Causal Forcing 与 LongCat 用 `native.json`，temporal V 直接加
-`V_PREDICTOR=temporal`。
+两个 family 配置的历史长度都是 `kh2-vh1`。Self-Forcing 复现参考实现的 KH3 要显式写
+`KH=3`；Causal Forcing 可按实验选择 native CrossKV 或 legacy temporal V，LongCat 使用
+native family。attention refinement 当前要求 legacy/shared temporal K；V 可选 temporal 或
+`CrossKV + V-history`。native/layered K 会在拟合开始前被拒绝，而不是运行到 rollout 中途才失败。
+启用 refinement 时，同一次拟合还会保存 `k_temporal_ls.npz` 和对应的 `v_*_ls.npz`，供
+LS-only / refined 严格消融；常规文件名仍指向 refinement 后参数。
+训练 loss 在 K/V 两个 phase 中分别使用当前 tensor relative SSE 与 attention-output relative
+SSE 的归一化 `0.5/0.5` 加权，并由 Adam 多步优化、guardrail 选取最佳检查点。
 
 ### 参数目录名
 
@@ -123,10 +135,10 @@ KH3 要显式写 `KH=3`；Causal Forcing 与 LongCat 用 `native.json`，tempora
 目录名把它们全部编码进去，互不覆盖：
 
 ```text
-legacy-kh2-vh1-int4        legacy.json 默认
+legacy-kh2-vh1-int4        Self-Forcing legacy.json 默认（CrossKV V）
+legacy-kh2-vt1-int4        Causal legacy.json 默认（temporal V）
 legacy-kh3-vh1-int4        + KH=3（Self-Forcing 参考实现）
 legacy-kh2-vh1-int2        + BITS=2
-legacy-kh2-vt1-int4        + V_PREDICTOR=temporal（vt 而不是 vh）
 kh2-vh1-int4               native.json 默认
 kh2-vh1-int4-s780          + CACHE_STRIDE=780
 kh2-vh1-k2-v4              K/V 位宽不同
@@ -137,12 +149,11 @@ kh2-vh1-k2-v4              K/V 位宽不同
 
 ### 两条约束
 
-**legacy 家族只接受 Self-Forcing 的 legacy trace 协议。**
+**legacy 家族只接受固定的 legacy event trace 协议。**
 `scripts/common/fit_params.py` 会校验 `trace_layout=legacy_event_bpfhd_v1`、
-`trace_stride=1560` 和固定的 30 层张量形状，只有
-`experiments/Self-Forcing/tempokv_adapter/prepare_trace.py` 产出这种 trace。所以
-Causal Forcing 与 LongCat 只能走 native 家族——但 temporal V 在 native 下同样可用，
-不再受这条限制。
+`trace_stride=1560` 和固定的 30 层张量形状。Self-Forcing 与 Causal-Forcing 的 trace bridge
+都能产出该协议，但 checkpoint 与 cache 分布不同，参数仍不能跨 backend 复用。LongCat
+目前只提供 native trace 入口。
 
 **stride 随模型而变，不是常量。** 它是模型的 frame token 数（Self-Forcing /
 Causal Forcing 是 1560；LongCat 在 CP>1 时按 CP 度数切成 780 / 390），只是
@@ -179,7 +190,8 @@ init 视频。
 
 ## 历史帧数敏感性实验
 
-扫 K 与 V 的历史帧数，报告重建误差、attention 输出误差和预测项占比：
+扫 K 与 V 的历史帧数，报告重建误差、sampled temporal-track attention proxy 误差和
+预测项占比：
 
 ```bash
 bash scripts/Self-Forcing/sweep_history.sh          # 三个模型各有一个同名入口
@@ -237,6 +249,25 @@ bash scripts/evaluation/evaluate_all.sh
 脚本按视频清单与 VBench 配置指纹复用已完成的 BF16 VBench，输入或配置变化自动重算，
 `FORCE=1` 强制重算。其余可选变量见
 [`scripts/evaluation/evaluate_all.sh`](scripts/evaluation/evaluate_all.sh) 头部。
+
+## 运行时加速路径
+
+TempoKV 的 CUDA 路径不是“先用 PyTorch 做 predictor，再单独反量化”。Triton decoder
+在同一个 persistent kernel 中完成低比特 unpack、scale/zero-point 反量化、temporal 或
+CrossKV prediction、residual add 和 BF16 截断；temporal 路径一次 launch 最多推进 16 个
+unit，CrossKV 路径因寄存器压力上限为 8 个。输出可直接写入 backend 需要的 BSHD/BHSD
+cache-read slice，避免中间 layout tensor 和额外 copy。
+
+编码侧会对一个 span 的 CrossKV projection 做一次 batched GEMM，并让 K/V encoder 复用
+输入 buffer 完成闭环重建。解码侧直接读取 reconstructed-K source view，不为每个 packed
+span 复制完整 K。每个 rank 使用可跨运行复用的 Triton compilation cache，避免把重复编译
+计入稳态 latency。
+
+这些是**已实现的机制**，不是端到端加速结论。当前每次读取 packed span 仍会重新构造完整
+BF16 K/V read buffer，K 解码后再单独执行 RoPE；尚未实现 decoded-span cache、decode+RoPE
+融合、decode+attention 融合或 compressed-domain attention。因此论文和报告必须分别给出
+encode/decode、attention、完整 generation 的实测结果，不能从 KV bytes 或 kernel
+microbenchmark 推导端到端加速。
 
 ## 性能分解
 
