@@ -79,7 +79,10 @@ if [[ "$mode" == "tempokv" ]]; then
   config_path="$(resolve_path "$CONFIG")"
   [[ -f "$config_path" ]] || die "CONFIG 不存在：$config_path"
   read -r fit_mode v_predictor_mode <<<"$(resolve_codec_modes "$config_path" "${V_PREDICTOR:-}")"
-  parameter_name="${PARAM_NAME:-$(codec_slug "$config_path" "${K_HISTORY_LENGTH:-}" "${V_HISTORY_LENGTH:-}" "${K_BITS:-}" "${V_BITS:-}" "" "$v_predictor_mode")}"
+  # This only selects the matching fitted parameter directory; runtime always
+  # consumes reconstructed cache state regardless of the fitting ablation.
+  FIT_HISTORY_SOURCE="${FIT_HISTORY_SOURCE:-reconstructed}"
+  parameter_name="${PARAM_NAME:-$(codec_slug "$config_path" "${K_HISTORY_LENGTH:-}" "${V_HISTORY_LENGTH:-}" "${K_BITS:-}" "${V_BITS:-}" "" "$v_predictor_mode" "$FIT_HISTORY_SOURCE")}"
   param_dir="$(resolve_path "${PARAM_DIR:-data/causal-forcing/params/$generation_mode/$parameter_name}")"
   result_label="$parameter_name"
   if [[ "$v_predictor_mode" == "temporal" ]]; then

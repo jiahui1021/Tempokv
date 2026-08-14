@@ -71,7 +71,10 @@ fi
 # ---------- 目录 ----------
 
 if [[ "$mode" == "tempokv" ]]; then
-  parameter_name="${PARAM_NAME:-$(codec_slug "$(resolve_path "$CONFIG")" "${K_HISTORY_LENGTH:-}" "${V_HISTORY_LENGTH:-}" "${K_BITS:-}" "${V_BITS:-}" "" "${V_PREDICTOR:-}")}"
+  # This only selects the matching fitted parameter directory; runtime always
+  # consumes reconstructed cache state regardless of the fitting ablation.
+  FIT_HISTORY_SOURCE="${FIT_HISTORY_SOURCE:-reconstructed}"
+  parameter_name="${PARAM_NAME:-$(codec_slug "$(resolve_path "$CONFIG")" "${K_HISTORY_LENGTH:-}" "${V_HISTORY_LENGTH:-}" "${K_BITS:-}" "${V_BITS:-}" "" "${V_PREDICTOR:-}" "$FIT_HISTORY_SOURCE")}"
   param_dir="$(resolve_path "${PARAM_DIR:-data/self-forcing/params/$parameter_name}")"
   result_label="$parameter_name"
   v_predictor_mode="$("$python_bin" - "$(resolve_path "$CONFIG")" <<'PY'

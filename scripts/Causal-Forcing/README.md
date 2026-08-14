@@ -144,17 +144,19 @@ CPU 拟合同时会把方程降到 float64，比看上去慢得多，所以回�
 
 `V_PREDICTOR=cross_kv|temporal` 切换 V 预测器，也不需要单独的配置文件；它会同时
 决定参数目录名（`vh1` 与 `vt1`）和参数文件名（`v_cross_kv.npz` 与 `v_temporal.npz`），
-两者不会互相覆盖。基础 native fitter 可以产出 temporal V；attention refinement 当前要求
-legacy/shared temporal K，V 可选 temporal 或 `CrossKV + V-history`。其他 K shape 会在读 trace
-前报错。
+两者不会互相覆盖。基础 native fitter 可以产出 temporal V；attention refinement 同时支持
+native/layer-head 与 legacy/shared temporal K，V 可选 temporal、CrossKV only 或
+`CrossKV + V-history`，每种结构都必须从同一 trace 独立拟合。
 
 ## Attention proxy refinement
 
-`3340753` 起 Causal trace 同时保存采样位置的 post-RoPE Q/K。对 legacy/shared temporal K
-以及 temporal 或 CrossKV V，可在基础 closed-loop least-squares fitting 后启用可选 refinement：
+`3340753` 起 Causal trace 同时保存采样位置的 post-RoPE Q/K。对 native/layer-head 或
+legacy/shared temporal K，以及 temporal 或 CrossKV V，可在基础 closed-loop least-squares
+fitting 后启用可选 refinement：
 
 ```bash
-CONFIG=configs/legacy.json ATTENTION_STEPS=100 ATTENTION_LR=0.001 \
+CONFIG=configs/legacy.json PARAM_NAME=legacy-temporal-adam-r05-a05-kv \
+ATTENTION_STEPS=100 ATTENTION_LR=0.001 \
 ATTENTION_PATIENCE=10 ATTENTION_LAYER_CHUNK=4 \
 bash scripts/Causal-Forcing/fit_params.sh
 ```
@@ -163,6 +165,22 @@ bash scripts/Causal-Forcing/fit_params.sh
 `v_temporal_ls.npz` / `v_cross_kv_ls.npz`，常规文件名保存 refinement 后参数。
 每个 K/V phase 用 Adam 最小化归一化的 `0.5 * own reconstruction + 0.5 * attention`
 目标，按 phase 起点做非退化 guardrail，并用 patience 早停、保留最佳检查点。
+
+objective/optimizer 消融使用同一入口，例如 reconstruction-only V phase 与历史 sign-gradient：
+
+```bash
+CONFIG=configs/native.json PARAM_NAME=native-winner-adam-r1-a0-kv ATTENTION_STEPS=100 \
+ATTENTION_RECONSTRUCTION_WEIGHT=1 ATTENTION_OUTPUT_WEIGHT=0 \
+ATTENTION_REFINE_TENSORS=value \
+bash scripts/Causal-Forcing/fit_params.sh
+
+CONFIG=configs/native.json PARAM_NAME=native-winner-sign-r05-a05-kv ATTENTION_STEPS=1 \
+ATTENTION_OPTIMIZER=sign_gradient ATTENTION_SIGN_STEP_SIZES="0.001 0.01" \
+bash scripts/Causal-Forcing/fit_params.sh
+```
+
+`PARAM_NAME` 必须为每个 optimizer/objective/phase 组合取独立值；默认 codec slug 不编码这些
+拟合超参，已有参数默认拒绝覆盖，但不能用 `OVERWRITE=1` 把不同消融写进同一目录。
 
 该目标把每个采样空间位置作为独立 record，只沿帧轴计算 recorded-Q SDPA；它不重放完整
 1560-token attention 或 backend mask，因此报告中称为 `recorded-Q temporal-track attention

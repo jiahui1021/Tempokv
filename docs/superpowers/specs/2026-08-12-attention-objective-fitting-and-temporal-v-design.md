@@ -72,7 +72,7 @@ TempoKV 的 Self-Forcing legacy 模式经过多轮对齐后，质量仍与参考
 | `apply_rotation(x, cos, sin)` | 把旋转施加到任意同形状张量上 |
 | `objective_terms(...)` | 返回 6 个 FP64 标量：`k_sse, k_ref, v_sse, v_ref, attn_sse, attn_ref` |
 | `nmse(sums)` | 由 6 个分量得到 `k_nmse` / `v_nmse` / `attention_nmse` 三个归一化指标 |
-| `phase_score(nmse, baseline, kind)` | 相位复合分数：`0.5 · own_nmse/baseline[own] + 0.5 · attention_nmse/baseline[attention]` |
+| `phase_score(nmse, baseline, kind, weights)` | 相位复合分数；最终方法为 `0.5/0.5`，消融可显式切换权重 |
 
 ### 5.2 改动模块
 
@@ -81,7 +81,7 @@ TempoKV 的 Self-Forcing legacy 模式经过多轮对齐后，质量仍与参考
 - `src/tempokv/fitting.py`：`fit_legacy_shared_temporal` 复用于 V（VH1 → `[1,1,128]`）；新增 `refine_attention()` 驱动交替相位、早停与 guardrail。
 - `experiments/Self-Forcing/tempokv_adapter/trace_bridge.py`：在与 k/v 相同的采样位置额外记录 `q_post_rope`、`k_post_rope`。
 - `experiments/Self-Forcing/tempokv_adapter/prepare_trace.py`：落盘两个新数组，协议串升版。
-- `scripts/common/fit_params.py`：提供 `--attention-steps` / `--attention-lr` / `--attention-max-tokens` / `--attention-patience` / `--attention-min-relative-improvement`；报告写入每相位的接受或回退、最佳步与实际步数。
+- `scripts/common/fit_params.py`：提供 steps/lr/patience/token cap，并显式控制 optimizer、objective weights 与 K/V phase；报告写入每相位的接受或回退、最佳步与实际步数。
 
 ## 6. 数据流
 
@@ -151,7 +151,8 @@ keys / values / q_post_rope / k_post_rope   各 [30, 24, 1, 8, 24, 12, 128]
 - rollout 在层与 event 维度上全并行，每个 Adam 步只有 24 次帧循环。
 - 显存通过**按层分块 + 梯度累加**控制；V 参数全层共享，梯度对层求和，因此分块与不分块在数学上等价。
 - 不使用随机 minibatch：同一份 trace 两次拟合必须得到完全一致的参数。
-- 实现同时支持 legacy/shared temporal K 搭配 temporal V 或 `CrossKV + V-history`；后者保留 aligned reconstructed-K 条件，并在 K phase 中通过 V prediction 路径传播 attention 梯度。
+- 实现同时支持 legacy/shared `[P,P,D]` 与 native/layer-head `[L,P,P,H,D]` temporal K；V 可为 temporal、CrossKV only 或 `CrossKV + V-history`。后两者保留 aligned reconstructed-K 条件，并在 K phase 中通过 V prediction 路径传播 attention 梯度。
+- 同协议消融可选 Adam 或历史单方向 sign-gradient scan、reconstruction/attention 权重以及 K-only、V-only、K+V phase；训练、候选选择和 guardrail 共用同一组非零权重。
 
 ## 8. 参数文件与兼容性
 
@@ -165,7 +166,7 @@ keys / values / q_post_rope / k_post_rope   各 [30, 24, 1, 8, 24, 12, 128]
 
 - 要求 attention 精调但 trace 缺少 `q_post_rope` / `k_post_rope` → 报错并提示重新采集。
 - 精调过程中出现非有限 loss → 报错。
-- 相位回退 → `fit_report.json` 写明 `attention_refined` 或 `guardrail_fallback`，附相位起止分数。
+- 相位回退 → `fit_report.json` 写明 `accepted` 或 `guardrail_fallback`，附 optimizer、objective、phase 和相位起止分数。
 - `v_predictor_mode` 与参数文件实际格式不符 → 加载即报错。
 - `v_predictor_mode="temporal"` 但参数不是全层全头共享形状 → 报错。
 

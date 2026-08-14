@@ -53,17 +53,40 @@ def temporal_rollout(
 ) -> torch.Tensor:
     """Replay the codec's closed loop while staying differentiable in the parameters.
 
-    ``weight`` is ``[P, P, D]`` and ``bias`` is ``[P, D]``, shared across every
-    leading axis.  ``detach_residual`` blocks gradients through the quantized
-    residual, which is the straight-through proxy the refinement relies on:
-    the residual is refreshed from the current prediction each step, but only
-    the prediction path carries gradient.
+    Parameters may be shared ``[P,P,D]``, per-head ``[P,P,H,D]``, or native
+    per-layer/per-head ``[L,P,P,H,D]``.  ``detach_residual`` blocks gradients
+    through the quantized residual, which is the straight-through proxy the
+    refinement relies on: the residual is refreshed from the current
+    prediction each step, but only the prediction path carries gradient.
     """
     if target.ndim < 3:
         raise ValueError("rollout target must be [..., F, H, D]")
-    if weight.ndim != 3 or weight.shape[0] != weight.shape[1]:
-        raise ValueError("weight must be [P, P, D] with a square history block")
-    history_length = int(weight.shape[0])
+    if weight.ndim not in (3, 4, 5):
+        raise ValueError(
+            "weight must be [P,P,D], [P,P,H,D], or [L,P,P,H,D]"
+        )
+    layered = weight.ndim == 5
+    history_axis = 1 if layered else 0
+    history_length = int(weight.shape[history_axis])
+    if int(weight.shape[history_axis + 1]) != history_length:
+        raise ValueError("temporal weight must have a square history block")
+    expected_bias = (
+        (weight.shape[0], history_length, weight.shape[-2], weight.shape[-1])
+        if layered
+        else (
+            (history_length, weight.shape[-2], weight.shape[-1])
+            if weight.ndim == 4
+            else (history_length, weight.shape[-1])
+        )
+    )
+    if tuple(bias.shape) != tuple(expected_bias):
+        raise ValueError(f"temporal bias must have shape {tuple(expected_bias)}")
+    if layered and int(target.shape[0]) != int(weight.shape[0]):
+        raise ValueError("layered temporal parameters do not match the trace")
+    if weight.ndim >= 4 and int(target.shape[-2]) != int(weight.shape[-2]):
+        raise ValueError("temporal parameters do not match the trace head count")
+    if int(target.shape[-1]) != int(weight.shape[-1]):
+        raise ValueError("temporal parameters do not match the trace head dimension")
     frames = int(target.shape[-3])
     if history_length >= frames:
         raise ValueError("history length must be smaller than the frame count")
@@ -78,11 +101,50 @@ def temporal_rollout(
     ]
     for frame in range(1, frames):
         order = min(frame, history_length)
-        prediction = bias[order - 1].view(1, -1)
-        for lag in range(order):
-            prediction = prediction + (
-                reconstructed[-1 - lag] * weight[order - 1, lag].view(1, -1)
+        current = target[..., frame, :, :]
+        if layered:
+            current_bias = bias[:, order - 1]
+            prediction = current_bias.view(
+                current_bias.shape[0],
+                *([1] * (current.ndim - 3)),
+                current_bias.shape[-2],
+                current_bias.shape[-1],
             )
+        elif weight.ndim == 4:
+            current_bias = bias[order - 1]
+            prediction = current_bias.view(
+                *([1] * (current.ndim - 2)),
+                current_bias.shape[-2],
+                current_bias.shape[-1],
+            )
+        else:
+            current_bias = bias[order - 1]
+            prediction = current_bias.view(
+                *([1] * (current.ndim - 1)), current_bias.shape[-1]
+            )
+        for lag in range(order):
+            previous = reconstructed[-1 - lag]
+            if layered:
+                current_weight = weight[:, order - 1, lag]
+                multiplier = current_weight.view(
+                    current_weight.shape[0],
+                    *([1] * (previous.ndim - 3)),
+                    current_weight.shape[-2],
+                    current_weight.shape[-1],
+                )
+            elif weight.ndim == 4:
+                current_weight = weight[order - 1, lag]
+                multiplier = current_weight.view(
+                    *([1] * (previous.ndim - 2)),
+                    current_weight.shape[-2],
+                    current_weight.shape[-1],
+                )
+            else:
+                current_weight = weight[order - 1, lag]
+                multiplier = current_weight.view(
+                    *([1] * (previous.ndim - 1)), current_weight.shape[-1]
+                )
+            prediction = prediction + previous * multiplier
         residual = _round_trip(
             target[..., frame, :, :] - prediction,
             bits=bits,
@@ -329,17 +391,24 @@ def normalized_errors(sums: torch.Tensor) -> dict[str, float]:
 
 
 def phase_score(
-    errors: dict[str, float], baseline: dict[str, float], *, tensor: str
+    errors: dict[str, float],
+    baseline: dict[str, float],
+    *,
+    tensor: str,
+    reconstruction_weight: float = 0.5,
+    attention_weight: float = 0.5,
 ) -> float:
     """Score a candidate against the least-squares baseline.
 
-    Half the score is the tensor the phase optimizes and half is the attention
-    output, so a phase can only win by improving its own reconstruction without
-    spending more attention error than it gains.
+    The configured normalized weights match the training objective, so
+    reconstruction-only and joint-objective ablations use coherent candidate
+    selection rather than sharing a hidden fixed scoring rule.
     """
     metric = f"{tensor}_nmse"
     if metric not in {"key_nmse", "value_nmse"}:
         raise ValueError(f"phase tensor must be key or value, got {tensor!r}")
-    return 0.5 * errors[metric] / max(baseline[metric], EPS) + 0.5 * errors[
-        "attention_nmse"
-    ] / max(baseline["attention_nmse"], EPS)
+    return reconstruction_weight * errors[metric] / max(
+        baseline[metric], EPS
+    ) + attention_weight * errors["attention_nmse"] / max(
+        baseline["attention_nmse"], EPS
+    )

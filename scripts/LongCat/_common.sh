@@ -78,9 +78,10 @@ codec_slug() {
   local config_path="$1" k_override="${2:-}" v_override="${3:-}"
   local k_bits_override="${4:-}" v_bits_override="${5:-}" stride_override="${6:-}"
   local v_predictor_override="${7:-}"
+  local fit_history_source="${8:-reconstructed}"
   "$python_bin" - "$config_path" "$k_override" "$v_override" \
     "$k_bits_override" "$v_bits_override" "$stride_override" \
-    "$v_predictor_override" <<'SLUGPY'
+    "$v_predictor_override" "$fit_history_source" <<'SLUGPY'
 import json
 import sys
 
@@ -135,6 +136,13 @@ else:
 # parameters.  Without this segment every CP degree wrote to one directory and
 # silently overwrote the others.
 stride_label = "" if stride == DEFAULT_STRIDE else f"-s{stride}"
-print(f"{mode_label}{k_label}-{v_label}-{precision_label}{stride_label}")
+fit_history_source = sys.argv[8]
+if fit_history_source not in {"reconstructed", "clean"}:
+    raise SystemExit(
+        "FIT_HISTORY_SOURCE must be reconstructed or clean, got "
+        f"{fit_history_source!r}"
+    )
+fit_label = "" if fit_history_source == "reconstructed" else "-fitclean"
+print(f"{mode_label}{k_label}-{v_label}-{precision_label}{stride_label}{fit_label}")
 SLUGPY
 }

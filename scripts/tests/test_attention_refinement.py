@@ -317,3 +317,320 @@ def test_refine_attention_is_deterministic() -> None:
     assert torch.equal(first[1].weight, second[1].weight)
     assert torch.equal(first[1].history_weights, second[1].history_weights)
     assert first[2] == second[2]
+
+
+def test_native_temporal_rollout_matches_independent_layers() -> None:
+    generator = torch.Generator().manual_seed(31)
+    target = torch.randn(2, 3, 4, 2, 4, generator=generator)
+    weight = torch.randn(2, 1, 1, 2, 4, generator=generator).requires_grad_(True)
+    bias = torch.randn(2, 1, 2, 4, generator=generator).requires_grad_(True)
+    config = CodecConfig(
+        k_bits=2,
+        v_bits=2,
+        anchor_bits=2,
+        group_size=4,
+        stride=2,
+        k_history_length=1,
+        v_history_length=1,
+        v_predictor_mode="temporal",
+        scale_dtype="float32",
+        use_triton=False,
+    )
+
+    layered = temporal_rollout(
+        target, weight, bias, bits=config.k_bits, config=config
+    )
+    independent = torch.stack(
+        [
+            temporal_rollout(
+                target[layer],
+                weight[layer],
+                bias[layer],
+                bits=config.k_bits,
+                config=config,
+            )
+            for layer in range(2)
+        ]
+    )
+
+    assert torch.equal(layered, independent)
+    layered[..., 1:, :, :].square().sum().backward()
+    assert weight.grad is not None and torch.isfinite(weight.grad).all()
+    assert bias.grad is not None and torch.isfinite(bias.grad).all()
+
+
+def test_native_layer_chunks_preserve_the_global_objective_gradient() -> None:
+    generator = torch.Generator().manual_seed(33)
+    keys = torch.randn(2, 2, 4, 1, 4, generator=generator)
+    values = torch.randn(keys.shape, generator=generator)
+    query = torch.randn(keys.shape, generator=generator)
+    config = CodecConfig(
+        k_bits=2,
+        v_bits=2,
+        anchor_bits=2,
+        group_size=4,
+        stride=2,
+        k_history_length=1,
+        v_history_length=1,
+        v_predictor_mode="temporal",
+        scale_dtype="float32",
+        use_triton=False,
+    )
+    key_weight = torch.full((2, 1, 1, 1, 4), 0.7)
+    key_bias = torch.zeros(2, 1, 1, 4)
+    value_weight = torch.full((2, 1, 1, 1, 4), 0.6)
+    value_bias = torch.zeros(2, 1, 1, 4)
+    reference = _objective_sums(
+        keys,
+        values,
+        query,
+        keys,
+        key_weight,
+        key_bias,
+        value_weight,
+        value_bias,
+        config=config,
+        layer_chunk=2,
+    )
+
+    gradients = []
+    for layer_chunk in (1, 2):
+        candidate = key_weight.clone().requires_grad_(True)
+        _objective_sums(
+            keys,
+            values,
+            query,
+            keys,
+            candidate,
+            key_bias,
+            value_weight,
+            value_bias,
+            config=config,
+            layer_chunk=layer_chunk,
+            backward_tensor="key",
+            reference_sums=reference,
+        )
+        assert candidate.grad is not None
+        gradients.append(candidate.grad)
+
+    assert torch.allclose(gradients[0], gradients[1])
+
+
+@pytest.mark.parametrize("v_predictor_mode", ["temporal", "cross_kv"])
+def test_refine_attention_accepts_native_layered_parameters(
+    v_predictor_mode: str,
+) -> None:
+    generator = torch.Generator().manual_seed(37)
+    keys = torch.randn(2, 2, 4, 1, 4, generator=generator)
+    values = 0.4 * keys + torch.randn(keys.shape, generator=generator) * 0.1
+    query = torch.randn(keys.shape, generator=generator)
+    config = CodecConfig(
+        k_bits=2,
+        v_bits=2,
+        anchor_bits=2,
+        group_size=4,
+        stride=2,
+        k_history_length=1,
+        v_history_length=1,
+        v_predictor_mode=v_predictor_mode,
+        scale_dtype="float32",
+        use_triton=False,
+    )
+    key_parameters = TemporalParameters(
+        history_weights=torch.full((2, 1, 1, 1, 4), 0.7),
+        history_bias=torch.zeros(2, 1, 1, 4),
+        stride=2,
+        layer_ids=(0, 1),
+    )
+    value_parameters: TemporalParameters | CrossKVParameters
+    if v_predictor_mode == "temporal":
+        value_parameters = TemporalParameters(
+            history_weights=torch.full((2, 1, 1, 1, 4), 0.6),
+            history_bias=torch.zeros(2, 1, 1, 4),
+            stride=2,
+            layer_ids=(0, 1),
+        )
+    else:
+        value_parameters = CrossKVParameters(
+            weight=torch.eye(4).view(1, 1, 4, 4).repeat(2, 1, 1, 1) * 0.4,
+            bias=torch.zeros(2, 1, 4),
+            stride=2,
+            layer_ids=(0, 1),
+            history_weights=torch.full((2, 1, 1, 4), 0.1),
+        )
+
+    refined_key, refined_value, report = refine_attention(
+        keys,
+        values,
+        query,
+        keys,
+        key_parameters,
+        value_parameters,
+        config,
+        steps=2,
+        learning_rate=1e-4,
+        patience=1,
+        layer_chunk=1,
+    )
+
+    assert refined_key.history_weights.shape == (2, 1, 1, 1, 4)
+    assert refined_value.layer_ids == (0, 1)
+    assert report["optimizer"] == "adam"
+    assert report["refine_tensors"] == ["key", "value"]
+
+
+def test_reconstruction_only_value_phase_and_sign_scan_are_explicit() -> None:
+    generator = torch.Generator().manual_seed(41)
+    keys = torch.randn(1, 2, 4, 1, 4, generator=generator)
+    values = torch.randn(keys.shape, generator=generator)
+    query = torch.randn(keys.shape, generator=generator)
+    key_parameters = TemporalParameters(
+        history_weights=torch.full((1, 1, 4), 0.7),
+        history_bias=torch.zeros(1, 4),
+        stride=2,
+    )
+    value_parameters = TemporalParameters(
+        history_weights=torch.full((1, 1, 4), 0.6),
+        history_bias=torch.zeros(1, 4),
+        stride=2,
+    )
+    config = CodecConfig(
+        k_bits=2,
+        v_bits=2,
+        anchor_bits=2,
+        group_size=4,
+        stride=2,
+        k_history_length=1,
+        v_history_length=1,
+        v_predictor_mode="temporal",
+        scale_dtype="float32",
+        use_triton=False,
+    )
+
+    refined_key, _, report = refine_attention(
+        keys,
+        values,
+        query,
+        keys,
+        key_parameters,
+        value_parameters,
+        config,
+        optimizer_name="sign_gradient",
+        reconstruction_weight=1.0,
+        attention_weight=0.0,
+        refine_tensors=("value",),
+        sign_step_sizes=(1e-4, 1e-3),
+        layer_chunk=1,
+    )
+
+    assert torch.equal(refined_key.history_weights, key_parameters.history_weights)
+    assert report["optimizer"] == "sign_gradient"
+    assert report["objective_weights"] == {
+        "reconstruction": 1.0,
+        "attention": 0.0,
+    }
+    assert report["refine_tensors"] == ["value"]
+    assert report["sign_step_sizes"] == [1e-4, 1e-3]
+    assert [phase["tensor"] for phase in report["phases"]] == ["value"]
+
+
+def test_adam_reconstruction_only_is_a_distinct_objective() -> None:
+    generator = torch.Generator().manual_seed(43)
+    keys = torch.randn(1, 2, 4, 1, 4, generator=generator)
+    values = torch.randn(keys.shape, generator=generator)
+    query = torch.randn(keys.shape, generator=generator)
+    key_parameters = TemporalParameters(
+        history_weights=torch.full((1, 1, 4), 0.7),
+        history_bias=torch.zeros(1, 4),
+        stride=2,
+    )
+    value_parameters = TemporalParameters(
+        history_weights=torch.full((1, 1, 4), 0.6),
+        history_bias=torch.zeros(1, 4),
+        stride=2,
+    )
+    config = CodecConfig(
+        k_bits=2,
+        v_bits=2,
+        anchor_bits=2,
+        group_size=4,
+        stride=2,
+        k_history_length=1,
+        v_history_length=1,
+        v_predictor_mode="temporal",
+        scale_dtype="float32",
+        use_triton=False,
+    )
+
+    _, _, report = refine_attention(
+        keys,
+        values,
+        query,
+        keys,
+        key_parameters,
+        value_parameters,
+        config,
+        steps=2,
+        learning_rate=1e-4,
+        patience=1,
+        reconstruction_weight=1.0,
+        attention_weight=0.0,
+        layer_chunk=1,
+    )
+
+    assert report["optimizer"] == "adam"
+    assert report["objective_weights"] == {
+        "reconstruction": 1.0,
+        "attention": 0.0,
+    }
+
+
+def test_cross_kv_only_refinement_skips_the_empty_history_parameter() -> None:
+    generator = torch.Generator().manual_seed(47)
+    keys = torch.randn(1, 2, 4, 1, 4, generator=generator)
+    values = torch.randn(keys.shape, generator=generator)
+    query = torch.randn(keys.shape, generator=generator)
+    config = CodecConfig(
+        k_bits=2,
+        v_bits=2,
+        anchor_bits=2,
+        group_size=4,
+        stride=2,
+        k_history_length=1,
+        v_history_length=0,
+        v_predictor_mode="cross_kv",
+        scale_dtype="float32",
+        use_triton=False,
+    )
+    key_parameters = TemporalParameters(
+        history_weights=torch.full((1, 1, 1, 1, 4), 0.7),
+        history_bias=torch.zeros(1, 1, 1, 4),
+        stride=2,
+        layer_ids=(0,),
+    )
+    value_parameters = CrossKVParameters(
+        weight=torch.eye(4).view(1, 1, 4, 4) * 0.4,
+        bias=torch.zeros(1, 1, 4),
+        stride=2,
+        layer_ids=(0,),
+        history_weights=torch.empty(1, 0, 1, 4),
+    )
+
+    _, refined_value, report = refine_attention(
+        keys,
+        values,
+        query,
+        keys,
+        key_parameters,
+        value_parameters,
+        config,
+        steps=2,
+        learning_rate=1e-4,
+        patience=1,
+        refine_tensors=("value",),
+        layer_chunk=1,
+    )
+
+    assert isinstance(refined_value, CrossKVParameters)
+    assert refined_value.history_weights.shape == (1, 0, 1, 4)
+    assert report["refine_tensors"] == ["value"]

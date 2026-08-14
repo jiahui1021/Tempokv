@@ -141,6 +141,7 @@ legacy temporal V 可在基础 fitting 后启用 sampled attention proxy refinem
 
 ```bash
 CONFIG=configs/legacy.json V_PREDICTOR=temporal \
+PARAM_NAME=legacy-temporal-adam-r05-a05-kv \
 ATTENTION_STEPS=100 ATTENTION_LR=0.001 ATTENTION_PATIENCE=10 \
 ATTENTION_LAYER_CHUNK=4 \
 bash scripts/Self-Forcing/fit_params.sh
@@ -148,6 +149,10 @@ bash scripts/Self-Forcing/fit_params.sh
 
 该目标使用 recorded post-RoPE Q/K，但每个采样空间位置独立、只沿帧轴做 SDPA；它不是完整
 1560-token backend attention 的重放。`fit_report.json` 会记录 refinement 是否启用及 phase 结果。
+同一入口还支持 `ATTENTION_OPTIMIZER=sign_gradient`、归一化
+`ATTENTION_RECONSTRUCTION_WEIGHT` / `ATTENTION_OUTPUT_WEIGHT`，以及
+`ATTENTION_REFINE_TENSORS=key|value|key_value`；这些只用于同协议消融，最终方法默认仍是
+Adam、`0.5/0.5`、K+V。
 
 ## 3. TempoKV 生成
 

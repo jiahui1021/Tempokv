@@ -105,10 +105,14 @@ fitter/runtime，并编码进参数目录，不能共享参数。
 | `K_BITS` / `V_BITS` | 分别设，用于混合精度 | 全部 |
 | `KH` / `VH` | K/V 历史长度（长名 `K_HISTORY_LENGTH` / `V_HISTORY_LENGTH`） | 全部 |
 | `V_PREDICTOR` | V 预测器：`cross_kv` 或 `temporal` | 全部 |
+| `FIT_HISTORY_SOURCE` | predictor 拟合历史：`reconstructed`（默认）或 `clean` | 全部 |
 | `CACHE_STRIDE` | 本次运行的 local cache stride（CP>1 时用） | LongCat |
 | `TORCH_DECODER=1` | 用 PyTorch 参考解码器而不是 Triton | Self-Forcing |
-| `ATTENTION_STEPS` | 每个 K/V phase 的最大 Adam 步数；留空不精调 | Self-Forcing / Causal Forcing legacy family |
-| `ATTENTION_LR` / `ATTENTION_PATIENCE` | Adam 学习率与早停 patience | Self-Forcing / Causal Forcing legacy family |
+| `ATTENTION_STEPS` | 每个 K/V phase 的最大 Adam 步数；留空不精调 | Self-Forcing / Causal Forcing |
+| `ATTENTION_OPTIMIZER` | `adam`（默认）或历史 `sign_gradient` 对照 | Self-Forcing / Causal Forcing |
+| `ATTENTION_RECONSTRUCTION_WEIGHT` / `ATTENTION_OUTPUT_WEIGHT` | 归一化 objective 权重，和必须为 1 | Self-Forcing / Causal Forcing |
+| `ATTENTION_REFINE_TENSORS` | `key`、`value` 或 `key_value` | Self-Forcing / Causal Forcing |
+| `ATTENTION_LR` / `ATTENTION_PATIENCE` | Adam 学习率与早停 patience | Self-Forcing / Causal Forcing |
 | `ATTENTION_LAYER_CHUNK` | refinement 每批处理的层数 | Self-Forcing / Causal Forcing |
 
 冲突会直接报错，不会悄悄取一个：`BITS` 与 `K_BITS`/`V_BITS` 不一致，或 `KH` 与
@@ -117,17 +121,21 @@ fitter/runtime，并编码进参数目录，不能共享参数。
 ```bash
 CONFIG=configs/legacy.json BITS=2 bash scripts/Self-Forcing/fit_params.sh
 CONFIG=configs/legacy.json V_PREDICTOR=temporal bash scripts/Self-Forcing/fit_params.sh
+CONFIG=configs/legacy.json FIT_HISTORY_SOURCE=clean bash scripts/Self-Forcing/fit_params.sh
 CONFIG=configs/native.json CACHE_STRIDE=780 bash scripts/LongCat/fit_params.sh
 ```
 
 两个 family 配置的历史长度都是 `kh2-vh1`。Self-Forcing 复现参考实现的 KH3 要显式写
 `KH=3`；Causal Forcing 可按实验选择 native CrossKV 或 legacy temporal V，LongCat 使用
-native family。attention refinement 当前要求 legacy/shared temporal K；V 可选 temporal 或
-`CrossKV + V-history`。native/layered K 会在拟合开始前被拒绝，而不是运行到 rollout 中途才失败。
+native family。attention refinement 支持 legacy/shared 与 native/layered temporal K；V 可选
+temporal 或 `CrossKV + V-history`。
 启用 refinement 时，同一次拟合还会保存 `k_temporal_ls.npz` 和对应的 `v_*_ls.npz`，供
 LS-only / refined 严格消融；常规文件名仍指向 refinement 后参数。
-训练 loss 在 K/V 两个 phase 中分别使用当前 tensor relative SSE 与 attention-output relative
-SSE 的归一化 `0.5/0.5` 加权，并由 Adam 多步优化、guardrail 选取最佳检查点。
+最终方法的训练 loss 在 K/V 两个 phase 中分别使用当前 tensor relative SSE 与 attention-output
+relative SSE 的归一化 `0.5/0.5` 加权，并由 Adam 多步优化、guardrail 选取最佳检查点。
+消融接口可在同一 rollout/trace/参数布局下切换 reconstruction-only `1/0`、历史
+`sign_gradient`、K-only、V-only 与 K+V；候选选择和 guardrail 使用与训练相同的非零权重，
+避免 reconstruction-only 被隐藏的 attention guardrail 污染。
 
 ### 参数目录名
 
@@ -142,7 +150,13 @@ legacy-kh2-vh1-int2        + BITS=2
 kh2-vh1-int4               native.json 默认
 kh2-vh1-int4-s780          + CACHE_STRIDE=780
 kh2-vh1-k2-v4              K/V 位宽不同
+kh2-vh1-int4-fitclean       clean-history fitting 消融
 ```
+
+`FIT_HISTORY_SOURCE` 只改变 predictor 拟合时可见的历史；target 始终是 clean current K/V，
+生成时仍只读取量化闭环重建 cache。默认 `reconstructed` 保留历史目录名，`clean` 增加
+`-fitclean` 后缀，避免覆盖。`fit_report.json` 会记录请求迭代数、实际重建轮数和 K/V
+feature source。
 
 参数文件记录拟合时的 codec signature，加载时校验，用错位宽、用错 stride 或用另一次
 拟合的半套参数都会直接报错，而不是产出错误结果。

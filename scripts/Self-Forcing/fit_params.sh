@@ -23,11 +23,16 @@
 #   K_HISTORY_LENGTH  K 历史长度（默认读取 CONFIG）
 #   V_HISTORY_LENGTH  V 历史长度（默认读取 CONFIG）
 #   ITERATIONS     拟合迭代次数（默认 2）
+#   FIT_HISTORY_SOURCE  reconstructed（默认）或 clean；仅用于拟合消融
 #   TEMPORAL_RIDGE / CROSS_RIDGE / V_HISTORY_RIDGE / MAX_GAIN
 #                  拟合正则与增益（legacy 模式默认 1.0/0.1/0.0/1.0）
 #   ATTENTION_STEPS  每个 K/V phase 的最大 Adam 步数（留空则不精调）
 #   ATTENTION_LR / ATTENTION_PATIENCE / ATTENTION_MIN_RELATIVE_IMPROVEMENT
 #                    Adam 学习率、早停 patience 与最小相对改善
+#   ATTENTION_OPTIMIZER  adam（默认）或 sign_gradient
+#   ATTENTION_RECONSTRUCTION_WEIGHT / ATTENTION_OUTPUT_WEIGHT  objective 权重
+#   ATTENTION_REFINE_TENSORS  key、value 或 key_value（默认）
+#   ATTENTION_SIGN_STEP_SIZES  sign-gradient 候选步长，空格分隔
 #   ATTENTION_MAX_TOKENS  refinement 使用的 sampled token-track 上限
 #   ATTENTION_LAYER_CHUNK  attention refinement 每批层数（默认 4）
 #   FIT_DEVICE     拟合设备（默认 auto，有 CUDA 时自动使用 GPU）
@@ -49,7 +54,8 @@ require_env CONFIG
 
 trace_file="$(resolve_path "${TRACE_FILE:-data/self-forcing/trace/clean_trace.npz}")"
 config_path="$(resolve_path "$CONFIG")"
-parameter_name="${PARAM_NAME:-$(codec_slug "$config_path" "${K_HISTORY_LENGTH:-}" "${V_HISTORY_LENGTH:-}" "${K_BITS:-}" "${V_BITS:-}" "" "${V_PREDICTOR:-}")}"
+FIT_HISTORY_SOURCE="${FIT_HISTORY_SOURCE:-reconstructed}"
+parameter_name="${PARAM_NAME:-$(codec_slug "$config_path" "${K_HISTORY_LENGTH:-}" "${V_HISTORY_LENGTH:-}" "${K_BITS:-}" "${V_BITS:-}" "" "${V_PREDICTOR:-}" "$FIT_HISTORY_SOURCE")}"
 output_dir="$(resolve_path "${OUTPUT_DIR:-data/self-forcing/params/$parameter_name}")"
 v_predictor_mode="$("$python_bin" - "$config_path" <<'PY'
 import json
@@ -100,6 +106,11 @@ ATTENTION_LAYER_CHUNK="${ATTENTION_LAYER_CHUNK:-4}"
 ATTENTION_LR="${ATTENTION_LR:-0.001}"
 ATTENTION_PATIENCE="${ATTENTION_PATIENCE:-10}"
 ATTENTION_MIN_RELATIVE_IMPROVEMENT="${ATTENTION_MIN_RELATIVE_IMPROVEMENT:-0.0001}"
+ATTENTION_OPTIMIZER="${ATTENTION_OPTIMIZER:-adam}"
+ATTENTION_RECONSTRUCTION_WEIGHT="${ATTENTION_RECONSTRUCTION_WEIGHT:-0.5}"
+ATTENTION_OUTPUT_WEIGHT="${ATTENTION_OUTPUT_WEIGHT:-0.5}"
+ATTENTION_REFINE_TENSORS="${ATTENTION_REFINE_TENSORS:-key_value}"
+read -r -a attention_sign_step_sizes <<<"${ATTENTION_SIGN_STEP_SIZES:-0.01}"
 OVERWRITE="${OVERWRITE:-0}"
 DRY_RUN="${DRY_RUN:-0}"
 
@@ -111,6 +122,8 @@ if [[ -n "${ATTENTION_STEPS:-}" ]]; then
   check_int ATTENTION_STEPS 1
   check_int ATTENTION_PATIENCE 1
   [[ -z "${ATTENTION_MAX_TOKENS:-}" ]] || check_int ATTENTION_MAX_TOKENS 1
+  case "$ATTENTION_OPTIMIZER" in adam|sign_gradient) ;; *) die "ATTENTION_OPTIMIZER 必须是 adam 或 sign_gradient" ;; esac
+  case "$ATTENTION_REFINE_TENSORS" in key|value|key_value) ;; *) die "ATTENTION_REFINE_TENSORS 必须是 key、value 或 key_value" ;; esac
 fi
 
 fit_command=(
@@ -119,6 +132,7 @@ fit_command=(
   --config "$config_path"
   --output-dir "$output_dir"
   --iterations "$ITERATIONS"
+  --fit-history-source "$FIT_HISTORY_SOURCE"
   --temporal-ridge "$TEMPORAL_RIDGE"
   --cross-ridge "$CROSS_RIDGE"
   --v-history-ridge "$V_HISTORY_RIDGE"
@@ -135,6 +149,11 @@ if [[ -n "${ATTENTION_STEPS:-}" ]]; then
     --attention-patience "$ATTENTION_PATIENCE"
     --attention-min-relative-improvement "$ATTENTION_MIN_RELATIVE_IMPROVEMENT"
     --attention-layer-chunk "$ATTENTION_LAYER_CHUNK"
+    --attention-optimizer "$ATTENTION_OPTIMIZER"
+    --attention-reconstruction-weight "$ATTENTION_RECONSTRUCTION_WEIGHT"
+    --attention-output-weight "$ATTENTION_OUTPUT_WEIGHT"
+    --attention-refine-tensors "$ATTENTION_REFINE_TENSORS"
+    --attention-sign-step-sizes "${attention_sign_step_sizes[@]}"
   )
   [[ -n "${ATTENTION_MAX_TOKENS:-}" ]] && \
     fit_command+=(--attention-max-tokens "$ATTENTION_MAX_TOKENS")

@@ -68,6 +68,15 @@ def build_parser() -> argparse.ArgumentParser:
         "channel and cannot represent cross-channel recurrence",
     )
     parser.add_argument("--iterations", type=int, default=2)
+    parser.add_argument(
+        "--fit-history-source",
+        choices=("reconstructed", "clean"),
+        default="reconstructed",
+        help=(
+            "history visible during fitting: reconstructed matches deployment; "
+            "clean is a teacher-forced ablation"
+        ),
+    )
     parser.add_argument("--temporal-ridge", type=float)
     parser.add_argument("--cross-ridge", type=float)
     parser.add_argument("--v-history-ridge", type=float)
@@ -102,7 +111,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--attention-steps",
         type=int,
-        help="maximum Adam steps per K/V phase; omit to skip refinement",
+        help="maximum Adam steps per phase; any positive value enables refinement",
+    )
+    parser.add_argument(
+        "--attention-optimizer",
+        choices=("adam", "sign_gradient"),
+        default="adam",
+        help="refinement optimizer; sign_gradient reproduces the historical scan",
     )
     parser.add_argument(
         "--attention-lr",
@@ -132,6 +147,31 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=4,
         help="layers per refinement chunk; bounds memory without changing results",
+    )
+    parser.add_argument(
+        "--attention-reconstruction-weight",
+        type=float,
+        default=0.5,
+        help="normalized own-reconstruction objective weight (default: 0.5)",
+    )
+    parser.add_argument(
+        "--attention-output-weight",
+        type=float,
+        default=0.5,
+        help="normalized attention-output objective weight (default: 0.5)",
+    )
+    parser.add_argument(
+        "--attention-refine-tensors",
+        choices=("key", "value", "key_value"),
+        default="key_value",
+        help="run only K, only V, or sequential K+V refinement",
+    )
+    parser.add_argument(
+        "--attention-sign-step-sizes",
+        type=float,
+        nargs="+",
+        default=(0.01,),
+        help="candidate step sizes for the historical sign-gradient scan",
     )
     parser.add_argument("--fit-mode", choices=("native", "legacy"))
     parser.add_argument(
@@ -345,12 +385,6 @@ def _limit_attention_tracks(
 
 def run(args: argparse.Namespace) -> dict[str, Any]:
     config = _codec_config(args)
-    if args.attention_steps is not None:
-        if config.fit_mode != "legacy" or config.k_predictor_mode != "shared":
-            raise ValueError(
-                "attention refinement currently requires legacy/shared "
-                "temporal K predictor"
-            )
     temporal_ridge = (
         1.0
         if args.temporal_ridge is None and config.fit_mode == "legacy"
@@ -465,6 +499,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         v_history_mode=v_history_mode,
         layer_ids=layer_ids,
         coordinate_system=coordinate_system,
+        fit_history_source=args.fit_history_source,
     )
     ls_temporal, ls_cross = temporal, cross
     refinement = None
@@ -495,6 +530,15 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             min_relative_improvement=args.attention_min_relative_improvement,
             max_gain=args.max_gain,
             layer_chunk=args.attention_layer_chunk,
+            optimizer_name=args.attention_optimizer,
+            reconstruction_weight=args.attention_reconstruction_weight,
+            attention_weight=args.attention_output_weight,
+            refine_tensors=(
+                ("key", "value")
+                if args.attention_refine_tensors == "key_value"
+                else (args.attention_refine_tensors,)
+            ),
+            sign_step_sizes=tuple(args.attention_sign_step_sizes),
         )
     if device.type == "cuda":
         torch.cuda.synchronize(device)
@@ -559,6 +603,25 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             ).history_length,
             "k_predictor_mode": config.k_predictor_mode,
             "iterations": int(args.iterations),
+            "requested_iterations": int(args.iterations),
+            "fit_history_source": args.fit_history_source,
+            "effective_reconstruction_rounds": (
+                int(args.iterations)
+                if args.fit_history_source == "reconstructed"
+                else 0
+            ),
+            "effective_regression_solves": (
+                int(args.iterations)
+                if args.fit_history_source == "reconstructed"
+                else 1
+            ),
+            "k_history_input": args.fit_history_source,
+            "v_history_input": args.fit_history_source,
+            "cross_k_input": (
+                args.fit_history_source
+                if config.v_predictor_mode == "cross_kv"
+                else None
+            ),
             "temporal_ridge": float(temporal_ridge),
             "cross_ridge": float(cross_ridge),
             "v_history_ridge": float(v_history_ridge),

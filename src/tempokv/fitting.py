@@ -148,9 +148,13 @@ def _solve(system: torch.Tensor, rhs: torch.Tensor, *, regularized: bool) -> tor
 
 
 
-def _project_gain(weight: torch.Tensor, max_gain: float) -> None:
+def _project_gain(
+    weight: torch.Tensor, max_gain: float, *, lag_axis: int | None = None
+) -> None:
     """Cap each channel's summed absolute history gain, in place."""
-    gain = weight.abs().sum(dim=1, keepdim=True).clamp_min(1e-20)
+    if lag_axis is None:
+        lag_axis = 2 if weight.ndim == 5 else 1
+    gain = weight.abs().sum(dim=lag_axis, keepdim=True).clamp_min(1e-20)
     weight.mul_(torch.clamp(max_gain / gain, max=1.0))
 
 
@@ -169,25 +173,39 @@ def _objective_sums(
     layer_chunk: int,
     backward_tensor: str | None = None,
     reference_sums: torch.Tensor | None = None,
+    reconstruction_weight: float = 0.5,
+    attention_weight: float = 0.5,
 ) -> torch.Tensor:
     """Accumulate the six objective sums over the trace, one layer chunk at a time.
 
-    Chunking bounds the rollout activations kept for backward.  Temporal
-    parameters are shared across layers while CrossKV parameters are sliced
-    with the trace; summing chunk gradients is the gradient of the whole trace.
+    Chunking bounds the rollout activations kept for backward.  Native temporal
+    and CrossKV parameters are sliced with the trace; shared parameters are
+    reused.  Summing chunk gradients is the gradient of the whole trace.
     """
     totals = torch.zeros(6, dtype=torch.float64, device=keys.device)
     layer_count = int(keys.shape[0])
     for start in range(0, layer_count, layer_chunk):
         stop = min(start + layer_chunk, layer_count)
+        chunk_key_weight = key_weight[start:stop] if key_weight.ndim == 5 else key_weight
+        chunk_key_bias = key_bias[start:stop] if key_bias.ndim == 4 else key_bias
         rebuilt_key = temporal_rollout(
-            keys[start:stop], key_weight, key_bias, bits=config.k_bits, config=config
+            keys[start:stop],
+            chunk_key_weight,
+            chunk_key_bias,
+            bits=config.k_bits,
+            config=config,
         )
         if config.v_predictor_mode == "temporal":
+            chunk_value_weight = (
+                value_weight[start:stop] if value_weight.ndim == 5 else value_weight
+            )
+            chunk_value_bias = (
+                value_bias[start:stop] if value_bias.ndim == 4 else value_bias
+            )
             rebuilt_value = temporal_rollout(
                 values[start:stop],
-                value_weight,
-                value_bias,
+                chunk_value_weight,
+                chunk_value_bias,
                 bits=config.v_bits,
                 config=config,
             )
@@ -226,7 +244,9 @@ def _objective_sums(
                 own_reference = reference_sums[3]
             else:
                 raise ValueError("backward tensor must be key or value")
-            loss = 0.5 * own_error / own_reference.clamp_min(1e-12) + 0.5 * (
+            loss = reconstruction_weight * own_error / own_reference.clamp_min(
+                1e-12
+            ) + attention_weight * (
                 terms.attention_error
                 / reference_sums[5].clamp_min(1e-12)
             )
@@ -250,6 +270,7 @@ class PhaseResult:
     tensor: str
     accepted: bool
     best_step: int | None
+    step_size: float | None
     steps_run: int
     start_score: float
     best_score: float
@@ -298,17 +319,22 @@ def refine_attention(
     min_relative_improvement: float = 1e-4,
     max_gain: float = 1.0,
     layer_chunk: int = 4,
+    optimizer_name: str = "adam",
+    reconstruction_weight: float = 0.5,
+    attention_weight: float = 0.5,
+    refine_tensors: Sequence[str] = ("key", "value"),
+    sign_step_sizes: Sequence[float] = (0.01,),
 ) -> tuple[
     TemporalParameters,
     TemporalParameters | CrossKVParameters,
     dict[str, object],
 ]:
-    """Refine least-squares predictors with normalized attention-aware Adam.
+    """Refine least-squares predictors under an explicit ablation protocol.
 
-    K and V are optimized in separate phases.  Each phase minimizes an equal
-    mixture of its own relative reconstruction SSE and relative attention-output
-    SSE, keeps the best guarded candidate, and falls back to its phase start if
-    no candidate improves both metrics.
+    K and V are optimized in selected, separate phases.  Adam is the primary
+    optimizer; ``sign_gradient`` reproduces the historical one-direction scan
+    inside the same rollout and parameter protocol.  Candidate selection and
+    guardrails use the same normalized objective weights as training.
     """
     if steps <= 0:
         raise ValueError("refinement steps must be positive")
@@ -324,6 +350,31 @@ def refine_attention(
     if layer_chunk <= 0:
         raise ValueError("layer_chunk must be positive")
     max_gain = _check_scalar("max_gain", max_gain, positive=True)
+    if optimizer_name not in {"adam", "sign_gradient"}:
+        raise ValueError("optimizer_name must be adam or sign_gradient")
+    for name, weight in (
+        ("reconstruction_weight", reconstruction_weight),
+        ("attention_weight", attention_weight),
+    ):
+        if not math.isfinite(weight) or weight < 0.0:
+            raise ValueError(f"{name} must be finite and non-negative")
+    if not math.isclose(
+        reconstruction_weight + attention_weight,
+        1.0,
+        rel_tol=0.0,
+        abs_tol=1e-12,
+    ):
+        raise ValueError("objective weights must sum to 1.0")
+    phases_to_run = tuple(refine_tensors)
+    if not phases_to_run or any(item not in {"key", "value"} for item in phases_to_run):
+        raise ValueError("refine_tensors must contain key, value, or both")
+    if len(set(phases_to_run)) != len(phases_to_run):
+        raise ValueError("refine_tensors must not contain duplicates")
+    if not sign_step_sizes:
+        raise ValueError("sign-gradient refinement needs at least one step size")
+    for step_size in sign_step_sizes:
+        if not math.isfinite(step_size) or step_size <= 0.0:
+            raise ValueError("sign-gradient step sizes must be positive and finite")
 
     if config.v_predictor_mode == "temporal" and not isinstance(
         value_parameters, TemporalParameters
@@ -366,29 +417,141 @@ def refine_attention(
 
     phases: list[PhaseResult] = []
     errors = baseline
-    for tensor in ("key", "value"):
+    for tensor in phases_to_run:
         parameter_names = [f"{tensor}_weight", f"{tensor}_bias"]
-        if tensor == "value" and "value_history_weights" in current:
+        if (
+            tensor == "value"
+            and "value_history_weights" in current
+            and current["value_history_weights"].numel()
+        ):
             parameter_names.append("value_history_weights")
-        start_score = phase_score(errors, baseline, tensor=tensor)
+        start_score = phase_score(
+            errors,
+            baseline,
+            tensor=tensor,
+            reconstruction_weight=reconstruction_weight,
+            attention_weight=attention_weight,
+        )
         start_errors = errors
-        trainable = {
-            name: current[name].clone().requires_grad_(True)
-            for name in parameter_names
-        }
-        optimizer = torch.optim.Adam(trainable.values(), lr=learning_rate)
+        guarded_metrics = []
+        if reconstruction_weight:
+            guarded_metrics.append(f"{tensor}_nmse")
+        if attention_weight:
+            guarded_metrics.append("attention_nmse")
         best: tuple[
             float,
-            int,
+            int | None,
+            float | None,
             dict[str, float],
             dict[str, torch.Tensor],
         ] | None
         best = None
-        stale_steps = 0
         steps_run = 0
-        for step in range(1, steps + 1):
-            steps_run = step
-            optimizer.zero_grad(set_to_none=True)
+
+        if optimizer_name == "adam":
+            trainable = {
+                name: current[name].clone().requires_grad_(True)
+                for name in parameter_names
+            }
+            optimizer = torch.optim.Adam(trainable.values(), lr=learning_rate)
+            stale_steps = 0
+            for step in range(1, steps + 1):
+                steps_run = step
+                optimizer.zero_grad(set_to_none=True)
+                _objective_sums(
+                    keys,
+                    values,
+                    query_post_rope,
+                    key_post_rope,
+                    **{
+                        **{name: current[name] for name in current},
+                        **trainable,
+                    },
+                    config=config,
+                    layer_chunk=layer_chunk,
+                    backward_tensor=tensor,
+                    reference_sums=baseline_sums,
+                    reconstruction_weight=reconstruction_weight,
+                    attention_weight=attention_weight,
+                )
+                if any(parameter.grad is None for parameter in trainable.values()):
+                    raise ValueError(f"{tensor} refinement produced no gradient")
+                if not all(
+                    torch.isfinite(parameter.grad).all()
+                    for parameter in trainable.values()
+                    if parameter.grad is not None
+                ):
+                    raise ValueError(
+                        f"{tensor} refinement produced a non-finite gradient"
+                    )
+                optimizer.step()
+                gain_name = (
+                    "key_weight"
+                    if tensor == "key"
+                    else (
+                        "value_weight"
+                        if isinstance(value_parameters, TemporalParameters)
+                        else (
+                            "value_history_weights"
+                            if "value_history_weights" in trainable
+                            else None
+                        )
+                    )
+                )
+                if gain_name is not None:
+                    with torch.no_grad():
+                        _project_gain(
+                            trainable[gain_name],
+                            max_gain,
+                            lag_axis=(
+                                1 if gain_name == "value_history_weights" else None
+                            ),
+                        )
+                candidate_values = {
+                    name: parameter.detach().clone()
+                    for name, parameter in trainable.items()
+                }
+                candidate = {**current, **candidate_values}
+                candidate_errors = _evaluate(
+                    keys,
+                    values,
+                    query_post_rope,
+                    key_post_rope,
+                    candidate,
+                    config=config,
+                    layer_chunk=layer_chunk,
+                )
+                score = phase_score(
+                    candidate_errors,
+                    baseline,
+                    tensor=tensor,
+                    reconstruction_weight=reconstruction_weight,
+                    attention_weight=attention_weight,
+                )
+                regressed = any(
+                    candidate_errors[name] > start_errors[name] + 1e-12
+                    for name in guarded_metrics
+                )
+                best_score = start_score if best is None else best[0]
+                relative_improvement = (best_score - score) / max(
+                    abs(best_score), 1e-12
+                )
+                if not regressed and score < best_score:
+                    best = (score, step, None, candidate_errors, candidate_values)
+                    if relative_improvement >= min_relative_improvement:
+                        stale_steps = 0
+                    else:
+                        stale_steps += 1
+                else:
+                    stale_steps += 1
+                if stale_steps >= patience:
+                    break
+        else:
+            steps_run = 1
+            trainable = {
+                name: current[name].clone().requires_grad_(True)
+                for name in parameter_names
+            }
             _objective_sums(
                 keys,
                 values,
@@ -402,6 +565,8 @@ def refine_attention(
                 layer_chunk=layer_chunk,
                 backward_tensor=tensor,
                 reference_sums=baseline_sums,
+                reconstruction_weight=reconstruction_weight,
+                attention_weight=attention_weight,
             )
             if any(parameter.grad is None for parameter in trainable.values()):
                 raise ValueError(f"{tensor} refinement produced no gradient")
@@ -413,57 +578,66 @@ def refine_attention(
                 raise ValueError(
                     f"{tensor} refinement produced a non-finite gradient"
                 )
-            optimizer.step()
-            gain_name = (
-                "key_weight"
-                if tensor == "key"
-                else (
-                    "value_weight"
-                    if isinstance(value_parameters, TemporalParameters)
-                    else "value_history_weights"
-                )
-            )
-            with torch.no_grad():
-                _project_gain(trainable[gain_name], max_gain)
-            candidate_values = {
-                name: parameter.detach().clone()
+            directions = {
+                name: -parameter.grad.sign()
                 for name, parameter in trainable.items()
+                if parameter.grad is not None
             }
-            candidate = {**current, **candidate_values}
-            candidate_errors = _evaluate(
-                keys,
-                values,
-                query_post_rope,
-                key_post_rope,
-                candidate,
-                config=config,
-                layer_chunk=layer_chunk,
-            )
-            score = phase_score(candidate_errors, baseline, tensor=tensor)
-            regressed = any(
-                candidate_errors[name] > start_errors[name] + 1e-12
-                for name in (f"{tensor}_nmse", "attention_nmse")
-            )
-            best_score = start_score if best is None else best[0]
-            relative_improvement = (best_score - score) / max(
-                abs(best_score), 1e-12
-            )
-            if not regressed and score < best_score:
-                best = (score, step, candidate_errors, candidate_values)
-                if relative_improvement >= min_relative_improvement:
-                    stale_steps = 0
-                else:
-                    stale_steps += 1
-            else:
-                stale_steps += 1
-            if stale_steps >= patience:
-                break
+            for step_size in sign_step_sizes:
+                candidate_values = {
+                    name: current[name] + step_size * directions[name]
+                    for name in parameter_names
+                }
+                gain_name = (
+                    "key_weight"
+                    if tensor == "key"
+                    else (
+                        "value_weight"
+                        if isinstance(value_parameters, TemporalParameters)
+                        else (
+                            "value_history_weights"
+                            if "value_history_weights" in candidate_values
+                            else None
+                        )
+                    )
+                )
+                if gain_name is not None:
+                    _project_gain(
+                        candidate_values[gain_name],
+                        max_gain,
+                        lag_axis=(1 if gain_name == "value_history_weights" else None),
+                    )
+                candidate = {**current, **candidate_values}
+                candidate_errors = _evaluate(
+                    keys,
+                    values,
+                    query_post_rope,
+                    key_post_rope,
+                    candidate,
+                    config=config,
+                    layer_chunk=layer_chunk,
+                )
+                score = phase_score(
+                    candidate_errors,
+                    baseline,
+                    tensor=tensor,
+                    reconstruction_weight=reconstruction_weight,
+                    attention_weight=attention_weight,
+                )
+                regressed = any(
+                    candidate_errors[name] > start_errors[name] + 1e-12
+                    for name in guarded_metrics
+                )
+                best_score = start_score if best is None else best[0]
+                if not regressed and score < best_score:
+                    best = (score, None, step_size, candidate_errors, candidate_values)
 
         if best is None:
             phases.append(
                 PhaseResult(
                     tensor,
                     False,
+                    None,
                     None,
                     steps_run,
                     start_score,
@@ -472,13 +646,14 @@ def refine_attention(
                 )
             )
             continue
-        score, best_step, errors, candidate_values = best
+        score, best_step, step_size, errors, candidate_values = best
         current.update(candidate_values)
         phases.append(
             PhaseResult(
                 tensor,
                 True,
                 best_step,
+                step_size,
                 steps_run,
                 start_score,
                 score,
@@ -489,19 +664,29 @@ def refine_attention(
     report = {
         "baseline": baseline,
         "final": errors,
-        "optimizer": "adam",
-        "training_objective": "normalized_0.5_own_reconstruction_0.5_attention",
-        "selection_objective": "normalized_0.5_reconstruction_0.5_attention",
-        "objective_weights": {"reconstruction": 0.5, "attention": 0.5},
-        "steps": int(steps),
-        "learning_rate": float(learning_rate),
-        "patience": int(patience),
+        "optimizer": optimizer_name,
+        "training_objective": "normalized_weighted_reconstruction_attention",
+        "selection_objective": "normalized_weighted_reconstruction_attention",
+        "objective_weights": {
+            "reconstruction": float(reconstruction_weight),
+            "attention": float(attention_weight),
+        },
+        "refine_tensors": list(phases_to_run),
+        "steps": int(steps) if optimizer_name == "adam" else None,
+        "learning_rate": float(learning_rate) if optimizer_name == "adam" else None,
+        "patience": int(patience) if optimizer_name == "adam" else None,
         "min_relative_improvement": float(min_relative_improvement),
+        "sign_step_sizes": (
+            [float(step_size) for step_size in sign_step_sizes]
+            if optimizer_name == "sign_gradient"
+            else None
+        ),
         "phases": [
             {
                 "tensor": phase.tensor,
-                "outcome": "attention_refined" if phase.accepted else "guardrail_fallback",
+                "outcome": "accepted" if phase.accepted else "guardrail_fallback",
                 "best_step": phase.best_step,
+                "step_size": phase.step_size,
                 "steps_run": phase.steps_run,
                 "start_score": phase.start_score,
                 "score": phase.best_score,
@@ -1508,6 +1693,7 @@ def fit_legacy_temporal_v_alpha(
     rounds: int = 2,
     ridge: float = 0.0,
     gain_limit: float = 1.0,
+    fit_history_source: str = "reconstructed",
 ) -> CrossKVParameters:
     """Fit the legacy diagonal ``Cross(K_t) + sum_lag alpha_lag * Vhat_(t-lag)``.
 
@@ -1530,6 +1716,10 @@ def fit_legacy_temporal_v_alpha(
     if isinstance(rounds, bool) or int(rounds) != rounds or int(rounds) <= 0:
         raise ValueError("rounds must be a positive integer")
     rounds = int(rounds)
+    if fit_history_source not in {"reconstructed", "clean"}:
+        raise ValueError(
+            "fit_history_source must be 'reconstructed' or 'clean'"
+        )
     ridge = _check_scalar("ridge", ridge)
     gain_limit = _check_scalar("gain_limit", gain_limit)
     if gain_limit > 1.0:
@@ -1550,7 +1740,8 @@ def fit_legacy_temporal_v_alpha(
     weight = cross.weight.to(clean_values.device)
     bias = cross.bias.to(clean_values.device)
 
-    for _ in range(rounds):
+    effective_rounds = rounds if fit_history_source == "reconstructed" else 1
+    for _ in range(effective_rounds):
         rollout_parameters = CrossKVParameters(
             weight=weight,
             bias=bias,
@@ -1558,11 +1749,15 @@ def fit_legacy_temporal_v_alpha(
             layer_ids=cross.layer_ids,
             history_weights=alpha,
         )
-        rebuilt_values = _reconstruct_cross_kv_trace(
-            reconstructed_keys,
-            clean_values,
-            rollout_parameters,
-            config,
+        rebuilt_values = (
+            _reconstruct_cross_kv_trace(
+                reconstructed_keys,
+                clean_values,
+                rollout_parameters,
+                config,
+            )
+            if fit_history_source == "reconstructed"
+            else clean_values
         )
         next_alpha: list[torch.Tensor] = []
         with _cuda_matmul_precision(
@@ -1721,6 +1916,7 @@ def _fit_legacy_shared_temporal_v(
     ridge: float,
     max_gain: float,
     signature: str,
+    fit_history_source: str,
 ) -> TemporalParameters:
     """Fit V with the predictor K uses, shared across every layer and head.
 
@@ -1742,9 +1938,14 @@ def _fit_legacy_shared_temporal_v(
         stride=config.stride,
         codec_signature=signature,
     )
-    for _ in range(iterations):
-        reconstructed = _reconstruct_temporal_trace(
-            values, parameters, config, bits=config.v_bits
+    effective_iterations = iterations if fit_history_source == "reconstructed" else 1
+    for _ in range(effective_iterations):
+        reconstructed = (
+            _reconstruct_temporal_trace(
+                values, parameters, config, bits=config.v_bits
+            )
+            if fit_history_source == "reconstructed"
+            else values
         )
         fitted = fit_legacy_shared_temporal(
             reconstructed,
@@ -1776,6 +1977,7 @@ def _fit_legacy_predictors(
     max_gain: float,
     layer_ids: tuple[int, ...] | None,
     coordinate_system: str | None,
+    fit_history_source: str,
 ) -> tuple[TemporalParameters, CrossKVParameters]:
     """Reproduce the legacy shared-K/Cross+previous-V fitter."""
     dim = int(keys.shape[-1])
@@ -1799,8 +2001,13 @@ def _fit_legacy_predictors(
         stride=config.stride,
         codec_signature=signature,
     )
-    for _ in range(iterations):
-        reconstructed_keys = _reconstruct_temporal_trace(keys, temporal, config)
+    effective_iterations = iterations if fit_history_source == "reconstructed" else 1
+    for _ in range(effective_iterations):
+        reconstructed_keys = (
+            _reconstruct_temporal_trace(keys, temporal, config)
+            if fit_history_source == "reconstructed"
+            else keys
+        )
         fitted = fit_legacy_shared_temporal(
             reconstructed_keys,
             keys,
@@ -1816,7 +2023,11 @@ def _fit_legacy_predictors(
             codec_signature=signature,
         )
 
-    reconstructed_keys = _reconstruct_temporal_trace(keys, temporal, config)
+    reconstructed_keys = (
+        _reconstruct_temporal_trace(keys, temporal, config)
+        if fit_history_source == "reconstructed"
+        else keys
+    )
     if config.v_predictor_mode == "temporal":
         cross = _fit_legacy_shared_temporal_v(
             values,
@@ -1826,6 +2037,7 @@ def _fit_legacy_predictors(
             ridge=temporal_ridge,
             max_gain=max_gain,
             signature=signature,
+            fit_history_source=fit_history_source,
         )
         return _stamp_parameter_identity(
             temporal,
@@ -1849,6 +2061,7 @@ def _fit_legacy_predictors(
             rounds=iterations,
             ridge=v_history_ridge,
             gain_limit=max_gain,
+            fit_history_source=fit_history_source,
         )
     return _stamp_parameter_identity(
         temporal,
@@ -1873,8 +2086,9 @@ def fit_predictors(
     v_history_mode: str = "dense",
     layer_ids: tuple[int, ...] | None = None,
     coordinate_system: str | None = None,
+    fit_history_source: str = "reconstructed",
 ) -> tuple[TemporalParameters, CrossKVParameters]:
-    """Fit deployable K and V predictors with closed-loop K reconstruction.
+    """Fit deployable K and V predictors from reconstructed or clean history.
 
     The trace is scanned for non-finite values once here; everything below
     derives from it, so the per-layer and per-iteration fits skip the repeat
@@ -1895,6 +2109,7 @@ def fit_predictors(
             v_history_mode=v_history_mode,
             layer_ids=layer_ids,
             coordinate_system=coordinate_system,
+            fit_history_source=fit_history_source,
         )
 
 
@@ -1913,8 +2128,9 @@ def _fit_predictors(
     v_history_mode: str = "dense",
     layer_ids: tuple[int, ...] | None = None,
     coordinate_system: str | None = None,
+    fit_history_source: str = "reconstructed",
 ) -> tuple[TemporalParameters, CrossKVParameters]:
-    """Fit deployable K and V predictors with closed-loop K reconstruction.
+    """Fit deployable K and V predictors from reconstructed or clean history.
 
     ``v_history_mode`` selects the V-history map: ``"dense"`` fits a full
     ``D x D`` matrix per lag, so the V history can mix channels the way the
@@ -1923,11 +2139,10 @@ def _fit_predictors(
     represent cross-channel recurrence, so it is only the right choice when a
     trace shows the V history is genuinely per-channel.
 
-    Clean traces use ``[L, ..., T, H, D]`` layout.  K starts from a persistence
-    predictor.  Each iteration reconstructs K with the configured anchor and
-    residual quantizers, then refits temporal parameters using that
-    reconstruction as history.  V is then fitted from the final reconstructed
-    K and, when configured, iterated against its own quantized reconstruction.
+    Clean traces use ``[L, ..., T, H, D]`` layout.  ``fit_history_source`` is a
+    fitting-only ablation: ``"reconstructed"`` runs the deployable closed loop,
+    while ``"clean"`` teacher-forces K/V history and the current K used by
+    CrossKV.  Prediction targets remain the current clean K/V in both modes.
     When either maximum history setting is present, fitting pools every active
     length and returns one compact coefficient map shared by all history frames.
     """
@@ -1935,6 +2150,10 @@ def _fit_predictors(
     if isinstance(iterations, bool) or int(iterations) != iterations or iterations <= 0:
         raise ValueError(f"iterations must be a positive integer, got {iterations!r}")
     iterations = int(iterations)
+    if fit_history_source not in {"reconstructed", "clean"}:
+        raise ValueError(
+            "fit_history_source must be 'reconstructed' or 'clean'"
+        )
     resolved = config or CodecConfig()
     if not isinstance(resolved, CodecConfig):
         raise TypeError(f"config must be CodecConfig or None, got {type(resolved).__name__}")
@@ -2011,6 +2230,7 @@ def _fit_predictors(
             max_gain=max_gain,
             layer_ids=layer_ids,
             coordinate_system=coordinate_system,
+            fit_history_source=fit_history_source,
         )
 
     layer_count = int(keys.shape[0])
@@ -2041,8 +2261,13 @@ def _fit_predictors(
         codec_signature=resolved.format_signature(),
     )
 
-    for _ in range(iterations):
-        reconstructed = _reconstruct_temporal_trace(keys, temporal, resolved)
+    effective_iterations = iterations if fit_history_source == "reconstructed" else 1
+    for _ in range(effective_iterations):
+        reconstructed = (
+            _reconstruct_temporal_trace(keys, temporal, resolved)
+            if fit_history_source == "reconstructed"
+            else keys
+        )
         fitted_temporal = fit_temporal_layers(
             reconstructed,
             keys,
@@ -2091,9 +2316,13 @@ def _fit_predictors(
             layer_ids=layer_ids,
             codec_signature=resolved.format_signature(),
         )
-        for _ in range(iterations):
-            reconstructed_values = _reconstruct_temporal_trace(
-                values, temporal_v, resolved, bits=resolved.v_bits
+        for _ in range(effective_iterations):
+            reconstructed_values = (
+                _reconstruct_temporal_trace(
+                    values, temporal_v, resolved, bits=resolved.v_bits
+                )
+                if fit_history_source == "reconstructed"
+                else values
             )
             fitted_v = fit_temporal_layers(
                 reconstructed_values,
@@ -2118,7 +2347,11 @@ def _fit_predictors(
             coordinate_system=coordinate_system,
         )
 
-    reconstructed = _reconstruct_temporal_trace(keys, temporal, resolved)
+    reconstructed = (
+        _reconstruct_temporal_trace(keys, temporal, resolved)
+        if fit_history_source == "reconstructed"
+        else keys
+    )
     if resolved.v_history_length:
         initial_cross = fit_cross_kv(
             reconstructed[..., 1:, :, :],
@@ -2141,10 +2374,14 @@ def _fit_predictors(
                 dtype=torch.float32,
             ),
         )
-        reconstructed_values = _reconstruct_cross_kv_trace(
-            reconstructed, values, initial_joint, resolved
+        reconstructed_values = (
+            _reconstruct_cross_kv_trace(
+                reconstructed, values, initial_joint, resolved
+            )
+            if fit_history_source == "reconstructed"
+            else values
         )
-        for _ in range(iterations):
+        for _ in range(effective_iterations):
             fitted_cross = fit_cross_kv(
                 reconstructed,
                 values,
@@ -2155,9 +2392,10 @@ def _fit_predictors(
                 stride=resolved.stride,
                 layer_ids=layer_ids,
             )
-            reconstructed_values = _reconstruct_cross_kv_trace(
-                reconstructed, values, fitted_cross, resolved
-            )
+            if fit_history_source == "reconstructed":
+                reconstructed_values = _reconstruct_cross_kv_trace(
+                    reconstructed, values, fitted_cross, resolved
+                )
     else:
         fitted_cross = fit_cross_kv(
             reconstructed[..., 1:, :, :],

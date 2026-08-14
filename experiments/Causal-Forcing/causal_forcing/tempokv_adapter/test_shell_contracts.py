@@ -50,6 +50,43 @@ def test_native_fit_keeps_cross_kv_identity() -> None:
     assert "--v-predictor-mode cross_kv" in completed.stdout
 
 
+def test_clean_fitting_state_has_an_isolated_parameter_directory() -> None:
+    completed = _run(
+        FIT_SCRIPT,
+        CONFIG="configs/native.json",
+        FIT_HISTORY_SOURCE="clean",
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert "params/chunkwise/kh2-vh1-int4-fitclean" in completed.stdout
+    assert "--fit-history-source clean" in completed.stdout
+
+
+def test_generate_selects_clean_fitted_parameters_without_runtime_override() -> None:
+    completed = _run(
+        GENERATE_SCRIPT,
+        CHECKPOINT="checkpoint.pt",
+        MODEL_ROOT="model-root",
+        PROMPTS="prompts.txt",
+        CONFIG="configs/native.json",
+        FIT_HISTORY_SOURCE="clean",
+    )
+
+    assert "params/chunkwise/kh2-vh1-int4-fitclean/k_temporal.npz" in completed.stdout
+    assert "--fit-history-source" not in completed.stdout
+
+
+def test_invalid_fitting_state_is_rejected_by_the_shell_contract() -> None:
+    completed = _run(
+        FIT_SCRIPT,
+        CONFIG="configs/native.json",
+        FIT_HISTORY_SOURCE="runtime",
+    )
+
+    assert completed.returncode != 0
+    assert "FIT_HISTORY_SOURCE must be reconstructed or clean" in completed.stderr
+
+
 @pytest.mark.parametrize(
     ("config", "parameter_name", "v_artifact", "v_predictor"),
     [
@@ -117,7 +154,7 @@ def test_attention_controls_are_forwarded_for_legacy_cross_kv() -> None:
     assert "--attention-steps 2" in completed.stdout
 
 
-def test_attention_refinement_rejects_native_before_fitting() -> None:
+def test_attention_refinement_controls_are_forwarded_for_native() -> None:
     completed = _run(
         FIT_SCRIPT,
         CONFIG="configs/native.json",
@@ -125,8 +162,30 @@ def test_attention_refinement_rejects_native_before_fitting() -> None:
         ATTENTION_STEPS="2",
     )
 
-    assert completed.returncode == 2
-    assert "只支持 legacy/shared temporal K" in completed.stderr
+    assert completed.returncode == 0, completed.stderr
+    assert "--v-predictor-mode temporal" in completed.stdout
+    assert "--attention-steps 2" in completed.stdout
+    assert "--attention-optimizer adam" in completed.stdout
+
+
+def test_attention_ablation_controls_are_forwarded() -> None:
+    completed = _run(
+        FIT_SCRIPT,
+        CONFIG="configs/native.json",
+        ATTENTION_STEPS="1",
+        ATTENTION_OPTIMIZER="sign_gradient",
+        ATTENTION_RECONSTRUCTION_WEIGHT="1.0",
+        ATTENTION_OUTPUT_WEIGHT="0.0",
+        ATTENTION_REFINE_TENSORS="value",
+        ATTENTION_SIGN_STEP_SIZES="0.001 0.01",
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert "--attention-optimizer sign_gradient" in completed.stdout
+    assert "--attention-reconstruction-weight 1.0" in completed.stdout
+    assert "--attention-output-weight 0.0" in completed.stdout
+    assert "--attention-refine-tensors value" in completed.stdout
+    assert "--attention-sign-step-sizes 0.001 0.01" in completed.stdout
 
 
 @pytest.mark.parametrize(
@@ -166,7 +225,7 @@ def test_trace_protocol_override_cannot_conflict_with_config() -> None:
     assert "与 CONFIG 的 fit_mode=native 冲突" in completed.stderr
 
 
-def test_common_fitter_rejects_layered_attention_refinement_early(
+def test_common_fitter_accepts_layered_attention_refinement_controls(
     tmp_path: Path,
 ) -> None:
     spec = importlib.util.spec_from_file_location("tempokv_fit_params", COMMON_FITTER)
@@ -187,8 +246,9 @@ def test_common_fitter_rejects_layered_attention_refinement_early(
         ]
     )
 
-    with pytest.raises(ValueError, match="requires legacy/shared"):
-        module.run(args)
+    assert args.attention_steps == 2
+    assert args.attention_optimizer == "adam"
+    assert args.attention_refine_tensors == "key_value"
 
 
 def test_attention_token_limit_is_deterministic() -> None:

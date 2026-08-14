@@ -20,6 +20,7 @@
 #   K_HISTORY_LENGTH / V_HISTORY_LENGTH  历史长度（默认读取 CONFIG），可简写 KH / VH
 #   PARAM_NAME          直接指定参数方案目录名
 #   FIT_DEVICE          拟合设备（默认 auto：有 CUDA 就用 GPU，否则回退 CPU 并告警）
+#   FIT_HISTORY_SOURCE  reconstructed（默认）或 clean；仅用于拟合消融
 #   DRY_RUN             只打印命令不执行（0/1，默认 0）
 #   ITERATIONS / TEMPORAL_RIDGE / CROSS_RIDGE / MAX_GAIN  拟合控制
 #
@@ -45,7 +46,8 @@ fi
 # collect_trace.sh 写出的是 TRACE_FILE；TRACE 是本脚本的旧名字，继续支持。
 trace="$(resolve_path "${TRACE_FILE:-${TRACE:-data/longcat/trace/clean_trace.npz}}")"
 config="$(resolve_path "${CONFIG:-configs/native.json}")"
-parameter_name="${PARAM_NAME:-$(codec_slug "$config" "${K_HISTORY_LENGTH:-}" "${V_HISTORY_LENGTH:-}" "${K_BITS:-}" "${V_BITS:-}" "${CACHE_STRIDE:-}" "${V_PREDICTOR:-}")}"
+FIT_HISTORY_SOURCE="${FIT_HISTORY_SOURCE:-reconstructed}"
+parameter_name="${PARAM_NAME:-$(codec_slug "$config" "${K_HISTORY_LENGTH:-}" "${V_HISTORY_LENGTH:-}" "${K_BITS:-}" "${V_BITS:-}" "${CACHE_STRIDE:-}" "${V_PREDICTOR:-}" "$FIT_HISTORY_SOURCE")}"
 output_dir="$(resolve_path "${OUTPUT_DIR:-data/longcat/params/$parameter_name}")"
 
 if [[ "$output_dir" == "/" ]]; then
@@ -69,6 +71,7 @@ fit_command=(
   --output-dir "$output_dir"
   --coordinate-system pre_rope_normalized
   --iterations "$ITERATIONS"
+  --fit-history-source "$FIT_HISTORY_SOURCE"
   --temporal-ridge "$TEMPORAL_RIDGE"
   --cross-ridge "$CROSS_RIDGE"
   --max-gain "$MAX_GAIN"
