@@ -16,13 +16,13 @@ from pathlib import Path
 import sys
 import time
 
+import imageio.v3 as iio
 import torch
 import torch.distributed as dist
 from einops import rearrange
 from omegaconf import OmegaConf
 from torch.utils.data import DataLoader, SequentialSampler, Subset
 from torchvision import transforms
-from torchvision.io import write_video
 
 _RUNTIME_ROOT = Path(__file__).resolve().parent
 if str(_RUNTIME_ROOT) not in sys.path:
@@ -227,7 +227,12 @@ def _write_video_checked(path: str, frames: torch.Tensor, fps: int) -> None:
     stem, suffix = os.path.splitext(path)
     temporary = f"{stem}.tmp-{os.getpid()}{suffix or '.mp4'}"
     try:
-        write_video(temporary, frames, fps=fps)
+        iio.imwrite(
+            temporary,
+            frames.to(dtype=torch.uint8).cpu().numpy(),
+            fps=fps,
+            codec="libx264",
+        )
         if not _is_valid_video(temporary):
             raise RuntimeError(f"video encoder produced an empty file: {temporary}")
         os.replace(temporary, path)
