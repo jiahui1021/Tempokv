@@ -65,6 +65,16 @@ parser.add_argument("--end_index", type=int, default=-1)
 parser.add_argument("--local_attn_size", type=int, default=-1)
 parser.add_argument("--skip_existing", action="store_true")
 parser.add_argument("--skip_video_save", action="store_true", help=argparse.SUPPRESS)
+parser.add_argument(
+    "--report_timing",
+    action="store_true",
+    help="record diffusion-only generation timing",
+)
+parser.add_argument(
+    "--retain_final_cache",
+    action="store_true",
+    help="run the final clean refresh before releasing the cache",
+)
 args = parser.parse_args()
 
 if "LOCAL_RANK" in os.environ:
@@ -97,6 +107,60 @@ config.model_root = str(Path(args.model_root).expanduser().resolve())
 if "model_kwargs" not in config:
     config.model_kwargs = {}
 config.model_kwargs.local_attn_size = args.local_attn_size
+
+num_frame_per_block = int(getattr(config, "num_frame_per_block", 1))
+latent_frames = int(args.num_output_frames)
+if latent_frames < 1:
+    raise ValueError("num_output_frames must be positive")
+if latent_frames % num_frame_per_block:
+    raise ValueError(
+        "num_output_frames must be divisible by num_frame_per_block for the "
+        "formal Causal-Forcing workload"
+    )
+compression_span_frames = (
+    int(os.environ["TEMPOKV_SPAN_FRAMES"])
+    if os.environ.get("TEMPOKV_SPAN_FRAMES")
+    else None
+)
+benchmark_config = {
+    "method": "TempoKV" if os.environ.get("TEMPOKV_CONFIG_PATH") else "BF16",
+    "pixel_frames": latent_frames * 4 - 3,
+    "latent_frames": latent_frames,
+    "num_frame_per_block": num_frame_per_block,
+    "num_blocks": latent_frames // num_frame_per_block,
+    "local_attn_size": int(args.local_attn_size),
+    "attention_mode": (
+        "full_history"
+        if args.local_attn_size in (-1, latent_frames)
+        else "windowed"
+    ),
+    "compression_span_frames": compression_span_frames,
+    "seed": int(args.seed),
+    "checkpoint": (
+        str(Path(args.checkpoint_path).expanduser().resolve())
+        if args.checkpoint_path
+        else None
+    ),
+    "prompt_file": str(Path(args.data_path).expanduser().resolve()),
+}
+tempokv_config_path = os.environ.get("TEMPOKV_CONFIG_PATH")
+if tempokv_config_path and os.path.isfile(tempokv_config_path):
+    codec_payload = json.loads(
+        Path(tempokv_config_path).read_text(encoding="utf-8")
+    )
+    codec_payload = codec_payload.get("codec", codec_payload)
+    for name in (
+        "k_history_length",
+        "v_history_length",
+        "k_bits",
+        "v_bits",
+        "v_predictor_mode",
+    ):
+        if name in codec_payload:
+            benchmark_config[f"tempokv_{name}"] = codec_payload[name]
+print("[BenchmarkConfig]", flush=True)
+for key, value in benchmark_config.items():
+    print(f"{key} = {value}", flush=True)
 
 if hasattr(config, "denoising_step_list"):
     pipeline = CausalInferencePipeline(config, device=device)
@@ -190,6 +254,7 @@ if args.skip_existing and args.save_with_index:
                         "path": output_path,
                         "skipped": True,
                         "generation_seconds": None,
+                        "diffusion_generation_s": None,
                         "total_seconds": None,
                     }
                 )
@@ -200,6 +265,7 @@ if args.skip_existing and args.save_with_index:
                     "generated_samples": 0,
                     "skipped_samples": int(args.num_samples),
                     "generation_seconds": None,
+                    "diffusion_generation_s": None,
                     "video_save_seconds": None,
                     "total_seconds": None,
                     "timing_scope": "prompt_batch",
@@ -291,9 +357,13 @@ for batch_data in dataloader:
         return_latents=True,
         initial_latent=initial_latent,
         low_memory=low_memory,
+        report_timing=args.report_timing,
+        retain_final_cache=args.retain_final_cache,
     )
     torch.cuda.synchronize(device)
     generation_seconds = time.perf_counter() - generation_start
+    diffusion_generation_s = getattr(pipeline, "diffusion_generation_s", None)
+    vae_decode_s = getattr(pipeline, "vae_decode_s", None)
 
     if args.skip_video_save:
         pipeline.vae.model.clear_cache()
@@ -317,6 +387,8 @@ for batch_data in dataloader:
                 "path": output_path,
                 "skipped": False,
                 "generation_seconds": generation_seconds,
+                "diffusion_generation_s": diffusion_generation_s,
+                "vae_decode_s": vae_decode_s,
                 "save_seconds": time.perf_counter() - save_start,
                 "total_seconds": None,
             }
@@ -341,6 +413,8 @@ for batch_data in dataloader:
             "generated_samples": int(args.num_samples),
             "skipped_samples": 0,
             "generation_seconds": generation_seconds,
+            "diffusion_generation_s": diffusion_generation_s,
+            "vae_decode_s": vae_decode_s,
             "video_save_seconds": batch_video_save_seconds,
             "total_seconds": batch_total_seconds,
             "generation_seconds_per_sample": generation_seconds_per_sample,
@@ -366,6 +440,15 @@ rank_summary = {
     "local_rank": int(local_rank),
     "world_size": int(world_size),
     "generation_wall_seconds": generation_wall_seconds,
+    "diffusion_generation_s": max(
+        (
+            float(batch["diffusion_generation_s"])
+            for batch in batch_summaries
+            if batch.get("diffusion_generation_s") is not None
+        ),
+        default=None,
+    ),
+    "benchmark_config": benchmark_config,
     "batches": batch_summaries,
     "videos": video_summaries,
     "tempokv_report": tempokv_report.to_dict() if tempokv_report is not None else None,

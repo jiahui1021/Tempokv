@@ -1,4 +1,5 @@
 from typing import List, Optional
+import os
 import time
 import torch
 
@@ -7,6 +8,15 @@ from causal_forcing.kv_cache import ChunkedKVCache
 
 from causal_forcing.demo_utils.memory import gpu, get_cuda_free_memory_gb, move_model_to_device_with_memory_preservation
 import tqdm
+
+
+def _set_cache_index(cache: dict, name: str, value: int) -> None:
+    current = cache[name]
+    if isinstance(current, torch.Tensor):
+        current.fill_(int(value))
+    else:
+        cache[name] = int(value)
+
 
 class CausalInferencePipeline(torch.nn.Module):
     def __init__(
@@ -60,6 +70,10 @@ class CausalInferencePipeline(torch.nn.Module):
         self.frame_seq_length = int(getattr(args, "frame_seq_length", 1560))
 
         self.kv_cache1 = None
+        # The native BF16 path uses dense post-RoPE tensors.  TempoKV and
+        # trace collection set this flag before the first inference so they
+        # can keep their frame-addressable pre-RoPE ChunkedKVCache.
+        self._uses_pre_rope_cache = False
         self.args = args
         # The TempoKV bridge replaces `finalize_kv_cache` and reads `summary`;
         # the BF16 and trace paths leave both inert.
@@ -76,6 +90,8 @@ class CausalInferencePipeline(torch.nn.Module):
         # `inference()`. Kept as attributes so callers can read them afterward.
         self.last_generation_time = None
         self.first_chunk_time = None
+        self.diffusion_generation_s = None
+        self.vae_decode_s = None
 
         print(f"KV inference with {self.num_frame_per_block} frames per block")
 
@@ -114,6 +130,12 @@ class CausalInferencePipeline(torch.nn.Module):
                 It is normalized to be in the range [0, 1].
         """
         batch_size, num_frames, num_channels, height, width = noise.shape
+        # Do not leak timing values when a pipeline instance is reused with a
+        # different timing setting for the next prompt.
+        self.last_generation_time = None
+        self.first_chunk_time = None
+        self.diffusion_generation_s = None
+        self.vae_decode_s = None
         if not self.independent_first_frame or (self.independent_first_frame and initial_latent is not None):
             # If the first frame is independent and the first frame is provided, then the number of frames in the
             # noise should still be a multiple of num_frame_per_block
@@ -128,11 +150,11 @@ class CausalInferencePipeline(torch.nn.Module):
         num_input_frames = initial_latent.shape[1] if initial_latent is not None else 0
         num_output_frames = num_frames + num_input_frames  # add the initial latent frames
 
-        # Optional: start generation timer (excludes VAE decode). Only runs
-        # when the caller explicitly opts in.
+        # Keep this marker for the legacy timing field. The comparable timer
+        # starts later, after text encoding and KV cache initialization.
         if report_timing:
             torch.cuda.synchronize()
-            self._gen_start_time = time.time()
+            self._gen_start_time = time.perf_counter()
 
         conditional_dict = self.text_encoder(
             text_prompts=text_prompts
@@ -181,14 +203,25 @@ class CausalInferencePipeline(torch.nn.Module):
             # reset kv cache
             for block_index in range(len(self.kv_cache1)):
                 layer = self.kv_cache1[block_index]
-                if layer["k"].max_num_chunks < num_output_frames:
-                    raise ValueError(
-                        "existing Causal Forcing cache is smaller than this request"
-                    )
-                layer["k"].clear()
-                layer["v"].clear()
-                layer["global_end_index"] = 0
-                layer["local_end_index"] = 0
+                if self._uses_pre_rope_cache:
+                    if layer["k"].max_num_chunks < num_output_frames:
+                        raise ValueError(
+                            "existing Causal Forcing cache is smaller than this request"
+                        )
+                    layer["k"].clear()
+                    layer["v"].clear()
+                else:
+                    # Dense BF16 tensors are reused across prompts.  Clearing
+                    # the index state is sufficient because every attention
+                    # read is bounded by local_end_index; zeroing the whole
+                    # multi-gigabyte cache would add avoidable benchmark cost.
+                    required_tokens = num_output_frames * self.frame_seq_length
+                    if layer["k"].shape[1] < required_tokens:
+                        raise ValueError(
+                            "existing Causal Forcing cache is smaller than this request"
+                        )
+                _set_cache_index(layer, "global_end_index", 0)
+                _set_cache_index(layer, "local_end_index", 0)
         self.summary["finalize_events"] = []
         self.summary["last_kv_cache_memory"] = None
         self.summary["terminal_cache_event"] = None
@@ -240,11 +273,36 @@ class CausalInferencePipeline(torch.nn.Module):
             torch.cuda.synchronize()
             diffusion_start.record()
 
+        # Start after text encoding, cache initialization, and any context
+        # refresh, immediately before the autoregressive temporal loop. This
+        # is the shared diffusion-only benchmark interval.
+        if report_timing:
+            torch.cuda.synchronize()
+            diffusion_started = time.perf_counter()
+
         # Step 3: Temporal denoising loop
         all_num_frames = [self.num_frame_per_block] * num_blocks
         if self.independent_first_frame and initial_latent is None:
             all_num_frames = [1] + all_num_frames
         for block_index, current_num_frames in enumerate(tqdm.tqdm(all_num_frames)):
+            if (
+                os.environ.get("CAUSAL_FORCING_BENCHMARK") == "1"
+                and block_index in {1, 8, 16, 32, 59}
+            ):
+                current_end_frame = current_start_frame + current_num_frames
+                attention_start_frame = (
+                    0
+                    if self.local_attn_size == -1
+                    else max(0, current_end_frame - int(self.local_attn_size))
+                )
+                print(
+                    "[AttentionCheck] "
+                    f"block={block_index} "
+                    f"current_end_frame={current_end_frame} "
+                    f"attention_start_frame={attention_start_frame} "
+                    f"attention_length_frames={current_end_frame - attention_start_frame}",
+                    flush=True,
+                )
             # Optional: time the first block (TTFC). Excludes the KV-cache
             # refresh pass that follows the main denoising.
             if report_timing and block_index == 0:
@@ -361,11 +419,6 @@ class CausalInferencePipeline(torch.nn.Module):
             diffusion_time = diffusion_start.elapsed_time(diffusion_end)
             init_time = init_start.elapsed_time(init_end)
             vae_start.record()
-        # Record diffusion time (excluding VAE decode).
-        if report_timing:
-            torch.cuda.synchronize()
-            self.last_generation_time = time.time() - self._gen_start_time
-
         if retain_final_cache or not all_num_frames:
             if all_num_frames:
                 self.summary["terminal_cache_event"] = {
@@ -377,9 +430,22 @@ class CausalInferencePipeline(torch.nn.Module):
                 }
             self.flush_kv_cache()
 
+        # Record diffusion time after the final clean refresh/cache flush and
+        # before VAE decoding. This is the primary benchmark metric.
+        if report_timing:
+            torch.cuda.synchronize()
+            self.diffusion_generation_s = time.perf_counter() - diffusion_started
+            self.last_generation_time = self.diffusion_generation_s
+
         # Step 4: Decode the output
+        if report_timing:
+            torch.cuda.synchronize()
+            vae_started = time.perf_counter()
         video = self.vae.decode_to_pixel(output, use_cache=False)
         video = (video * 0.5 + 0.5).clamp(0, 1)
+        if report_timing:
+            torch.cuda.synchronize()
+            self.vae_decode_s = time.perf_counter() - vae_started
 
         if profile:
             # End VAE timing and synchronize CUDA
@@ -453,8 +519,82 @@ class CausalInferencePipeline(torch.nn.Module):
     ):
         """
         Initialize a Per-GPU KV cache for the Wan model.
+
+        BF16 deliberately keeps the native Causal Forcing representation:
+        post-RoPE keys and raw values in preallocated contiguous tensors.  The
+        frame-addressable ChunkedKVCache is reserved for TempoKV and trace
+        collection, whose read-time RoPE and span metadata are part of their
+        method definitions.
         """
         kv_cache1 = []
+        if not self._uses_pre_rope_cache:
+            if self.local_attn_size != -1:
+                max_num_chunks = int(self.local_attn_size)
+            else:
+                max_num_chunks = int(target_frames or 21)
+            if max_num_chunks < 1:
+                raise ValueError("Causal Forcing KV cache capacity must be positive")
+            max_tokens = max_num_chunks * self.frame_seq_length
+
+            def attach_compat_methods(tensor: torch.Tensor) -> torch.Tensor:
+                """Keep the old test/runtime write API over a dense tensor.
+
+                The model only uses tensor slicing.  A few lightweight pipeline
+                harnesses write/read the cache directly, so expose the same
+                narrow methods without turning the BF16 cache into a chunked
+                object or changing its storage layout.
+                """
+                tensor.max_num_chunks = max_num_chunks
+                tensor.kv_cache_size = max_tokens
+
+                def write(
+                    start_index: int,
+                    end_index: int,
+                    data: torch.Tensor,
+                    *,
+                    global_start_frame: int | None = None,
+                ) -> None:
+                    del global_start_frame
+                    if end_index - start_index != data.shape[1]:
+                        raise ValueError("dense cache write shape does not match range")
+                    tensor[:, start_index:end_index].copy_(data)
+
+                def read(
+                    start_index: int,
+                    end_index: int,
+                    source_tensor: torch.Tensor | None = None,
+                ) -> torch.Tensor:
+                    del source_tensor
+                    return tensor[:, start_index:end_index]
+
+                def clear() -> None:
+                    tensor.zero_()
+
+                tensor.write = write
+                tensor.read = read
+                tensor.clear = clear
+                return tensor
+
+            for _ in range(self.num_transformer_blocks):
+                key = attach_compat_methods(torch.zeros(
+                    (batch_size, max_tokens, self.num_heads, self.head_dim),
+                    dtype=dtype,
+                    device=device,
+                ))
+                value = attach_compat_methods(torch.zeros_like(key))
+                kv_cache1.append({
+                    "k": key,
+                    "v": value,
+                    "cache_backend": "bf16",
+                    # Keep these as Python integers: converting a CUDA scalar
+                    # with `.item()` in every attention call would synchronize
+                    # the GPU and distort the native BF16 benchmark.
+                    "global_end_index": 0,
+                    "local_end_index": 0,
+                })
+            self.kv_cache1 = kv_cache1
+            return
+
         # Storage stays frame-addressable for the whole rollout even when
         # attention only reads a local window, so absolute frame positions —
         # and therefore RoPE and TempoKV spans — never shift under eviction.

@@ -122,6 +122,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--skip-existing", action="store_true")
     parser.add_argument(
+        "--report-timing",
+        action="store_true",
+        help="record the diffusion-only generation interval",
+    )
+    parser.add_argument(
+        "--retain-final-cache",
+        action="store_true",
+        help="run the final clean refresh before releasing the cache",
+    )
+    parser.add_argument(
         "--use-ema",
         action="store_true",
         help="load generator_ema instead of generator from the checkpoint",
@@ -279,6 +289,10 @@ def _generation_command(
         command.append("--use_ema")
     if args.skip_existing:
         command.append("--skip_existing")
+    if args.report_timing:
+        command.append("--report_timing")
+    if args.retain_final_cache:
+        command.append("--retain_final_cache")
     return command
 
 
@@ -409,7 +423,7 @@ def _require_tempokv_activity(report: dict[str, object]) -> None:
 
 
 def _require_direct_persistent_routes(
-    routes: dict[str, object], v_predictor_mode: str
+    routes: dict[str, object], v_predictor_mode: str = "cross_kv"
 ) -> None:
     """Reject a nominally accelerated run that missed the production kernels."""
     # The temporal V predictor never decodes a Cross(K) tensor, so it produces
@@ -494,11 +508,19 @@ def run(args: argparse.Namespace) -> dict[str, object]:
     if args.local_attn_size == 0 or args.local_attn_size < -1:
         raise ValueError("local-attn-size must be -1 or a positive integer")
     latent_frames = latent_frames_for(args.frames, args.num_frame_per_block)
-    if args.local_attn_size != -1 and args.local_attn_size < latent_frames:
+    # Keep the ordinary launcher guard for the historical one-shot/demo
+    # workflow.  The explicit benchmark protocol also supports the documented
+    # all-method 51-frame sliding-window ablation, so that mode may opt into a
+    # shorter window through BENCHMARK=1.
+    if (
+        args.local_attn_size != -1
+        and args.local_attn_size < latent_frames
+        and os.environ.get("CAUSAL_FORCING_BENCHMARK") != "1"
+    ):
         raise ValueError(
             "local-attn-size must cover the complete generated latent sequence "
-            f"({latent_frames} frames) so BF16 and TempoKV use identical "
-            "Causal Forcing attention semantics"
+            f"({latent_frames} frames) unless BENCHMARK=1 is set for the "
+            "sliding-window ablation"
         )
 
     config = None
@@ -558,6 +580,19 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         ),
         "num_frame_per_block": args.num_frame_per_block,
         "latent_frames": latent_frames,
+        "num_blocks": latent_frames // args.num_frame_per_block,
+        "pixel_frames": args.frames,
+        "local_attn_size": args.local_attn_size,
+        "attention_mode": (
+            "full_history"
+            if args.local_attn_size in (-1, latent_frames)
+            else "windowed"
+        ),
+        "seed": int(args.seed),
+        "checkpoint": str(paths["checkpoint"]),
+        "prompt_file": str(paths["prompts"]),
+        "report_timing": bool(args.report_timing),
+        "retain_final_cache": bool(args.retain_final_cache),
         "created_at": datetime.now(timezone.utc).isoformat(),
         "generation_command": generation_command,
         "output_dir": str(paths["run"]),
@@ -565,6 +600,9 @@ def run(args: argparse.Namespace) -> dict[str, object]:
     if args.mode == "tempokv":
         report["parameters"] = parameters
         report["span_frames"] = span_frames
+        report["compression_span_frames"] = span_frames
+    else:
+        report["compression_span_frames"] = None
     if args.dry_run:
         print(json.dumps(report, indent=2, ensure_ascii=False))
         return report
@@ -590,6 +628,11 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                 "TEMPOKV_V_PARAMS_PATH": str(paths["v_params"]),
                 "TEMPOKV_SPAN_FRAMES": str(span_frames),
                 "TEMPOKV_MODEL_NAME": f"causal_forcing_{report['generation_mode']}",
+                "TEMPOKV_FORCE_PARTIAL_SPAN": (
+                    "0"
+                    if os.environ.get("CAUSAL_FORCING_BENCHMARK") == "1"
+                    else "1"
+                ),
             }
         )
         if args.triton_cache is not None:
@@ -628,6 +671,18 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         report["trace_dir"] = environment["TEMPOKV_TRACE_DIR"]
     else:
         ranks = _rank_summaries(paths["videos"])
+        diffusion_times = [
+            float(rank["diffusion_generation_s"])
+            for rank in ranks
+            if rank.get("diffusion_generation_s") is not None
+        ]
+        report["timing"] = {
+            "diffusion_generation_s": max(diffusion_times)
+            if diffusion_times
+            else None,
+            "end_to_end_s": float(generation_seconds),
+            "total_worker_s": float(performance["max_worker_seconds"]),
+        }
         videos = [
             entry["path"]
             for rank in ranks

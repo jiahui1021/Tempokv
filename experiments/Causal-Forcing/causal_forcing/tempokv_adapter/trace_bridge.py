@@ -167,6 +167,10 @@ def install(runtime_root: str | Path | None = None) -> type:
     class TraceCausalInferencePipeline(base):
         def __init__(self, *args: Any, **kwargs: Any) -> None:
             super().__init__(*args, **kwargs)
+            # Trace collection samples the pre-RoPE K/V representation used by
+            # TempoKV and therefore must retain the chunked read-time-RoPE
+            # cache instead of the native BF16 dense path.
+            self._uses_pre_rope_cache = True
             blocks = self.generator.model.blocks
             output_root.mkdir(parents=True, exist_ok=True)
             self._trace_event_index = 0

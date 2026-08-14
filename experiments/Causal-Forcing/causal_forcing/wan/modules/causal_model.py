@@ -225,63 +225,126 @@ class CausalWanSelfAttention(nn.Module):
 
             current_end = current_start + roped_query.shape[1]
             num_new_tokens = roped_query.shape[1]
-            if self.sink_size and self.local_attn_size != -1:
-                raise NotImplementedError(
-                    "TempoKV Causal Forcing does not implement sink retention "
-                    "with a local attention window yet; run with sink_size=0"
-                )
             global_end_index = _cache_index(kv_cache, "global_end_index")
             cached_local_end = _cache_index(kv_cache, "local_end_index")
             local_end_index = cached_local_end + current_end - global_end_index
             local_start_index = local_end_index - num_new_tokens
-            if local_start_index < 0 or local_end_index > kv_cache["k"].kv_cache_size:
-                raise ValueError("Causal Forcing KV cache capacity is too small")
-
-            # Upstream caches the post-RoPE key. TempoKV stores the normalized
-            # pre-RoPE key instead: a temporal predictor fitted on rotated keys
-            # would have to model the positional rotation as well as the
-            # content change, and the rotation keeps growing with the absolute
-            # frame index on a long rollout.
-            kv_cache["k"].write(
-                local_start_index,
-                local_end_index,
-                k,
-                global_start_frame=current_start_frame,
-            )
-            kv_cache["v"].write(
-                local_start_index,
-                local_end_index,
-                v,
-                global_start_frame=current_start_frame,
-            )
-
-            attention_start = 0
-            if self.local_attn_size != -1:
-                attention_start = max(
-                    0, local_end_index - self.local_attn_size * frame_seqlen
+            cache_backend = kv_cache.get("cache_backend")
+            if cache_backend is None:
+                # Preserve the direct attention-module API used by older
+                # callers: a ChunkedKVCache object unambiguously selects the
+                # pre-RoPE/read-time-RoPE path, while a tensor is native BF16.
+                cache_backend = (
+                    "bf16" if isinstance(kv_cache.get("k"), torch.Tensor)
+                    else "tempokv"
                 )
-            k_all = kv_cache["k"].read(attention_start, local_end_index)
-            # RoPE happens only after the cache has been read back, and each
-            # resident span is rotated at its own absolute frame position.
-            absolute_k = apply_rope_by_span(
-                k_all,
-                grid_sizes,
-                freqs,
-                kv_cache["k"].spans(attention_start, local_end_index),
-            ).type_as(v)
-            # V is decoded from the reconstructed pre-RoPE K, closing the
-            # TempoKV K -> V loop before either tensor is rotated.
-            v_all = kv_cache["v"].read(
-                attention_start,
-                local_end_index,
-                source_tensor=k_all,
-            )
-            recorder = getattr(self, "tempokv_trace_recorder", None)
-            if recorder is not None:
-                # Record the rotated tensors actually used by attention.  The
-                # newly written keys are the tail of the reconstructed cache.
-                recorder(roped_query, absolute_k[:, -num_new_tokens:])
-            x = attention(roped_query, absolute_k, v_all)
+            if cache_backend != "tempokv":
+                # Native BF16 baseline: post-RoPE K in a contiguous tensor
+                # cache, with no ChunkedKVCache or read-time RoPE overhead.
+                roped_key = causal_rope_apply(
+                    k, grid_sizes, freqs,
+                    start_frame=current_start_frame).type_as(v)
+                cache_k = kv_cache["k"]
+                cache_v = kv_cache["v"]
+                cache_size = int(cache_k.shape[1])
+                if num_new_tokens > cache_size:
+                    raise ValueError(
+                        "Causal Forcing KV cache capacity is smaller than one block"
+                    )
+                sink_tokens = self.sink_size * frame_seqlen
+                if (
+                    self.local_attn_size != -1
+                    and current_end > global_end_index
+                    and cached_local_end + num_new_tokens > cache_size
+                ):
+                    num_evicted_tokens = (
+                        cached_local_end + num_new_tokens - cache_size
+                    )
+                    num_rolled_tokens = (
+                        cached_local_end - num_evicted_tokens - sink_tokens
+                    )
+                    if num_rolled_tokens > 0:
+                        cache_k[:, sink_tokens:sink_tokens + num_rolled_tokens] = (
+                            cache_k[
+                                :,
+                                sink_tokens + num_evicted_tokens:
+                                sink_tokens + num_evicted_tokens + num_rolled_tokens,
+                            ].clone()
+                        )
+                        cache_v[:, sink_tokens:sink_tokens + num_rolled_tokens] = (
+                            cache_v[
+                                :,
+                                sink_tokens + num_evicted_tokens:
+                                sink_tokens + num_evicted_tokens + num_rolled_tokens,
+                            ].clone()
+                        )
+                    local_end_index = cached_local_end + current_end - global_end_index
+                    local_end_index -= num_evicted_tokens
+                    local_start_index = local_end_index - num_new_tokens
+                elif local_end_index > cache_size:
+                    raise ValueError("Causal Forcing KV cache capacity is too small")
+                cache_k[:, local_start_index:local_end_index] = roped_key
+                cache_v[:, local_start_index:local_end_index] = v
+                attention_start = 0
+                if self.local_attn_size != -1:
+                    attention_start = max(
+                        0, local_end_index - self.local_attn_size * frame_seqlen
+                    )
+                x = attention(
+                    roped_query,
+                    cache_k[:, attention_start:local_end_index],
+                    cache_v[:, attention_start:local_end_index],
+                )
+            else:
+                if self.sink_size and self.local_attn_size != -1:
+                    raise NotImplementedError(
+                        "TempoKV Causal Forcing does not implement sink retention "
+                        "with a local attention window yet; run with sink_size=0"
+                    )
+
+                # TempoKV stores normalized pre-RoPE K/V in frame-aligned
+                # chunks. RoPE is applied after each read, at absolute frame
+                # positions, so the predictor never has to model rotation.
+                if (
+                    local_start_index < 0
+                    or local_end_index > kv_cache["k"].kv_cache_size
+                ):
+                    raise ValueError("Causal Forcing KV cache capacity is too small")
+                kv_cache["k"].write(
+                    local_start_index,
+                    local_end_index,
+                    k,
+                    global_start_frame=current_start_frame,
+                )
+                kv_cache["v"].write(
+                    local_start_index,
+                    local_end_index,
+                    v,
+                    global_start_frame=current_start_frame,
+                )
+
+                attention_start = 0
+                if self.local_attn_size != -1:
+                    attention_start = max(
+                        0, local_end_index - self.local_attn_size * frame_seqlen
+                    )
+                k_all = kv_cache["k"].read(attention_start, local_end_index)
+                absolute_k = apply_rope_by_span(
+                    k_all,
+                    grid_sizes,
+                    freqs,
+                    kv_cache["k"].spans(attention_start, local_end_index),
+                ).type_as(v)
+                v_all = kv_cache["v"].read(
+                    attention_start,
+                    local_end_index,
+                    source_tensor=k_all,
+                )
+                recorder = getattr(self, "tempokv_trace_recorder", None)
+                if recorder is not None:
+                    recorder(roped_query, absolute_k[:, -num_new_tokens:])
+                x = attention(roped_query, absolute_k, v_all)
+
             _set_cache_index(kv_cache, "global_end_index", current_end)
             _set_cache_index(kv_cache, "local_end_index", local_end_index)
 

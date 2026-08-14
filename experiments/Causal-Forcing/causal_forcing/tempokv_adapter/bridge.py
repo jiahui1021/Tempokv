@@ -170,6 +170,10 @@ def install(runtime_root: str | Path | None = None) -> type:
     class TempoKVCausalInferencePipeline(base):
         def __init__(self, *args: Any, **kwargs: Any) -> None:
             super().__init__(*args, **kwargs)
+            # TempoKV intentionally keeps the pre-RoPE, frame-addressable
+            # cache so finalized spans can be predicted and re-rotated at
+            # absolute positions during reads.
+            self._uses_pre_rope_cache = True
             self.tempokv_codec = load_codec_from_env()
             config = self.tempokv_codec.config
             if config.stride != self.frame_seq_length:
@@ -244,13 +248,37 @@ def install(runtime_root: str | Path | None = None) -> type:
                     "Causal Forcing finalized frame "
                     f"{start_frame} out of order; expected {expected}"
                 )
+            previous_span_start = self.tempokv_stream.span_start_frame
             self.tempokv_stream.finalize(self.kv_cache1, num_frames=num_frames)
+            if os.environ.get("CAUSAL_FORCING_BENCHMARK") == "1":
+                packed_until = self.tempokv_stream.span_start_frame
+                while previous_span_start < packed_until:
+                    span_end = min(
+                        previous_span_start + self.tempokv_stream.span_frames,
+                        packed_until,
+                    )
+                    print(
+                        "[TempoKVSchedule] "
+                        f"start_frame={previous_span_start} "
+                        f"end_frame={span_end} "
+                        f"num_frames={span_end - previous_span_start}",
+                        flush=True,
+                    )
+                    previous_span_start = span_end
             self.summary["finalize_events"].append(
                 {"start_frame": int(start_frame), "num_frames": int(num_frames)}
             )
 
         def flush_kv_cache(self) -> None:
-            self.tempokv_stream.flush(self.kv_cache1, force=True)
+            # Formal long-video benchmarks keep the incomplete final span as a
+            # BF16 tail. Preserve the historical force-flush behavior for
+            # interactive callers and unit tests unless the benchmark launcher
+            # explicitly disables it.
+            force_partial = os.environ.get("TEMPOKV_FORCE_PARTIAL_SPAN", "1")
+            self.tempokv_stream.flush(
+                self.kv_cache1,
+                force=force_partial not in {"0", "false", "no"},
+            )
             self.summary["last_kv_cache_memory"] = self.tempokv_report.to_dict()
 
         def discard_terminal_kv_cache(
