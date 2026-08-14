@@ -364,6 +364,12 @@ def _fit_device(name: str) -> torch.device:
     return device
 
 
+def _reset_cuda_peak_memory_stats(device: torch.device) -> None:
+    """Initialize the selected CUDA context before resetting its counters."""
+    torch.empty(0, device=device)
+    torch.cuda.reset_peak_memory_stats(device)
+
+
 def _limit_attention_tracks(
     tensor: torch.Tensor, max_tokens: int | None
 ) -> torch.Tensor:
@@ -472,7 +478,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     device = _fit_device(args.device)
     print(f"[fit] device={device}", file=sys.stderr)
     if device.type == "cuda":
-        torch.cuda.reset_peak_memory_stats(device)
+        _reset_cuda_peak_memory_stats(device)
     fit_started = time.perf_counter()
     if device.type == "cuda":
         # Avoid carrying float64 trace storage onto the GPU.  All CUDA fitting
