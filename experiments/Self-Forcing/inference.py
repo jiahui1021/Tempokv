@@ -1,11 +1,11 @@
 import argparse
 import json
+import imageio.v3 as iio
 import torch
 import os
 import time
 from omegaconf import OmegaConf
 from torchvision import transforms
-from torchvision.io import write_video
 from einops import rearrange
 import torch.distributed as dist
 from torch.utils.data import DataLoader, SequentialSampler, Subset
@@ -219,7 +219,12 @@ def _write_video_checked(path: str, frames: torch.Tensor, fps: int) -> None:
     stem, suffix = os.path.splitext(path)
     temporary = f"{stem}.tmp-{os.getpid()}{suffix or '.mp4'}"
     try:
-        write_video(temporary, frames, fps=fps)
+        iio.imwrite(
+            temporary,
+            frames.to(dtype=torch.uint8).cpu().numpy(),
+            fps=fps,
+            codec="libx264",
+        )
         if not _is_valid_video(temporary):
             raise RuntimeError(f"video encoder produced an empty file: {temporary}")
         os.replace(temporary, path)
