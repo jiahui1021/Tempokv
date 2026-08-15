@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import inspect
 from pathlib import Path
 
 import pytest
@@ -15,6 +16,11 @@ SPEC = importlib.util.spec_from_file_location("compare_v_predictors", MODULE_PAT
 assert SPEC is not None and SPEC.loader is not None
 MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
+
+
+def test_candidate_accepts_trace_array_field_names() -> None:
+    parameters = inspect.signature(MODULE._candidate).parameters
+    assert {"keys", "values", "q_post_rope", "k_post_rope"} <= set(parameters)
 
 
 def test_ratio_summary_preserves_prompt_layer_and_head_axes() -> None:

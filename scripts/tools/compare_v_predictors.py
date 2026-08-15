@@ -212,8 +212,8 @@ def attention_summary(
     clean_value: torch.Tensor,
     rebuilt_key: torch.Tensor,
     rebuilt_value: torch.Tensor,
-    query_post_rope: torch.Tensor,
-    key_post_rope: torch.Tensor,
+    q_post_rope: torch.Tensor,
+    k_post_rope: torch.Tensor,
     *,
     prompt_count: int,
 ) -> dict[str, Any]:
@@ -225,8 +225,8 @@ def attention_summary(
             clean_value,
             rebuilt_key,
             rebuilt_value,
-            query_post_rope,
-            key_post_rope,
+            q_post_rope,
+            k_post_rope,
         )
     ]
     clean_key, clean_value, rebuilt_key, rebuilt_value, query, clean_key_post = tensors
@@ -283,8 +283,8 @@ def _candidate(
     mode: str,
     keys: torch.Tensor,
     values: torch.Tensor,
-    query_post_rope: torch.Tensor,
-    key_post_rope: torch.Tensor,
+    q_post_rope: torch.Tensor,
+    k_post_rope: torch.Tensor,
     key_parameters: TemporalParameters,
     value_parameters: TemporalParameters | CrossKVParameters,
     config: CodecConfig,
@@ -352,8 +352,8 @@ def _candidate(
             values,
             rebuilt_key,
             rebuilt_value,
-            query_post_rope,
-            key_post_rope,
+            q_post_rope,
+            k_post_rope,
             prompt_count=prompt_count,
         ),
     }
