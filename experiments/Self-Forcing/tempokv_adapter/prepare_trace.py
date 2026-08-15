@@ -163,7 +163,10 @@ def convert_trace_root(
     output: Path,
     *,
     legacy_protocol: bool = False,
+    trace_role: str = "calibration",
 ) -> dict[str, object]:
+    if trace_role not in {"calibration", "diagnostic"}:
+        raise ValueError("trace_role must be calibration or diagnostic")
     root = root.expanduser().resolve()
     if not root.is_dir():
         raise FileNotFoundError(f"trace directory does not exist: {root}")
@@ -271,6 +274,7 @@ def convert_trace_root(
         legacy_trace_protocol=np.asarray(
             _LEGACY_TRACE_PROTOCOL if legacy_protocol else ""
         ),
+        trace_role=np.asarray(trace_role),
     )
     report = {
         "status": "complete",
@@ -278,6 +282,7 @@ def convert_trace_root(
         "output": str(output),
         "events": len(event_starts),
         "legacy_protocol": legacy_protocol,
+        "trace_role": trace_role,
         "arrays": sorted(merged),
         "shape": list(keys.shape),
     }
@@ -292,12 +297,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("trace_root", type=Path)
     parser.add_argument("output", type=Path)
     parser.add_argument("--legacy-protocol", action="store_true")
+    parser.add_argument(
+        "--trace-role", choices=("calibration", "diagnostic"), default="calibration"
+    )
     args = parser.parse_args(argv)
     try:
         convert_trace_root(
             args.trace_root,
             args.output,
             legacy_protocol=args.legacy_protocol,
+            trace_role=args.trace_role,
         )
     except (OSError, ValueError) as error:
         parser.error(str(error))

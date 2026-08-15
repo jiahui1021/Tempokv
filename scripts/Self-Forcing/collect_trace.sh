@@ -26,6 +26,8 @@
 #   MODEL_CONFIG   Self-Forcing 配置（默认使用仓库内置的 self_forcing_dmd.yaml）
 #   NUM_GPUS       采集用 GPU 数量（默认 1；多卡按 prompt 分片，数据与单卡一致）
 #   LEGACY_PROTOCOL  使用 legacy 原始拟合数据协议（0/1，默认 1）
+#   TRACE_ROLE     calibration（默认）或 diagnostic；diagnostic 允许使用另一组
+#                  恰好 12 条 prompt，并把角色写入 trace，fitter 会拒绝误用
 #   TRACE_FRAMES   每个 prompt 生成的 latent 帧数（legacy 固定 51）
 #   TRACE_TOKENS_PER_FRAME  每帧抽取的 token 数（legacy 固定 8）
 #   BASE_SEED      随机种子（默认 0）
@@ -62,6 +64,11 @@ fi
 
 LEGACY_PROTOCOL="${LEGACY_PROTOCOL:-1}"
 check_flag LEGACY_PROTOCOL
+TRACE_ROLE="${TRACE_ROLE:-calibration}"
+case "$TRACE_ROLE" in
+  calibration|diagnostic) ;;
+  *) die "TRACE_ROLE 必须是 calibration 或 diagnostic（当前值：${TRACE_ROLE}）" ;;
+esac
 if [[ "$LEGACY_PROTOCOL" == "1" ]]; then
   default_trace_frames=51
 else
@@ -128,6 +135,7 @@ fi
 merge_command=(
   "$python_bin" "$adapter_root/prepare_trace.py"
   "$raw_trace_dir" "$trace_file"
+  --trace-role "$TRACE_ROLE"
 )
 [[ "$LEGACY_PROTOCOL" == "1" ]] && merge_command+=(--legacy-protocol)
 
@@ -149,17 +157,20 @@ fi
 [[ -d "$wan_model_dir" ]] || die "WAN_MODEL_DIR 不存在：$wan_model_dir"
 [[ -f "$prompts" ]] || die "PROMPTS 不存在：$prompts"
 if [[ "$LEGACY_PROTOCOL" == "1" ]]; then
-  "$python_bin" - "$prompts" "$project_root/assets/moviegen128.txt" <<'PY'
+  "$python_bin" - "$prompts" "$project_root/assets/moviegen128.txt" "$TRACE_ROLE" <<'PY'
 from pathlib import Path
 import sys
 
 PROMPT_COUNT = 12
 actual = Path(sys.argv[1]).read_text(encoding="utf-8").splitlines()
 reference = Path(sys.argv[2]).read_text(encoding="utf-8").splitlines()[:PROMPT_COUNT]
+role = sys.argv[3]
 if len(actual) != PROMPT_COUNT or any(not line.strip() for line in actual):
-    raise SystemExit("LEGACY_PROTOCOL 的 PROMPTS 必须恰好包含 12 条非空 prompt")
-if actual != reference:
-    raise SystemExit("LEGACY_PROTOCOL 的 PROMPTS 必须是 moviegen128.txt 的前 12 条")
+  raise SystemExit("LEGACY_PROTOCOL 的 PROMPTS 必须恰好包含 12 条非空 prompt")
+if role == "calibration" and actual != reference:
+  raise SystemExit("LEGACY_PROTOCOL 的 PROMPTS 必须是 moviegen128.txt 的前 12 条")
+if role == "diagnostic" and actual == reference:
+  raise SystemExit("diagnostic trace 必须与前 12 条 calibration prompts 不同")
 PY
 fi
 

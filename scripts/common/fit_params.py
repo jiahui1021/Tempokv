@@ -260,6 +260,7 @@ def _load_trace(
                 "frames_per_event",
                 "tokens_per_frame",
                 "legacy_trace_protocol",
+                "trace_role",
             ):
                 if name in archive:
                     metadata[name] = np.asarray(archive[name]).item()
@@ -432,6 +433,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 f"trace {name} metadata is {int(recorded)}, but the array has {actual}"
             )
     if config.fit_mode == "legacy":
+        if trace_metadata.get("trace_role", "calibration") != "calibration":
+            raise ValueError(
+                "legacy fitting rejects diagnostic traces; use the calibration trace"
+            )
         events = 2 * LEGACY_PROMPT_COUNT
         expected_trace_metadata: dict[str, object] = {
             "trace_layout": "legacy_event_bpfhd_v1",
