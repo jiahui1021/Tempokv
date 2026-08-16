@@ -249,19 +249,28 @@ python scripts/evaluation/evaluate_quality.py \
 frame FID。这里的 FID 以同 prompt、同 seed 的 BF16 视频为 reference，衡量量化后的帧
 分布偏移，**不是**生成视频相对真实数据集的标准 FID，也不替代时间一致性评测。
 
-一键跑 quality/FID 加 BF16 与候选各自的 VBench：
+一键跑 quality/FID，加 BF16 与候选各自的 VBench-Long custom-input 六维评测：
 
 ```bash
 BASELINE_DIR=results/self_forcing/bf16/videos \
 CANDIDATE_DIR=results/self_forcing/legacy-kh2-vh1-int4/videos \
 CANDIDATE_NAME=legacy-kh2-vh1-int4 \
 OUTPUT_DIR=results/self_forcing/evaluation \
+PROMPT_FILE=results/self_forcing/moviegen128_prompts.json \
+VBENCH_CACHE_DIR=~/storage/cache/vbench \
 DEVICE=cuda \
 bash scripts/evaluation/evaluate_all.sh
 ```
 
-脚本按视频清单与 VBench 配置指纹复用已完成的 BF16 VBench，输入或配置变化自动重算，
-`FORCE=1` 强制重算。其余可选变量见
+`PROMPT_FILE` 必须是从每个视频文件名到原始 prompt 的完整 JSON 映射。脚本把视频链接到
+评测输出目录内的隔离 staging 区，再由官方 VBench-Long 做长视频切片与 slow-fast 评测；
+原始视频目录不会写入 `split_clip`。默认六维为 subject consistency、background
+consistency、motion smoothness、dynamic degree、aesthetic quality 和 imaging quality。
+该口径不是官方 VBench Total，也不会补算自定义输入未定义的八维 aggregate。
+
+脚本按视频清单、prompt 映射和 VBench-Long 配置指纹复用已完成的 BF16 结果，输入或配置
+变化自动重算，`FORCE=1` 强制重算。真实运行需要完整的官方 VBench checkout，使
+`vbench2_beta_long` 可导入，并设置已有模型权重根 `VBENCH_CACHE_DIR`。其余可选变量见
 [`scripts/evaluation/evaluate_all.sh`](scripts/evaluation/evaluate_all.sh) 头部。
 
 ## 运行时加速路径

@@ -15,6 +15,12 @@ def _environment(tmp_path: Path, *, fail_name: str = "") -> tuple[dict[str, str]
     candidate.mkdir()
     (baseline / "0_0.mp4").write_bytes(b"baseline")
     (candidate / "0_0.mp4").write_bytes(b"candidate")
+    prompt_file = tmp_path / "prompts.json"
+    prompt_file.write_text(
+        '{"0_0.mp4":"a test prompt"}\n', encoding="utf-8"
+    )
+    cache = tmp_path / "vbench-cache"
+    cache.mkdir()
     log = tmp_path / "calls.log"
     fake_python = tmp_path / "fake-python"
     fake_python.write_text(
@@ -49,6 +55,8 @@ done
             "CANDIDATE_DIR": str(candidate),
             "CANDIDATE_NAME": "int2",
             "OUTPUT_DIR": str(tmp_path / "evaluation"),
+            "PROMPT_FILE": str(prompt_file),
+            "VBENCH_CACHE_DIR": str(cache),
             "DEVICE": "cuda:1",
             "FRAME_STRIDE": "3",
             "FID_BATCH_SIZE": "8",
@@ -73,6 +81,8 @@ def test_shell_calls_quality_then_baseline_and_candidate_vbench(tmp_path) -> Non
     assert "--fid-batch-size 8" in calls[0]
     assert "--name bf16" in calls[1]
     assert "--name int2" in calls[2]
+    assert "--mode long_custom_input" in calls[1]
+    assert "--prompt-file" in calls[1]
     assert "--reuse-complete" in calls[1]
 
 
