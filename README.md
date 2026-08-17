@@ -249,7 +249,7 @@ python scripts/evaluation/evaluate_quality.py \
 frame FID。这里的 FID 以同 prompt、同 seed 的 BF16 视频为 reference，衡量量化后的帧
 分布偏移，**不是**生成视频相对真实数据集的标准 FID，也不替代时间一致性评测。
 
-一键跑 quality/FID，加 BF16 与候选各自的 VBench-Long custom-input 六维评测：
+一键跑 quality/FID，加 BF16 与候选各自的 VBench-Long 八维评测：
 
 ```bash
 BASELINE_DIR=results/self_forcing/bf16/videos \
@@ -264,9 +264,12 @@ bash scripts/evaluation/evaluate_all.sh
 
 `PROMPT_FILE` 必须是从每个视频文件名到原始 prompt 的完整 JSON 映射。脚本把视频链接到
 评测输出目录内的隔离 staging 区，再由官方 VBench-Long 做长视频切片与 slow-fast 评测；
-原始视频目录不会写入 `split_clip`。默认六维为 subject consistency、background
-consistency、motion smoothness、dynamic degree、aesthetic quality 和 imaging quality。
-该口径不是官方 VBench Total，也不会补算自定义输入未定义的八维 aggregate。
+原始视频目录不会写入 `split_clip`。默认运行八个底层指标：subject consistency、
+background consistency、motion smoothness、dynamic degree、aesthetic quality、imaging
+quality、overall consistency 和 CLIP score。评测同时生成 `*_vbench_long_summary.json`：
+论文表中的 `Visual Quality` 是前六维的算术平均，`Text Alignment` 是 overall
+consistency 与 CLIP score 的算术平均。因此表格展示为六个视觉分项加两个聚合列。
+该八维口径标记为 `vbench_long_custom8_derived`，不是官方 VBench Total。
 
 脚本按视频清单、prompt 映射和 VBench-Long 配置指纹复用已完成的 BF16 结果，输入或配置
 变化自动重算，`FORCE=1` 强制重算。真实运行需要完整的官方 VBench checkout，使

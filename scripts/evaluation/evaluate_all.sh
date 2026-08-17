@@ -49,8 +49,10 @@ FID_BATCH_SIZE="${FID_BATCH_SIZE:-32}"
 FRAME_STRIDE="${FRAME_STRIDE:-1}"
 VBENCH_MODE="${VBENCH_MODE:-long_custom_input}"
 VBENCH_READ_FRAME="${VBENCH_READ_FRAME:-0}"
+VBENCH_LOCAL_CHECKPOINTS="${VBENCH_LOCAL_CHECKPOINTS:-0}"
 FORCE="${FORCE:-0}"
 check_flag VBENCH_READ_FRAME
+check_flag VBENCH_LOCAL_CHECKPOINTS
 check_flag FORCE
 [[ "$FID_BATCH_SIZE" =~ ^[1-9][0-9]*$ ]] || die "FID_BATCH_SIZE 必须是正整数"
 [[ "$FRAME_STRIDE" =~ ^[1-9][0-9]*$ ]] || die "FRAME_STRIDE 必须是正整数"
@@ -98,6 +100,7 @@ vbench_common=(--device "$DEVICE" --mode "$VBENCH_MODE")
 [[ -n "${VBENCH_DIMENSIONS:-}" ]] && vbench_common+=(--dimensions "$VBENCH_DIMENSIONS")
 [[ -n "${VBENCH_FULL_INFO:-}" ]] && vbench_common+=(--full-info "$vbench_full_info")
 [[ "$VBENCH_READ_FRAME" == "1" ]] && vbench_common+=(--read-frame)
+[[ "$VBENCH_LOCAL_CHECKPOINTS" == "1" ]] && vbench_common+=(--local-checkpoints)
 [[ "$FORCE" == "0" ]] && vbench_common+=(--reuse-complete)
 
 printf '[evaluate_all] quality + FID: %s\n' "$CANDIDATE_NAME"

@@ -75,7 +75,7 @@ def test_completed_fingerprint_is_reused_and_video_change_invalidates(
     assert saved["input_fingerprint"] == third["input_fingerprint"]
 
 
-def test_custom_mode_requires_complete_prompt_mapping_and_six_dimensions(tmp_path) -> None:
+def test_custom_mode_requires_complete_prompt_mapping_and_uses_eight_metrics(tmp_path) -> None:
     videos, prompt_file = _inputs(tmp_path)
     common = [str(videos), "--output-dir", str(tmp_path / "results")]
 
@@ -89,7 +89,14 @@ def test_custom_mode_requires_complete_prompt_mapping_and_six_dimensions(tmp_pat
         )
 
     prompt_file.write_text('{"0_0.mp4": "prompt"}', encoding="utf-8")
-    with pytest.raises(ValueError, match="does not support overall_consistency"):
+    config, _ = vbench.prepare(
+        vbench._parser().parse_args(common + ["--prompt-file", str(prompt_file)])
+    )
+    assert config["dimensions"] == list(vbench.CUSTOM_INPUT_DIMENSIONS)
+    assert config["dimensions"][-2:] == ["overall_consistency", "clip_score"]
+    assert config["display_columns"][-2:] == ["visual_quality", "text_alignment"]
+
+    with pytest.raises(ValueError, match="does not support temporal_flickering"):
         vbench.prepare(
             vbench._parser().parse_args(
                 common
@@ -97,7 +104,7 @@ def test_custom_mode_requires_complete_prompt_mapping_and_six_dimensions(tmp_pat
                     "--prompt-file",
                     str(prompt_file),
                     "--dimensions",
-                    "subject_consistency,overall_consistency",
+                    "subject_consistency,temporal_flickering",
                 ]
             )
         )
@@ -168,6 +175,7 @@ def test_vbench_long_stages_links_and_runs_each_dimension(tmp_path, monkeypatch)
     (package / "__init__.py").write_text("", encoding="utf-8")
     (package / "VBench_full_info.json").write_text("[]", encoding="utf-8")
     calls = []
+    competition_calls = []
 
     class FakeVBenchLong:
         def __init__(self, device, full_info, output_path):
@@ -177,20 +185,55 @@ def test_vbench_long_stages_links_and_runs_each_dimension(tmp_path, monkeypatch)
 
         def evaluate(self, **kwargs):
             calls.append(kwargs)
-            result = self.output_path / (
-                f"{kwargs['name']}_{kwargs['dimension']}_eval_results.json"
-            )
+            dimension = kwargs["dimension_list"][0]
+            result = self.output_path / f"{kwargs['name']}_eval_results.json"
             result.write_text(
-                json.dumps({kwargs["dimension"]: [0.75, {"video": 0.5}]}),
+                json.dumps({dimension: [0.75, {"video": 0.5}]}),
                 encoding="utf-8",
             )
 
     fake_module = SimpleNamespace(
         VBenchLong=FakeVBenchLong, __file__=str(package / "__init__.py")
     )
+    competition_package = tmp_path / "competitions"
+    competition_configs = competition_package / "configs"
+    competition_configs.mkdir(parents=True)
+    (competition_package / "__init__.py").write_text("", encoding="utf-8")
+
+    class FakeVBenchCompetition:
+        def __init__(self, device, _full_info, output_path):
+            self.output_path = Path(output_path)
+            assert device == "fake-device"
+
+        def evaluate_long(self, **kwargs):
+            competition_calls.append(kwargs)
+            result = self.output_path / f"{kwargs['name']}_eval_results.json"
+            result.write_text(
+                json.dumps(
+                    {
+                        "text_alignment": [
+                            0.75,
+                            {
+                                "overall_consistency": [0.75, {"video": 0.5}],
+                                "clip_score": [0.75, {"video": 0.5}],
+                            },
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+    fake_competitions = SimpleNamespace(
+        VBenchCompetition=FakeVBenchCompetition,
+        __file__=str(competition_package / "__init__.py"),
+    )
     monkeypatch.setenv("VBENCH_CACHE_DIR", str(cache))
     monkeypatch.setattr(vbench, "_device", lambda name: "fake-device")
-    monkeypatch.setattr(vbench.importlib, "import_module", lambda name: fake_module)
+    monkeypatch.setattr(
+        vbench.importlib,
+        "import_module",
+        lambda name: fake_competitions if name == "competitions" else fake_module,
+    )
     before = sorted(path.name for path in videos.iterdir())
     config, prompts = vbench.prepare(
         vbench._parser().parse_args(
@@ -209,13 +252,86 @@ def test_vbench_long_stages_links_and_runs_each_dimension(tmp_path, monkeypatch)
     assert completed == list(vbench.CUSTOM_INPUT_DIMENSIONS)
     assert sorted(path.name for path in videos.iterdir()) == before
     staging = output / vbench.STAGING_DIR_NAME
-    assert sorted(path.name for path in staging.iterdir()) == ["0-0.mp4", "1-0.mp4"]
+    assert sorted(path.name for path in staging.iterdir()) == [
+        "0001_input-0.mp4",
+        "0002_input-0.mp4",
+    ]
     assert all(path.is_symlink() for path in staging.iterdir())
-    assert [call["dimension"] for call in calls] == list(vbench.CUSTOM_INPUT_DIMENSIONS)
+    assert [call["dimension_list"] for call in calls] == [
+        [dimension] for dimension in vbench.VISUAL_DIMENSIONS
+    ]
+    assert [call["name"] for call in calls] == [
+        f"videos_{dimension}" for dimension in vbench.VISUAL_DIMENSIONS
+    ]
+    assert [call["dimension_list"] for call in competition_calls] == [["text_alignment"]]
+    assert all(call["local"] is False for call in calls)
     assert all(call["mode"] == "long_custom_input" for call in calls)
     assert all(call["prompt_list"] == ["prompt 0", "prompt 1"] for call in calls)
     assert all(call["use_semantic_splitting"] is False for call in calls)
     assert all(call["imaging_quality_preprocessing_mode"] == "longer" for call in calls)
+    summary = json.loads(
+        (output / "videos_vbench_long_summary.json").read_text(encoding="utf-8")
+    )
+    assert summary["protocol"] == "vbench_long_custom8_derived"
+    assert summary["display_columns"] == list(vbench.DISPLAY_COLUMNS)
+    assert summary["display_scores"]["visual_quality"] == pytest.approx(0.75)
+    assert summary["display_scores"]["text_alignment"] == pytest.approx(0.75)
+    assert summary["official_vbench_total"] is False
+
+
+def test_local_checkpoints_are_fingerprinted_and_forwarded(tmp_path, monkeypatch) -> None:
+    videos, prompt_file = _inputs(tmp_path)
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    package = tmp_path / "vbench2_beta_long"
+    configs = package / "configs"
+    configs.mkdir(parents=True)
+    for filename in (
+        "clip_length_mix.yaml",
+        "slow_fast_params.yaml",
+        "subject_mapping_table.yaml",
+        "background_mapping_table.yaml",
+    ):
+        (configs / filename).write_text("{}", encoding="utf-8")
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    (package / "VBench_full_info.json").write_text("[]", encoding="utf-8")
+    calls = []
+
+    class FakeVBenchLong:
+        def __init__(self, _device, _full_info, output_path):
+            self.output_path = Path(output_path)
+
+        def evaluate(self, **kwargs):
+            calls.append(kwargs)
+            result = self.output_path / f"{kwargs['name']}_eval_results.json"
+            dimension = kwargs["dimension_list"][0]
+            result.write_text(json.dumps({dimension: [0.5]}), encoding="utf-8")
+
+    fake_module = SimpleNamespace(
+        VBenchLong=FakeVBenchLong, __file__=str(package / "__init__.py")
+    )
+    monkeypatch.setenv("VBENCH_CACHE_DIR", str(cache))
+    monkeypatch.setattr(vbench, "_device", lambda _name: "fake-device")
+    monkeypatch.setattr(vbench, "_install_torchvision_write_video_compat", lambda: None)
+    monkeypatch.setattr(vbench.importlib, "import_module", lambda _name: fake_module)
+    config, prompts = vbench.prepare(
+        vbench._parser().parse_args(
+            [
+                str(videos),
+                "--output-dir",
+                str(tmp_path / "results"),
+                "--prompt-file",
+                str(prompt_file),
+                "--dimensions",
+                "subject_consistency",
+                "--local-checkpoints",
+            ]
+        )
+    )
+
+    assert config["local_checkpoints"] is True
+    vbench.run(config, prompts)
+    assert calls[0]["local"] is True
 
 
 def test_failure_is_recorded_and_not_reusable(tmp_path, monkeypatch) -> None:
@@ -250,3 +366,17 @@ def test_non_finite_dimension_result_is_rejected(tmp_path) -> None:
 
     with pytest.raises(RuntimeError, match="missing or non-finite"):
         vbench._validate_result(result, "subject_consistency")
+
+
+def test_summary_matches_eight_column_paper_protocol(tmp_path) -> None:
+    scores = {
+        dimension: float(index)
+        for index, dimension in enumerate(vbench.CUSTOM_INPUT_DIMENSIONS, start=1)
+    }
+
+    path = vbench._write_summary(tmp_path, "candidate", scores)
+    summary = json.loads(path.read_text(encoding="utf-8"))
+
+    assert summary["display_scores"]["visual_quality"] == pytest.approx(3.5)
+    assert summary["display_scores"]["text_alignment"] == pytest.approx(7.5)
+    assert len(summary["display_scores"]) == 8

@@ -12,10 +12,11 @@ import os
 from pathlib import Path
 import re
 import shutil
+import sys
 from typing import Any
 
 
-CUSTOM_INPUT_DIMENSIONS = (
+VISUAL_DIMENSIONS = (
     "subject_consistency",
     "background_consistency",
     "motion_smoothness",
@@ -23,10 +24,14 @@ CUSTOM_INPUT_DIMENSIONS = (
     "aesthetic_quality",
     "imaging_quality",
 )
-DEFAULT_STANDARD_DIMENSIONS = CUSTOM_INPUT_DIMENSIONS + (
-    "temporal_flickering",
+TEXT_ALIGNMENT_DIMENSIONS = (
     "overall_consistency",
+    "clip_score",
 )
+CUSTOM_INPUT_DIMENSIONS = VISUAL_DIMENSIONS + TEXT_ALIGNMENT_DIMENSIONS
+DEFAULT_STANDARD_DIMENSIONS = CUSTOM_INPUT_DIMENSIONS
+PROTOCOL = "vbench_long_custom8_derived"
+DISPLAY_COLUMNS = VISUAL_DIMENSIONS + ("visual_quality", "text_alignment")
 VIDEO_EXTENSIONS = (".mp4", ".avi", ".mov")
 DIMENSION_NAME = re.compile(r"^[a-z][a-z0-9_]*$")
 EVALUATOR = "vbench_long"
@@ -60,7 +65,7 @@ def _parser() -> argparse.ArgumentParser:
         "--dimensions",
         help=(
             "Comma-separated VBench-Long dimensions; long_custom_input defaults "
-            "to the six dimensions officially supported for custom videos"
+            "to the frozen eight-metric long-video protocol"
         ),
     )
     parser.add_argument(
@@ -83,6 +88,11 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--device", default="auto", help="auto, cpu, cuda, or cuda:N")
     parser.add_argument("--read-frame", action="store_true")
+    parser.add_argument(
+        "--local-checkpoints",
+        action="store_true",
+        help="Load VBench models from VBENCH_CACHE_DIR instead of model hubs",
+    )
     parser.add_argument(
         "--dry-run",
         action="store_true",
@@ -202,6 +212,7 @@ def _fingerprint(
     full_info: Path | None,
     device: str,
     read_frame: bool,
+    local_checkpoints: bool,
 ) -> str:
     inventory = [
         {
@@ -221,6 +232,7 @@ def _fingerprint(
         }
     payload = {
         "evaluator": EVALUATOR,
+        "protocol": PROTOCOL,
         "videos_path": str(videos[0].parent),
         "videos": inventory,
         "name": name,
@@ -231,7 +243,9 @@ def _fingerprint(
         "full_info": full_info_stat,
         "device": device,
         "read_frame": read_frame,
+        "local_checkpoints": local_checkpoints,
         "preprocessing": PREPROCESSING,
+        "display_columns": DISPLAY_COLUMNS,
     }
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
     return hashlib.sha256(encoded).hexdigest()
@@ -253,7 +267,7 @@ def prepare(args: argparse.Namespace) -> tuple[dict[str, Any], dict[str, str]]:
             raise ValueError(
                 "VBench-Long does not support "
                 + ", ".join(unsupported)
-                + " for custom input; use only the six official custom-input dimensions"
+                + " in the frozen eight-metric custom-input protocol"
             )
     name = _safe_name(args.name or videos_dir.name)
     prompt_path = args.prompt_file.expanduser().resolve() if args.prompt_file else None
@@ -269,6 +283,7 @@ def prepare(args: argparse.Namespace) -> tuple[dict[str, Any], dict[str, str]]:
     mapping = _staging_mapping(video_paths, prompts, args.mode)
     config = {
         "evaluator": EVALUATOR,
+        "protocol": PROTOCOL,
         "videos_path": str(videos_dir),
         "video_count": len(video_paths),
         "output_path": str(output_dir),
@@ -276,11 +291,13 @@ def prepare(args: argparse.Namespace) -> tuple[dict[str, Any], dict[str, str]]:
         "staging_mapping": mapping,
         "name": name,
         "dimensions": list(dimensions),
+        "display_columns": list(DISPLAY_COLUMNS),
         "mode": args.mode,
         "prompt_file": str(prompt_path) if prompt_path else None,
         "full_info": str(full_info) if full_info else None,
         "device": args.device,
         "read_frame": bool(args.read_frame),
+        "local_checkpoints": bool(args.local_checkpoints),
         "preprocessing": dict(PREPROCESSING),
         "input_fingerprint": _fingerprint(
             video_paths,
@@ -292,6 +309,7 @@ def prepare(args: argparse.Namespace) -> tuple[dict[str, Any], dict[str, str]]:
             full_info=full_info,
             device=args.device,
             read_frame=bool(args.read_frame),
+            local_checkpoints=bool(args.local_checkpoints),
         ),
     }
     return config, prompts
@@ -308,6 +326,31 @@ def _device(name: str):
     if selected.startswith("cuda") and not torch.cuda.is_available():
         raise RuntimeError(f"CUDA device {selected!r} was requested but CUDA is unavailable")
     return torch.device(selected)
+
+
+def _install_torchvision_write_video_compat() -> None:
+    """Restore the API used by VBench-Long after Torchvision 0.26 removed it."""
+    torchvision_io = importlib.import_module("torchvision.io")
+    if hasattr(torchvision_io, "write_video"):
+        return
+
+    imageio = importlib.import_module("imageio.v3")
+    numpy = importlib.import_module("numpy")
+
+    def write_video(filename, video_array, fps, video_codec=None, **_kwargs):
+        frames = video_array.detach().cpu().numpy()
+        if frames.dtype != numpy.uint8:
+            frames = numpy.clip(frames, 0, 255).astype(numpy.uint8)
+        imageio.imwrite(
+            filename,
+            frames,
+            plugin="FFMPEG",
+            fps=float(fps),
+            codec=video_codec or "libx264",
+            pixelformat="yuv420p",
+        )
+
+    torchvision_io.write_video = write_video
 
 
 def _stage_videos(config: dict[str, Any]) -> Path:
@@ -327,6 +370,17 @@ def _stage_videos(config: dict[str, Any]) -> Path:
     return staging_dir
 
 
+def _restage_for_competition(staging_dir: Path, config: dict[str, Any]) -> None:
+    """Match the official competition's one-based filename/prompt contract."""
+    split_clips = staging_dir / "split_clip"
+    if split_clips.exists():
+        shutil.rmtree(split_clips)
+    for index, entry in enumerate(config["staging_mapping"], start=1):
+        source = staging_dir / entry["staged_name"]
+        destination = staging_dir / f"{index:04d}_input-0{source.suffix.lower()}"
+        source.rename(destination)
+
+
 def _numeric_values(value: Any) -> list[float]:
     if isinstance(value, bool):
         return []
@@ -339,7 +393,7 @@ def _numeric_values(value: Any) -> list[float]:
     return []
 
 
-def _validate_result(path: Path, dimension: str) -> None:
+def _validate_result(path: Path, dimension: str) -> float:
     if not path.is_file():
         raise RuntimeError(f"VBench-Long did not produce {path.name}")
     try:
@@ -351,6 +405,64 @@ def _validate_result(path: Path, dimension: str) -> None:
     numbers = _numeric_values(payload[dimension])
     if not numbers or not all(math.isfinite(number) for number in numbers):
         raise RuntimeError(f"VBench-Long result for {dimension} is missing or non-finite")
+    return numbers[0]
+
+
+def _write_summary(output_dir: Path, name: str, scores: dict[str, float]) -> Path:
+    missing = [dimension for dimension in CUSTOM_INPUT_DIMENSIONS if dimension not in scores]
+    if missing:
+        raise RuntimeError(
+            "cannot summarize an incomplete VBench-Long custom8 run: "
+            + ", ".join(missing)
+        )
+    temporal_quality = (
+        scores["subject_consistency"]
+        + scores["background_consistency"]
+        + scores["motion_smoothness"]
+        + 0.5 * scores["dynamic_degree"]
+    ) / 3.5
+    frame_wise_quality = (
+        scores["aesthetic_quality"] + scores["imaging_quality"]
+    ) / 2.0
+    visual_quality = sum(scores[dimension] for dimension in VISUAL_DIMENSIONS) / len(
+        VISUAL_DIMENSIONS
+    )
+    text_alignment = sum(
+        scores[dimension] for dimension in TEXT_ALIGNMENT_DIMENSIONS
+    ) / len(TEXT_ALIGNMENT_DIMENSIONS)
+    display_scores = {
+        dimension: scores[dimension] for dimension in VISUAL_DIMENSIONS
+    }
+    display_scores.update(
+        {"visual_quality": visual_quality, "text_alignment": text_alignment}
+    )
+    summary = {
+        "schema_version": 1,
+        "protocol": PROTOCOL,
+        "raw_dimensions": list(CUSTOM_INPUT_DIMENSIONS),
+        "raw_scores": {
+            dimension: scores[dimension] for dimension in CUSTOM_INPUT_DIMENSIONS
+        },
+        "display_columns": list(DISPLAY_COLUMNS),
+        "display_scores": display_scores,
+        "official_competition_aspects": {
+            "temporal_quality": temporal_quality,
+            "frame_wise_quality": frame_wise_quality,
+            "text_alignment": text_alignment,
+        },
+        "aggregation": {
+            "temporal_quality": "(subject_consistency + background_consistency + motion_smoothness + 0.5 * dynamic_degree) / 3.5",
+            "frame_wise_quality": "(aesthetic_quality + imaging_quality) / 2",
+            "visual_quality": "mean of the six visual dimensions",
+            "text_alignment": "official competition formula: (overall_consistency + clip_score) / 2",
+        },
+        "official_vbench_total": False,
+    }
+    path = output_dir / f"{name}_vbench_long_summary.json"
+    path.write_text(
+        json.dumps(summary, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+    )
+    return path
 
 
 def _runtime_full_info(module: Any, config: dict[str, Any]) -> Path:
@@ -375,6 +487,7 @@ def run(config: dict[str, Any], prompts: dict[str, str]) -> list[str]:
     cache_dir = Path(cache_dir_text).expanduser().resolve()
     if not cache_dir.is_dir():
         raise RuntimeError(f"VBENCH_CACHE_DIR does not exist: {cache_dir}")
+    _install_torchvision_write_video_compat()
     try:
         module = importlib.import_module("vbench2_beta_long")
         evaluator_type = getattr(module, "VBenchLong")
@@ -404,21 +517,39 @@ def run(config: dict[str, Any], prompts: dict[str, str]) -> list[str]:
             + ", ".join(missing_configs)
         )
     staging_dir = _stage_videos(config)
-    evaluator = evaluator_type(_device(config["device"]), str(full_info), str(output_dir))
+    device = _device(config["device"])
+    evaluator = evaluator_type(device, str(full_info), str(output_dir))
     prompt_list = [
         prompts[entry["source_name"]]
         for entry in config["staging_mapping"]
         if entry["prompt_index"] is not None
     ]
     completed = []
-    for dimension in config["dimensions"]:
-        result_path = output_dir / f"{config['name']}_{dimension}_eval_results.json"
+    scores = {}
+    requested_text = [
+        dimension
+        for dimension in TEXT_ALIGNMENT_DIMENSIONS
+        if dimension in config["dimensions"]
+    ]
+    if requested_text and tuple(requested_text) != TEXT_ALIGNMENT_DIMENSIONS:
+        raise RuntimeError(
+            "overall_consistency and clip_score must be evaluated together via "
+            "the official VBench competition text_alignment aspect"
+        )
+    for dimension in (
+        dimension
+        for dimension in config["dimensions"]
+        if dimension not in TEXT_ALIGNMENT_DIMENSIONS
+    ):
+        run_name = f"{config['name']}_{dimension}"
+        result_path = output_dir / f"{run_name}_eval_results.json"
         result_path.unlink(missing_ok=True)
         evaluator.evaluate(
             videos_path=str(staging_dir),
-            name=config["name"],
+            name=run_name,
             prompt_list=prompt_list,
-            dimension=dimension,
+            dimension_list=[dimension],
+            local=config["local_checkpoints"],
             read_frame=config["read_frame"],
             mode=config["mode"],
             sb_clip2clip_feat_extractor=preprocessing["sb_clip2clip_feat_extractor"],
@@ -441,8 +572,74 @@ def run(config: dict[str, Any], prompts: dict[str, str]) -> list[str]:
             split_rank=preprocessing["split_rank"],
             split_world_size=preprocessing["split_world_size"],
         )
-        _validate_result(result_path, dimension)
+        scores[dimension] = _validate_result(result_path, dimension)
         completed.append(dimension)
+    if requested_text:
+        _restage_for_competition(staging_dir, config)
+        vbench_root = Path(module.__file__).resolve().parent.parent
+        competition_module_dir = vbench_root / "competitions"
+        if str(competition_module_dir) not in sys.path:
+            sys.path.insert(0, str(competition_module_dir))
+        try:
+            competition_module = importlib.import_module("competitions")
+            competition_type = getattr(competition_module, "VBenchCompetition")
+        except (ImportError, AttributeError) as error:
+            raise RuntimeError(
+                "the official VBench competitions package is required for text_alignment"
+            ) from error
+        competition_config_dir = Path(competition_module.__file__).resolve().parent / "configs"
+        competition = competition_type(device, None, str(output_dir))
+        text_name = f"{config['name']}_text_alignment"
+        text_result = output_dir / f"{text_name}_eval_results.json"
+        text_result.unlink(missing_ok=True)
+        competition.evaluate_long(
+            videos_path=str(staging_dir),
+            name=text_name,
+            prompt_list=prompt_list,
+            dimension_list=["text_alignment"],
+            local=config["local_checkpoints"],
+            read_frame=config["read_frame"],
+            mode=config["mode"],
+            clip_length_config=preprocessing["clip_length_config"],
+            use_semantic_splitting=preprocessing["use_semantic_splitting"],
+            slow_fast_eval_config=str(
+                competition_config_dir / preprocessing["slow_fast_eval_config"]
+            ),
+            dev_flag=preprocessing["dev_flag"],
+            sb_mapping_file_path=str(
+                competition_config_dir / preprocessing["sb_mapping_file"]
+            ),
+            bg_mapping_file_path=str(
+                competition_config_dir / preprocessing["bg_mapping_file"]
+            ),
+            sb_clip2clip_feat_extractor=preprocessing["sb_clip2clip_feat_extractor"],
+            bg_clip2clip_feat_extractor=preprocessing["bg_clip2clip_feat_extractor"],
+            imaging_quality_preprocessing_mode=preprocessing[
+                "imaging_quality_preprocessing_mode"
+            ],
+            w_inclip=preprocessing["w_inclip"],
+            w_clip2clip=preprocessing["w_clip2clip"],
+            num_of_samples_per_prompt=preprocessing["num_of_samples_per_prompt"],
+            split_rank=preprocessing["split_rank"],
+            split_world_size=preprocessing["split_world_size"],
+        )
+        payload = json.loads(text_result.read_text(encoding="utf-8"))
+        try:
+            subdimensions = payload["text_alignment"][1]
+        except (KeyError, IndexError, TypeError) as error:
+            raise RuntimeError(
+                f"official competition result is malformed: {text_result}"
+            ) from error
+        for dimension in TEXT_ALIGNMENT_DIMENSIONS:
+            dimension_result = output_dir / f"{config['name']}_{dimension}_eval_results.json"
+            dimension_result.write_text(
+                json.dumps({dimension: subdimensions[dimension]}, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            scores[dimension] = _validate_result(dimension_result, dimension)
+            completed.append(dimension)
+    if all(dimension in scores for dimension in CUSTOM_INPUT_DIMENSIONS):
+        _write_summary(output_dir, config["name"], scores)
     return completed
 
 
