@@ -99,6 +99,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--end-index", type=int, default=-1)
     parser.add_argument("--num-gpus", type=int, default=1)
     parser.add_argument("--local-attn-size", type=int)
+    parser.add_argument(
+        "--span-frames",
+        type=int,
+        help=(
+            "latent frames per independently anchored TempoKV span; unset "
+            "preserves the historical 24-frame lifecycle"
+        ),
+    )
     parser.add_argument("--triton-cache", type=Path)
     parser.add_argument(
         "--allow-triton-fallback",
@@ -501,9 +509,9 @@ def _end_to_end_latency(
     for batch in batch_entries:
         if int(batch.get("generated_samples", 0) or 0) <= 0:
             continue
-        total = batch.get("total_seconds")
-        if isinstance(total, (int, float)) and total > 0:
-            candidates.append(float(total))
+        generation = batch.get("generation_seconds")
+        if isinstance(generation, (int, float)) and generation > 0:
+            candidates.append(float(generation))
     if not candidates:
         seen_prompts: set[object] = set()
         for video in video_entries:
@@ -513,9 +521,9 @@ def _end_to_end_latency(
             if prompt_index in seen_prompts:
                 continue
             seen_prompts.add(prompt_index)
-            total = video.get("total_seconds")
-            if isinstance(total, (int, float)) and total > 0:
-                candidates.append(float(total))
+            generation = video.get("generation_seconds")
+            if isinstance(generation, (int, float)) and generation > 0:
+                candidates.append(float(generation))
     if not candidates:
         return None
     return float(sum(candidates) / len(candidates))
@@ -577,6 +585,8 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         raise ValueError("benchmark mode does not allow --skip-existing")
     if args.num_gpus < 1:
         raise ValueError("num-gpus must be positive")
+    if args.span_frames is not None and args.span_frames < 2:
+        raise ValueError("span-frames must be at least 2")
     if args.local_attn_size is not None and (
         args.local_attn_size == 0 or args.local_attn_size < -1
     ):
@@ -633,6 +643,21 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         parameters = _validate_parameters(
             paths["k_params"], paths["v_params"], config
         )
+        if args.span_frames is not None:
+            fit_report_path = paths["k_params"].parent / "fit_report.json"
+            if not fit_report_path.is_file():
+                raise ValueError(
+                    "span experiments require fit_report.json beside the "
+                    "parameter files"
+                )
+            fit_report = json.loads(fit_report_path.read_text(encoding="utf-8"))
+            fitted_span = (fit_report.get("fit") or {}).get("span_frames")
+            if fitted_span != args.span_frames:
+                raise ValueError(
+                    "TempoKV parameters were not calibrated for "
+                    f"span_frames={args.span_frames}: fit report has "
+                    f"{fitted_span!r}"
+                )
 
     generation_command = _generation_command(args, paths)
     report: dict[str, object] = {
@@ -662,6 +687,9 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             ),
             "v_backend": "triton",
         }
+        report["span_frames"] = (
+            args.span_frames if args.span_frames is not None else 24
+        )
     if args.dry_run:
         print(json.dumps(report, indent=2, ensure_ascii=False))
         return report
@@ -685,6 +713,8 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                 "TEMPOKV_NUM_FRAMES": str(latent_frames_for(args.frames)),
             }
         )
+        if args.span_frames is not None:
+            environment["TEMPOKV_SPAN_FRAMES"] = str(args.span_frames)
         # The attention window normally spans every generated frame, because
         # TempoKV compresses the whole cache and no longer needs the model's
         # 21-frame default.  Overriding it back to a smaller window is what
@@ -826,6 +856,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             "skipped_samples": skipped_samples,
             "benchmark_valid": benchmark_valid,
             "performance": performance,
+            "prompt_batches": batch_entries,
             "videos": [str(path) for path in videos],
         }
     )

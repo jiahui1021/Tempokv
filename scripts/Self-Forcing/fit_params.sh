@@ -163,6 +163,7 @@ fi
 [[ -n "${K_BITS:-}" ]] && fit_command+=(--k-bits "$K_BITS")
 [[ -n "${V_BITS:-}" ]] && fit_command+=(--v-bits "$V_BITS")
 [[ -n "${V_PREDICTOR:-}" ]] && fit_command+=(--v-predictor-mode "$V_PREDICTOR")
+[[ -n "${SPAN_FRAMES:-}" ]] && fit_command+=(--span-frames "$SPAN_FRAMES")
 
 if [[ "$DRY_RUN" == "1" ]]; then
   printf '[fit_params] 干跑模式：打印将要执行的命令，不执行\n'

@@ -7,7 +7,7 @@ import argparse
 import hashlib
 import json
 import sys
-from dataclasses import asdict, fields
+from dataclasses import asdict, fields, replace
 from datetime import datetime, timezone
 from pathlib import Path
 import time
@@ -25,6 +25,7 @@ if SOURCE_ROOT.is_dir() and str(SOURCE_ROOT) not in sys.path:
 
 from tempokv.config import CodecConfig, config_from_mapping  # noqa: E402
 from tempokv.fitting import fit_predictors, refine_attention  # noqa: E402
+from tempokv.parameters import CrossKVParameters, TemporalParameters  # noqa: E402
 
 
 CODEC_FIELDS = {field.name for field in fields(CodecConfig)}
@@ -97,6 +98,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--anchor-bits", type=int)
     parser.add_argument("--group-size", type=int)
     parser.add_argument("--stride", type=int)
+    parser.add_argument(
+        "--span-frames",
+        type=int,
+        help=(
+            "split every calibration event into independent spans of this "
+            "many temporal units before fitting"
+        ),
+    )
     parser.add_argument("--v-history-length", type=int, choices=range(0, 6))
     parser.add_argument("--residual-mode", choices=("symmetric", "asymmetric"))
     parser.add_argument("--scale-dtype", choices=("float32", "float16", "bfloat16"))
@@ -390,6 +399,146 @@ def _limit_attention_tracks(
     return flattened[:, : min(max_tokens, tracks)]
 
 
+def _split_calibration_spans(
+    tensor: torch.Tensor, span_frames: int, *, legacy: bool
+) -> torch.Tensor:
+    """Reset fitting history at each non-overlapping calibration span."""
+    if span_frames < 2:
+        raise ValueError("span_frames must be at least 2")
+    frame_count = int(tensor.shape[-3])
+    windows = frame_count // span_frames
+    if windows < 1:
+        raise ValueError(
+            f"span_frames={span_frames} exceeds trace length {frame_count}"
+        )
+    pieces = [
+        tensor[..., index * span_frames : (index + 1) * span_frames, :, :]
+        for index in range(windows)
+    ]
+    if legacy:
+        # [L,E,B,P,F,H,D] -> [L,E*windows,B,P,span,H,D]
+        return torch.cat(pieces, dim=1).contiguous()
+    # Preserve every pre-temporal sample axis and introduce a window axis.
+    return torch.stack(pieces, dim=1).contiguous()
+
+
+def _pad_temporal_history(
+    parameters: TemporalParameters, target: int
+) -> TemporalParameters:
+    current = parameters.history_length
+    if current == target:
+        return parameters
+    if not 0 < current < target:
+        raise ValueError("invalid temporal history padding request")
+    weights = parameters.history_weights
+    bias = parameters.history_bias
+    if weights.ndim == 5:
+        padded_weights = weights.new_zeros(
+            weights.shape[0], target, target, *weights.shape[-2:]
+        )
+        padded_bias = bias.new_zeros(bias.shape[0], target, *bias.shape[-2:])
+        padded_weights[:, :current, :current] = weights
+        padded_bias[:, :current] = bias
+    else:
+        padded_weights = weights.new_zeros(target, target, *weights.shape[2:])
+        padded_bias = bias.new_zeros(target, *bias.shape[1:])
+        padded_weights[:current, :current] = weights
+        padded_bias[:current] = bias
+    return TemporalParameters(
+        padded_weights,
+        padded_bias,
+        parameters.stride,
+        parameters.layer_ids,
+        coordinate_system=parameters.coordinate_system,
+    )
+
+
+def _pad_cross_history(
+    parameters: CrossKVParameters, target: int
+) -> CrossKVParameters:
+    current = parameters.history_length
+    if current == target:
+        return parameters
+    if not 0 <= current < target:
+        raise ValueError("invalid CrossKV history padding request")
+    history = parameters.history_weights
+    if parameters.layered:
+        padded = history.new_zeros(
+            history.shape[0], target, *history.shape[2:]
+        )
+        padded[:, :current] = history
+    else:
+        padded = history.new_zeros(target, *history.shape[1:])
+        padded[:current] = history
+    return CrossKVParameters(
+        parameters.weight,
+        parameters.bias,
+        parameters.stride,
+        parameters.layer_ids,
+        coordinate_system=parameters.coordinate_system,
+        history_weights=padded,
+    )
+
+
+def _bind_requested_config(
+    temporal: TemporalParameters,
+    value_parameters: CrossKVParameters | TemporalParameters,
+    config: CodecConfig,
+    coordinate_system: str,
+) -> tuple[TemporalParameters, CrossKVParameters | TemporalParameters]:
+    """Bind padded, span-specific fits to the production codec identity."""
+    signature = config.format_signature()
+    identity = hashlib.sha256(signature.encode("utf-8"))
+    identity.update(coordinate_system.encode("utf-8"))
+    tensors = [temporal.history_weights, temporal.history_bias]
+    if isinstance(value_parameters, TemporalParameters):
+        tensors.extend(
+            [value_parameters.history_weights, value_parameters.history_bias]
+        )
+    else:
+        tensors.extend(
+            [
+                value_parameters.weight,
+                value_parameters.history_weights,
+                value_parameters.bias,
+            ]
+        )
+    for tensor in tensors:
+        identity.update(tensor.detach().cpu().contiguous().numpy().tobytes())
+    parameter_set_id = identity.hexdigest()
+    rebound_temporal = TemporalParameters(
+        temporal.history_weights,
+        temporal.history_bias,
+        temporal.stride,
+        temporal.layer_ids,
+        signature,
+        parameter_set_id,
+        coordinate_system,
+    )
+    if isinstance(value_parameters, TemporalParameters):
+        rebound_value = TemporalParameters(
+            value_parameters.history_weights,
+            value_parameters.history_bias,
+            value_parameters.stride,
+            value_parameters.layer_ids,
+            signature,
+            parameter_set_id,
+            coordinate_system,
+        )
+    else:
+        rebound_value = CrossKVParameters(
+            value_parameters.weight,
+            value_parameters.bias,
+            value_parameters.stride,
+            value_parameters.layer_ids,
+            signature,
+            parameter_set_id,
+            coordinate_system,
+            value_parameters.history_weights,
+        )
+    return rebound_temporal, rebound_value
+
+
 def run(args: argparse.Namespace) -> dict[str, Any]:
     config = _codec_config(args)
     temporal_ridge = (
@@ -480,6 +629,31 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             )
     if trace_metadata.get("cross_source_kind") not in (None, "normalized"):
         raise ValueError("trace CrossKV source must be normalized for TempoKV")
+    requested_k_history = (
+        args.history_length
+        if args.history_length is not None
+        else config.k_history_length if config.k_history_length is not None else 3
+    )
+    fit_config = config
+    if args.span_frames is not None:
+        keys = _split_calibration_spans(
+            keys, args.span_frames, legacy=config.fit_mode == "legacy"
+        )
+        values = _split_calibration_spans(
+            values, args.span_frames, legacy=config.fit_mode == "legacy"
+        )
+        rotated = {
+            name: _split_calibration_spans(
+                tensor, args.span_frames, legacy=config.fit_mode == "legacy"
+            )
+            for name, tensor in rotated.items()
+        }
+        reachable = args.span_frames - 1
+        fit_config = replace(
+            config,
+            k_history_length=min(int(requested_k_history), reachable),
+            v_history_length=min(int(config.v_history_length), reachable),
+        )
     device = _fit_device(args.device)
     print(f"[fit] device={device}", file=sys.stderr)
     if device.type == "cuda":
@@ -496,11 +670,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     temporal, cross = fit_predictors(
         keys,
         values,
-        config=config,
+        config=fit_config,
         history_length=(
-            args.history_length
-            if args.history_length is not None
-            else config.k_history_length
+            fit_config.k_history_length
         ),
         iterations=args.iterations,
         temporal_ridge=temporal_ridge,
@@ -534,7 +706,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             *refinement_tensors,
             temporal,
             cross,
-            config,
+            fit_config,
             steps=args.attention_steps,
             learning_rate=args.attention_lr,
             patience=args.attention_patience,
@@ -551,6 +723,16 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             ),
             sign_step_sizes=tuple(args.attention_sign_step_sizes),
         )
+    if temporal.history_length != int(requested_k_history):
+        temporal = _pad_temporal_history(temporal, int(requested_k_history))
+    if config.v_predictor_mode == "temporal":
+        if cross.history_length != int(config.v_history_length):
+            cross = _pad_temporal_history(cross, int(config.v_history_length))
+    elif cross.history_length != int(config.v_history_length):
+        cross = _pad_cross_history(cross, int(config.v_history_length))
+    temporal, cross = _bind_requested_config(
+        temporal, cross, config, coordinate_system
+    )
     if device.type == "cuda":
         torch.cuda.synchronize(device)
         peak_fit_allocated = int(torch.cuda.max_memory_allocated(device))
@@ -609,6 +791,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "fit": {
             # Keep the old report key while exposing the clearer config name.
             "history_length": temporal.history_length,
+            "span_frames": args.span_frames,
+            "reachable_k_history_length": fit_config.k_history_length,
+            "reachable_v_history_length": fit_config.v_history_length,
             "k_history_length": temporal.with_history_length(
                 config.k_history_length
             ).history_length,

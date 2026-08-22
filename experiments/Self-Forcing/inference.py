@@ -312,6 +312,10 @@ for i, batch_data in enumerate(dataloader):
             [args.num_samples, args.num_output_frames, 16, 60, 104], device=device, dtype=torch.bfloat16
         )
 
+    # A benchmark interval must not inherit queued work from prompt loading or
+    # noise construction.  The matching synchronize after ``pipeline.inference``
+    # closes the same device interval.
+    torch.cuda.synchronize(device)
     generation_start = time.perf_counter()
     video, latents = pipeline.inference(
         noise=sampled_noise,
@@ -390,6 +394,14 @@ for i, batch_data in enumerate(dataloader):
                 "generation_seconds_per_sample": generation_seconds_per_sample,
                 "throughput_samples_per_second": throughput_samples_per_second,
                 "timing_scope": "prompt_batch",
+                "kv_cache_memory": getattr(pipeline, "summary", {}).get(
+                    "last_kv_cache_memory"
+                ),
+                "quantization_events": list(
+                    getattr(pipeline, "summary", {}).get(
+                        "quantization_events", []
+                    )
+                ),
             }
         )
     del video, latents, current_video, all_video, sampled_noise, initial_latent

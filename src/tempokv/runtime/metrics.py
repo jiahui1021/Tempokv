@@ -18,8 +18,16 @@ from dataclasses import dataclass, field
 import time
 from typing import Any
 
+import torch
+
 
 BF16_BYTES_PER_VALUE = 2
+
+# One drain costs one ``torch.cuda.synchronize``.  ``decode_ms`` is bracketed
+# once per packed span per cache read per layer, so the pool has to hold a
+# comfortable multiple of that before a drain becomes necessary; profiling.py
+# uses the same bound for the same reason.
+TIMER_EVENT_POOL_SIZE = 8192
 
 
 @dataclass
@@ -54,6 +62,12 @@ class TempoKVRuntimeReport:
     # distort the thing being measured, and it is recoverable as
     # `generation_ms` minus `encode_ms` and `decode_ms`. Per-prompt wall time
     # lives in the runtime's own `summary.json`.
+    #
+    # All three are GPU intervals measured with CUDA events, not host clocks:
+    # kernel launches are asynchronous, so wall time around an encode or a
+    # decode measures how long it took to *queue* the work. They are only
+    # correct once `drain_timers` has read the events back, which `to_dict`
+    # does; read them through `to_dict` rather than as attributes.
     encode_ms: float = 0.0
     decode_ms: float = 0.0
     generation_ms: float = 0.0
@@ -70,6 +84,14 @@ class TempoKVRuntimeReport:
     peak_resident_total_bytes: int = 0
 
     _resident: dict[Any, _SpanBytes] = field(default_factory=dict, repr=False)
+    # Recorded-but-unread CUDA event pairs, and the pool they are recycled
+    # through.  ``None`` means the CUDA check has not run yet.
+    _pending_intervals: list[tuple[str, Any, Any]] = field(
+        default_factory=list, repr=False
+    )
+    _free_events: list[tuple[Any, Any]] = field(default_factory=list, repr=False)
+    _uses_cuda_events: bool | None = field(default=None, repr=False)
+    _timer_drains: int = field(default=0, repr=False)
 
     # -- cache state -----------------------------------------------------
 
@@ -144,6 +166,45 @@ class TempoKVRuntimeReport:
     def timer(self, field_name: str) -> "_Timer":
         return _Timer(self, field_name)
 
+    def uses_cuda_events(self) -> bool:
+        """Whether timing brackets record CUDA events instead of a host clock."""
+        if self._uses_cuda_events is None:
+            self._uses_cuda_events = torch.cuda.is_available()
+        return self._uses_cuda_events
+
+    def _acquire_events(self) -> tuple[Any, Any]:
+        if self._free_events:
+            return self._free_events.pop()
+        if len(self._pending_intervals) >= TIMER_EVENT_POOL_SIZE:
+            self.drain_timers()
+            if self._free_events:
+                return self._free_events.pop()
+        return (
+            torch.cuda.Event(enable_timing=True),
+            torch.cuda.Event(enable_timing=True),
+        )
+
+    def drain_timers(self) -> None:
+        """Fold every finished GPU interval into its field, synchronizing once.
+
+        Recording an event does not synchronize, so an instrumented run keeps
+        the launch pattern of an uninstrumented one.  The cost is that the
+        latency fields are stale until this runs; ``to_dict`` calls it, and a
+        caller that reads the attributes directly has to call it itself.
+        """
+        if not self._pending_intervals:
+            return
+        torch.cuda.synchronize()
+        self._timer_drains += 1
+        for field_name, start, end in self._pending_intervals:
+            setattr(
+                self,
+                field_name,
+                getattr(self, field_name) + start.elapsed_time(end),
+            )
+            self._free_events.append((start, end))
+        self._pending_intervals.clear()
+
     # -- output ----------------------------------------------------------
 
     def require_tempokv_activity(self) -> None:
@@ -171,6 +232,9 @@ class TempoKVRuntimeReport:
             )
 
     def to_dict(self) -> dict[str, Any]:
+        # The latency fields are event intervals that have not been read back
+        # yet, so this has to happen before any of them is serialized.
+        self.drain_timers()
         return {
             "model": self.model,
             "kv_mode": self.kv_mode,
@@ -205,7 +269,16 @@ class TempoKVRuntimeReport:
 
 
 class _Timer:
-    """Accumulate wall time into one report field."""
+    """Accumulate one section's GPU time into a report field.
+
+    On CUDA the bracket is a pair of events rather than a host clock.  The
+    encode and decode paths issue their whole kernel sequence without ever
+    synchronizing, so ``perf_counter`` around them measures launch time, not
+    device time -- and the amount it understates by depends on how much of the
+    launch queue happened to be full, which makes it not merely small but
+    unpredictable.  Off CUDA the host clock stays, so the accounting logic is
+    exercisable without a device.
+    """
 
     def __init__(self, report: TempoKVRuntimeReport, field_name: str) -> None:
         if not hasattr(report, field_name):
@@ -213,12 +286,25 @@ class _Timer:
         self._report = report
         self._field = field_name
         self._started = 0.0
+        self._events: tuple[Any, Any] | None = None
 
     def __enter__(self) -> "_Timer":
+        if self._report.uses_cuda_events():
+            self._events = self._report._acquire_events()
+            self._events[0].record()
+            return self
         self._started = time.perf_counter()
         return self
 
     def __exit__(self, *exc_info: object) -> None:
+        if self._events is not None:
+            start, end = self._events
+            end.record()
+            # Read back later: one synchronize per drain instead of one per
+            # bracket, which would serialize the pipeline being measured.
+            self._report._pending_intervals.append((self._field, start, end))
+            self._events = None
+            return
         elapsed_ms = (time.perf_counter() - self._started) * 1000.0
         setattr(self._report, self._field, getattr(self._report, self._field) + elapsed_ms)
 

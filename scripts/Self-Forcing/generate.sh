@@ -188,6 +188,7 @@ fi
 
 [[ -n "${MODEL_CONFIG:-}" ]] && generate_command+=(--model-config "$(resolve_path "$MODEL_CONFIG")")
 [[ -n "${LOCAL_ATTN_SIZE:-}" ]] && generate_command+=(--local-attn-size "$LOCAL_ATTN_SIZE")
+[[ -n "${SPAN_FRAMES:-}" ]] && generate_command+=(--span-frames "$SPAN_FRAMES")
 [[ -n "${TRITON_CACHE:-}" ]] && generate_command+=(--triton-cache "$(resolve_path "$TRITON_CACHE")")
 [[ "$ALLOW_TRITON_FALLBACK" == "1" ]] && generate_command+=(--allow-triton-fallback)
 [[ "$SKIP_EXISTING" == "1" ]] && generate_command+=(--skip-existing)

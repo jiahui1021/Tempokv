@@ -1,0 +1,58 @@
+{
+  "schema_version": "tempokv.latency-manifest.v1",
+  "experiment_id": "self-forcing-a100-latency-v1",
+  "output_dir": "results/paper_experiments/latency-v1",
+  "horizons": [180, 360, 540, 717, 1050, 1400],
+  "fixed_frames": 717,
+  "repeats": 5,
+  "session_scope": "coordinator_session_multiple_processes",
+  "frozen": {
+    "model": "Self-Forcing",
+    "width": 832,
+    "height": 480,
+    "prompt_sha256": "REPLACE_ME_WITH_SHA256",
+    "seed": 0,
+    "gpu_name": "NVIDIA A100-SXM4-80GB",
+    "gpu_uuid": "REPLACE_ME_NVIDIA_SMI_GPU_UUID",
+    "cuda_version": "REPLACE_ME",
+    "attention_backend": "REPLACE_ME_E_G_FLASHATTN2",
+    "attention_lifecycle": "REPLACE_ME_EXACT_DESCRIPTION"
+  },
+  "methods": [
+    {
+      "name": "BF16",
+      "bit_width": null,
+      "command": ["REPLACE_ME_BF16_ADAPTER", "--phase", "{phase}", "--frames", "{frames}"]
+    },
+    {
+      "name": "RTN_INT2",
+      "bit_width": 2,
+      "command": ["REPLACE_ME_RTN_INT2_ADAPTER", "--phase", "{phase}", "--frames", "{frames}"]
+    },
+    {
+      "name": "RTN_INT4",
+      "bit_width": 4,
+      "command": ["REPLACE_ME_RTN_INT4_ADAPTER", "--phase", "{phase}", "--frames", "{frames}"]
+    },
+    {
+      "name": "QVG_INT2",
+      "bit_width": 2,
+      "command": ["REPLACE_ME_QVG_INT2_ADAPTER", "--phase", "{phase}", "--frames", "{frames}"]
+    },
+    {
+      "name": "QVG_INT4",
+      "bit_width": 4,
+      "command": ["REPLACE_ME_QVG_INT4_ADAPTER", "--phase", "{phase}", "--frames", "{frames}"]
+    },
+    {
+      "name": "TempoKV_INT2",
+      "bit_width": 2,
+      "command": ["REPLACE_ME_TEMPOKV_INT2_ADAPTER", "--phase", "{phase}", "--frames", "{frames}"]
+    },
+    {
+      "name": "TempoKV_INT4",
+      "bit_width": 4,
+      "command": ["REPLACE_ME_TEMPOKV_INT4_ADAPTER", "--phase", "{phase}", "--frames", "{frames}"]
+    }
+  ]
+}

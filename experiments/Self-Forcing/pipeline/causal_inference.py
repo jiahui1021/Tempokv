@@ -10,6 +10,20 @@ from kv_cache import ChunkedKVCache
 from demo_utils.memory import gpu, get_cuda_free_memory_gb, DynamicSwapInstaller, move_model_to_device_with_memory_preservation
 
 
+def ready_quantization_spans(
+    next_start_frame: int, finalized_frames: int, span_frames: int
+) -> list[tuple[int, int]]:
+    """Return complete, non-overlapping spans available for compression."""
+    if span_frames < 2:
+        raise ValueError("span_frames must be at least 2")
+    if next_start_frame < 0 or finalized_frames < next_start_frame:
+        raise ValueError("invalid finalized-frame cursor")
+    return [
+        (start, start + span_frames)
+        for start in range(next_start_frame, finalized_frames - span_frames + 1, span_frames)
+    ]
+
+
 class CausalInferencePipeline(torch.nn.Module):
     def __init__(
             self,
@@ -212,7 +226,19 @@ class CausalInferencePipeline(torch.nn.Module):
         all_num_frames = [self.num_frame_per_block] * num_blocks
         if self.independent_first_frame and initial_latent is None:
             all_num_frames = [1] + all_num_frames
-        quantization_factor = 8
+        # The historical Self-Forcing integration finalized eight 3-frame
+        # model blocks at a time (24 latent frames).  Paper ablations need the
+        # anchor interval itself to be controllable, including intervals that
+        # cross a model-block boundary, so schedule by finalized *frames*
+        # instead of by block count.  Leaving the environment unset preserves
+        # the historical 24-frame lifecycle exactly.
+        default_span_frames = 8 * self.num_frame_per_block
+        span_frames = int(
+            os.environ.get("TEMPOKV_SPAN_FRAMES", str(default_span_frames))
+        )
+        if span_frames < 2:
+            raise ValueError("TEMPOKV_SPAN_FRAMES must be at least 2")
+        next_span_start_frame = 0
         hide_progress = (
             torch.distributed.is_initialized()
             and torch.distributed.get_rank() != 0
@@ -226,19 +252,16 @@ class CausalInferencePipeline(torch.nn.Module):
                 if profile:
                     block_start.record()
 
-                if (
-                    chunk_index >= quantization_factor
-                    and chunk_index % quantization_factor == 0
+                finalized_frames = sum(all_num_frames[:chunk_index])
+                for quantized_frames_start, quantized_frames_end in ready_quantization_spans(
+                    next_span_start_frame, finalized_frames, span_frames
                 ):
-                    quantized_frames_start = sum(
-                        all_num_frames[: chunk_index - quantization_factor]
-                    )
-                    quantized_frames_end = sum(all_num_frames[:chunk_index])
                     self.quantize_kv_cache(
                         quantized_frames_start * self.frame_seq_length,
                         quantized_frames_end * self.frame_seq_length,
                         int(self.kv_cache1[0]["local_end_index"]),
                     )
+                    next_span_start_frame = quantized_frames_end
 
                 noisy_input = noise[
                     :, current_start_frame - num_input_frames:current_start_frame + current_num_frames - num_input_frames]

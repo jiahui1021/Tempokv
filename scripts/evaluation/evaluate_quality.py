@@ -170,6 +170,11 @@ def _parser() -> argparse.ArgumentParser:
         default=32,
         help="Frames per Inception batch (default: 32)",
     )
+    parser.add_argument(
+        "--no-fid",
+        action="store_true",
+        help="skip directory-level FID when only paired PSNR/SSIM/LPIPS are needed",
+    )
     parser.add_argument("--device", default="auto", help="auto, cpu, cuda, or cuda:N")
     parser.add_argument(
         "--lpips-network", choices=("alex", "vgg", "squeeze"), default="alex"
@@ -302,6 +307,7 @@ def evaluate(
     max_frames: int | None = None,
     frame_stride: int = 1,
     fid_batch_size: int = 32,
+    compute_fid: bool = True,
     device: str = "auto",
     lpips_network: str = "alex",
 ) -> dict[str, Any]:
@@ -330,7 +336,11 @@ def evaluate(
     total_ssim = 0.0
     total_lpips = 0.0
     backend = QualityBackend(device=device, network=lpips_network)
-    fid_backend = FidBackend(device=device, batch_size=fid_batch_size)
+    fid_backend = (
+        FidBackend(device=device, batch_size=fid_batch_size)
+        if compute_fid
+        else None
+    )
     for reference in references:
         relative = reference.relative_to(reference_dir)
         candidate = candidate_dir / relative
@@ -354,7 +364,7 @@ def evaluate(
         raise ValueError("no matching video pairs were available to evaluate")
 
     pooled_mse = total_error / total_values
-    fid = fid_backend.compute()
+    fid = fid_backend.compute() if fid_backend is not None else None
     return {
         "reference_dir": str(reference_dir),
         "candidate_dir": str(candidate_dir),
@@ -367,10 +377,10 @@ def evaluate(
         "lpips": total_lpips / total_frames,
         "lpips_network": lpips_network,
         "fid": fid,
-        "fid_feature": 2048,
-        "fid_reference": "bf16",
-        "fid_frames": fid_backend.frames,
-        "fid_batch_size": fid_batch_size,
+        "fid_feature": 2048 if compute_fid else None,
+        "fid_reference": "bf16" if compute_fid else None,
+        "fid_frames": fid_backend.frames if fid_backend is not None else 0,
+        "fid_batch_size": fid_batch_size if compute_fid else None,
         "frame_stride": frame_stride,
         "max_frames_per_video": max_frames,
         "device": device,
@@ -388,6 +398,7 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
         max_frames=args.max_frames,
         frame_stride=args.frame_stride,
         fid_batch_size=args.fid_batch_size,
+        compute_fid=not args.no_fid,
         device=args.device,
         lpips_network=args.lpips_network,
     )

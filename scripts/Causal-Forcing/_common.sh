@@ -133,14 +133,16 @@ if v_history is None:
     if v_history is None:
         v_history = 0
 
+# Legacy and native fits are not interchangeable, so they must not share a
+# parameter directory.  Native configs carry no prefix, so existing directory
+# names are unchanged.
+mode_label = "legacy-" if config.get("fit_mode") == "legacy" else ""
 k_label = f"kh{int(k_history)}"
-# The fit family and V predictor are part of parameter identity; incompatible
-# predictors must never share a directory.
-fit_mode = config.get("fit_mode", "native")
-mode_label = "legacy-" if fit_mode == "legacy" else ""
-v_predictor = sys.argv[7] or config.get("v_predictor_mode")
-if v_predictor is None:
-    v_predictor = "temporal" if fit_mode == "legacy" else DEFAULT_V_PREDICTOR_MODE
+# The V segment records the predictor structure: parameters fitted for the
+# temporal V predictor are not interchangeable with CrossKV ones.
+v_predictor = sys.argv[7] or config.get(
+    "v_predictor_mode", DEFAULT_V_PREDICTOR_MODE
+)
 v_prefix = "vt" if v_predictor == "temporal" else "vh"
 v_label = f"{v_prefix}{int(v_history)}"
 if k_bits == v_bits:

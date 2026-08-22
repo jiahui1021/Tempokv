@@ -196,6 +196,7 @@ SEED             随机种子
 START_INDEX      起始 prompt 序号
 END_INDEX        结束 prompt 序号
 NUM_GPUS         GPU 数量
+SPAN_FRAMES      每个独立 anchor span 的 latent 帧数；不设置时保持原来的 24
 SKIP_EXISTING    跳过已有视频，0 或 1（默认 1）
 BENCHMARK        要求本次完整生成，不能跳过已有视频，0 或 1（默认 0）
 DRY_RUN          只检查并打印命令，0 或 1
