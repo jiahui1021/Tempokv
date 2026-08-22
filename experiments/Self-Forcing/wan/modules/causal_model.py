@@ -239,31 +239,57 @@ class CausalWanSelfAttention(nn.Module):
             kv_cache["k"].write(local_start_index, local_end_index, k)
             kv_cache["v"].write(local_start_index, local_end_index, v)
 
-            attention_start = 0
-            if self.local_attn_size != -1:
-                attention_start = max(
-                    0, local_end_index - self.local_attn_size * frame_seqlen
-                )
-            k_all = kv_cache["k"].read(attention_start, local_end_index)
+            # Always read the full resident range so a quantized TempoKV span is
+            # never cut (the cache rejects partial-span reads), then slice the
+            # attention window: [sink] ∪ [recent].  The whole range is rotated at
+            # absolute frame positions before slicing, so a gapped window keeps
+            # each side on its own absolute RoPE timeline.
+            k_all = kv_cache["k"].read(0, local_end_index)
             absolute_k = causal_rope_apply_long_input(
                 k_all,
                 grid_sizes,
                 freqs,
-                start_frame=attention_start // frame_seqlen,
+                start_frame=0,
                 precision=getattr(kv_cache["k"], "rope_precision", "native"),
             ).type_as(v)
             v_all = kv_cache["v"].read(
-                attention_start,
+                0,
                 local_end_index,
                 source_tensor=k_all,
             )
+            if self.local_attn_size == -1:
+                attn_k, attn_v = absolute_k, v_all
+            else:
+                sink_tokens = self.sink_size * frame_seqlen
+                recent_frames = max(1, self.local_attn_size - self.sink_size)
+                recent_start = max(
+                    0, local_end_index - recent_frames * frame_seqlen
+                )
+                if self.sink_size > 0 and recent_start > sink_tokens:
+                    attn_k = torch.cat(
+                        [absolute_k[:, :sink_tokens], absolute_k[:, recent_start:]],
+                        dim=1,
+                    )
+                    attn_v = torch.cat(
+                        [v_all[:, :sink_tokens], v_all[:, recent_start:]],
+                        dim=1,
+                    )
+                elif self.sink_size > 0:
+                    # The sink overlaps the recent window, so their union covers
+                    # the whole resident range.
+                    attn_k, attn_v = absolute_k, v_all
+                else:
+                    attn_k, attn_v = (
+                        absolute_k[:, recent_start:],
+                        v_all[:, recent_start:],
+                    )
             recorder = getattr(self, "tempokv_trace_recorder", None)
             if recorder is not None:
                 # The attention objective needs the rotated Q and K the model
-                # actually used.  The newly written tokens are the tail of the
-                # rotated cache read, so no RoPE is recomputed for the trace.
-                recorder(roped_query, absolute_k[:, -num_new_tokens:])
-            x = attention(roped_query, absolute_k, v_all)
+                # actually used.  The newly written tokens are always the tail of
+                # the attention window, so no RoPE is recomputed for the trace.
+                recorder(roped_query, attn_k[:, -num_new_tokens:])
+            x = attention(roped_query, attn_k, attn_v)
             _set_cache_index(kv_cache, "global_end_index", current_end)
             _set_cache_index(kv_cache, "local_end_index", local_end_index)
 

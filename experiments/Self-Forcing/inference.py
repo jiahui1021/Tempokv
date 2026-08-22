@@ -36,6 +36,7 @@ parser.add_argument("--save_with_index", action="store_true",
 parser.add_argument("--start_index", type=int, default=0)
 parser.add_argument("--end_index", type=int, default=-1)
 parser.add_argument("--local_attn_size", type=int, default=-1)
+parser.add_argument("--sink_size", type=int, default=0)
 parser.add_argument("--skip_existing", action="store_true")
 parser.add_argument("--skip_video_save", action="store_true", help=argparse.SUPPRESS)
 args = parser.parse_args()
@@ -71,6 +72,7 @@ default_config = OmegaConf.load(
 )
 config = OmegaConf.merge(default_config, config)
 config.model_kwargs.local_attn_size = args.local_attn_size
+config.model_kwargs.sink_size = args.sink_size
 
 # Initialize pipeline
 if hasattr(config, 'denoising_step_list'):

@@ -107,6 +107,12 @@ def build_parser() -> argparse.ArgumentParser:
             "preserves the historical 24-frame lifecycle"
         ),
     )
+    parser.add_argument(
+        "--sink-size",
+        type=int,
+        default=0,
+        help="attention sink frames pinned at the start of a bounded attention window",
+    )
     parser.add_argument("--triton-cache", type=Path)
     parser.add_argument(
         "--allow-triton-fallback",
@@ -351,6 +357,8 @@ def _generation_command(
         "--use_ema",
         "--local_attn_size",
         str(local_attn_size),
+        "--sink_size",
+        str(args.sink_size),
     ]
     if args.skip_existing:
         command.append("--skip_existing")
@@ -603,13 +611,14 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             )
     latent_frames = latent_frames_for(args.frames)
     if (
-        args.local_attn_size not in (None, -1)
-        and args.local_attn_size < latent_frames
+        args.sink_size < 0
+        or (
+            args.local_attn_size not in (None, -1)
+            and args.sink_size >= args.local_attn_size
+        )
     ):
         raise ValueError(
-            "local-attn-size must cover the complete generated latent sequence "
-            f"({latent_frames} frames) so BF16 and TempoKV use identical "
-            "Self-Forcing attention semantics"
+            "sink-size must be non-negative and smaller than local-attn-size"
         )
     config = None
     parameters = None

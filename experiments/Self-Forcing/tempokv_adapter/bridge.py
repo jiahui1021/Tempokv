@@ -152,14 +152,13 @@ def install(runtime_root: str | Path) -> type:
             # full sequence span readable instead of capping attention at the
             # 21-frame default window. The target frame count arrives through
             # TEMPOKV_NUM_FRAMES because omegaconf args lack num_output_frames.
+            # A bounded local attention window (with or without a sink) is
+            # legitimate: the causal model reads the full resident cache and
+            # slices its attention window afterward, so TempoKV spans are never
+            # cut.
             frames = int(os.environ.get("TEMPOKV_NUM_FRAMES", "0"))
             if frames <= 0:
                 raise ValueError("TEMPOKV_NUM_FRAMES must be set for TempoKV runs")
-            if self.local_attn_size != -1 and self.local_attn_size < frames:
-                raise ValueError(
-                    "TempoKV Self-Forcing attention window must cover the "
-                    "complete generated sequence"
-                )
             target = frames * self.frame_seq_length
             for block in self.generator.model.blocks:
                 if hasattr(block.self_attn, "max_attention_size"):
