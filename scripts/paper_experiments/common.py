@@ -24,7 +24,11 @@ METHODS = (
     "TempoKV_INT2",
     "TempoKV_INT4",
 )
-HORIZONS = (180, 360, 540, 717, 1050, 1400)
+# Every horizon must satisfy (F + 3) % 12 == 0 so it maps exactly to complete
+# 3-frame latent blocks.  The paper's original 180/360/540/1050/1400 are not
+# valid Self-Forcing lengths; this set keeps the same short→long coverage while
+# retaining 717 as the fixed-length benchmark.
+HORIZONS = (105, 177, 357, 717, 1053, 1401)
 FIXED_FRAMES = 717
 REPEATS = 5
 

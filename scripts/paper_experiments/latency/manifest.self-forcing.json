@@ -1,0 +1,53 @@
+{
+  "schema_version": "tempokv.latency-manifest.v1",
+  "experiment_id": "self-forcing-a100-latency-bf16-tempokv",
+  "output_dir": "results/paper_experiments/latency-self-forcing",
+  "horizons": [717],
+  "fixed_frames": 717,
+  "repeats": 5,
+  "session_scope": "coordinator_session_multiple_processes",
+  "frozen": {
+    "model": "Self-Forcing",
+    "width": 832,
+    "height": 480,
+    "prompt_sha256": "2656344a3629ce161429e73a861bc0c47aeae4c9c8ae1a9039d5a6f3c1bb4727",
+    "seed": 0,
+    "gpu_name": "NVIDIA A100-SXM4-80GB",
+    "gpu_uuid": "GPU-51d8de1f-3455-fc7a-f4e3-d0e6daee337b",
+    "cuda_version": "12.8",
+    "attention_backend": "flex_attention",
+    "attention_lifecycle": "single-pass causal with TempoKV span compression"
+  },
+  "methods": [
+    {
+      "name": "BF16",
+      "bit_width": null,
+      "command": [
+        "/mnt/cpfs/epic-user/hujiahui-20260612/miniconda3/envs/qvg/bin/python",
+        "scripts/paper_experiments/latency/self_forcing_adapter.py",
+        "--phase", "{phase}",
+        "--frames", "{frames}"
+      ]
+    },
+    {
+      "name": "TempoKV_INT2",
+      "bit_width": 2,
+      "command": [
+        "/mnt/cpfs/epic-user/hujiahui-20260612/miniconda3/envs/qvg/bin/python",
+        "scripts/paper_experiments/latency/self_forcing_adapter.py",
+        "--phase", "{phase}",
+        "--frames", "{frames}"
+      ]
+    },
+    {
+      "name": "TempoKV_INT4",
+      "bit_width": 4,
+      "command": [
+        "/mnt/cpfs/epic-user/hujiahui-20260612/miniconda3/envs/qvg/bin/python",
+        "scripts/paper_experiments/latency/self_forcing_adapter.py",
+        "--phase", "{phase}",
+        "--frames", "{frames}"
+      ]
+    }
+  ]
+}

@@ -80,6 +80,8 @@ def _fit_command(
         str(span),
         "--fit-history-source",
         "reconstructed",
+        "--v-history-mode",
+        "diagonal",
         "--device",
         args.fit_device,
     ]

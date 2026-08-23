@@ -72,8 +72,15 @@ def _manifest(path: Path) -> dict[str, Any]:
         )
     if payload["schema_version"] != MANIFEST_SCHEMA:
         raise ContractError(f"schema_version must be {MANIFEST_SCHEMA!r}")
-    if payload["horizons"] != list(HORIZONS):
-        raise ContractError(f"horizons must be exactly {list(HORIZONS)}")
+    horizons = payload["horizons"]
+    if not isinstance(horizons, list) or not horizons:
+        raise ContractError("horizons must be a non-empty list")
+    if any(frame not in HORIZONS for frame in horizons):
+        raise ContractError(f"each horizon must be drawn from {list(HORIZONS)}")
+    if horizons != sorted(horizons):
+        raise ContractError(f"horizons must be sorted ascending: {horizons}")
+    if horizons != [h for h in HORIZONS if h in horizons]:
+        raise ContractError(f"horizons must keep the protocol order: {list(HORIZONS)}")
     if payload["fixed_frames"] != FIXED_FRAMES:
         raise ContractError(f"fixed_frames must be {FIXED_FRAMES}")
     if payload["repeats"] != REPEATS:
@@ -94,11 +101,15 @@ def _manifest(path: Path) -> dict[str, Any]:
     if frozen["gpu_name"] != "NVIDIA A100-SXM4-80GB":
         raise ContractError("the formal manifest is fixed to NVIDIA A100-SXM4-80GB")
     methods = payload["methods"]
-    if not isinstance(methods, list) or len(methods) != len(METHODS):
-        raise ContractError("manifest must configure all seven methods")
+    if not isinstance(methods, list) or not methods:
+        raise ContractError("manifest must configure at least one method")
     names = [item.get("name") if isinstance(item, dict) else None for item in methods]
-    if tuple(names) != METHODS:
-        raise ContractError(f"methods must appear in this order: {list(METHODS)}")
+    if any(name not in METHODS for name in names):
+        raise ContractError(f"methods must be drawn from {list(METHODS)}")
+    if tuple(names) != tuple(dict.fromkeys(names)):
+        raise ContractError(f"methods must not repeat: {names}")
+    if tuple(names) != tuple(m for m in METHODS if m in names):
+        raise ContractError(f"methods must keep the protocol order: {list(METHODS)}")
     for item in methods:
         if set(item) != {"name", "bit_width", "command"}:
             raise ContractError(
@@ -497,7 +508,14 @@ def execute(
         return output_dir
     write_json(output_dir / "compilation.json", compilation)
     write_json(output_dir / "measurements.json", records)
-    aggregate(output_dir, compilation, records, synthetic=synthetic)
+    aggregate(
+        output_dir,
+        compilation,
+        records,
+        methods=[item["name"] for item in manifest["methods"]],
+        horizons=manifest["horizons"],
+        synthetic=synthetic,
+    )
     return output_dir
 
 
@@ -525,9 +543,11 @@ def aggregate(
     compilation: Sequence[Mapping[str, Any]],
     records: Sequence[Mapping[str, Any]],
     *,
+    methods: Sequence[str],
+    horizons: Sequence[int],
     synthetic: bool,
 ) -> None:
-    expected = len(METHODS) * len(HORIZONS) * REPEATS
+    expected = len(methods) * len(horizons) * REPEATS
     if len(records) != expected:
         raise ContractError(f"expected {expected} measured reports, got {len(records)}")
     grouped: dict[tuple[str, int], list[Mapping[str, Any]]] = {}
@@ -541,11 +561,11 @@ def aggregate(
         by_pair[pair_key] = record
 
     rows: list[dict[str, Any]] = []
-    for frames in HORIZONS:
+    for frames in horizons:
         baselines = grouped[("BF16", frames)]
         if sorted(int(item["repeat"]) for item in baselines) != list(range(REPEATS)):
             raise ContractError(f"BF16 frames={frames} has incomplete repeat identities")
-        for method in METHODS:
+        for method in methods:
             members = grouped.get((method, frames), [])
             if sorted(int(item["repeat"]) for item in members) != list(range(REPEATS)):
                 raise ContractError(f"{method} frames={frames} has incomplete repeats")
@@ -622,6 +642,7 @@ def _svg_plot(
     left, right, top, bottom = 105, 220, 65, 85
     plot_w, plot_h = width - left - right, height - top - bottom
     colors = ("#222222", "#D55E00", "#E69F00", "#0072B2", "#56B4E9", "#009E73", "#CC79A7")
+    frames_present = sorted({int(row["effective_frames"]) for row in rows})
     values = [float(row[value_key]) for row in rows]
     transformed = [math.log10(value) if logarithmic else value for value in values]
     low, high = min(transformed), max(transformed)
@@ -630,7 +651,7 @@ def _svg_plot(
     high += padding
 
     def x_pos(frame: int) -> float:
-        return left + (frame - min(HORIZONS)) / (max(HORIZONS) - min(HORIZONS)) * plot_w
+        return left + (frame - min(frames_present)) / (max(frames_present) - min(frames_present)) * plot_w
 
     def y_pos(value: float) -> float:
         adjusted = math.log10(value) if logarithmic else value
@@ -655,12 +676,13 @@ def _svg_plot(
             f'<line class="axis" x1="{left}" y1="{top+plot_h}" x2="{left+plot_w}" y2="{top+plot_h}"/>',
         )
     )
-    for frame in HORIZONS:
+    for frame in frames_present:
         x = x_pos(frame)
         lines.append(f'<text x="{x:.2f}" y="{top+plot_h+26}" text-anchor="middle" font-size="13">{frame}</text>')
     lines.append(f'<text x="{left+plot_w/2}" y="{height-25}" text-anchor="middle" font-size="15">Generated video frames</text>')
     lines.append(f'<text transform="translate(25 {top+plot_h/2}) rotate(-90)" text-anchor="middle" font-size="15">{esc(y_label)}</text>')
-    for index, method in enumerate(METHODS):
+    plotted = [m for m in METHODS if any(row["method"] == m for row in rows)]
+    for index, method in enumerate(plotted):
         members = sorted(
             (row for row in rows if row["method"] == method),
             key=lambda row: int(row["effective_frames"]),
