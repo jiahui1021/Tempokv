@@ -23,17 +23,20 @@
 ```text
 {method} {phase} {frames} {repeat} {seed}
 {report_path} {output_dir} {session_id} {session_scope}
+{runtime_instance_id} {warmup_report_path} {measure_report_path}
 ```
 
 同样的信息会注入环境变量：
 
 ```text
 PAPER_EXPERIMENT_METHOD
-PAPER_EXPERIMENT_PHASE       compilation | warmup | measure
+PAPER_EXPERIMENT_PHASE       compilation | pair
 PAPER_EXPERIMENT_FRAMES
 PAPER_EXPERIMENT_REPEAT
 PAPER_EXPERIMENT_SEED
 PAPER_EXPERIMENT_REPORT
+PAPER_EXPERIMENT_WARMUP_REPORT
+PAPER_EXPERIMENT_MEASURE_REPORT
 PAPER_EXPERIMENT_OUTPUT
 PAPER_EXPERIMENT_SESSION_ID
 PAPER_EXPERIMENT_SESSION_SCOPE
@@ -41,11 +44,13 @@ PAPER_EXPERIMENT_RUNTIME_INSTANCE_ID
 PAPER_EXPERIMENT_FROZEN_JSON
 ```
 
-adapter 必须保持模型加载和正式计时的边界，并把报告写到
-`PAPER_EXPERIMENT_REPORT`。当前编排器会启动多个 adapter 进程，因此 manifest 只能如实填写
+`pair` adapter 必须在同一个进程、同一个已加载模型中依次完成完整 warmup 和正式测量，
+分别把报告写到 `PAPER_EXPERIMENT_WARMUP_REPORT` 和
+`PAPER_EXPERIMENT_MEASURE_REPORT`。`PAPER_EXPERIMENT_REPORT` 是 measured report 的兼容别名。
+当前编排器会为每个 method × horizon × repeat 启动一个 paired adapter 进程，因此 manifest 只能如实填写
 `coordinator_session_multiple_processes`；填写 `single_process` 会直接拒绝。若论文协议要求七种方法在同一 Python 进程内常驻，需要各 runtime 另行提供常驻 worker，不能由本编排器谎报。
-warmup 与紧随其后的 measure 会收到同一个 `PAPER_EXPERIMENT_RUNTIME_INSTANCE_ID`，严格输入必须原样报告为
-`runtime_instance_id`。adapter 只有在两次调用确实连接同一个已加载的常驻 runtime 时才能回报该标识；若两条命令各自重新加载模型，不能把编排器提供的标识当作同一实例的证明。
+两份报告必须原样报告同一个 `PAPER_EXPERIMENT_RUNTIME_INSTANCE_ID`。编排器会同时校验两份报告，
+不再允许两个独立 CLI 进程分别执行 warmup 和 measure。
 
 ## 报告 adapter
 
@@ -54,7 +59,7 @@ warmup 与紧随其后的 measure 会收到同一个 `PAPER_EXPERIMENT_RUNTIME_I
 ```json
 {
   "effective_frames": 717,
-  "runtime_instance_id": "persistent-worker-uuid",
+  "runtime_instance_id": "coordinator-assigned-pair-id",
   "observed_frozen": {
     "model": "Self-Forcing",
     "width": 832,
