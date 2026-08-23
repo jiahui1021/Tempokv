@@ -187,6 +187,81 @@ def _run_adapter(
     return command
 
 
+def _run_adapter_pair(
+    method: Mapping[str, Any],
+    *,
+    frames: int,
+    repeat: int,
+    warmup_report_path: Path,
+    measure_report_path: Path,
+    output_dir: Path,
+    session_id: str,
+    session_scope: str,
+    runtime_instance_id: str,
+    frozen: Mapping[str, Any],
+    dry_run: bool,
+) -> list[str]:
+    """Run warmup and measurement in one loaded runtime process."""
+    context = {
+        "method": method["name"],
+        "phase": "pair",
+        "frames": frames,
+        "repeat": repeat,
+        "seed": frozen["seed"],
+        "report_path": str(measure_report_path),
+        "warmup_report_path": str(warmup_report_path),
+        "measure_report_path": str(measure_report_path),
+        "output_dir": str(output_dir),
+        "session_id": session_id,
+        "session_scope": session_scope,
+        "runtime_instance_id": runtime_instance_id,
+    }
+    command = _expand_command(method["command"], context) if not dry_run else [
+        part.format_map(context) for part in method["command"]
+    ]
+    if dry_run:
+        return command
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "PAPER_EXPERIMENT_METHOD": method["name"],
+            "PAPER_EXPERIMENT_PHASE": "pair",
+            "PAPER_EXPERIMENT_FRAMES": str(frames),
+            "PAPER_EXPERIMENT_REPEAT": str(repeat),
+            "PAPER_EXPERIMENT_SEED": str(frozen["seed"]),
+            # Keep REPORT as a compatibility alias for the measured report.
+            "PAPER_EXPERIMENT_REPORT": str(measure_report_path),
+            "PAPER_EXPERIMENT_WARMUP_REPORT": str(warmup_report_path),
+            "PAPER_EXPERIMENT_MEASURE_REPORT": str(measure_report_path),
+            "PAPER_EXPERIMENT_OUTPUT": str(output_dir),
+            "PAPER_EXPERIMENT_SESSION_ID": session_id,
+            "PAPER_EXPERIMENT_SESSION_SCOPE": session_scope,
+            "PAPER_EXPERIMENT_RUNTIME_INSTANCE_ID": runtime_instance_id,
+            "PAPER_EXPERIMENT_FROZEN_JSON": json.dumps(frozen, sort_keys=True),
+        }
+    )
+    warmup_report_path.unlink(missing_ok=True)
+    measure_report_path.unlink(missing_ok=True)
+    completed = subprocess.run(
+        command, cwd=PROJECT_ROOT, env=environment, check=False
+    )
+    if completed.returncode:
+        raise RuntimeError(
+            f"adapter failed ({method['name']} pair, frames={frames}, "
+            f"repeat={repeat}): exit {completed.returncode}"
+        )
+    missing = [
+        str(path)
+        for path in (warmup_report_path, measure_report_path)
+        if not path.is_file()
+    ]
+    if missing:
+        raise ContractError(
+            "paired adapter did not write both reports: " + ", ".join(missing)
+        )
+    return command
+
+
 def _synthetic_timings(method: str, frames: int, repeat: int) -> dict[str, float]:
     # Deliberately right-skewed repeat factors exercise the requested robust
     # summaries.  These are plumbing fixtures and are stamped synthetic.
@@ -345,67 +420,77 @@ def execute(
                 name = method["name"]
                 method_dir = raw_dir / name / f"frames-{frames}" / f"repeat-{repeat}"
                 pair_runtime_instance = f"{session_id}:{name}:{frames}:{repeat}"
-                warmup_runtime_instance: str | None = None
-                for phase in ("warmup", "measure"):
-                    report_path = method_dir / f"{phase}.json"
-                    command = _run_adapter(
-                        method,
-                        phase=phase,
-                        frames=frames,
-                        repeat=repeat,
-                        report_path=report_path,
-                        output_dir=output_dir,
-                        session_id=session_id,
-                        session_scope=scope,
-                        runtime_instance_id=pair_runtime_instance,
-                        frozen=frozen,
-                        dry_run=dry_run or synthetic,
-                    )
-                    plan.append(
-                        {
-                            "method": name,
-                            "phase": phase,
-                            "frames": frames,
-                            "repeat": repeat,
-                            "command": command,
-                        }
-                    )
-                    if synthetic:
-                        report = _canonical_run(
-                            method=name,
-                            phase=phase,
-                            repeat=repeat,
-                            frames=frames,
-                            session_id=session_id,
-                            session_scope=scope,
-                            runtime_instance_id=(
-                                pair_runtime_instance
+                warmup_path = method_dir / "warmup.json"
+                measure_path = method_dir / "measure.json"
+                command = _run_adapter_pair(
+                    method,
+                    frames=frames,
+                    repeat=repeat,
+                    warmup_report_path=warmup_path,
+                    measure_report_path=measure_path,
+                    output_dir=output_dir,
+                    session_id=session_id,
+                    session_scope=scope,
+                    runtime_instance_id=pair_runtime_instance,
+                    frozen=frozen,
+                    dry_run=dry_run or synthetic,
+                )
+                plan.append(
+                    {
+                        "method": name,
+                        "phase": "pair",
+                        "frames": frames,
+                        "repeat": repeat,
+                        "warmup_report": str(warmup_path),
+                        "measure_report": str(measure_path),
+                        "command": command,
+                    }
+                )
+                if synthetic:
+                    for phase, path in (
+                        ("warmup", warmup_path),
+                        ("measure", measure_path),
+                    ):
+                        write_json(
+                            path,
+                            _canonical_run(
+                                method=name,
+                                phase=phase,
+                                repeat=repeat,
+                                frames=frames,
+                                session_id=session_id,
+                                session_scope=scope,
+                                runtime_instance_id=pair_runtime_instance,
+                                frozen=frozen,
+                                timings=_synthetic_timings(name, frames, repeat),
                             ),
-                            frozen=frozen,
-                            timings=_synthetic_timings(name, frames, repeat),
                         )
-                        write_json(report_path, report)
-                    if not dry_run:
-                        validated = validate_run_report(
-                            read_json(report_path),
-                            expected_method=name,
-                            expected_phase=phase,
-                            expected_repeat=repeat,
-                            expected_frames=frames,
-                            expected_session_id=session_id,
-                            expected_session_scope=scope,
-                            expected_frozen=frozen,
-                            expected_runtime_instance_id=(
-                                warmup_runtime_instance
-                                if phase == "measure"
-                                else pair_runtime_instance
-                            ),
-                            formal=not pilot,
-                        )
-                        if phase == "warmup":
-                            warmup_runtime_instance = validated["runtime_instance_id"]
-                        else:
-                            records.append(validated)
+                if not dry_run:
+                    warmup = validate_run_report(
+                        read_json(warmup_path),
+                        expected_method=name,
+                        expected_phase="warmup",
+                        expected_repeat=repeat,
+                        expected_frames=frames,
+                        expected_session_id=session_id,
+                        expected_session_scope=scope,
+                        expected_frozen=frozen,
+                        expected_runtime_instance_id=pair_runtime_instance,
+                        formal=not pilot,
+                    )
+                    measured = validate_run_report(
+                        read_json(measure_path),
+                        expected_method=name,
+                        expected_phase="measure",
+                        expected_repeat=repeat,
+                        expected_frames=frames,
+                        expected_session_id=session_id,
+                        expected_session_scope=scope,
+                        expected_frozen=frozen,
+                        expected_runtime_instance_id=warmup["runtime_instance_id"],
+                        formal=not pilot,
+                    )
+                    records.append(measured)
 
     write_json(output_dir / "execution_plan.json", plan)
     if dry_run:

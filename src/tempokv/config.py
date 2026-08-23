@@ -130,8 +130,9 @@ class CodecConfig:
             # ieee reproduces the reference arithmetic and stays the default;
             # tf32 trades the last mantissa bits of the Cross projection for
             # tensor cores, which is worth measuring end to end.
-            if self.k_bits != self.v_bits:
-                raise ValueError("legacy fitting requires matching K/V bits")
+            # K and V are packed and decoded independently.  Legacy keeps its
+            # shared predictor and reference arithmetic, but does not require
+            # the two cache tensors to use the same residual bit width.
             # anchor_bits and group_size fix the quantizer's bit layout, so the
             # reference implementation is only reproduced at these values.
             # stride is not one of them: it only decides where the encoder cuts

@@ -80,16 +80,10 @@ def test_each_measurement_is_immediately_preceded_by_full_warmup(tmp_path) -> No
     output = runner.execute(manifest, dry_run=True, synthetic=False, pilot=False)
     plan = json.loads((output / "execution_plan.json").read_text(encoding="utf-8"))
     non_compilation = [item for item in plan if item["phase"] != "compilation"]
-    assert len(non_compilation) == 7 * 6 * 5 * 2
-    for index in range(0, len(non_compilation), 2):
-        warmup, measure = non_compilation[index : index + 2]
-        assert warmup["phase"] == "warmup"
-        assert measure["phase"] == "measure"
-        assert (warmup["method"], warmup["frames"], warmup["repeat"]) == (
-            measure["method"],
-            measure["frames"],
-            measure["repeat"],
-        )
+    assert len(non_compilation) == 7 * 6 * 5
+    assert all(item["phase"] == "pair" for item in non_compilation)
+    assert all(item["warmup_report"].endswith("warmup.json") for item in non_compilation)
+    assert all(item["measure_report"].endswith("measure.json") for item in non_compilation)
 
 
 def _valid_report(manifest: dict) -> dict:
