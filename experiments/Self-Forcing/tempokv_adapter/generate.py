@@ -366,6 +366,10 @@ def _generation_command(
     ]
     if args.skip_existing:
         command.append("--skip_existing")
+    if os.environ.get("SELF_FORCING_HORIZON_PROBE") == "1":
+        # Horizon probing only needs the cache lifecycle.  Skipping VAE and
+        # video encoding keeps the probe focused on the OOM boundary.
+        command.append("--skip_video_save")
     return command
 
 
@@ -615,6 +619,54 @@ def _write_efficiency_record(
             instrumentation=instrumentation,
         ),
     )
+
+
+def _write_horizon_record(
+    args: argparse.Namespace,
+    *,
+    output_dir: Path,
+    result: dict[str, object],
+) -> dict:
+    """Turn the worker's OOM bookkeeping into the shared horizon schema."""
+    import torch
+
+    prompts = args.prompts.expanduser().read_bytes()
+    local_attn_size = int(result.get("local_attn_size", latent_frames_for(args.frames)))
+    run = {
+        "model": "Self-Forcing",
+        "width": 832,
+        "height": 480,
+        "frames": int(args.frames),
+        "latent_frames": latent_frames_for(args.frames),
+        "prompts_sha256": hashlib.sha256(prompts).hexdigest(),
+        "prompt_indices": [int(args.start_index)],
+        "seed": int(args.seed),
+        "num_gpus": int(args.num_gpus),
+        "gpu_name": torch.cuda.get_device_name(0),
+        "gpu_uuid": _gpu_uuid(),
+        "torch_version": torch.__version__,
+        "cuda_version": torch.version.cuda or "",
+        "local_attn_size": local_attn_size,
+    }
+    payload = efficiency.build_horizon_payload(
+        repo="Tempokv",
+        method="TempoKV" if args.mode == "tempokv" else "BF16",
+        bits=args.k_bits if args.mode == "tempokv" else None,
+        run=run,
+        budget={
+            "device_total_bytes": int(torch.cuda.get_device_properties(0).total_memory),
+            "alloc_conf": os.environ.get("PYTORCH_CUDA_ALLOC_CONF", ""),
+            "exclusive_device": True,
+        },
+        probe_mode="run_to_oom",
+        max_feasible_frames=int(result["max_feasible_frames"]),
+        oom_reached=bool(result["oom_reached"]),
+        peak_allocated_bytes_at_max=int(result.get("peak_allocated_bytes_at_max", 0)),
+        kv_resident_bytes_at_max=int(result.get("kv_resident_bytes_at_max", 0)),
+        bisect_probes=[],
+    )
+    efficiency.write_record(output_dir / "horizon.json", payload)
+    return payload
 
 
 def _load_worker_profiles(
@@ -938,6 +990,25 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         raise subprocess.CalledProcessError(
             completed.returncode, generation_command
         )
+    if os.environ.get("SELF_FORCING_HORIZON_PROBE") == "1":
+        probe_path = paths["videos"] / "horizon_probe.json"
+        if not probe_path.is_file():
+            raise RuntimeError(
+                "Self-Forcing horizon probe finished without horizon_probe.json"
+            )
+        probe = json.loads(probe_path.read_text(encoding="utf-8"))
+        payload = _write_horizon_record(
+            args,
+            output_dir=paths["run"],
+            result=probe,
+        )
+        report.update({"status": "horizon_complete", "horizon": payload})
+        (paths["run"] / "pipeline_report.json").write_text(
+            json.dumps(report, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        print(json.dumps(report, indent=2, ensure_ascii=False))
+        return report
     performance = _load_worker_metrics(metrics_dir, args.num_gpus)
     if args.profile:
         report["runtime_profile"] = _load_worker_profiles(

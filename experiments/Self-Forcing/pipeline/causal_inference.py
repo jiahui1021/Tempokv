@@ -78,6 +78,8 @@ class CausalInferencePipeline(torch.nn.Module):
         # per block, and a run that silently forgot a measurement flag is a
         # wasted GPU hour.
         self.efficiency_sampler = efficiency.ResidentSampler()
+        self.horizon_result: dict | None = None
+        self._horizon_completed_frames = 0
         if getattr(self.quant_config, "kv_cache_cpu_offload", False):
             raise ValueError(
                 "bundled Self-Forcing does not support KV cache CPU offload"
@@ -118,6 +120,9 @@ class CausalInferencePipeline(torch.nn.Module):
                 It is normalized to be in the range [0, 1].
         """
         batch_size, num_frames, num_channels, height, width = noise.shape
+        horizon_probe = os.environ.get("SELF_FORCING_HORIZON_PROBE") == "1"
+        self.horizon_result = None
+        self._horizon_completed_frames = 0
         if not self.independent_first_frame or (self.independent_first_frame and initial_latent is not None):
             # If the first frame is independent and the first frame is provided, then the number of frames in the
             # noise should still be a multiple of num_frame_per_block
@@ -335,10 +340,21 @@ class CausalInferencePipeline(torch.nn.Module):
 
                 # Step 3.4: update the start and end frame indices
                 current_start_frame += current_num_frames
+                self._horizon_completed_frames += int(current_num_frames) * 4
                 self._sample_resident_kv()
                 progress_bar.update(1)
 
         self._sample_resident_kv()
+        if horizon_probe:
+            self.horizon_result = {
+                "max_feasible_frames": efficiency.largest_grid_horizon(
+                    self._horizon_completed_frames
+                ),
+                "oom_reached": False,
+                "peak_allocated_bytes_at_max": int(torch.cuda.max_memory_allocated()),
+                "kv_resident_bytes_at_max": self.efficiency_sampler.peak_resident_bytes,
+                "local_attn_size": int(self.generator.model.local_attn_size),
+            }
 
         if profile:
             # End diffusion timing and synchronize CUDA

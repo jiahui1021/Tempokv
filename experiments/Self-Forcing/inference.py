@@ -192,6 +192,8 @@ torch.cuda.reset_peak_memory_stats(device)
 generation_run_start = time.perf_counter()
 video_summaries = list(pre_skipped_summaries) if global_rank == 0 else []
 batch_summaries = list(pre_skipped_batches) if global_rank == 0 else []
+horizon_probe = os.environ.get("SELF_FORCING_HORIZON_PROBE") == "1"
+horizon_probe_result = None
 
 
 def encode(self, videos: torch.Tensor) -> torch.Tensor:
@@ -233,6 +235,14 @@ def _write_video_checked(path: str, frames: torch.Tensor, fps: int) -> None:
     finally:
         if os.path.exists(temporary):
             os.unlink(temporary)
+
+
+def _write_horizon_probe(path: str, result: dict) -> None:
+    temporary = f"{path}.tmp-{os.getpid()}"
+    with open(temporary, "w", encoding="utf-8") as handle:
+        json.dump(result, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+    os.replace(temporary, path)
 
 
 for i, batch_data in enumerate(dataloader):
@@ -319,14 +329,41 @@ for i, batch_data in enumerate(dataloader):
     # closes the same device interval.
     torch.cuda.synchronize(device)
     generation_start = time.perf_counter()
-    video, latents = pipeline.inference(
-        noise=sampled_noise,
-        text_prompts=prompts,
-        return_latents=True,
-        initial_latent=initial_latent,
-        low_memory=low_memory,
-        decode_output=not args.skip_video_save,
-    )
+    try:
+        video, latents = pipeline.inference(
+            noise=sampled_noise,
+            text_prompts=prompts,
+            return_latents=True,
+            initial_latent=initial_latent,
+            low_memory=low_memory,
+            decode_output=not args.skip_video_save,
+        )
+    except torch.cuda.OutOfMemoryError:
+        if not horizon_probe:
+            raise
+        completed_frames = int(
+            getattr(pipeline, "_horizon_completed_frames", 0)
+        )
+        feasible_frames = (
+            0
+            if completed_frames < 9
+            else completed_frames - ((completed_frames + 3) % 12)
+        )
+        horizon_probe_result = getattr(pipeline, "horizon_result", None) or {
+            "max_feasible_frames": feasible_frames,
+            "oom_reached": True,
+            "peak_allocated_bytes_at_max": int(torch.cuda.max_memory_allocated(device)),
+            "kv_resident_bytes_at_max": int(
+                getattr(pipeline.efficiency_sampler, "peak_resident_bytes", 0)
+            ),
+            "local_attn_size": int(pipeline.generator.model.local_attn_size),
+        }
+        break
+    if horizon_probe:
+        horizon_probe_result = getattr(pipeline, "horizon_result", None)
+        if horizon_probe_result is None:
+            raise RuntimeError("horizon probe completed without a result")
+        break
     torch.cuda.synchronize(device)
     generation_seconds = time.perf_counter() - generation_start
     if args.skip_video_save:
@@ -424,6 +461,11 @@ for i, batch_data in enumerate(dataloader):
     del video, latents, current_video, all_video, sampled_noise, initial_latent
 
 generation_wall_seconds = time.perf_counter() - generation_run_start
+if horizon_probe and global_rank == 0 and horizon_probe_result is not None:
+    _write_horizon_probe(
+        os.path.join(args.output_folder, "horizon_probe.json"),
+        horizon_probe_result,
+    )
 rank_summary = {
     "rank": int(global_rank),
     "local_rank": int(local_rank),

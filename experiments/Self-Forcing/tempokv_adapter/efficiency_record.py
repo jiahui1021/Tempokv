@@ -70,15 +70,19 @@ def tensor_bytes(obj: Any, *, skip_fields: frozenset[str] = frozenset()) -> int:
     under two keys) are counted once: the figure is device bytes held, not
     references taken.
     """
-    seen: set[int] = set()
+    seen: set[tuple[int, int]] = set()
 
     def walk(node: Any) -> int:
         if isinstance(node, torch.Tensor):
-            pointer = node.data_ptr()
-            if pointer in seen:
+            # ``data_ptr()`` differs for offset views.  The resident allocation
+            # is the underlying storage, so identify that storage directly and
+            # count its allocated bytes once.
+            storage = node.untyped_storage()
+            identity = (int(storage.data_ptr()), int(storage.nbytes()))
+            if identity in seen:
                 return 0
-            seen.add(pointer)
-            return node.numel() * node.element_size()
+            seen.add(identity)
+            return identity[1]
         if isinstance(node, dict):
             return sum(
                 walk(value)

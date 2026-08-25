@@ -1,0 +1,95 @@
+{
+  "schema_version": "efficiency-manifest.v1",
+  "experiment_id": "self-forcing-efficiency-a100",
+  "output_root": "results/paper_experiments/efficiency-self-forcing",
+  "frozen": {
+    "model": "Self-Forcing",
+    "width": 832,
+    "height": 480,
+    "frames": 717,
+    "seed": 0,
+    "num_gpus": 1,
+    "prompts": "@FILL@",
+    "prompts_sha256": "@FILL@",
+    "prompt_indices": [0, 1, 2, 3],
+    "gpu_name": "NVIDIA A100-SXM4-80GB",
+    "gpu_uuid": "@FILL@",
+    "horizon_probe_frames": 3009,
+    "horizon_latent_frames": 753,
+    "alloc_conf": "expandable_segments:True",
+    "checkpoint": "@FILL@",
+    "wan_model_dir": "@FILL@"
+  },
+  "repos": {
+    "tempokv": "/Users/hui/Desktop/code/Tempokv",
+    "qvg": "/Users/hui/Desktop/code/qvg/Quant-VideoGen",
+    "kvquant": "/Users/hui/Desktop/code/kv-quant-4-videogen"
+  },
+  "runs": [
+    {
+      "name": "BF16", "repo": "tempokv", "bits": null,
+      "command": ["env", "PROFILE=1", "BENCHMARK=1", "SKIP_EXISTING=0", "FRAMES=717", "NUM_GPUS=1", "SEED=0", "START_INDEX=0", "END_INDEX=3", "CHECKPOINT={checkpoint}", "WAN_MODEL_DIR={wan_model_dir}", "PROMPTS={prompts}", "OUTPUT_DIR={output_dir}", "bash", "scripts/Self-Forcing/run_bf16.sh"],
+      "horizon_command": ["env", "SELF_FORCING_HORIZON_PROBE=1", "FRAMES=3009", "LOCAL_ATTN_SIZE=753", "NUM_GPUS=1", "SEED=0", "START_INDEX=0", "END_INDEX=0", "SKIP_EXISTING=0", "CHECKPOINT={checkpoint}", "WAN_MODEL_DIR={wan_model_dir}", "PROMPTS={prompts}", "OUTPUT_DIR={output_dir}", "bash", "scripts/Self-Forcing/run_bf16.sh"]
+    },
+    {
+      "name": "TEMPOKV_INT2", "repo": "tempokv", "bits": 2,
+      "command": ["env", "PROFILE=1", "BENCHMARK=1", "SKIP_EXISTING=0", "FRAMES=717", "BITS=2", "NUM_GPUS=1", "SEED=0", "START_INDEX=0", "END_INDEX=3", "CONFIG=configs/native.json", "CHECKPOINT={checkpoint}", "WAN_MODEL_DIR={wan_model_dir}", "PROMPTS={prompts}", "OUTPUT_DIR={output_dir}", "bash", "scripts/Self-Forcing/run_tempokv.sh"],
+      "horizon_command": ["env", "SELF_FORCING_HORIZON_PROBE=1", "FRAMES=3009", "LOCAL_ATTN_SIZE=753", "BITS=2", "NUM_GPUS=1", "SEED=0", "START_INDEX=0", "END_INDEX=0", "SKIP_EXISTING=0", "CONFIG=configs/native.json", "CHECKPOINT={checkpoint}", "WAN_MODEL_DIR={wan_model_dir}", "PROMPTS={prompts}", "OUTPUT_DIR={output_dir}", "bash", "scripts/Self-Forcing/run_tempokv.sh"]
+    },
+    {
+      "name": "TEMPOKV_INT4", "repo": "tempokv", "bits": 4,
+      "command": ["env", "PROFILE=1", "BENCHMARK=1", "SKIP_EXISTING=0", "FRAMES=717", "BITS=4", "NUM_GPUS=1", "SEED=0", "START_INDEX=0", "END_INDEX=3", "CONFIG=configs/native.json", "CHECKPOINT={checkpoint}", "WAN_MODEL_DIR={wan_model_dir}", "PROMPTS={prompts}", "OUTPUT_DIR={output_dir}", "bash", "scripts/Self-Forcing/run_tempokv.sh"],
+      "horizon_command": ["env", "SELF_FORCING_HORIZON_PROBE=1", "FRAMES=3009", "LOCAL_ATTN_SIZE=753", "BITS=4", "NUM_GPUS=1", "SEED=0", "START_INDEX=0", "END_INDEX=0", "SKIP_EXISTING=0", "CONFIG=configs/native.json", "CHECKPOINT={checkpoint}", "WAN_MODEL_DIR={wan_model_dir}", "PROMPTS={prompts}", "OUTPUT_DIR={output_dir}", "bash", "scripts/Self-Forcing/run_tempokv.sh"]
+    },
+    {
+      "name": "QVG_INT2", "repo": "qvg", "bits": 2,
+      "command": ["env", "QVG_LATENCY_TIMING=1", "QVG_EFFICIENCY_PROFILE=1", "QVG_FORMAL_WARMUP_VIDEOS=1", "QVG_BITS=2", "NUM_GPUS=1", "MEASURE_KV_CACHE_MEMORY=0", "NUM_OUTPUT_FRAMES=180", "LOCAL_ATTN_SIZE=180", "BASE_SEED=0", "START_INDEX=0", "END_INDEX=3", "CKPT_PATH={checkpoint}", "PROMPTS_PATH={prompts}", "OUTPUT_FOLDER={output_dir}", "bash", "scripts/Self-Forcing/run_qvg.sh"],
+      "horizon_command": ["env", "SELF_FORCING_HORIZON_PROBE=1", "QVG_BITS=2", "NUM_GPUS=1", "NUM_OUTPUT_FRAMES=753", "LOCAL_ATTN_SIZE=753", "BASE_SEED=0", "START_INDEX=0", "END_INDEX=0", "CKPT_PATH={checkpoint}", "PROMPTS_PATH={prompts}", "OUTPUT_FOLDER={output_dir}", "bash", "scripts/Self-Forcing/run_qvg.sh"]
+    },
+    {
+      "name": "QVG_INT4", "repo": "qvg", "bits": 4,
+      "command": ["env", "QVG_LATENCY_TIMING=1", "QVG_EFFICIENCY_PROFILE=1", "QVG_FORMAL_WARMUP_VIDEOS=1", "QVG_BITS=4", "NUM_GPUS=1", "MEASURE_KV_CACHE_MEMORY=0", "NUM_OUTPUT_FRAMES=180", "LOCAL_ATTN_SIZE=180", "BASE_SEED=0", "START_INDEX=0", "END_INDEX=3", "CKPT_PATH={checkpoint}", "PROMPTS_PATH={prompts}", "OUTPUT_FOLDER={output_dir}", "bash", "scripts/Self-Forcing/run_qvg.sh"],
+      "horizon_command": ["env", "SELF_FORCING_HORIZON_PROBE=1", "QVG_BITS=4", "NUM_GPUS=1", "NUM_OUTPUT_FRAMES=753", "LOCAL_ATTN_SIZE=753", "BASE_SEED=0", "START_INDEX=0", "END_INDEX=0", "CKPT_PATH={checkpoint}", "PROMPTS_PATH={prompts}", "OUTPUT_FOLDER={output_dir}", "bash", "scripts/Self-Forcing/run_qvg.sh"]
+    },
+    {
+      "name": "QVG_PRO_INT2", "repo": "qvg", "bits": 2,
+      "command": ["env", "QVG_LATENCY_TIMING=1", "QVG_EFFICIENCY_PROFILE=1", "QVG_FORMAL_WARMUP_VIDEOS=1", "S2_BITS=2", "NUM_GPUS=1", "MEASURE_KV_CACHE_MEMORY=0", "NUM_OUTPUT_FRAMES=180", "LOCAL_ATTN_SIZE=180", "BASE_SEED=0", "START_INDEX=0", "END_INDEX=3", "CKPT_PATH={checkpoint}", "PROMPTS_PATH={prompts}", "OUTPUT_FOLDER={output_dir}", "bash", "scripts/Self-Forcing/run_s2.sh"],
+      "horizon_command": ["env", "SELF_FORCING_HORIZON_PROBE=1", "S2_BITS=2", "NUM_GPUS=1", "NUM_OUTPUT_FRAMES=753", "LOCAL_ATTN_SIZE=753", "BASE_SEED=0", "START_INDEX=0", "END_INDEX=0", "CKPT_PATH={checkpoint}", "PROMPTS_PATH={prompts}", "OUTPUT_FOLDER={output_dir}", "bash", "scripts/Self-Forcing/run_s2.sh"]
+    },
+    {
+      "name": "QVG_PRO_INT4", "repo": "qvg", "bits": 4,
+      "command": ["env", "QVG_LATENCY_TIMING=1", "QVG_EFFICIENCY_PROFILE=1", "QVG_FORMAL_WARMUP_VIDEOS=1", "S2_BITS=4", "NUM_GPUS=1", "MEASURE_KV_CACHE_MEMORY=0", "NUM_OUTPUT_FRAMES=180", "LOCAL_ATTN_SIZE=180", "BASE_SEED=0", "START_INDEX=0", "END_INDEX=3", "CKPT_PATH={checkpoint}", "PROMPTS_PATH={prompts}", "OUTPUT_FOLDER={output_dir}", "bash", "scripts/Self-Forcing/run_s2.sh"] ,
+      "horizon_command": ["env", "SELF_FORCING_HORIZON_PROBE=1", "S2_BITS=4", "NUM_GPUS=1", "NUM_OUTPUT_FRAMES=753", "LOCAL_ATTN_SIZE=753", "BASE_SEED=0", "START_INDEX=0", "END_INDEX=0", "CKPT_PATH={checkpoint}", "PROMPTS_PATH={prompts}", "OUTPUT_FOLDER={output_dir}", "bash", "scripts/Self-Forcing/run_s2.sh"]
+    },
+    {
+      "name": "RTN_INT2", "repo": "kvquant", "bits": 2,
+      "command": ["python", "Self-Forcing/scripts/01_generate.py", "--method", "RTN_INT2", "--bits", "2", "--num-output-frames", "180", "--local-attn-size", "180", "--max-prompts", "4", "--seed", "0", "--profile-quant-timing", "--config-path", "@FILL@", "--default-config-path", "@FILL@", "--checkpoint-path", "{checkpoint}", "--prompt-path", "{prompts}", "--results-root", "{output_dir}", "--efficiency-output", "{output_dir}/efficiency.json"],
+      "horizon_command": ["python", "Self-Forcing/scripts/probe_horizon.py", "--method", "RTN_INT2", "--probe-frames", "3009", "--config-path", "@FILL@", "--default-config-path", "@FILL@", "--checkpoint-path", "{checkpoint}", "--output", "{output_dir}/horizon.json"]
+    },
+    {
+      "name": "RTN_INT4", "repo": "kvquant", "bits": 4,
+      "command": ["python", "Self-Forcing/scripts/01_generate.py", "--method", "RTN_INT4", "--bits", "4", "--num-output-frames", "180", "--local-attn-size", "180", "--max-prompts", "4", "--seed", "0", "--profile-quant-timing", "--config-path", "@FILL@", "--default-config-path", "@FILL@", "--checkpoint-path", "{checkpoint}", "--prompt-path", "{prompts}", "--results-root", "{output_dir}", "--efficiency-output", "{output_dir}/efficiency.json"],
+      "horizon_command": ["python", "Self-Forcing/scripts/probe_horizon.py", "--method", "RTN_INT4", "--probe-frames", "3009", "--config-path", "@FILL@", "--default-config-path", "@FILL@", "--checkpoint-path", "{checkpoint}", "--output", "{output_dir}/horizon.json"]
+    },
+    {
+      "name": "KIVI_INT2", "repo": "kvquant", "bits": 2,
+      "command": ["python", "Self-Forcing/scripts/01_generate.py", "--method", "KIVI_INT2", "--bits", "2", "--num-output-frames", "180", "--local-attn-size", "180", "--max-prompts", "4", "--seed", "0", "--profile-quant-timing", "--config-path", "@FILL@", "--default-config-path", "@FILL@", "--checkpoint-path", "{checkpoint}", "--prompt-path", "{prompts}", "--results-root", "{output_dir}", "--efficiency-output", "{output_dir}/efficiency.json"],
+      "horizon_command": ["python", "Self-Forcing/scripts/probe_horizon.py", "--method", "KIVI_INT2", "--probe-frames", "3009", "--config-path", "@FILL@", "--default-config-path", "@FILL@", "--checkpoint-path", "{checkpoint}", "--output", "{output_dir}/horizon.json"]
+    },
+    {
+      "name": "KIVI_INT4", "repo": "kvquant", "bits": 4,
+      "command": ["python", "Self-Forcing/scripts/01_generate.py", "--method", "KIVI_INT4", "--bits", "4", "--num-output-frames", "180", "--local-attn-size", "180", "--max-prompts", "4", "--seed", "0", "--profile-quant-timing", "--config-path", "@FILL@", "--default-config-path", "@FILL@", "--checkpoint-path", "{checkpoint}", "--prompt-path", "{prompts}", "--results-root", "{output_dir}", "--efficiency-output", "{output_dir}/efficiency.json"],
+      "horizon_command": ["python", "Self-Forcing/scripts/probe_horizon.py", "--method", "KIVI_INT4", "--probe-frames", "3009", "--config-path", "@FILL@", "--default-config-path", "@FILL@", "--checkpoint-path", "{checkpoint}", "--output", "{output_dir}/horizon.json"]
+    },
+    {
+      "name": "QUAROT_KV_INT2", "repo": "kvquant", "bits": 2,
+      "command": ["python", "Self-Forcing/scripts/01_generate.py", "--method", "QUAROT_KV_INT2", "--bits", "2", "--num-output-frames", "180", "--local-attn-size", "180", "--max-prompts", "4", "--seed", "0", "--profile-quant-timing", "--config-path", "@FILL@", "--default-config-path", "@FILL@", "--checkpoint-path", "{checkpoint}", "--prompt-path", "{prompts}", "--results-root", "{output_dir}", "--efficiency-output", "{output_dir}/efficiency.json"],
+      "horizon_command": ["python", "Self-Forcing/scripts/probe_horizon.py", "--method", "QUAROT_KV_INT2", "--probe-frames", "3009", "--config-path", "@FILL@", "--default-config-path", "@FILL@", "--checkpoint-path", "{checkpoint}", "--output", "{output_dir}/horizon.json"]
+    },
+    {
+      "name": "QUAROT_KV_INT4", "repo": "kvquant", "bits": 4,
+      "command": ["python", "Self-Forcing/scripts/01_generate.py", "--method", "QUAROT_KV_INT4", "--bits", "4", "--num-output-frames", "180", "--local-attn-size", "180", "--max-prompts", "4", "--seed", "0", "--profile-quant-timing", "--config-path", "@FILL@", "--default-config-path", "@FILL@", "--checkpoint-path", "{checkpoint}", "--prompt-path", "{prompts}", "--results-root", "{output_dir}", "--efficiency-output", "{output_dir}/efficiency.json"],
+      "horizon_command": ["python", "Self-Forcing/scripts/probe_horizon.py", "--method", "QUAROT_KV_INT4", "--probe-frames", "3009", "--config-path", "@FILL@", "--default-config-path", "@FILL@", "--checkpoint-path", "{checkpoint}", "--output", "{output_dir}/horizon.json"]
+    }
+  ]
+}
