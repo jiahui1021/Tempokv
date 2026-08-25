@@ -111,11 +111,16 @@ DRY_RUN="${DRY_RUN:-0}"
 ALLOW_TRITON_FALLBACK="${ALLOW_TRITON_FALLBACK:-0}"
 SKIP_EXISTING="${SKIP_EXISTING:-1}"
 USE_EMA="${USE_EMA:-0}"
+# Retain the finalized KV cache across prompts. Without it the dense BF16 cache
+# is discarded after every video and fully re-preallocated for the next one,
+# which accumulates memory and OOMs after ~5 videos on 80 GB cards.
+RETAIN_FINAL_CACHE="${RETAIN_FINAL_CACHE:-0}"
 
 check_flag DRY_RUN
 check_flag ALLOW_TRITON_FALLBACK
 check_flag SKIP_EXISTING
 check_flag USE_EMA
+check_flag RETAIN_FINAL_CACHE
 check_int FRAMES 1
 check_int NUM_SAMPLES 1
 check_int SEED 0
@@ -175,6 +180,7 @@ fi
 [[ "$ALLOW_TRITON_FALLBACK" == "1" ]] && generate_command+=(--allow-triton-fallback)
 [[ "$SKIP_EXISTING" == "1" ]] && generate_command+=(--skip-existing)
 [[ "$USE_EMA" == "1" ]] && generate_command+=(--use-ema)
+[[ "$RETAIN_FINAL_CACHE" == "1" ]] && generate_command+=(--retain-final-cache)
 [[ "$DRY_RUN" == "1" ]] && generate_command+=(--dry-run)
 
 if [[ "$DRY_RUN" == "1" ]]; then
