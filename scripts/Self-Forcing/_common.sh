@@ -93,7 +93,6 @@ DEFAULT_V_BITS = 2
 DEFAULT_STRIDE = 1560
 DEFAULT_V_HISTORY_LENGTH = 0
 DEFAULT_V_PREDICTOR_MODE = "cross_kv"
-DEFAULT_CROSS_KV_WEIGHT_MODE = "layer_head"
 
 
 def override(index):
@@ -126,9 +125,15 @@ v_predictor = sys.argv[7] or config.get(
 )
 v_prefix = "vt" if v_predictor == "temporal" else "vh"
 v_label = f"{v_prefix}{int(v_history)}"
-cross_weight_mode = config.get(
-    "cross_kv_weight_mode", DEFAULT_CROSS_KV_WEIGHT_MODE
-)
+if v_predictor == "temporal":
+    cross_weight_mode = "layer_head"
+else:
+    default_cross_weight_mode = (
+        "layer_shared" if config.get("fit_mode") == "legacy" else "layer_head"
+    )
+    cross_weight_mode = config.get(
+        "cross_kv_weight_mode", default_cross_weight_mode
+    )
 cross_weight_labels = {
     "layer_head": "",
     "layer_shared": "-layershared",

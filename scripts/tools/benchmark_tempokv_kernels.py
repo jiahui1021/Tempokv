@@ -23,7 +23,7 @@ them; occupancy is deliberately absent rather than guessed — the plan reads th
 from Nsight Compute.
 
     python scripts/tools/benchmark_tempokv_kernels.py --route v --units 24 \\
-      --sweep production --persistent-units 2 4 8 12 16
+      --sweep production --persistent-units 2 4 8
 
 A microbenchmark win is not a result.  The plan requires the 717-frame
 generation to confirm it.
@@ -88,7 +88,11 @@ class Shape:
 
 
 def _production_config(
-    bits: int, k_history: int, v_history: int, stride: int
+    bits: int,
+    k_history: int,
+    v_history: int,
+    stride: int,
+    cross_matmul_precision: str,
 ) -> CodecConfig:
     """The legacy production codec settings the plan freezes for this round.
 
@@ -109,10 +113,11 @@ def _production_config(
         strict_triton=True,
         k_history_length=k_history,
         v_history_length=v_history,
-        cross_matmul_precision="ieee",
+        cross_matmul_precision=cross_matmul_precision,
         k_predictor_mode="shared",
         v_predictor_mode="cross_kv",
         fit_mode="legacy",
+        cross_kv_weight_mode="layer_shared",
     )
 
 
@@ -745,7 +750,13 @@ def main(argv: list[str] | None = None) -> int:
         help="units per packed span; Self-Forcing packs 24 frames per event",
     )
     parser.add_argument(
-        "--persistent-units", type=int, nargs="+", default=(2, 4, 8, 12, 16)
+        "--persistent-units", type=int, nargs="+", default=(2, 4, 8)
+    )
+    parser.add_argument(
+        "--cross-matmul-precision",
+        choices=("ieee", "tf32"),
+        default="ieee",
+        help="CrossKV tl.dot precision; run both values to measure the TF32 candidate",
     )
     parser.add_argument("--block-s", type=int, nargs="+", default=(8, 16, 32))
     parser.add_argument("--block-d", type=int, nargs="+", default=(16, 32, 64))
@@ -777,6 +788,7 @@ def main(argv: list[str] | None = None) -> int:
         arguments.k_history,
         arguments.v_history,
         arguments.stride,
+        arguments.cross_matmul_precision,
     )
     generator = torch.Generator(device=device).manual_seed(arguments.seed)
     codec = _load_codec(
@@ -841,6 +853,7 @@ def main(argv: list[str] | None = None) -> int:
         "bits": arguments.bits,
         "k_history": arguments.k_history,
         "v_history": arguments.v_history,
+        "cross_matmul_precision": arguments.cross_matmul_precision,
         "parameters": (
             "fitted"
             if arguments.k_params and arguments.v_params

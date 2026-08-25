@@ -214,12 +214,16 @@ def _read_json_config(path: Path | None) -> dict[str, Any]:
 
 
 def _codec_config(args: argparse.Namespace) -> CodecConfig:
-    values = asdict(CodecConfig())
-    values.update(_read_json_config(args.config))
+    values = _read_json_config(args.config)
     for name in CODEC_FIELDS:
         override = getattr(args, name, None)
         if override is not None:
             values[name] = override
+    # CrossKV sharing is irrelevant when V predicts from its own history.  A
+    # V_PREDICTOR=temporal override must therefore leave the shared-CrossKV
+    # production preset and return to the compatible baseline automatically.
+    if values.get("v_predictor_mode") == "temporal":
+        values["cross_kv_weight_mode"] = "layer_head"
     try:
         config = config_from_mapping(values)
     except (TypeError, ValueError) as error:

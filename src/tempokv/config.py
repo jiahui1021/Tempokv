@@ -26,7 +26,14 @@ def config_from_mapping(payload: Mapping[str, Any]) -> "CodecConfig":
             )
             + " — remove them and refit if the parameters were shared"
         )
-    return CodecConfig(**payload)
+    resolved = dict(payload)
+    if (
+        "cross_kv_weight_mode" not in resolved
+        and resolved.get("fit_mode", "native") == "legacy"
+        and resolved.get("v_predictor_mode", "cross_kv") == "cross_kv"
+    ):
+        resolved["cross_kv_weight_mode"] = "layer_shared"
+    return CodecConfig(**resolved)
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,7 +67,10 @@ class CodecConfig:
     fit_mode: str = "native"
     # Select whether legacy CrossKV projections are independent per layer/head,
     # shared across layers, shared across heads, or shared across both axes.
-    # Appended so positional construction by older callers stays compatible.
+    # Production legacy CrossKV configs select layer_shared explicitly.  The
+    # generic dataclass keeps layer_head for native and temporal-V callers,
+    # whose fitters do not implement shared CrossKV constraints.  Appended so
+    # positional construction by older callers stays compatible.
     cross_kv_weight_mode: str = "layer_head"
 
     def __post_init__(self) -> None:

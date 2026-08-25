@@ -1248,7 +1248,7 @@ def fit_legacy_cross_kv(
     ridge: float = 0.1,
     stride: int | None = None,
     layer_ids: tuple[int, ...] | None = None,
-    weight_mode: str = "layer_head",
+    weight_mode: str = "layer_shared",
 ) -> CrossKVParameters:
     """Fit the legacy Cross(K) backbone in FP64.
 

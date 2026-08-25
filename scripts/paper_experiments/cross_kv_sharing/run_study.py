@@ -17,6 +17,7 @@ from typing import Any
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 MODES = ("layer_head", "layer_shared", "head_shared", "shared")
 METHODS = ("bf16", *MODES)
+TF32_METHOD = "layer_shared_tf32"
 
 
 def _read_codec(path: Path) -> dict[str, Any]:
@@ -70,6 +71,17 @@ def make_variant_configs(base_config: Path, output: Path) -> dict[str, Path]:
                 f"{mode} config differs in unexpected fields: {differences}"
             )
     return variants
+
+
+def add_tf32_latency_candidate(
+    variants: dict[str, Path], output: Path
+) -> dict[str, Path]:
+    """Add a layer_shared candidate that changes only CrossKV dot precision."""
+    codec = _read_codec(variants["layer_shared"])
+    codec["cross_matmul_precision"] = "tf32"
+    path = output / "configs" / f"cross_kv_{TF32_METHOD}.json"
+    _write_json(path, {"codec": codec})
+    return {**variants, TF32_METHOD: path}
 
 
 def _fit_command(args: argparse.Namespace, mode: str, config: Path, params: Path) -> list[str]:
@@ -150,6 +162,7 @@ def _generation_command(
         "--num-gpus",
         str(args.num_gpus),
         "--benchmark",
+        "--profile",
     ]
     if method != "bf16":
         assert config is not None and params is not None
@@ -233,6 +246,7 @@ def _vbench_files(
     args: argparse.Namespace,
     output: Path,
     runs: dict[str, Path],
+    methods: tuple[str, ...],
 ) -> tuple[Path, list[str]]:
     if args.samples != 1 or args.start_index != 0 or args.end_index <= 0:
         raise ValueError("VBench-Long requires samples=1 and prompt range 0..N")
@@ -258,7 +272,7 @@ def _vbench_files(
             "prompt_text": str(prompt_path.resolve()),
             "entries": [
                 {"name": method, "videos": str((runs[method] / "videos").resolve()), "lane": 0}
-                for method in METHODS
+                for method in methods
             ],
         },
     )
@@ -290,12 +304,16 @@ def build_manifest(args: argparse.Namespace) -> dict[str, Any]:
         )
     output = args.output.resolve()
     variants = make_variant_configs(args.base_config, output)
+    if getattr(args, "include_tf32_latency_candidate", False):
+        variants = add_tf32_latency_candidate(variants, output)
+    tempokv_methods = tuple(variants)
+    methods = ("bf16", *tempokv_methods)
     fair = _fair_fields(args)
-    params = {mode: output / "params" / mode for mode in MODES}
-    runs = {method: output / "runs" / method for method in METHODS}
+    params = {mode: output / "params" / mode for mode in tempokv_methods}
+    runs = {method: output / "runs" / method for method in methods}
     reconstruction_trace = args.held_out_trace or args.calibration_trace
     steps: list[dict[str, Any]] = []
-    for mode in MODES:
+    for mode in tempokv_methods:
         steps.append(
             {
                 "id": f"fit_{mode}",
@@ -317,7 +335,7 @@ def build_manifest(args: argparse.Namespace) -> dict[str, Any]:
                 "expected": str(reconstruction_base.with_suffix(".json").resolve()),
             }
         )
-    for method in METHODS:
+    for method in methods:
         steps.append(
             {
                 "id": f"generate_{method}",
@@ -334,7 +352,7 @@ def build_manifest(args: argparse.Namespace) -> dict[str, Any]:
                 "fairness": fair,
             }
         )
-    for mode in MODES:
+    for mode in tempokv_methods:
         quality = runs[mode] / "quality_vs_bf16.json"
         steps.append(
             {
@@ -350,7 +368,7 @@ def build_manifest(args: argparse.Namespace) -> dict[str, Any]:
     if args.vbench_long:
         if args.vbench_root is None or args.vbench_cache_dir is None or not args.vbench_devices:
             raise ValueError("--vbench-long requires root, cache dir, and devices")
-        vbench_manifest, command = _vbench_files(args, output, runs)
+        vbench_manifest, command = _vbench_files(args, output, runs, methods)
         steps.append(
             {
                 "id": "vbench_long_matrix",
@@ -366,8 +384,14 @@ def build_manifest(args: argparse.Namespace) -> dict[str, Any]:
             "CrossKV projections can share weights across layers, heads, or "
             "both without unacceptable reconstruction or generation loss"
         ),
-        "only_treatment_difference": "codec.cross_kv_weight_mode",
+        "sharing_ablation_difference": "codec.cross_kv_weight_mode",
+        "latency_candidate_difference": (
+            "codec.cross_matmul_precision"
+            if TF32_METHOD in tempokv_methods
+            else None
+        ),
         "modes": list(MODES),
+        "methods": list(methods),
         "base_config": str(args.base_config.resolve()),
         "variant_configs": {mode: str(path.resolve()) for mode, path in variants.items()},
         "calibration_trace": str(args.calibration_trace.resolve()),
@@ -383,9 +407,25 @@ def build_manifest(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
+def _comparison_methods(output: Path) -> tuple[str, ...]:
+    candidate = output / "configs" / f"cross_kv_{TF32_METHOD}.json"
+    return (*METHODS, TF32_METHOD) if candidate.is_file() else METHODS
+
+
+def _profile_total(report: dict[str, Any], section_name: str) -> float | None:
+    total = 0.0
+    found = False
+    for profile in report.get("runtime_profile", []) or []:
+        for section in profile.get("sections", []) or []:
+            if section.get("name") == section_name:
+                total += float(section["total_ms"])
+                found = True
+    return total if found else None
+
+
 def _comparison_rows(output: Path) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
-    for method in METHODS:
+    for method in _comparison_methods(output):
         row: dict[str, Any] = {
             "method": method,
             "status": "reference" if method == "bf16" else "planned",
@@ -397,6 +437,11 @@ def _comparison_rows(output: Path) -> list[dict[str, Any]]:
             "fid": None,
             "materialized_parameter_mib": None,
             "logical_parameter_mib": None,
+            "generation_seconds": None,
+            "decode_v_ms": None,
+            "cross_kv_triton_calls": None,
+            "generation_speedup_vs_layer_shared": None,
+            "decode_v_speedup_vs_layer_shared": None,
             "vbench_visual_quality": None,
             "vbench_temporal_quality": None,
             "vbench_frame_wise_quality": None,
@@ -418,6 +463,17 @@ def _comparison_rows(output: Path) -> list[dict[str, Any]]:
             row["vbench_temporal_quality"] = official.get("temporal_quality")
             row["vbench_frame_wise_quality"] = official.get("frame_wise_quality")
             row["vbench_text_alignment"] = official.get("text_alignment")
+        pipeline = output / "runs" / method / "pipeline_report.json"
+        if pipeline.is_file():
+            payload = json.loads(pipeline.read_text(encoding="utf-8"))
+            row["generation_seconds"] = payload.get("generation_seconds")
+            row["decode_v_ms"] = _profile_total(payload, "decode_v")
+            routes = payload.get("performance", {}).get("decode_routes", {})
+            row["cross_kv_triton_calls"] = sum(
+                int(count)
+                for name, count in routes.items()
+                if name.startswith("cross_kv_persistent")
+            )
         if method != "bf16":
             fit_report = output / "params" / method / "fit_report.json"
             reconstruction = output / "reconstruction" / f"{method}.json"
@@ -438,6 +494,16 @@ def _comparison_rows(output: Path) -> list[dict[str, Any]]:
             if fit_report.is_file() and reconstruction.is_file() and quality.is_file():
                 row["status"] = "complete"
         rows.append(row)
+    baseline = next(row for row in rows if row["method"] == "layer_shared")
+    for row in rows:
+        for value_key, speedup_key in (
+            ("generation_seconds", "generation_speedup_vs_layer_shared"),
+            ("decode_v_ms", "decode_v_speedup_vs_layer_shared"),
+        ):
+            before = baseline[value_key]
+            after = row[value_key]
+            if before is not None and after is not None and float(after) > 0.0:
+                row[speedup_key] = float(before) / float(after)
     return rows
 
 
@@ -453,6 +519,13 @@ def write_comparison(output: Path) -> None:
             "parameter_metrics": [
                 "materialized_parameter_mib",
                 "logical_parameter_mib",
+            ],
+            "latency_metrics": [
+                "generation_seconds",
+                "decode_v_ms",
+                "cross_kv_triton_calls",
+                "generation_speedup_vs_layer_shared",
+                "decode_v_speedup_vs_layer_shared",
             ],
             "optional_vbench_long_metrics": [
                 "vbench_visual_quality",
@@ -538,6 +611,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--fid-batch-size", type=int, default=32)
     parser.add_argument("--max-quality-frames", type=int)
     parser.add_argument("--attention-steps", type=int)
+    parser.add_argument("--include-tf32-latency-candidate", action="store_true")
     parser.add_argument("--vbench-long", action="store_true")
     parser.add_argument("--vbench-root", type=Path)
     parser.add_argument("--vbench-cache-dir", type=Path)

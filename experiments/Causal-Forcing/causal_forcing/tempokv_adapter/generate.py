@@ -539,6 +539,8 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             )
             if value is not None
         }
+        if overrides.get("v_predictor_mode") == "temporal":
+            overrides["cross_kv_weight_mode"] = "layer_head"
         if overrides:
             config = replace(config, **overrides)
         if 128 % config.group_size:

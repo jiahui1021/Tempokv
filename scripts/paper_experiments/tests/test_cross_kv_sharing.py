@@ -140,6 +140,7 @@ def test_manifest_freezes_fair_generation_and_contains_full_chain(
 
     generation = [step for step in manifest["steps"] if step["kind"] == "generation"]
     assert all(step["fairness"] == manifest["fair_generation_protocol"] for step in generation)
+    assert all("--profile" in step["command"] for step in generation)
     assert manifest["fair_generation_protocol"]["wan_model_dir"] == str(wan.resolve())
     fair_options = (
         "--checkpoint",
@@ -200,6 +201,36 @@ def test_dry_run_writes_manifest_and_planned_comparison_without_model_files(
         "shared",
     ]
     assert (args.output / "comparison.csv").is_file()
+
+
+def test_tf32_latency_candidate_changes_only_precision_and_mode_label(
+    tmp_path: Path,
+) -> None:
+    study = _module(
+        "cross_kv_sharing_study_tf32",
+        "scripts/paper_experiments/cross_kv_sharing/run_study.py",
+    )
+    args = _args(tmp_path)
+    args.include_tf32_latency_candidate = True
+    manifest = study.build_manifest(args)
+    candidate = json.loads(
+        Path(manifest["variant_configs"]["layer_shared_tf32"]).read_text(
+            encoding="utf-8"
+        )
+    )["codec"]
+    baseline = json.loads(
+        Path(manifest["variant_configs"]["layer_shared"]).read_text(
+            encoding="utf-8"
+        )
+    )["codec"]
+    assert candidate["cross_kv_weight_mode"] == "layer_shared"
+    assert candidate["cross_matmul_precision"] == "tf32"
+    assert {
+        key
+        for key in set(candidate) | set(baseline)
+        if candidate.get(key) != baseline.get(key)
+    } == {"cross_matmul_precision"}
+    assert manifest["methods"][-1] == "layer_shared_tf32"
 
 
 def test_synthetic_trace_reconstruction_has_pooled_layer_and_head_nmse(tmp_path: Path) -> None:
@@ -344,6 +375,50 @@ def test_comparison_collects_materialized_and_logical_parameter_sizes(tmp_path: 
         assert rows[mode]["logical_parameter_mib"] == logical
 
 
+def test_comparison_collects_end_to_end_and_decode_v_latency(tmp_path: Path) -> None:
+    study = _module(
+        "cross_kv_sharing_study_latency_comparison",
+        "scripts/paper_experiments/cross_kv_sharing/run_study.py",
+    )
+    for method, generation_seconds, decode_v_ms in (
+        ("bf16", 10.0, None),
+        ("layer_shared", 12.5, 420.0),
+    ):
+        report = tmp_path / "runs" / method / "pipeline_report.json"
+        report.parent.mkdir(parents=True, exist_ok=True)
+        sections = [] if decode_v_ms is None else [
+            {"name": "decode_v", "total_ms": decode_v_ms}
+        ]
+        report.write_text(
+            json.dumps(
+                {
+                    "generation_seconds": generation_seconds,
+                    "runtime_profile": [{"sections": sections}],
+                    "performance": {
+                        "decode_routes": {
+                            "cross_kv_persistent_direct_bhsd": 30
+                        }
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    study.write_comparison(tmp_path)
+    rows = {
+        row["method"]: row
+        for row in json.loads(
+            (tmp_path / "comparison.json").read_text(encoding="utf-8")
+        )["rows"]
+    }
+    assert rows["bf16"]["generation_seconds"] == 10.0
+    assert rows["layer_shared"]["generation_seconds"] == 12.5
+    assert rows["layer_shared"]["decode_v_ms"] == 420.0
+    assert rows["layer_shared"]["cross_kv_triton_calls"] == 30
+    assert rows["layer_shared"]["generation_speedup_vs_layer_shared"] == 1.0
+    assert rows["layer_shared"]["decode_v_speedup_vs_layer_shared"] == 1.0
+
+
 def test_formal_protocol_rejects_more_than_one_video(tmp_path: Path) -> None:
     study = _module(
         "cross_kv_sharing_study_one_video",
@@ -388,7 +463,7 @@ def test_run_one_video_entrypoint_is_valid_and_pins_the_protocol(tmp_path: Path)
             "PYTHON_BIN": str(stub),
             "CAPTURE": str(capture),
             "CALIBRATION_TRACE": str(tmp_path / "calibration.npz"),
-            "HELD_OUT_TRACE": str(tmp_path / "held-out.npz"),
+            "BASELINE_REPORT": str(tmp_path / "baseline" / "pipeline_report.json"),
             "CHECKPOINT": str(tmp_path / "checkpoint.pt"),
             "WAN_MODEL_DIR": str(tmp_path / "wan"),
             "PROMPTS": str(tmp_path / "prompts.txt"),
@@ -404,8 +479,92 @@ def test_run_one_video_entrypoint_is_valid_and_pins_the_protocol(tmp_path: Path)
     )
     assert completed.returncode == 0, completed.stderr
     arguments = capture.read_text(encoding="utf-8").splitlines()
-    assert arguments[0].endswith("cross_kv_sharing/run_study.py")
-    assert _option(arguments, "--samples") == "1"
-    assert _option(arguments, "--start-index") == "0"
-    assert _option(arguments, "--end-index") == "1"
-    assert "--execute" in arguments
+    assert arguments[0].endswith("cross_kv_sharing/run_tf32_one_video.py")
+    assert _option(arguments, "--prompt-index") == "0"
+    assert _option(arguments, "--baseline-report").endswith("pipeline_report.json")
+    assert "--samples" not in arguments
+    assert "--execute" not in arguments
+
+
+def test_tf32_one_video_comparison_reports_latency_reduction(tmp_path: Path) -> None:
+    runner = _module(
+        "cross_kv_tf32_one_video",
+        "scripts/paper_experiments/cross_kv_sharing/run_tf32_one_video.py",
+    )
+
+    def report(
+        path: Path, generation: float, decode_v: float, precision: str
+    ) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        runtime_config = path.with_name("runtime_config.json")
+        runtime_config.write_text(
+            json.dumps(
+                {
+                    "cross_kv_weight_mode": "layer_shared",
+                    "cross_matmul_precision": precision,
+                }
+            ),
+            encoding="utf-8",
+        )
+        path.write_text(
+            json.dumps(
+                {
+                    "benchmark_valid": True,
+                    "generated_samples": 1,
+                    "generation_seconds": generation,
+                    "runtime_config": str(runtime_config.resolve()),
+                    "generation_command": [
+                        "python",
+                        "-m",
+                        "torch.distributed.run",
+                        "--nproc_per_node=1",
+                        "worker.py",
+                        "--checkpoint_path",
+                        "/model.pt",
+                        "--data_path",
+                        "/prompts.txt",
+                        "--num_output_frames",
+                        "180",
+                        "--num_samples",
+                        "1",
+                        "--seed",
+                        "0",
+                        "--start_index",
+                        "0",
+                        "--end_index",
+                        "1",
+                        "--config_path",
+                        "/model.yaml",
+                        "--local_attn_size",
+                        "180",
+                        "--sink_size",
+                        "0",
+                    ],
+                    "runtime_profile": [
+                        {
+                            "sections": [
+                                {"name": "decode_v", "total_ms": decode_v}
+                            ]
+                        }
+                    ],
+                    "performance": {
+                        "decode_routes": {
+                            "cross_kv_persistent_direct_bhsd": 30
+                        }
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    baseline = tmp_path / "baseline" / "pipeline_report.json"
+    candidate = tmp_path / "candidate" / "pipeline_report.json"
+    report(baseline, 12.0, 600.0, "ieee")
+    report(candidate, 10.0, 450.0, "tf32")
+
+    comparison = runner.compare_reports(baseline, candidate)
+
+    assert comparison["videos_generated_by_candidate"] == 1
+    assert comparison["generation_seconds"]["speedup"] == pytest.approx(1.2)
+    assert comparison["decode_v_ms"]["speedup"] == pytest.approx(4 / 3)
+    assert comparison["latency_reduced"] is True

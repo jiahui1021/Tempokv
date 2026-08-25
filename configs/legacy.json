@@ -4,6 +4,7 @@
   "k_history_length": 2,
   "v_history_length": 1,
   "k_predictor_mode": "shared",
+  "cross_kv_weight_mode": "layer_shared",
   "cross_matmul_precision": "ieee",
   "fit_mode": "legacy"
 }

@@ -84,7 +84,12 @@ config = config.get("codec", config)
 fit_mode = config.get("fit_mode", "native")
 v_predictor = sys.argv[2] or config.get("v_predictor_mode")
 if v_predictor is None:
-    v_predictor = "temporal" if fit_mode == "legacy" else "cross_kv"
+    shared_cross = config.get("cross_kv_weight_mode", "layer_head") != "layer_head"
+    v_predictor = (
+        "cross_kv" if shared_cross else (
+            "temporal" if fit_mode == "legacy" else "cross_kv"
+        )
+    )
 if fit_mode not in {"native", "legacy"}:
     raise SystemExit(f"unsupported fit_mode: {fit_mode}")
 if v_predictor not in {"cross_kv", "temporal"}:
@@ -113,7 +118,6 @@ DEFAULT_V_BITS = 2
 DEFAULT_STRIDE = 1560
 DEFAULT_V_HISTORY_LENGTH = 0
 DEFAULT_V_PREDICTOR_MODE = "cross_kv"
-DEFAULT_CROSS_KV_WEIGHT_MODE = "layer_head"
 
 
 def override(index):
@@ -146,9 +150,15 @@ v_predictor = sys.argv[7] or config.get(
 )
 v_prefix = "vt" if v_predictor == "temporal" else "vh"
 v_label = f"{v_prefix}{int(v_history)}"
-cross_weight_mode = config.get(
-    "cross_kv_weight_mode", DEFAULT_CROSS_KV_WEIGHT_MODE
-)
+if v_predictor == "temporal":
+    cross_weight_mode = "layer_head"
+else:
+    default_cross_weight_mode = (
+        "layer_shared" if config.get("fit_mode") == "legacy" else "layer_head"
+    )
+    cross_weight_mode = config.get(
+        "cross_kv_weight_mode", default_cross_weight_mode
+    )
 cross_weight_labels = {
     "layer_head": "",
     "layer_shared": "-layershared",

@@ -32,13 +32,13 @@ def _run(script: Path, **values: str) -> subprocess.CompletedProcess[str]:
     )
 
 
-def test_legacy_fit_uses_temporal_v_end_to_end() -> None:
+def test_legacy_fit_uses_layer_shared_cross_kv_end_to_end() -> None:
     completed = _run(FIT_SCRIPT, CONFIG="configs/legacy.json")
 
     assert completed.returncode == 0, completed.stderr
     assert "trace/chunkwise_legacy/clean_trace.npz" in completed.stdout
-    assert "legacy-kh2-vt1-int4" in completed.stdout
-    assert "--v-predictor-mode temporal" in completed.stdout
+    assert "legacy-kh2-vh1-int4-layershared" in completed.stdout
+    assert "--v-predictor-mode cross_kv" in completed.stdout
 
 
 def test_native_fit_keeps_cross_kv_identity() -> None:
@@ -92,9 +92,9 @@ def test_invalid_fitting_state_is_rejected_by_the_shell_contract() -> None:
     [
         (
             "configs/legacy.json",
-            "legacy-kh2-vt1-int4",
-            "v_temporal.npz",
-            "temporal",
+            "legacy-kh2-vh1-int4-layershared",
+            "v_cross_kv.npz",
+            "cross_kv",
         ),
         (
             "configs/native.json",
@@ -122,7 +122,7 @@ def test_generate_uses_the_same_v_predictor_identity_as_fitting(
     assert f"--v-predictor-mode {v_predictor}" in completed.stdout
 
 
-def test_attention_controls_are_forwarded_for_legacy_temporal() -> None:
+def test_attention_controls_are_forwarded_for_legacy_default() -> None:
     completed = _run(
         FIT_SCRIPT,
         CONFIG="configs/legacy.json",

@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from tempokv.config import CodecConfig
+from tempokv.config import CodecConfig, config_from_mapping
 from tempokv.fitting import fit_legacy_cross_kv, fit_predictors, refine_attention
 from tempokv.parameters import CrossKVParameters, TemporalParameters
 
@@ -23,11 +23,39 @@ def _legacy_config(**overrides: object) -> CodecConfig:
     return CodecConfig(**values)
 
 
+def test_legacy_mapping_without_mode_defaults_to_layer_shared() -> None:
+    config = config_from_mapping(
+        {
+            "k_history_length": 2,
+            "v_history_length": 1,
+            "k_predictor_mode": "shared",
+            "fit_mode": "legacy",
+        }
+    )
+
+    assert config.cross_kv_weight_mode == "layer_shared"
+    assert '"cross_kv_weight_mode":"layer_shared"' in config.format_signature()
+
+
+def test_temporal_v_mapping_keeps_layer_head_cross_mode() -> None:
+    config = config_from_mapping(
+        {
+            "k_history_length": 2,
+            "v_history_length": 1,
+            "k_predictor_mode": "shared",
+            "v_predictor_mode": "temporal",
+            "fit_mode": "legacy",
+        }
+    )
+
+    assert config.cross_kv_weight_mode == "layer_head"
+
+
 @pytest.mark.parametrize("mode", ("layer_shared", "head_shared", "shared"))
 def test_nondefault_modes_are_signature_separated_and_reject_wrong_families(
     mode: str,
 ) -> None:
-    baseline = _legacy_config()
+    baseline = _legacy_config(cross_kv_weight_mode="layer_head")
     grouped = _legacy_config(cross_kv_weight_mode=mode)
 
     assert baseline.cross_kv_weight_mode == "layer_head"
@@ -137,14 +165,14 @@ def test_grouped_cross_kv_broadcast_copies_are_exact(mode: str) -> None:
         )
 
 
-def test_explicit_layer_head_mode_is_identical_to_the_default() -> None:
+def test_explicit_layer_shared_mode_is_identical_to_the_default() -> None:
     generator = torch.Generator().manual_seed(20260826)
     keys = torch.randn(2, 3, 6, 2, 4, generator=generator)
     values = torch.randn(keys.shape, generator=generator)
 
     default = fit_legacy_cross_kv(keys, values, ridge=0.1)
     explicit = fit_legacy_cross_kv(
-        keys, values, ridge=0.1, weight_mode="layer_head"
+        keys, values, ridge=0.1, weight_mode="layer_shared"
     )
 
     torch.testing.assert_close(default.weight, explicit.weight, rtol=0, atol=0)

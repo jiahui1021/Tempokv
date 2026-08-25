@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run the formal five-video CrossKV sharing comparison.
+# Generate one layer_shared+TF32 video and compare it with a saved baseline.
 
 set -euo pipefail
 
@@ -15,6 +15,7 @@ require_env() {
 }
 
 require_env CALIBRATION_TRACE
+require_env BASELINE_REPORT
 require_env CHECKPOINT
 require_env WAN_MODEL_DIR
 
@@ -27,46 +28,27 @@ else
 fi
 
 prompts="${PROMPTS:-$project_root/assets/moviegen128.txt}"
-output_dir="${OUTPUT_DIR:-$project_root/results/paper/cross_kv_sharing_one_video}"
+output_dir="${OUTPUT_DIR:-$project_root/results/paper/layer_shared_tf32_one_video}"
 base_config="${BASE_CONFIG:-$project_root/configs/legacy.json}"
 
 command=(
-  "$python_bin" "$script_dir/run_study.py"
+  "$python_bin" "$script_dir/run_tf32_one_video.py"
   --base-config "$base_config"
   --calibration-trace "$CALIBRATION_TRACE"
+  --baseline-report "$BASELINE_REPORT"
   --checkpoint "$CHECKPOINT"
   --prompts "$prompts"
   --output "$output_dir"
   --frames "${FRAMES:-717}"
-  --samples 1
   --seed "${SEED:-0}"
-  --start-index 0
-  --end-index 1
+  --prompt-index "${PROMPT_INDEX:-0}"
   --num-gpus "${NUM_GPUS:-1}"
   --fit-device "${FIT_DEVICE:-auto}"
-  --reconstruction-device "${RECONSTRUCTION_DEVICE:-cpu}"
-  --quality-device "${QUALITY_DEVICE:-auto}"
-  --fid-batch-size "${FID_BATCH_SIZE:-32}"
-  --execute
 )
-
-[[ -n "${HELD_OUT_TRACE:-}" ]] && command+=(--held-out-trace "$HELD_OUT_TRACE")
 [[ -n "${MODEL_CONFIG:-}" ]] && command+=(--model-config "$MODEL_CONFIG")
 [[ -n "${LOCAL_ATTN_SIZE:-}" ]] && command+=(--local-attn-size "$LOCAL_ATTN_SIZE")
 [[ -n "${SPAN_FRAMES:-}" ]] && command+=(--span-frames "$SPAN_FRAMES")
-[[ -n "${MAX_QUALITY_FRAMES:-}" ]] && command+=(--max-quality-frames "$MAX_QUALITY_FRAMES")
-
-if [[ "${VBENCH_LONG:-0}" == "1" ]]; then
-  require_env VBENCH_ROOT
-  require_env VBENCH_CACHE_DIR
-  require_env VBENCH_DEVICES
-  command+=(
-    --vbench-long
-    --vbench-root "$VBENCH_ROOT"
-    --vbench-cache-dir "$VBENCH_CACHE_DIR"
-    --vbench-devices "$VBENCH_DEVICES"
-  )
-fi
+[[ "${DRY_RUN:-0}" == "1" ]] && command+=(--dry-run)
 
 export WAN_MODEL_DIR
 exec "${command[@]}"

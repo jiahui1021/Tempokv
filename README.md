@@ -103,13 +103,14 @@ fitter/runtime，并编码进参数目录，不能共享参数。
 
 | 模式 | 独立 W+b 数量 | 含义 |
 |---|---:|---|
-| `layer_head` | `L × H` | 每层、每个 head 独立，现有默认方案 |
+| `layer_head` | `L × H` | 每层、每个 head 独立 |
 | `layer_shared` | `H` | 同一 head 的参数跨所有层共享 |
 | `head_shared` | `L` | 每层内的所有 head 共享参数 |
 | `shared` | `1` | 所有层和 head 共用一套参数 |
 
-后三种只适用于 `legacy + v_predictor_mode=cross_kv`。V history 仍保持原来的逐层逐
-head 参数，因此实验只改变 CrossKV 主矩阵和偏置。
+支持共享的 `legacy + v_predictor_mode=cross_kv` 默认使用 `layer_shared`；native
+和 temporal-V 仍使用 `layer_head`，因为它们的拟合约束不同。V history 仍保持原来
+的逐层逐 head 参数，因此实验只改变 CrossKV 主矩阵和偏置。
 
 为保证现有 Torch、Triton 和生成入口完全走同一路径，shared 的 W/b 在参数文件里仍复制成
 原有 `[L,H,...]` 形状；`fit_report.json` 同时记录实际文件大小和只保存一份 W/b 时的
@@ -118,9 +119,9 @@ head 参数，因此实验只改变 CrossKV 主矩阵和偏置。
 
 完整 A/B 实验入口见
 [`scripts/paper_experiments/cross_kv_sharing/README.md`](scripts/paper_experiments/cross_kv_sharing/README.md)。
-它会生成四套参数，计算 held-out K/V 闭环 NMSE，再用完全相同的 prompt、seed 和帧数
-各生成 1 个视频，同时生成 1 个 BF16 参照，最后汇总 PSNR、SSIM、LPIPS、FID，并可选
-运行 VBench-Long 八项评测。
+完整四模式研究仍由 `run_study.py` 提供。最终 latency 入口只拟合
+`layer_shared + TF32` 并生成 1 条视频，读取已有 `layer_shared + IEEE` 报告后直接给出
+端到端耗时、V 解码耗时和加速倍数，不重复生成 BF16 或其他共享模式。
 
 ### 命令行 override
 
