@@ -12,6 +12,12 @@ import torch
 from tempokv.codec import PackedTensor, TempoKVCodec, decode_tensor
 from tempokv.integration import load_codec_from_env
 
+# This module is loaded both as ``bridge`` off the adapter directory and by
+# file path from the test suite, so it puts its own directory on the path
+# rather than relying on whoever imported it having done so.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import efficiency_record as efficiency
+
 
 _TEMPOKV_STATE_KEY = "_tempokv_packed"
 
@@ -223,6 +229,36 @@ def install(runtime_root: str | Path) -> type:
                 }
             )
             self._record_kv_cache_memory()
+
+        def _resident_kv_bytes(self) -> tuple[int, int]:
+            """Packed spans plus dense chunks, per ``resident_analytic.v1``.
+
+            Predictor parameters live inside every ``PackedTensor`` but are
+            shared across spans, so they are skipped here and reported once as
+            ``predictor_parameter_bytes``.
+            """
+            if not self.kv_cache1:
+                return 0, 0
+            resident = 0
+            for layer in self.kv_cache1:
+                for role in ("k", "v"):
+                    cache = layer[role]
+                    for span in cache.quantized_spans:
+                        packed = _unwrap_cache_state(span.get("quant_data"))
+                        if packed is None:
+                            continue
+                        resident += efficiency.tensor_bytes(
+                            packed, skip_fields=frozenset({"temporal", "cross_kv"})
+                        )
+                    resident += efficiency.tensor_bytes(cache.chunks)
+            tokens = int(self.kv_cache1[0]["local_end_index"])
+            equivalent = efficiency.bf16_equivalent_bytes(
+                batch=self.kv_cache1[0]["k"].batch_size,
+                tokens=tokens,
+                heads=self.num_heads,
+                head_dim=self.head_dim,
+            ) * len(self.kv_cache1)
+            return resident, equivalent
 
         def _record_kv_cache_memory(self) -> None:
             """Aggregate resident K/V bytes across every layer.

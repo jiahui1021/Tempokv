@@ -1,8 +1,15 @@
 from typing import List, Optional
 from types import SimpleNamespace
 import os
+from pathlib import Path
+import sys
 import torch
 from tqdm.auto import tqdm
+
+# Loaded both as ``pipeline.causal_inference`` and by file path from the
+# test suite, so it puts the adapter directory on the path itself.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tempokv_adapter"))
+import efficiency_record as efficiency
 
 from utils.wan_wrapper import WanDiffusionWrapper, WanTextEncoder, WanVAEWrapper
 from kv_cache import ChunkedKVCache
@@ -67,6 +74,10 @@ class CausalInferencePipeline(torch.nn.Module):
             "quantization_events": [],
             "last_kv_cache_memory": None,
         }
+        # Efficiency accounting is always on: it is a few dozen integer adds
+        # per block, and a run that silently forgot a measurement flag is a
+        # wasted GPU hour.
+        self.efficiency_sampler = efficiency.ResidentSampler()
         if getattr(self.quant_config, "kv_cache_cpu_offload", False):
             raise ValueError(
                 "bundled Self-Forcing does not support KV cache CPU offload"
@@ -249,6 +260,7 @@ class CausalInferencePipeline(torch.nn.Module):
             dynamic_ncols=True,
         ) as progress_bar:
             for chunk_index, current_num_frames in enumerate(all_num_frames):
+                self._sample_resident_kv()
                 if profile:
                     block_start.record()
 
@@ -323,7 +335,10 @@ class CausalInferencePipeline(torch.nn.Module):
 
                 # Step 3.4: update the start and end frame indices
                 current_start_frame += current_num_frames
+                self._sample_resident_kv()
                 progress_bar.update(1)
+
+        self._sample_resident_kv()
 
         if profile:
             # End diffusion timing and synchronize CUDA
@@ -380,6 +395,40 @@ class CausalInferencePipeline(torch.nn.Module):
     ) -> None:
         """BF16/trace hook. TempoKV replaces this method in ``bridge.py``."""
         del tokens_to_quantize_start, tokens_to_quantize_end, max_tokens_to_quantize
+
+    def _resident_kv_bytes(self) -> tuple[int, int]:
+        """Resident KV bytes and their BF16 equivalent, per ``resident_analytic.v1``.
+
+        The BF16 pipeline holds only dense chunks, so the two numbers are equal
+        here.  The TempoKV bridge overrides this method to add packed spans.
+        """
+        if not self.kv_cache1:
+            return 0, 0
+        resident = 0
+        for layer in self.kv_cache1:
+            for role in ("k", "v"):
+                resident += efficiency.tensor_bytes(layer[role].chunks)
+        # ``local_end_index`` is identical across layers; one read is enough.
+        tokens = int(self.kv_cache1[0]["local_end_index"])
+        equivalent = efficiency.bf16_equivalent_bytes(
+            batch=self.kv_cache1[0]["k"].batch_size,
+            tokens=tokens,
+            heads=self.num_heads,
+            head_dim=self.head_dim,
+        ) * len(self.kv_cache1)
+        return resident, equivalent
+
+    def _sample_resident_kv(self) -> None:
+        """One ``resident_analytic.v1`` sampling point.
+
+        Fired at block boundaries rather than at pack calls: the last
+        incomplete span never packs, so a pack-triggered sample never sees the
+        state in which every token is resident.
+        """
+        if self.kv_cache1 is None:
+            return
+        resident, equivalent = self._resident_kv_bytes()
+        self.efficiency_sampler.observe(resident, equivalent)
 
     def _initialize_kv_cache(
         self, batch_size, dtype, device, target_frames: Optional[int] = None
