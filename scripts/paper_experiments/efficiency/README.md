@@ -31,6 +31,21 @@ python scripts/paper_experiments/efficiency/collect_efficiency.py \
   --output-root results/paper_experiments/efficiency-self-forcing
 ```
 
+To run only the max-horizon probes:
+
+```bash
+CHECKPOINT=/path/model.pt \
+WAN_MODEL_DIR=/path/Wan2.1-T2V-1.3B \
+PROMPTS=/path/prompts.txt \
+CONFIG=configs/legacy.json \
+scripts/paper_experiments/efficiency/run_max_horizon.sh
+```
+
+The command fails if any selected method exits without writing
+`<output-root>/<method>/horizon.json`. A successful collection writes
+`horizon.csv` and `horizon.tex` with measured max feasible frames, whether the
+probe reached OOM, and the extrapolation cross-check.
+
 ## Three final per-repository launchers
 
 The same workload can be launched without editing the 13-row central manifest:

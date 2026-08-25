@@ -164,6 +164,9 @@ run_horizon() {
   fi
   command+=(bash "$repo_root/scripts/Self-Forcing/$launcher")
   run_cmd "$name horizon" "${command[@]}"
+  if (( ! dry_run )) && [[ ! -f "$out/horizon.json" ]]; then
+    die "$name horizon finished without $out/horizon.json"
+  fi
 }
 
 require_real_inputs
