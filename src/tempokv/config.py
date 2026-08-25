@@ -58,6 +58,10 @@ class CodecConfig:
     v_predictor_mode: str = "cross_kv"
     # Select the legacy fixed-point/shared-K and direct temporal-V fitting math.
     fit_mode: str = "native"
+    # Select whether legacy CrossKV projections are independent per layer/head,
+    # shared across layers, shared across heads, or shared across both axes.
+    # Appended so positional construction by older callers stays compatible.
+    cross_kv_weight_mode: str = "layer_head"
 
     def __post_init__(self) -> None:
         for name in ("k_bits", "v_bits", "anchor_bits"):
@@ -98,6 +102,16 @@ class CodecConfig:
             )
         if self.v_predictor_mode not in {"cross_kv", "temporal"}:
             raise ValueError("v_predictor_mode must be cross_kv or temporal")
+        if self.cross_kv_weight_mode not in {
+            "layer_head",
+            "layer_shared",
+            "head_shared",
+            "shared",
+        }:
+            raise ValueError(
+                "cross_kv_weight_mode must be layer_head, layer_shared, "
+                "head_shared, or shared"
+            )
         # The temporal V predictor reads only its own reconstructed history, so
         # with no history it has nothing to predict from.  Say so here; both
         # fitters would otherwise fail on a zero-length parameter axis.
@@ -107,6 +121,18 @@ class CodecConfig:
             )
         if self.fit_mode not in {"native", "legacy"}:
             raise ValueError("fit_mode must be native or legacy")
+        if self.cross_kv_weight_mode != "layer_head":
+            if self.v_predictor_mode != "cross_kv":
+                raise ValueError(
+                    f"cross_kv_weight_mode={self.cross_kv_weight_mode} "
+                    "requires v_predictor_mode=cross_kv"
+                )
+            if self.fit_mode != "legacy":
+                raise ValueError(
+                    f"cross_kv_weight_mode={self.cross_kv_weight_mode} "
+                    "requires fit_mode=legacy; "
+                    "native fitting does not support shared CrossKV weights"
+                )
         if (
             self.k_predictor_mode == "shared"
             and self.fit_mode != "legacy"
@@ -178,6 +204,10 @@ class CodecConfig:
             payload["k_history_length"] = int(self.k_history_length)
         if self.v_history_length:
             payload["v_history_length"] = int(self.v_history_length)
+        # Omitting the default keeps signatures byte-identical to parameters
+        # fitted before this experiment switch existed.
+        if self.cross_kv_weight_mode != "layer_head":
+            payload["cross_kv_weight_mode"] = self.cross_kv_weight_mode
         return "tempokv-codec-v5:" + json.dumps(
             payload, sort_keys=True, separators=(",", ":")
         )

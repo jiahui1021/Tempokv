@@ -769,6 +769,47 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     parameter_bytes = sum(
         tensor.numel() * tensor.element_size() for tensor in parameter_tensors
     )
+    logical_parameter_bytes = parameter_bytes
+    cross_weight_sharing = None
+    if not temporal_v and config.cross_kv_weight_mode != "layer_head":
+        # The experiment deliberately keeps the deployed [L,H,...] tensors so
+        # every existing Torch/Triton generation path stays unchanged.  Report
+        # the actual artifact size and the logical size at the selected sharing
+        # granularity.
+        expanded_cross_bytes = (
+            cross.weight.numel() * cross.weight.element_size()
+            + cross.bias.numel() * cross.bias.element_size()
+        )
+        dim = int(cross.weight.shape[-1])
+        layers = int(cross.weight.shape[0])
+        heads = int(cross.weight.shape[1])
+        unique_copies = {
+            "layer_shared": heads,
+            "head_shared": layers,
+            "shared": 1,
+        }[config.cross_kv_weight_mode]
+        unique_weight_shape = {
+            "layer_shared": [heads, dim, dim],
+            "head_shared": [layers, dim, dim],
+            "shared": [dim, dim],
+        }[config.cross_kv_weight_mode]
+        unique_bias_shape = unique_weight_shape[:-2] + [dim]
+        unique_cross_bytes = unique_copies * (
+            dim * dim * cross.weight.element_size()
+            + dim * cross.bias.element_size()
+        )
+        logical_parameter_bytes = (
+            parameter_bytes - expanded_cross_bytes + unique_cross_bytes
+        )
+        cross_weight_sharing = {
+            "mode": config.cross_kv_weight_mode,
+            "unique_copies": unique_copies,
+            "expanded_copies": layers * heads,
+            "unique_weight_shape": unique_weight_shape,
+            "unique_bias_shape": unique_bias_shape,
+            "logical_bytes": unique_cross_bytes,
+            "materialized_bytes": expanded_cross_bytes,
+        }
     temporal.save(temporal_path)
     cross.save(cross_path)
     if refinement is not None:
@@ -850,6 +891,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "attention_refinement": refinement,
         "parameters": {
             "v_predictor_mode": config.v_predictor_mode,
+            "cross_kv_weight_mode": config.cross_kv_weight_mode,
             "temporal_weight_shape": list(temporal.history_weights.shape),
             "temporal_bias_shape": list(temporal.history_bias.shape),
             **(
@@ -866,6 +908,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             ),
             "bytes": parameter_bytes,
             "mib": parameter_bytes / (1024**2),
+            "logical_bytes": logical_parameter_bytes,
+            "logical_mib": logical_parameter_bytes / (1024**2),
+            "cross_weight_sharing": cross_weight_sharing,
         },
         "artifacts": {
             "k_temporal": temporal_path.name,

@@ -113,6 +113,7 @@ DEFAULT_V_BITS = 2
 DEFAULT_STRIDE = 1560
 DEFAULT_V_HISTORY_LENGTH = 0
 DEFAULT_V_PREDICTOR_MODE = "cross_kv"
+DEFAULT_CROSS_KV_WEIGHT_MODE = "layer_head"
 
 
 def override(index):
@@ -145,6 +146,22 @@ v_predictor = sys.argv[7] or config.get(
 )
 v_prefix = "vt" if v_predictor == "temporal" else "vh"
 v_label = f"{v_prefix}{int(v_history)}"
+cross_weight_mode = config.get(
+    "cross_kv_weight_mode", DEFAULT_CROSS_KV_WEIGHT_MODE
+)
+cross_weight_labels = {
+    "layer_head": "",
+    "layer_shared": "-layershared",
+    "head_shared": "-headshared",
+    "shared": "-crossshared",
+}
+if cross_weight_mode not in cross_weight_labels:
+    raise SystemExit(
+        "cross_kv_weight_mode must be layer_head, layer_shared, "
+        "head_shared, or shared, got "
+        f"{cross_weight_mode!r}"
+    )
+cross_weight_label = cross_weight_labels[cross_weight_mode]
 if k_bits == v_bits:
     precision_label = f"int{k_bits}"
 else:
@@ -162,6 +179,9 @@ if fit_history_source not in {"reconstructed", "clean"}:
         f"{fit_history_source!r}"
     )
 fit_label = "" if fit_history_source == "reconstructed" else "-fitclean"
-print(f"{mode_label}{k_label}-{v_label}-{precision_label}{stride_label}{fit_label}")
+print(
+    f"{mode_label}{k_label}-{v_label}-{precision_label}"
+    f"{stride_label}{cross_weight_label}{fit_label}"
+)
 SLUGPY
 }

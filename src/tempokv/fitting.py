@@ -370,6 +370,13 @@ def refine_attention(
         raise ValueError("refine_tensors must contain key, value, or both")
     if len(set(phases_to_run)) != len(phases_to_run):
         raise ValueError("refine_tensors must not contain duplicates")
+    if config.cross_kv_weight_mode != "layer_head" and "value" in phases_to_run:
+        raise ValueError(
+            "value refinement does not support "
+            f"cross_kv_weight_mode={config.cross_kv_weight_mode} because it "
+            "would update the "
+            "broadcast CrossKV weights independently"
+        )
     if not sign_step_sizes:
         raise ValueError("sign-gradient refinement needs at least one step size")
     for step_size in sign_step_sizes:
@@ -1241,8 +1248,14 @@ def fit_legacy_cross_kv(
     ridge: float = 0.1,
     stride: int | None = None,
     layer_ids: tuple[int, ...] | None = None,
+    weight_mode: str = "layer_head",
 ) -> CrossKVParameters:
-    """Fit the legacy per-layer/head Cross(K) backbone in FP64."""
+    """Fit the legacy Cross(K) backbone in FP64.
+
+    ``weight_mode="layer_head"`` preserves the reference fit.  The other modes
+    pool across layers (``layer_shared``), heads (``head_shared``), or both
+    (``shared``), then broadcast W and bias to the deployed tensor shapes.
+    """
     _check_pair(
         reconstructed_keys,
         values,
@@ -1253,6 +1266,16 @@ def fit_legacy_cross_kv(
         raise ValueError("CrossKV fitting requires an anchor and one target frame")
     ridge = _check_scalar("ridge", ridge)
     stride = _check_stride(stride)
+    supported_weight_modes = {
+        "layer_head",
+        "layer_shared",
+        "head_shared",
+        "shared",
+    }
+    if weight_mode not in supported_weight_modes:
+        raise ValueError(
+            "weight_mode must be layer_head, layer_shared, head_shared, or shared"
+        )
     work_device = (
         torch.device("cpu")
         if reconstructed_keys.device.type == "mps"
@@ -1261,9 +1284,109 @@ def fit_legacy_cross_kv(
     heads = int(values.shape[-2])
     dim = int(values.shape[-1])
     identity = torch.eye(dim, dtype=torch.float64, device=work_device)
+    layer_count = int(values.shape[0])
+
+    if weight_mode != "layer_head":
+        group_count = heads if weight_mode == "layer_shared" else (
+            layer_count if weight_mode == "head_shared" else 1
+        )
+        counts = torch.zeros(
+            group_count, dtype=torch.float64, device=work_device
+        )
+        sum_x = torch.zeros(
+            group_count, dim, dtype=torch.float64, device=work_device
+        )
+        sum_y = torch.zeros_like(sum_x)
+        xx = torch.zeros(
+            group_count, dim, dim, dtype=torch.float64, device=work_device
+        )
+        xy = torch.zeros_like(xx)
+        for layer in range(layer_count):
+            key_records = _legacy_layer_records(reconstructed_keys, layer)
+            value_records = _legacy_layer_records(values, layer)
+            for key_record, value_record in zip(
+                key_records, value_records, strict=True
+            ):
+                x_by_head = (
+                    key_record[:, 1:]
+                    .detach()
+                    .to(work_device)
+                    .reshape(-1, heads, dim)
+                    .double()
+                )
+                y_by_head = (
+                    value_record[:, 1:]
+                    .detach()
+                    .to(work_device)
+                    .reshape(-1, heads, dim)
+                    .double()
+                )
+                if weight_mode == "layer_shared":
+                    observation_count = int(x_by_head.shape[0])
+                    counts.add_(observation_count)
+                    sum_x.add_(x_by_head.sum(dim=0))
+                    sum_y.add_(y_by_head.sum(dim=0))
+                    xx.add_(torch.einsum("nhd,nhe->hde", x_by_head, x_by_head))
+                    xy.add_(torch.einsum("nhd,nhe->hde", x_by_head, y_by_head))
+                    continue
+
+                x = x_by_head.reshape(-1, dim)
+                y = y_by_head.reshape(-1, dim)
+                group = layer if weight_mode == "head_shared" else 0
+                counts[group] += int(x.shape[0])
+                sum_x[group].add_(x.sum(dim=0))
+                sum_y[group].add_(y.sum(dim=0))
+                xx[group].add_(x.transpose(0, 1) @ x)
+                xy[group].add_(x.transpose(0, 1) @ y)
+        if bool((counts <= 0).any()):
+            raise ValueError(
+                f"no V fitting samples for cross_kv weight mode {weight_mode}"
+            )
+        mean_x = sum_x / counts[:, None]
+        mean_y = sum_y / counts[:, None]
+        gram = xx - torch.einsum(
+            "gd,ge->gde", sum_x, sum_x
+        ) / counts[:, None, None]
+        rhs = xy - torch.einsum(
+            "gd,ge->gde", sum_x, sum_y
+        ) / counts[:, None, None]
+        scale = torch.diagonal(gram, dim1=-2, dim2=-1).sum(dim=-1) / dim
+        penalty = ridge * scale.clamp_min(1e-12)
+        matrix = torch.linalg.solve(
+            gram + penalty[:, None, None] * identity, rhs
+        )
+        bias = mean_y - torch.einsum("gd,gde->ge", mean_x, matrix)
+        if weight_mode == "layer_shared":
+            weight = matrix.float().unsqueeze(0).expand(
+                layer_count, heads, dim, dim
+            )
+            expanded_bias = bias.float().unsqueeze(0).expand(
+                layer_count, heads, dim
+            )
+        elif weight_mode == "head_shared":
+            weight = matrix.float().unsqueeze(1).expand(
+                layer_count, heads, dim, dim
+            )
+            expanded_bias = bias.float().unsqueeze(1).expand(
+                layer_count, heads, dim
+            )
+        else:
+            weight = matrix.float().view(1, 1, dim, dim).expand(
+                layer_count, heads, dim, dim
+            )
+            expanded_bias = bias.float().view(1, 1, dim).expand(
+                layer_count, heads, dim
+            )
+        return CrossKVParameters(
+            weight=weight.to(values.device).contiguous(),
+            bias=expanded_bias.to(values.device).contiguous(),
+            stride=stride,
+            layer_ids=layer_ids,
+        )
+
     all_weights: list[torch.Tensor] = []
     all_biases: list[torch.Tensor] = []
-    for layer in range(int(values.shape[0])):
+    for layer in range(layer_count):
         count = 0
         sum_x = torch.zeros(
             heads, dim, dtype=torch.float64, device=work_device
@@ -2051,6 +2174,7 @@ def _fit_legacy_predictors(
         ridge=cross_ridge,
         stride=config.stride,
         layer_ids=layer_ids,
+        weight_mode=config.cross_kv_weight_mode,
     )
     if config.v_history_length:
         cross = fit_legacy_temporal_v_alpha(

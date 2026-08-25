@@ -97,6 +97,31 @@ K——它同时改 V 预测的累加顺序、编解码的 BF16 截断点，并�
 wrapper 为 attention-refinement 协议选择 temporal V。两者都会把解析后的 family 显式传给
 fitter/runtime，并编码进参数目录，不能共享参数。
 
+### Shared CrossKV 矩阵实验
+
+`cross_kv_weight_mode` 用来单独验证 CrossKV 的四种共享粒度：
+
+| 模式 | 独立 W+b 数量 | 含义 |
+|---|---:|---|
+| `layer_head` | `L × H` | 每层、每个 head 独立，现有默认方案 |
+| `layer_shared` | `H` | 同一 head 的参数跨所有层共享 |
+| `head_shared` | `L` | 每层内的所有 head 共享参数 |
+| `shared` | `1` | 所有层和 head 共用一套参数 |
+
+后三种只适用于 `legacy + v_predictor_mode=cross_kv`。V history 仍保持原来的逐层逐
+head 参数，因此实验只改变 CrossKV 主矩阵和偏置。
+
+为保证现有 Torch、Triton 和生成入口完全走同一路径，shared 的 W/b 在参数文件里仍复制成
+原有 `[L,H,...]` 形状；`fit_report.json` 同时记录实际文件大小和只保存一份 W/b 时的
+逻辑参数量。三种共享配置的参数目录分别增加 `-layershared`、`-headshared` 和
+`-crossshared`，不会覆盖原始对照组。
+
+完整 A/B 实验入口见
+[`scripts/paper_experiments/cross_kv_sharing/README.md`](scripts/paper_experiments/cross_kv_sharing/README.md)。
+它会生成四套参数，计算 held-out K/V 闭环 NMSE，再用完全相同的 prompt、seed 和帧数
+各生成 1 个视频，同时生成 1 个 BF16 参照，最后汇总 PSNR、SSIM、LPIPS、FID，并可选
+运行 VBench-Long 八项评测。
+
 ### 命令行 override
 
 | 变量 | 作用 | 适用 |
