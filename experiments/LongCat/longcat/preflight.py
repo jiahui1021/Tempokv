@@ -309,13 +309,11 @@ def _parameter_file_check(
                         and bias.shape
                         == (weights.shape[0], weights.shape[-2], weights.shape[-1])
                     )
-                elif weights.ndim in (2, 3):
+                elif weights.ndim == 3:
                     shape_ok = (
-                        weights.shape[-2:] == (
-                            EXPECTED_LONGCAT_MODEL["num_heads"],
-                            EXPECTED_LONGCAT_MODEL["head_dim"],
-                        )
-                        and bias.shape == weights.shape
+                        weights.shape[0] == weights.shape[1]
+                        and weights.shape[-1] == EXPECTED_LONGCAT_MODEL["head_dim"]
+                        and bias.shape == (weights.shape[0], weights.shape[-1])
                     )
                 else:
                     shape_ok = False
@@ -324,7 +322,7 @@ def _parameter_file_check(
                         history_mode == "shared"
                         or (history_mode == "independent" and weights.ndim == 5)
                     )
-                if weights.ndim == 2 and "layer_ids" in data and data["layer_ids"].size:
+                if weights.ndim != 5 and "layer_ids" in data and data["layer_ids"].size:
                     shape_ok = False
             else:
                 if "weight" not in data or "bias" not in data:

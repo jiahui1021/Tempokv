@@ -13,10 +13,8 @@
 #   VH=1 \
 #   bash scripts/Self-Forcing/fit_params.sh
 #
-# 必需变量：
-#   CONFIG      codec 配置 JSON（如 configs/legacy.json）
-#
 # 常用可选变量：
+#   CONFIG          codec 配置 JSON（默认 configs/legacy.json）
 #   TRACE_FILE      拟合输入（默认 data/self-forcing/trace/clean_trace.npz）
 #   OUTPUT_DIR      输出目录（默认 data/self-forcing/params/<参数方案>）
 #   BITS / K_BITS / V_BITS  位宽 override（2/4/8；默认读取 CONFIG）
@@ -49,8 +47,7 @@ K_HISTORY_LENGTH="$(resolve_history K_HISTORY_LENGTH KH)"
 V_HISTORY_LENGTH="$(resolve_history V_HISTORY_LENGTH VH)"
 K_BITS="$(resolve_bits K_BITS)"
 V_BITS="$(resolve_bits V_BITS)"
-
-require_env CONFIG
+CONFIG="${CONFIG:-$default_codec_config}"
 
 trace_file="$(resolve_path "${TRACE_FILE:-data/self-forcing/trace/clean_trace.npz}")"
 config_path="$(resolve_path "$CONFIG")"

@@ -40,7 +40,7 @@ The same workload can be launched without editing the 13-row central manifest:
 CHECKPOINT=/path/model.pt \
 WAN_MODEL_DIR=/path/Wan2.1-T2V-1.3B \
 PROMPTS=/path/prompts.txt \
-CONFIG=configs/native.json \
+CONFIG=configs/legacy.json \
 scripts/paper_experiments/efficiency/run_efficiency.sh --mode both
 
 # QVG: QVG/QVG-Pro INT2/INT4

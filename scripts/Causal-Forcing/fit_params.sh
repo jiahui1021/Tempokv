@@ -10,13 +10,11 @@
 # 完全相同，checkpoint、训练方式和 cache 分布都不同，必须重新采 trace 重新拟合。
 #
 # 用法：
-#   CONFIG=configs/native.json \
+#   CONFIG=configs/legacy.json \
 #   bash scripts/Causal-Forcing/fit_params.sh
 #
-# 必需变量：
-#   CONFIG      codec 配置 JSON
-#
 # 常用可选变量：
+#   CONFIG          codec 配置 JSON（默认 configs/legacy.json）
 #   GENERATION_MODE  chunkwise（默认）或 framewise
 #   TRACE_FILE       拟合输入（默认按 CONFIG 选择 native/legacy trace 目录）
 #   OUTPUT_DIR       输出目录（默认 data/causal-forcing/params/<模式>/<参数方案>）
@@ -45,8 +43,7 @@ K_HISTORY_LENGTH="$(resolve_history K_HISTORY_LENGTH KH)"
 V_HISTORY_LENGTH="$(resolve_history V_HISTORY_LENGTH VH)"
 K_BITS="$(resolve_bits K_BITS)"
 V_BITS="$(resolve_bits V_BITS)"
-
-require_env CONFIG
+CONFIG="${CONFIG:-$default_codec_config}"
 
 generation_mode="${GENERATION_MODE:-chunkwise}"
 case "$generation_mode" in

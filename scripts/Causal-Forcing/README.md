@@ -32,18 +32,15 @@ bash scripts/Causal-Forcing/run_bf16.sh
 CHECKPOINT=checkpoints/causal_forcing/chunkwise/causal_forcing.pt \
 MODEL_ROOT=checkpoints/causal_forcing/wan2.1-t2v-1.3b \
 PROMPTS=assets/fit_prompts.txt \
-CONFIG=configs/native.json \
 bash scripts/Causal-Forcing/collect_trace.sh
 
 # 拟合 INT4
-CONFIG=configs/native.json \
 bash scripts/Causal-Forcing/fit_params.sh
 
 # TempoKV 生成
 CHECKPOINT=checkpoints/causal_forcing/chunkwise/causal_forcing.pt \
 MODEL_ROOT=checkpoints/causal_forcing/wan2.1-t2v-1.3b \
 PROMPTS=assets/generation_prompts.txt \
-CONFIG=configs/native.json \
 bash scripts/Causal-Forcing/run_tempokv.sh
 ```
 
@@ -56,7 +53,7 @@ INT2 使用同一个配置并设置 `BITS=2`；参数目录会自动切换到 IN
 | `CHECKPOINT` | Causal Forcing 权重 | 必填 |
 | `MODEL_ROOT` | Wan2.1-T2V-1.3B 目录 | 必填 |
 | `PROMPTS` | prompt 列表 | 必填 |
-| `CONFIG` | codec 配置 JSON | TempoKV 模式必填 |
+| `CONFIG` | codec 配置 JSON | `configs/legacy.json` |
 | `GENERATION_MODE` | `chunkwise` 或 `framewise` | `chunkwise` |
 | `FRAMES` | 最终视频帧数 | `81` |
 | `SPAN_FRAMES` | 每个 TempoKV span 的 latent 帧数 | `12` |
@@ -67,8 +64,9 @@ INT2 使用同一个配置并设置 `BITS=2`；参数目录会自动切换到 IN
 `GENERATION_MODE` 会同时决定 `num_frame_per_block`（chunkwise=3，framewise=1）、
 默认的模型配置文件，以及 trace / 参数 / 结果的子目录，两种模式互不覆盖。
 
-采 trace 时同样必须传 `CONFIG`：native family 写入 `trace/<模式>/`，legacy family 写入
-`trace/<模式>_legacy/`。手工设置 `LEGACY_PROTOCOL` 与 config family 冲突会直接报错。
+采 trace 默认使用 legacy family 并写入 `trace/<模式>_legacy/`。显式传入
+`CONFIG=configs/native.json` 时写入 `trace/<模式>/`。手工设置 `LEGACY_PROTOCOL` 与
+config family 冲突会直接报错。
 
 `FRAMES` 必须让视频帧精确对应完整的 latent block：chunkwise 要求
 `(FRAMES + 3) % 12 == 0`，framewise 要求 `(FRAMES + 3) % 4 == 0`。

@@ -6,14 +6,14 @@
 # OUTPUT_DIR 后可以重复运行。
 #
 # 两种模式：
-#   MODE=tempokv  使用 TempoKV 量化参数（默认），需要 CONFIG + PARAM_DIR
+#   MODE=tempokv  使用 TempoKV 量化参数（默认），参数从 PARAM_DIR 读取
 #   MODE=bf16     不量化的对照基线，不需要 CONFIG / PARAM_DIR
 #
 # 用法（所有参数都用环境变量传入）：
 #   CHECKPOINT=/models/causal_forcing/chunkwise/causal_ode.pt \
 #   MODEL_ROOT=/models/Wan2.1-T2V-1.3B \
 #   PROMPTS=assets/generation_prompts.txt \
-#   CONFIG=configs/native.json \
+#   CONFIG=configs/legacy.json \
 #   FRAMES=81 \
 #   bash scripts/Causal-Forcing/generate.sh
 #
@@ -21,9 +21,9 @@
 #   CHECKPOINT   Causal Forcing 模型权重
 #   MODEL_ROOT   Wan2.1-T2V-1.3B 目录
 #   PROMPTS      prompt 列表
-#   CONFIG       codec 配置 JSON（仅 MODE=tempokv）
 #
 # 常用可选变量：
+#   CONFIG          codec 配置 JSON（默认 configs/legacy.json）
 #   GENERATION_MODE  chunkwise（默认）或 framewise，决定 num_frame_per_block
 #   PARAM_DIR        参数目录（默认 data/causal-forcing/params/<模式>/<参数方案>）
 #   OUTPUT_DIR       结果输出目录（默认 results/causal_forcing/<模式>/<量化标签>）
@@ -49,6 +49,7 @@ K_HISTORY_LENGTH="$(resolve_history K_HISTORY_LENGTH KH)"
 V_HISTORY_LENGTH="$(resolve_history V_HISTORY_LENGTH VH)"
 K_BITS="$(resolve_bits K_BITS)"
 V_BITS="$(resolve_bits V_BITS)"
+CONFIG="${CONFIG:-$default_codec_config}"
 mode="${MODE:-tempokv}"
 
 case "$mode" in
@@ -57,9 +58,6 @@ case "$mode" in
 esac
 
 require_env CHECKPOINT MODEL_ROOT PROMPTS
-if [[ "$mode" == "tempokv" ]]; then
-  require_env CONFIG
-fi
 
 generation_mode="${GENERATION_MODE:-chunkwise}"
 case "$generation_mode" in

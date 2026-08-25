@@ -93,9 +93,8 @@ K——它同时改 V 预测的累加顺序、编解码的 BF16 截断点，并�
 
 注意 legacy 池化的是 **K 与 temporal V**；它的 CrossKV V 仍然是 per-layer per-head。
 `v_predictor_mode=temporal` 需要 `v_history_length >= 1`——没有历史就没有可预测的东西。
-`legacy.json` 本身不钉死 V family：Self-Forcing wrapper 保持 CrossKV 默认，Causal-Forcing
-wrapper 为 attention-refinement 协议选择 temporal V。两者都会把解析后的 family 显式传给
-fitter/runtime，并编码进参数目录，不能共享参数。
+`legacy.json` 默认使用 CrossKV V predictor；三个模型都会把解析后的 family 显式传给
+fitter/runtime，并编码进参数目录。切换成 temporal V 时需要重新拟合，参数不能混用。
 
 ### Shared CrossKV 矩阵实验
 
@@ -148,12 +147,12 @@ fitter/runtime，并编码进参数目录，不能共享参数。
 CONFIG=configs/legacy.json BITS=2 bash scripts/Self-Forcing/fit_params.sh
 CONFIG=configs/legacy.json V_PREDICTOR=temporal bash scripts/Self-Forcing/fit_params.sh
 CONFIG=configs/legacy.json FIT_HISTORY_SOURCE=clean bash scripts/Self-Forcing/fit_params.sh
-CONFIG=configs/native.json CACHE_STRIDE=780 bash scripts/LongCat/fit_params.sh
+CACHE_STRIDE=780 bash scripts/LongCat/fit_params.sh
 ```
 
-两个 family 配置的历史长度都是 `kh2-vh1`。Self-Forcing 复现参考实现的 KH3 要显式写
-`KH=3`；Causal Forcing 可按实验选择 native CrossKV 或 legacy temporal V，LongCat 使用
-native family。attention refinement 支持 legacy/shared 与 native/layered temporal K；V 可选
+三个模型默认都使用 `configs/legacy.json`，即 shared K、layer-shared CrossKV 和 legacy
+拟合。Self-Forcing 复现参考实现的 KH3 要显式写 `KH=3`；`configs/native.json` 仅保留给
+显式对照实验。attention refinement 支持 legacy/shared 与 native/layered temporal K；V 可选
 temporal 或 `CrossKV + V-history`。
 启用 refinement 时，同一次拟合还会保存 `k_temporal_ls.npz` 和对应的 `v_*_ls.npz`，供
 LS-only / refined 严格消融；常规文件名仍指向 refinement 后参数。

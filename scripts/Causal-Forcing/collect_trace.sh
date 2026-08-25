@@ -21,9 +21,9 @@
 #   CHECKPOINT   Causal Forcing 模型权重
 #   MODEL_ROOT   Wan2.1-T2V-1.3B 目录
 #   PROMPTS      采集用 prompt 列表
-#   CONFIG       codec 配置；决定 native/legacy trace 协议与默认目录
 #
 # 常用可选变量：
+#   CONFIG          codec 配置（默认 configs/legacy.json）
 #   GENERATION_MODE  chunkwise（默认）或 framewise
 #   TRACE_DIR        trace 目录（默认 data/causal-forcing/trace/<模式>）
 #   TRACE_FILE       合并后的拟合输入（默认 <TRACE_DIR>/clean_trace.npz）
@@ -37,7 +37,8 @@ set -euo pipefail
 # shellcheck source=scripts/Causal-Forcing/_common.sh
 source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)/_common.sh"
 
-require_env CHECKPOINT MODEL_ROOT PROMPTS CONFIG
+require_env CHECKPOINT MODEL_ROOT PROMPTS
+CONFIG="${CONFIG:-$default_codec_config}"
 
 generation_mode="${GENERATION_MODE:-chunkwise}"
 case "$generation_mode" in

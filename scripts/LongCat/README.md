@@ -36,15 +36,14 @@ Parallel rank 的 metadata 一致。因此 `CONTEXT_PARALLEL_SIZE=1/2/4` 可以�
 ## 拟合参数
 
 ```bash
-CONFIG=configs/native.json \
 bash scripts/LongCat/fit_params.sh
 ```
 
 默认输出：
 
 ```text
-data/longcat/params/kh2-vh1-int4/k_temporal.npz
-data/longcat/params/kh2-vh1-int4/v_cross_kv.npz
+data/longcat/params/legacy-kh2-vh1-int4-layershared/k_temporal.npz
+data/longcat/params/legacy-kh2-vh1-int4-layershared/v_cross_kv.npz
 ```
 
 目录名由 `CONFIG` 与 override 共同推导（与 Self-Forcing、Causal Forcing 一致）。
@@ -66,9 +65,8 @@ bash scripts/LongCat/run_bf16.sh
 
 ```bash
 CHECKPOINT_DIR=/models/LongCat-Video \
-CONFIG=configs/native.json \
-K_PARAMS=data/longcat/params/kh2-vh1-int4/k_temporal.npz \
-V_PARAMS=data/longcat/params/kh2-vh1-int4/v_cross_kv.npz \
+K_PARAMS=data/longcat/params/legacy-kh2-vh1-int4-layershared/k_temporal.npz \
+V_PARAMS=data/longcat/params/legacy-kh2-vh1-int4-layershared/v_cross_kv.npz \
 PROMPT="a cinematic mountain road" \
 bash scripts/LongCat/run_tempokv.sh
 ```

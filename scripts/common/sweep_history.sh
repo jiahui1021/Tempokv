@@ -60,14 +60,14 @@ case "${MODEL:-}" in
         exit 2
         ;;
     esac
-    default_trace="data/causal-forcing/trace/$generation_mode/clean_trace.npz"
-    default_config="configs/native.json"
+    default_trace="data/causal-forcing/trace/${generation_mode}_legacy/clean_trace.npz"
+    default_config="configs/legacy.json"
     default_output="results/causal_forcing/$generation_mode/history_sweep.json"
     ;;
   longcat)
     model_dir="LongCat"
     default_trace="data/longcat/trace/clean_trace.npz"
-    default_config="configs/native.json"
+    default_config="configs/legacy.json"
     default_output="results/longcat/history_sweep.json"
     ;;
   *)
@@ -86,7 +86,7 @@ output="$(resolve_path "${OUTPUT:-$default_output}")"
 K_HISTORY="${K_HISTORY:-1,2,3,4}"
 V_HISTORY="${V_HISTORY:-0,1,2,3,4,5}"
 ITERATIONS="${ITERATIONS:-2}"
-TEMPORAL_RIDGE="${TEMPORAL_RIDGE:-0.1}"
+TEMPORAL_RIDGE="${TEMPORAL_RIDGE:-1.0}"
 CROSS_RIDGE="${CROSS_RIDGE:-0.1}"
 MAX_GAIN="${MAX_GAIN:-1.0}"
 FIT_DEVICE="${FIT_DEVICE:-auto}"

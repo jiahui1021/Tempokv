@@ -590,36 +590,63 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             raise ValueError(
                 "legacy fitting rejects diagnostic traces; use the calibration trace"
             )
-        events = 2 * LEGACY_PROMPT_COUNT
-        expected_trace_metadata: dict[str, object] = {
-            "trace_layout": "legacy_event_bpfhd_v1",
-            "trace_event_count": events,
-            "prompt_count": LEGACY_PROMPT_COUNT,
-            "frames_per_event": 24,
-            "tokens_per_frame": 8,
-            "legacy_trace_protocol": LEGACY_TRACE_PROTOCOL,
-            "token_indices": (0, 223, 445, 668, 891, 1114, 1336, 1559),
-            "event_tokens_start": (0, 37440) * LEGACY_PROMPT_COUNT,
-            "event_tokens_end": (37440, 74880) * LEGACY_PROMPT_COUNT,
-            "trace_stride": 1560,
-        }
-        for name, expected in expected_trace_metadata.items():
-            actual = trace_metadata.get(name)
-            if actual != expected:
+        trace_layout = trace_metadata.get("trace_layout")
+        if trace_layout is not None and trace_layout != "legacy_event_bpfhd_v1":
+            raise ValueError(f"unsupported legacy trace layout {trace_layout!r}")
+        if trace_layout == "legacy_event_bpfhd_v1":
+            events = 2 * LEGACY_PROMPT_COUNT
+            expected_trace_metadata: dict[str, object] = {
+                "trace_layout": "legacy_event_bpfhd_v1",
+                "trace_event_count": events,
+                "prompt_count": LEGACY_PROMPT_COUNT,
+                "frames_per_event": 24,
+                "tokens_per_frame": 8,
+                "legacy_trace_protocol": LEGACY_TRACE_PROTOCOL,
+                "token_indices": (0, 223, 445, 668, 891, 1114, 1336, 1559),
+                "event_tokens_start": (0, 37440) * LEGACY_PROMPT_COUNT,
+                "event_tokens_end": (37440, 74880) * LEGACY_PROMPT_COUNT,
+                "trace_stride": 1560,
+            }
+            for name, expected in expected_trace_metadata.items():
+                actual = trace_metadata.get(name)
+                if actual != expected:
+                    raise ValueError(
+                        f"legacy fitting requires trace {name}={expected!r}, "
+                        f"got {actual!r}; recollect the legacy-protocol trace"
+                    )
+            expected_shape = (30, events, 1, 8, 24, 12, 128)
+            if tuple(keys.shape) != expected_shape:
                 raise ValueError(
-                    f"legacy fitting requires trace {name}={expected!r}, "
-                    f"got {actual!r}; recollect the legacy-protocol trace"
+                    f"legacy trace must use {list(expected_shape)} layout, got "
+                    f"{tuple(keys.shape)}"
                 )
-        expected_shape = (30, events, 1, 8, 24, 12, 128)
-        if tuple(keys.shape) != expected_shape:
-            raise ValueError(
-                f"legacy trace must use {list(expected_shape)} layout, got "
-                f"{tuple(keys.shape)}"
-            )
+            expected_layer_ids = tuple(range(30))
+        else:
+            # LongCat writes the regular [L,S,T,H,D] fitting layout.  The
+            # legacy equations are shape-independent, so validate the model
+            # dimensions from the archive instead of imposing the 30-layer,
+            # 12-head event protocol used by the two Forcing trace bridges.
+            if keys.ndim != 5:
+                raise ValueError(
+                    "legacy standard traces must use [L,S,T,H,D] layout, got "
+                    f"{tuple(keys.shape)}"
+                )
+            expected_layer_ids = tuple(range(int(keys.shape[0])))
+            trace_stride = trace_metadata.get("trace_stride")
+            if trace_stride is None:
+                raise ValueError("legacy standard traces must record trace_stride")
+            if int(trace_stride) != int(config.stride):
+                raise ValueError(
+                    f"legacy trace stride {int(trace_stride)} does not match "
+                    f"codec stride {int(config.stride)}"
+                )
         if keys.dtype != torch.float32 or values.dtype != torch.float32:
             raise ValueError("legacy trace K/V arrays must use float32")
-        if layer_ids != tuple(range(30)):
-            raise ValueError("legacy trace layer_ids must be 0 through 29")
+        if layer_ids != expected_layer_ids:
+            raise ValueError(
+                "legacy trace layer_ids must cover every layer in order, got "
+                f"{layer_ids!r}"
+            )
     trace_coordinate_system = trace_metadata.get("coordinate_system")
     coordinate_system = args.coordinate_system
     if trace_coordinate_system is not None:
@@ -677,6 +704,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         config=fit_config,
         history_length=(
             fit_config.k_history_length
+            if fit_config.k_history_length is not None
+            else int(requested_k_history)
         ),
         iterations=args.iterations,
         temporal_ridge=temporal_ridge,

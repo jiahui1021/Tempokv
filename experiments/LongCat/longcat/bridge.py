@@ -725,9 +725,13 @@ class LongCatTempoKVBridge:
         if self.codec is not None:
             expected_layers = tuple(range(self.spec.num_layers))
             temporal_v = not self.codec.predicts_v_from_key
-            for name, parameters in (
-                ("temporal K", self.codec.temporal),
-                ("temporal V" if temporal_v else "CrossKV V", self.codec.v_parameters),
+            for name, parameters, allow_shared in (
+                ("temporal K", self.codec.temporal, True),
+                (
+                    "temporal V" if temporal_v else "CrossKV V",
+                    self.codec.v_parameters,
+                    temporal_v,
+                ),
             ):
                 if (
                     parameters.coordinate_system
@@ -743,7 +747,7 @@ class LongCatTempoKVBridge:
                         f"{name} parameters use stride {parameters.stride}, while "
                         f"the codec uses {self.codec.config.stride}"
                     )
-                if not parameters.layered:
+                if not parameters.layered and not allow_shared:
                     raise ValueError(
                         f"{name} parameters must be layered for a multi-layer "
                         "LongCat model"

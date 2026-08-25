@@ -10,10 +10,11 @@
 # INT4 与 INT2 不会互相覆盖。
 #
 # 用法：
-#   CONFIG=configs/native.json \
+#   CONFIG=configs/legacy.json \
 #   bash scripts/LongCat/fit_params.sh
 #
 # 常用可选变量：
+#   CONFIG          codec 配置 JSON（默认 configs/legacy.json）
 #   TRACE_FILE / TRACE  拟合输入（默认 data/longcat/trace/clean_trace.npz）
 #   OUTPUT_DIR          输出目录（默认 data/longcat/params/<参数方案>）
 #   BITS / K_BITS / V_BITS  位宽 override（2/4/8；默认读取 CONFIG）
@@ -45,7 +46,7 @@ fi
 
 # collect_trace.sh 写出的是 TRACE_FILE；TRACE 是本脚本的旧名字，继续支持。
 trace="$(resolve_path "${TRACE_FILE:-${TRACE:-data/longcat/trace/clean_trace.npz}}")"
-config="$(resolve_path "${CONFIG:-configs/native.json}")"
+config="$(resolve_path "${CONFIG:-$default_codec_config}")"
 FIT_HISTORY_SOURCE="${FIT_HISTORY_SOURCE:-reconstructed}"
 parameter_name="${PARAM_NAME:-$(codec_slug "$config" "${K_HISTORY_LENGTH:-}" "${V_HISTORY_LENGTH:-}" "${K_BITS:-}" "${V_BITS:-}" "${CACHE_STRIDE:-}" "${V_PREDICTOR:-}" "$FIT_HISTORY_SOURCE")}"
 output_dir="$(resolve_path "${OUTPUT_DIR:-data/longcat/params/$parameter_name}")"
@@ -59,7 +60,20 @@ FIT_DEVICE="${FIT_DEVICE:-auto}"
 DRY_RUN="${DRY_RUN:-0}"
 check_flag DRY_RUN
 ITERATIONS="${ITERATIONS:-2}"
-TEMPORAL_RIDGE="${TEMPORAL_RIDGE:-0.1}"
+fit_mode="$("$python_bin" - "$config" <<'PY'
+import json
+import sys
+
+config = json.load(open(sys.argv[1], encoding="utf-8"))
+print(config.get("codec", config).get("fit_mode", "native"))
+PY
+)"
+if [[ "$fit_mode" == "legacy" ]]; then
+  default_temporal_ridge=1.0
+else
+  default_temporal_ridge=0.1
+fi
+TEMPORAL_RIDGE="${TEMPORAL_RIDGE:-$default_temporal_ridge}"
 CROSS_RIDGE="${CROSS_RIDGE:-0.1}"
 MAX_GAIN="${MAX_GAIN:-1.0}"
 check_int ITERATIONS 1

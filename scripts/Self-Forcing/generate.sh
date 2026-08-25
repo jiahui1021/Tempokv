@@ -6,7 +6,7 @@
 # OUTPUT_DIR 后可以重复运行。
 #
 # 两种模式：
-#   MODE=tempokv  使用 TempoKV 量化参数（默认），需要 CONFIG + PARAM_DIR
+#   MODE=tempokv  使用 TempoKV 量化参数（默认），参数从 PARAM_DIR 读取
 #   MODE=bf16     不量化的对照基线，不需要 CONFIG / PARAM_DIR
 #
 # 用法（所有参数都用环境变量传入）：
@@ -23,9 +23,9 @@
 #   CHECKPOINT    Self-Forcing 模型权重
 #   WAN_MODEL_DIR Wan 模型目录
 #   PROMPTS       prompt 列表
-#   CONFIG        codec 配置 JSON（仅 MODE=tempokv）
 #
 # 常用可选变量：
+#   CONFIG          codec 配置 JSON（默认 configs/legacy.json）
 #   PARAM_DIR       参数目录（默认 data/self-forcing/params/<参数方案>）
 #   OUTPUT_DIR      结果输出目录（默认 results/$MODEL_TYPE/<量化标签>）
 #   FRAMES          最终视频帧数（两种模式默认均为 717）
@@ -54,6 +54,7 @@ K_HISTORY_LENGTH="$(resolve_history K_HISTORY_LENGTH KH)"
 V_HISTORY_LENGTH="$(resolve_history V_HISTORY_LENGTH VH)"
 K_BITS="$(resolve_bits K_BITS)"
 V_BITS="$(resolve_bits V_BITS)"
+CONFIG="${CONFIG:-$default_codec_config}"
 script_dir="$self_forcing_dir"
 mode="${MODE:-tempokv}"
 
@@ -66,9 +67,6 @@ case "$mode" in
 esac
 
 require_env CHECKPOINT WAN_MODEL_DIR PROMPTS
-if [[ "$mode" == "tempokv" ]]; then
-  require_env CONFIG
-fi
 
 # ---------- 目录 ----------
 

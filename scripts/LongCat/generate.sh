@@ -7,6 +7,7 @@ source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)/_common.sh"
 
 K_BITS="$(resolve_bits K_BITS)"
 V_BITS="$(resolve_bits V_BITS)"
+CONFIG="${CONFIG:-$default_codec_config}"
 
 mode="${MODE:-tempokv}"
 case "$mode" in
@@ -16,7 +17,7 @@ esac
 
 require_env CHECKPOINT_DIR
 if [[ "$mode" == "tempokv" ]]; then
-  require_env CONFIG K_PARAMS V_PARAMS
+  require_env K_PARAMS V_PARAMS
 fi
 
 CONTEXT_PARALLEL_SIZE="${CONTEXT_PARALLEL_SIZE:-1}"

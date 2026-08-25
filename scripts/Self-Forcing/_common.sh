@@ -8,6 +8,7 @@ fi
 
 self_forcing_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 project_root="$(cd -- "$self_forcing_dir/../.." && pwd -P)"
+default_codec_config="$project_root/configs/legacy.json"
 if [[ -n "${PYTHON_BIN:-}" ]]; then
   python_bin="$PYTHON_BIN"
 elif [[ -x "$project_root/.venv/bin/python" ]]; then

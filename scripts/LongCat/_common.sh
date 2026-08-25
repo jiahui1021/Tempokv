@@ -8,6 +8,7 @@ fi
 
 longcat_script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 project_root="$(cd -- "$longcat_script_dir/../.." && pwd -P)"
+default_codec_config="$project_root/configs/legacy.json"
 adapter_root="$project_root/experiments/LongCat/longcat"
 if [[ -n "${PYTHON_BIN:-}" ]]; then
   python_bin="$PYTHON_BIN"

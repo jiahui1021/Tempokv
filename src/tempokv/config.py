@@ -172,11 +172,9 @@ class CodecConfig:
             # anchor_bits and group_size fix the quantizer's bit layout, so the
             # reference implementation is only reproduced at these values.
             # stride is not one of them: it only decides where the encoder cuts
-            # units, and every legacy fitter merely records it, so pinning it
-            # here stated a parity requirement that does not exist.  The real
-            # limit sits in scripts/common/fit_params.py, which accepts the
-            # fixed legacy event protocol produced by the Self-Forcing and
-            # Causal-Forcing trace bridges; that protocol pins stride to 1560.
+            # units. Self-Forcing and Causal-Forcing use the fixed legacy event
+            # protocol at stride 1560; LongCat uses its regular model-shaped
+            # trace and records the matching runtime stride in that archive.
             if self.anchor_bits != 4 or self.group_size != 64:
                 raise ValueError(
                     "legacy fitting requires anchor_bits=4 and group_size=64"
