@@ -60,8 +60,8 @@ case "${MODEL:-}" in
         exit 2
         ;;
     esac
-    default_trace="data/causal-forcing/trace/$generation_mode/clean_trace.npz"
-    default_config="configs/native.json"
+    default_trace="data/causal-forcing/trace/${generation_mode}_legacy/clean_trace.npz"
+    default_config="configs/legacy.json"
     default_output="results/causal_forcing/$generation_mode/history_sweep.json"
     ;;
   longcat)

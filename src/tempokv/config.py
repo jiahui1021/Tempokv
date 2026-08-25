@@ -47,19 +47,51 @@ class CodecConfig:
     v_history_length: int = 0
     # None keeps legacy parameter-driven K history selection.
     k_history_length: int | None = None
-    # The legacy predictor uses IEEE FP32 CrossKV projections. ``tf32``
-    # retains the native TempoKV execution policy for other configurations.
-    cross_matmul_precision: str = "tf32"
-    # ``shared`` pools all Self-Forcing layers and heads into [P,P,D].
-    k_predictor_mode: str = "layer_head"
+    # Legacy is the repository default. Native remains available through an
+    # explicit config and keeps its own matmul/predictor settings.
+    cross_matmul_precision: str | None = None
+    # ``shared`` pools all layers and heads into [P,P,D].
+    k_predictor_mode: str | None = None
     # ``temporal`` predicts V from its own reconstructed history with the same
     # predictor K uses, so V needs no reconstructed K and no CrossKV matrix.
     # ``cross_kv`` keeps the Cross(K) projection.
     v_predictor_mode: str = "cross_kv"
     # Select the legacy fixed-point/shared-K and direct temporal-V fitting math.
-    fit_mode: str = "native"
+    fit_mode: str | None = None
 
     def __post_init__(self) -> None:
+        # An omitted family uses legacy for the production-shaped defaults.
+        # Small/non-reference hand-built configs from older callers retain the
+        # native behavior unless they explicitly select a family.
+        implicit_family = self.fit_mode is None
+        if implicit_family:
+            legacy_shape = (
+                self.anchor_bits == 4
+                and self.group_size == 64
+                and self.residual_mode == "asymmetric"
+                and self.scale_dtype == "bfloat16"
+                and self.reconstruction_dtype == "bfloat16"
+            )
+            resolved_fit_mode = "legacy" if legacy_shape else "native"
+        else:
+            resolved_fit_mode = self.fit_mode
+        if resolved_fit_mode not in {"native", "legacy"}:
+            raise ValueError("fit_mode must be native or legacy")
+        resolved_k_predictor = self.k_predictor_mode
+        if resolved_k_predictor is None:
+            resolved_k_predictor = (
+                "shared" if resolved_fit_mode == "legacy" else "layer_head"
+            )
+        resolved_precision = self.cross_matmul_precision
+        if resolved_precision is None:
+            resolved_precision = (
+                "ieee" if resolved_fit_mode == "legacy" else "tf32"
+            )
+        object.__setattr__(self, "fit_mode", resolved_fit_mode)
+        object.__setattr__(self, "k_predictor_mode", resolved_k_predictor)
+        object.__setattr__(self, "cross_matmul_precision", resolved_precision)
+        if resolved_fit_mode == "legacy" and self.k_history_length is None:
+            object.__setattr__(self, "k_history_length", 2)
         for name in ("k_bits", "v_bits", "anchor_bits"):
             value = int(getattr(self, name))
             if value not in (2, 4, 8):
@@ -105,8 +137,6 @@ class CodecConfig:
             raise ValueError(
                 "v_predictor_mode=temporal needs v_history_length >= 1"
             )
-        if self.fit_mode not in {"native", "legacy"}:
-            raise ValueError("fit_mode must be native or legacy")
         if (
             self.k_predictor_mode == "shared"
             and self.fit_mode != "legacy"

@@ -89,7 +89,7 @@ import json
 import sys
 
 config = json.load(open(sys.argv[1], encoding="utf-8"))
-print(config.get("codec", config).get("fit_mode", "native"))
+print(config.get("codec", config).get("fit_mode", "legacy"))
 PY
 )"
 if [[ "$fit_mode" == "legacy" ]]; then

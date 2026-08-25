@@ -31,7 +31,7 @@ PARAMS = {
     "TempoKV_INT2": "data/self-forcing/params/paper_exp5_mixed_bits/k4v4",
     "TempoKV_INT4": "data/self-forcing/params/kh2-vh1-int4",
 }
-CONFIG = PROJECT_ROOT / "configs/native.json"
+CONFIG = PROJECT_ROOT / "configs/legacy.json"
 
 
 def _env(name: str) -> str:

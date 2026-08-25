@@ -117,7 +117,7 @@ if v_history is None:
 # Legacy and native fits are not interchangeable, so they must not share a
 # parameter directory.  Native configs carry no prefix, so existing directory
 # names are unchanged.
-mode_label = "legacy-" if config.get("fit_mode") == "legacy" else ""
+mode_label = "legacy-" if config.get("fit_mode", "legacy") == "legacy" else ""
 k_label = f"kh{int(k_history)}"
 # The V segment records the predictor structure: parameters fitted for the
 # temporal V predictor are not interchangeable with CrossKV ones.

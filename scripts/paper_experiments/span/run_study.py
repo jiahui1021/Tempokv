@@ -331,7 +331,7 @@ def build_manifest(args: argparse.Namespace) -> dict[str, Any]:
     # compare all-INT2 against the default INT4-anchor/INT2-residual codec.
     anchor_source = args.anchor_control_config or args.base_config
     anchor_codec = _read_config(anchor_source)
-    if anchor_codec.get("fit_mode", "native") == "legacy":
+    if anchor_codec.get("fit_mode", "legacy") == "legacy":
         raise ValueError(
             "anchor INT2 is forbidden by legacy arithmetic; provide a native "
             "--anchor-control-config"

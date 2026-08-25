@@ -15,7 +15,7 @@ paper_init() {
   TRACE_FILE="${TRACE_FILE:-data/self-forcing/trace/clean_trace.npz}"
   require_env CHECKPOINT WAN_MODEL_DIR PROMPTS
 
-  CONFIG="$(resolve_path "${CONFIG:-configs/native.json}")"
+  CONFIG="$(resolve_path "${CONFIG:-configs/legacy.json}")"
   CHECKPOINT="$(resolve_path "$CHECKPOINT")"
   WAN_MODEL_DIR="$(resolve_path "$WAN_MODEL_DIR")"
   PROMPTS="$(resolve_path "$PROMPTS")"

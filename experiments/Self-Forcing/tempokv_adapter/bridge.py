@@ -101,7 +101,7 @@ def install(runtime_root: str | Path) -> type:
             config = self.tempokv_codec.config
             self._tempokv_rope_precision = (
                 "complex64"
-                if getattr(config, "fit_mode", "native") == "legacy"
+                if getattr(config, "fit_mode", "legacy") == "legacy"
                 else "native"
             )
             self._apply_tempokv_rope_precision()
