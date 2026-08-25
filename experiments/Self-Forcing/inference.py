@@ -404,8 +404,23 @@ for i, batch_data in enumerate(dataloader):
                         "quantization_events", []
                     )
                 ),
+                # The full per-block observation list, not just a peak: the
+                # runner recomputes the peak after this trip through JSON, and
+                # the sample count stays auditable.
+                "efficiency_samples": [
+                    list(sample)
+                    for sample in getattr(
+                        getattr(pipeline, "efficiency_sampler", None),
+                        "samples",
+                        [],
+                    )
+                ],
             }
         )
+        if int(idx) == args.start_index and torch.cuda.is_available():
+            # Prompt 0 absorbs Triton compilation and the allocator's first
+            # growth.  Everything reported comes from the prompts after it.
+            torch.cuda.reset_peak_memory_stats()
     del video, latents, current_video, all_video, sampled_noise, initial_latent
 
 generation_wall_seconds = time.perf_counter() - generation_run_start

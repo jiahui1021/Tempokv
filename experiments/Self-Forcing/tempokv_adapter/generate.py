@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import asdict, replace
 from datetime import datetime, timezone
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -20,6 +21,9 @@ if SOURCE_ROOT.is_dir() and str(SOURCE_ROOT) not in sys.path:
     sys.path.insert(0, str(SOURCE_ROOT))
 
 from tempokv.runtime import persistent_units_per_launch  # noqa: E402
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import efficiency_record as efficiency  # noqa: E402
 
 RUNTIME_ROOT = PROJECT_ROOT / "experiments" / "Self-Forcing"
 REQUIRED_RUNTIME_FILES = (
@@ -445,6 +449,174 @@ def _load_worker_metrics(
     }
 
 
+_ENCODE_SECTIONS = ("encode_k", "encode_v")
+_DECODE_SECTIONS = ("decode_k", "decode_v")
+
+
+def _efficiency_segments(
+    profiles: list[dict[str, object]]
+) -> tuple[dict[str, float | None], dict[str, str]]:
+    """Reduce per-rank profiles to the four measured latency segments.
+
+    Codec sections are absent for a BF16 run by design, so they report ``0.0``
+    with an explicit reason.  A section that should have been patched and was
+    not reports ``None``: the collector treats ``denoising_other`` as a
+    residual, and a missing segment silently folded into it would be a
+    fabricated number.
+    """
+    totals: dict[str, float] = {}
+    for profile in profiles:
+        for entry in profile.get("sections", []) or []:
+            name = str(entry["name"])
+            totals[name] = totals.get(name, 0.0) + float(entry["total_ms"])
+
+    has_codec = any(name in totals for name in _ENCODE_SECTIONS + _DECODE_SECTIONS)
+    segments: dict[str, float | None] = {}
+    instrumentation: dict[str, str] = {}
+
+    generation = [
+        profile.get("generation_ms")
+        for profile in profiles
+        if profile.get("generation_ms") is not None
+    ]
+    segments["e2e"] = max(float(value) for value in generation) if generation else None
+    instrumentation["e2e"] = "patched" if generation else "missing: generation_ms"
+
+    for label, names in (
+        ("cache_encode", _ENCODE_SECTIONS),
+        ("cache_decode", _DECODE_SECTIONS),
+    ):
+        present = [name for name in names if name in totals]
+        if present:
+            segments[label] = sum(totals[name] for name in present)
+            instrumentation[label] = "patched"
+        elif not has_codec:
+            segments[label] = 0.0
+            instrumentation[label] = "absent: no codec"
+        else:
+            segments[label] = None
+            instrumentation[label] = f"missing: {'/'.join(names)}"
+
+    if "vae_decode" in totals:
+        segments["vae_decode"] = totals["vae_decode"]
+        instrumentation["vae_decode"] = "patched"
+    else:
+        segments["vae_decode"] = None
+        instrumentation["vae_decode"] = "missing: vae_decode"
+
+    return segments, instrumentation
+
+
+def _gpu_uuid() -> str:
+    """The device UUID, so the collector can prove one card ran every method.
+
+    Best effort on purpose.  This runs after a generation has already produced
+    its videos, and no provenance lookup is worth losing that work to -- so any
+    failure yields an empty string.  Nothing is hidden by doing so: the
+    collector's consistency gate rejects a record whose ``gpu_uuid`` does not
+    match the manifest, empty included.
+    """
+    try:
+        return subprocess.check_output(
+            ["nvidia-smi", "--query-gpu=uuid", "--format=csv,noheader"],
+            text=True,
+        ).strip().splitlines()[0]
+    except Exception:
+        return ""
+
+
+def _frozen_run_block(
+    args: argparse.Namespace,
+    performance: dict[str, object],
+    batch_entries: list[dict[str, object]],
+) -> dict[str, object]:
+    """The identity of this run, as the collector's consistency gate reads it."""
+    import torch
+
+    prompts = Path(args.prompts).expanduser().read_bytes()
+    ranks = performance.get("ranks") or [{}]
+    return {
+        "model": "Self-Forcing",
+        "width": 832,
+        "height": 480,
+        "frames": int(args.frames),
+        "latent_frames": latent_frames_for(args.frames),
+        "prompts_sha256": hashlib.sha256(prompts).hexdigest(),
+        "prompt_indices": [
+            int(batch["prompt_index"]) for batch in batch_entries
+        ],
+        "seed": int(args.seed),
+        "num_gpus": int(args.num_gpus),
+        "gpu_name": str(ranks[0].get("gpu_name", "")),
+        "gpu_uuid": _gpu_uuid(),
+        "torch_version": torch.__version__,
+        "cuda_version": torch.version.cuda or "",
+    }
+
+
+def _sampler_from_summary(
+    batch_entries: list[dict[str, object]]
+) -> efficiency.ResidentSampler:
+    """Replay the per-block samples the pipeline recorded into a sampler.
+
+    The pipeline hands the run summary its full observation list rather than a
+    peak, so the peak is still computable after the trip through JSON and the
+    sample count stays auditable.
+    """
+    sampler = efficiency.ResidentSampler()
+    for batch in batch_entries:
+        for sample in batch.get("efficiency_samples") or []:
+            resident, equivalent = sample
+            sampler.observe(int(resident), int(equivalent))
+    return sampler
+
+
+def _write_efficiency_record(
+    args: argparse.Namespace,
+    *,
+    output_dir: Path,
+    report: dict[str, object],
+    performance: dict[str, object],
+    batch_entries: list[dict[str, object]],
+    parameters: dict[str, object] | None,
+) -> None:
+    """Emit this run's ``efficiency.v1`` record beside the pipeline report."""
+    profiles = report.get("runtime_profile") or []
+    segments, instrumentation = _efficiency_segments(list(profiles))
+    efficiency.write_record(
+        output_dir / "efficiency.json",
+        efficiency.build_efficiency_payload(
+            repo="Tempokv",
+            method="TempoKV" if args.mode == "tempokv" else "BF16",
+            bits=(args.k_bits if args.mode == "tempokv" else None),
+            run=_frozen_run_block(args, performance, batch_entries),
+            sampler=_sampler_from_summary(batch_entries),
+            cache_shape={
+                "num_layers": 30,
+                "num_heads": 12,
+                "head_dim": 128,
+                "frame_seq_length": 1560,
+                "batch_size": 1,
+            },
+            fake_quant=False,
+            predictor_parameter_bytes=int(
+                (parameters or {}).get("predictor_parameter_bytes", 0)
+            ),
+            gpu_memory={
+                "peak_allocated_bytes": int(performance["peak_allocated_bytes"]),
+                "peak_reserved_bytes": int(performance["peak_reserved_bytes"]),
+                "peak_reset_after_prompt_index": int(args.start_index),
+            },
+            per_prompt_generation_seconds=[
+                float(batch["generation_seconds"]) for batch in batch_entries
+            ],
+            prompt_indices=[int(batch["prompt_index"]) for batch in batch_entries],
+            segments_ms=segments,
+            instrumentation=instrumentation,
+        ),
+    )
+
+
 def _load_worker_profiles(
     profile_dir: Path, expected_ranks: int
 ) -> list[dict[str, object]]:
@@ -868,6 +1040,14 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             "prompt_batches": batch_entries,
             "videos": [str(path) for path in videos],
         }
+    )
+    _write_efficiency_record(
+        args,
+        output_dir=paths["run"],
+        report=report,
+        performance=performance,
+        batch_entries=batch_entries,
+        parameters=parameters if args.mode == "tempokv" else None,
     )
     (paths["run"] / "pipeline_report.json").write_text(
         json.dumps(report, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
