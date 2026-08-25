@@ -84,6 +84,10 @@ def main() -> int:
 
     last_scan: set[int] = set()
     idle_polls = 0
+    # Targets whose reference video has not appeared yet. Unlike `done`, these
+    # are retried on later polls so a dynamically-growing reference directory
+    # (e.g. the BF16 baseline is still generating) can be caught up.
+    waiting: set[int] = set()
     while True:
         present: set[int] = set()
         for p in tgt_dir.glob("*_0.mp4"):
@@ -91,13 +95,13 @@ def main() -> int:
             if idx is not None:
                 present.add(idx)
 
-        new_videos = sorted(present - done)
+        new_videos = sorted(present - done - waiting)
         for idx in new_videos:
             name = f"{idx}_0.mp4"
             ref_path = ref_dir / name
             if not ref_path.exists():
-                print(f"  [skip] {name}: no reference at {ref_path}", flush=True)
-                done.add(idx)
+                print(f"  [wait] {name}: reference not ready yet", flush=True)
+                waiting.add(idx)
                 continue
             print(f"  [eval] {name}", flush=True)
             try:
@@ -132,6 +136,7 @@ def main() -> int:
                     write_header = False
                 w.writerow(row)
             done.add(idx)
+            waiting.discard(idx)
             print(
                 f"    -> {name}: psnr={row['psnr']} ssim={row['ssim']} "
                 f"lpips={row['lpips'] or 'n/a'} "
