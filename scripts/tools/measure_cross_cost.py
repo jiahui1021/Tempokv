@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Measure what the Cross(K) projection actually costs at production shapes.
+"""Measure the Torch Cross(K) projection cost at production shapes.
 
 The temporal V predictor reads only its own history, so its decode is pure
 elementwise work.  Cross + temporal V adds one 128x128 projection per decoded
@@ -10,6 +10,10 @@ batched GEMM instead of one small matmul per unit.
 Run it on the target GPU before committing to a full generation:
 
     python scripts/tools/measure_cross_cost.py --reads 7200
+
+This script does not launch the Triton ``tl.dot`` decoder and therefore cannot
+identify its lowering.  Use ``benchmark_tempokv_kernels.py --route v`` to
+compare the production Triton route and its tile configurations.
 """
 
 from __future__ import annotations
@@ -94,8 +98,12 @@ def main(argv: list[str] | None = None) -> int:
     print("-" * len(header))
     for units in args.units:
         sequence = units * stride
-        source = torch.randn(1, heads, sequence, dim, device=device)
-        previous = torch.randn(1, heads, stride, dim, device=device)
+        source = torch.randn(
+            1, heads, sequence, dim, device=device, dtype=torch.float32
+        ).to(torch.bfloat16)
+        previous = torch.randn(
+            1, heads, stride, dim, device=device, dtype=torch.float32
+        ).to(torch.bfloat16)
         gflop = 2 * sequence * heads * dim * dim / 1e9
 
         def batched() -> None:

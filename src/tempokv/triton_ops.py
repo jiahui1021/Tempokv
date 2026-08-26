@@ -315,6 +315,19 @@ def _cross_kv_persistent_decode_kernel(
         mask=channel < width,
         other=0.0,
     ).to(tl.float32)
+    # Cross(K)'s projection matrix is invariant across every unit owned by
+    # this program.  Load the tile once instead of issuing the same load from
+    # each unrolled iteration.
+    weight_offset = (
+        head * width * width
+        + input_channel[:, None] * width
+        + channel[None, :]
+    )
+    weight = tl.load(
+        weight_ptr + weight_offset,
+        mask=(input_channel[:, None] < width) & (channel[None, :] < width),
+        other=0.0,
+    ).to(tl.float32)
     for chunk_index in tl.static_range(0, chunk_units):
         unit_index = start_unit + chunk_index
         current_token = unit_index * stride + token
@@ -371,16 +384,6 @@ def _cross_kv_persistent_decode_kernel(
             mask=(token[:, None] < stride)
             & (current_token[:, None] < sequence)
             & (input_channel[None, :] < width),
-            other=0.0,
-        ).to(tl.float32)
-        weight_offset = (
-            head * width * width
-            + input_channel[:, None] * width
-            + channel[None, :]
-        )
-        weight = tl.load(
-            weight_ptr + weight_offset,
-            mask=(input_channel[:, None] < width) & (channel[None, :] < width),
             other=0.0,
         ).to(tl.float32)
         prediction = tl.dot(
@@ -459,9 +462,47 @@ def _cross_kv_history_persistent_decode_kernel(
         mask=channel < width,
         other=0.0,
     ).to(tl.float32)
-    # The diagonal map carries one coefficient set per lag, loaded on demand
-    # below.  Previous units are re-read from output_ptr instead of kept in a
-    # Python list, which Triton cannot materialize inside a kernel.
+    # The Cross(K) matrix tile is shared by all recurrent units in this
+    # program.  Keeping the load outside the unrolled loop avoids redundant
+    # memory instructions while preserving the FP32 projection exactly.
+    weight_offset = (
+        head * width * width
+        + input_channel[:, None] * width
+        + channel[None, :]
+    )
+    weight = tl.load(
+        weight_ptr + weight_offset,
+        mask=(input_channel[:, None] < width) & (channel[None, :] < width),
+        other=0.0,
+    ).to(tl.float32)
+    # V history length one is the production route.  Seed its recurrence from
+    # the unit immediately before this launch and then carry the BF16-rounded
+    # value in registers.  The explicit round preserves the old store/load
+    # semantics while avoiding a dependent global-memory read on every unit.
+    if history_length == 1:
+        previous_coefficient = tl.load(
+            history_weight_ptr + head * width + channel,
+            mask=channel < width,
+            other=0.0,
+        ).to(tl.float32)
+        previous_token = (start_unit - 1) * stride + token
+        previous_offset = _strided_bhsd_offsets(
+            batch_head,
+            previous_token,
+            channel,
+            heads,
+            output_stride_b,
+            output_stride_h,
+            output_stride_s,
+            output_stride_d,
+        )
+        previous_unit = tl.load(
+            output_ptr + previous_offset,
+            mask=(token[:, None] < stride)
+            & (previous_token[:, None] < sequence)
+            & (channel[None, :] < width),
+            other=0.0,
+        ).to(tl.float32)
 
     for chunk_index in tl.static_range(0, chunk_units):
         unit_index = start_unit + chunk_index
@@ -532,16 +573,6 @@ def _cross_kv_history_persistent_decode_kernel(
             & (input_channel[None, :] < width),
             other=0.0,
         ).to(tl.float32)
-        weight_offset = (
-            head * width * width
-            + input_channel[:, None] * width
-            + channel[None, :]
-        )
-        weight = tl.load(
-            weight_ptr + weight_offset,
-            mask=(input_channel[:, None] < width) & (channel[None, :] < width),
-            other=0.0,
-        ).to(tl.float32)
         prediction = tl.dot(
             source,
             weight,
@@ -549,35 +580,40 @@ def _cross_kv_history_persistent_decode_kernel(
             input_precision=cross_input_precision,
         ) + bias[None, :]
 
-        for lag in tl.static_range(0, history_length):
-            if unit_index > lag:
-                coefficient = tl.load(
-                    history_weight_ptr
-                    + (lag * heads + head) * width
-                    + channel,
-                    mask=channel < width,
-                    other=0.0,
-                ).to(tl.float32)
-                previous_token = (unit_index - lag - 1) * stride + token
-                previous_offset = _strided_bhsd_offsets(
-                    batch_head,
-                    previous_token,
-                    channel,
-                    heads,
-                    output_stride_b,
-                    output_stride_h,
-                    output_stride_s,
-                    output_stride_d,
-                )
-                previous = tl.load(
-                    output_ptr + previous_offset,
-                    mask=(token[:, None] < stride)
-                    & (previous_token[:, None] < sequence)
-                    & (channel[None, :] < width),
-                    other=0.0,
-                ).to(tl.float32)
-                prediction += previous * coefficient[None, :]
+        if history_length == 1:
+            prediction += previous_unit * previous_coefficient[None, :]
+        else:
+            for lag in tl.static_range(0, history_length):
+                if unit_index > lag:
+                    coefficient = tl.load(
+                        history_weight_ptr
+                        + (lag * heads + head) * width
+                        + channel,
+                        mask=channel < width,
+                        other=0.0,
+                    ).to(tl.float32)
+                    previous_token = (unit_index - lag - 1) * stride + token
+                    previous_offset = _strided_bhsd_offsets(
+                        batch_head,
+                        previous_token,
+                        channel,
+                        heads,
+                        output_stride_b,
+                        output_stride_h,
+                        output_stride_s,
+                        output_stride_d,
+                    )
+                    previous = tl.load(
+                        output_ptr + previous_offset,
+                        mask=(token[:, None] < stride)
+                        & (previous_token[:, None] < sequence)
+                        & (channel[None, :] < width),
+                        other=0.0,
+                    ).to(tl.float32)
+                    prediction += previous * coefficient[None, :]
         current = (prediction + residual).to(tl.bfloat16).to(tl.float32)
+        if history_length == 1:
+            previous_unit = current
         output_offset = _strided_bhsd_offsets(
             batch_head,
             current_token,
@@ -820,13 +856,16 @@ def decode(
     source_stride_b, source_stride_h, source_stride_s, source_stride_d = (
         source.stride()
     )
-    weight = parameters.weight.contiguous()
+    # CrossKVParameters normalizes every tensor to contiguous storage when it
+    # is constructed (including per-layer selections).  Avoid repeating the
+    # contiguous dispatch on every cache read.
+    weight = parameters.weight
     history_weight = (
-        parameters.history_weights.contiguous()
+        parameters.history_weights
         if parameters.history_length
         else weight
     )
-    bias = parameters.bias.contiguous()
+    bias = parameters.bias
     block_k = max(16, triton.next_power_of_2(width))
     cross_block_d = 32 if width >= 128 else block_d
     # As with the temporal route, only the persistent kernels remain, so a span

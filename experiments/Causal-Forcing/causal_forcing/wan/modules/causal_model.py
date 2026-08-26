@@ -329,17 +329,20 @@ class CausalWanSelfAttention(nn.Module):
                         0, local_end_index - self.local_attn_size * frame_seqlen
                     )
                 k_all = kv_cache["k"].read(attention_start, local_end_index)
+                # CrossKV consumes reconstructed K before RoPE.  Decode V
+                # immediately so the source remains cache-hot across the two
+                # cache reads; attention still sees the same rotated K below.
+                v_all = kv_cache["v"].read(
+                    attention_start,
+                    local_end_index,
+                    source_tensor=k_all,
+                )
                 absolute_k = apply_rope_by_span(
                     k_all,
                     grid_sizes,
                     freqs,
                     kv_cache["k"].spans(attention_start, local_end_index),
                 ).type_as(v)
-                v_all = kv_cache["v"].read(
-                    attention_start,
-                    local_end_index,
-                    source_tensor=k_all,
-                )
                 recorder = getattr(self, "tempokv_trace_recorder", None)
                 if recorder is not None:
                     recorder(roped_query, absolute_k[:, -num_new_tokens:])

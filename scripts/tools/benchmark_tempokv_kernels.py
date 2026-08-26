@@ -16,11 +16,12 @@ provided:
     ``num_warps`` and ``num_stages`` can be varied.  These are not yet runtime
     settings; the sweep exists to find the winner that Stage 1 then wires in.
 
-Every row is checked against the Torch decoder for the same packed state, so a
-configuration cannot look fast because it computed the wrong thing.  Registers
-and spills are read from the compiled kernel when the installed Triton exposes
-them; occupancy is deliberately absent rather than guessed — the plan reads that
-from Nsight Compute.
+Every row is checked against the Torch decoder for the same packed state.  Tile
+rows are also compared bit-for-bit with the current production Triton route, so
+a faster tile can be rejected when it changes the established reconstruction.
+Registers and spills are read from the compiled kernel when the installed Triton
+exposes them; occupancy is deliberately absent rather than guessed — the plan
+reads that from Nsight Compute.
 
     python scripts/tools/benchmark_tempokv_kernels.py --route v --units 24 \\
       --sweep production --persistent-units 2 4 8
@@ -65,10 +66,12 @@ COLUMNS = (
     "p90_ms",
     "min_ms",
     "peak_allocated_mib",
+    "production_equal",
+    "production_max_abs_diff",
     "max_abs_diff",
     "rmse",
     "registers_per_thread",
-    "spill_bytes",
+    "spills",
 )
 
 
@@ -391,44 +394,46 @@ def _launch_temporal(
         _ceil_div(packed.stride, block_s),
         _ceil_div(width, block_d),
     )
-    compiled = None
+    compiled = []
     for start_unit in range(1, len(packed.unit_lengths), persistent_units):
         chunk_units = min(
             persistent_units, len(packed.unit_lengths) - start_unit
         )
         # Keyword arguments so a kernel signature change fails loudly here
         # instead of silently shifting a positional argument.
-        compiled = _temporal_persistent_decode_kernel[grid](
-            quant_ptr=inputs.quant,
-            scale_ptr=inputs.scale,
-            zero_ptr=inputs.zero,
-            weight_ptr=parameters.history_weights.contiguous(),
-            bias_ptr=parameters.history_bias.contiguous(),
-            output_ptr=output,
-            output_stride_b=strides[0],
-            output_stride_h=strides[1],
-            output_stride_s=strides[2],
-            output_stride_d=strides[3],
-            sequence=sequence,
-            residual_sequence=inputs.residual_sequence,
-            heads=heads,
-            width=width,
-            packed_width=inputs.residual_packed_width,
-            scale_width=inputs.scale_width,
-            stride=packed.stride,
-            history_length=parameters.history_length,
-            start_unit=start_unit,
-            chunk_units=chunk_units,
-            bits=packed.bits,
-            group_size=packed.group_size,
-            per_head=parameters.per_head,
-            asymmetric=inputs.asymmetric,
-            block_s=block_s,
-            block_d=block_d,
-            num_warps=num_warps,
-            num_stages=num_stages,
+        compiled.append(
+            _temporal_persistent_decode_kernel[grid](
+                quant_ptr=inputs.quant,
+                scale_ptr=inputs.scale,
+                zero_ptr=inputs.zero,
+                weight_ptr=parameters.history_weights.contiguous(),
+                bias_ptr=parameters.history_bias.contiguous(),
+                output_ptr=output,
+                output_stride_b=strides[0],
+                output_stride_h=strides[1],
+                output_stride_s=strides[2],
+                output_stride_d=strides[3],
+                sequence=sequence,
+                residual_sequence=inputs.residual_sequence,
+                heads=heads,
+                width=width,
+                packed_width=inputs.residual_packed_width,
+                scale_width=inputs.scale_width,
+                stride=packed.stride,
+                history_length=parameters.history_length,
+                start_unit=start_unit,
+                chunk_units=chunk_units,
+                bits=packed.bits,
+                group_size=packed.group_size,
+                per_head=parameters.per_head,
+                asymmetric=inputs.asymmetric,
+                block_s=block_s,
+                block_d=block_d,
+                num_warps=num_warps,
+                num_stages=num_stages,
+            )
         )
-    return compiled
+    return tuple(compiled)
 
 
 def _launch_cross(
@@ -454,13 +459,13 @@ def _launch_cross(
     parameters = parameters.to(output.device)
     if parameters.layered:
         raise ValueError("select one layer before benchmarking CrossKV decode")
-    weight = parameters.weight.contiguous()
+    weight = parameters.weight
     history_weight = (
-        parameters.history_weights.contiguous()
+        parameters.history_weights
         if parameters.history_length
         else weight
     )
-    bias = parameters.bias.contiguous()
+    bias = parameters.bias
     block_k = max(16, _next_power_of_two(width))
     source_strides = source.stride()
     strides = output.stride()
@@ -469,7 +474,7 @@ def _launch_cross(
         _ceil_div(packed.stride, block_s),
         _ceil_div(width, block_d),
     )
-    compiled = None
+    compiled = []
     for start_unit in range(1, len(packed.unit_lengths), persistent_units):
         chunk_units = min(
             persistent_units, len(packed.unit_lengths) - start_unit
@@ -510,14 +515,16 @@ def _launch_cross(
             num_stages=num_stages,
         )
         if parameters.history_length:
-            compiled = _cross_kv_history_persistent_decode_kernel[grid](
-                history_weight_ptr=history_weight,
-                history_length=parameters.history_length,
-                **shared,
+            compiled.append(
+                _cross_kv_history_persistent_decode_kernel[grid](
+                    history_weight_ptr=history_weight,
+                    history_length=parameters.history_length,
+                    **shared,
+                )
             )
         else:
-            compiled = _cross_kv_persistent_decode_kernel[grid](**shared)
-    return compiled
+            compiled.append(_cross_kv_persistent_decode_kernel[grid](**shared))
+    return tuple(compiled)
 
 
 def _next_power_of_two(value: int) -> int:
@@ -528,10 +535,26 @@ def _next_power_of_two(value: int) -> int:
 
 
 def _kernel_metrics(compiled: Any) -> dict[str, int | None]:
-    """Registers and spills, when the installed Triton reports them."""
+    """Maximum registers and spills across every launch in one decode.
+
+    The last launch is commonly shorter than the others (for example 8/8/7
+    units), so reporting only its compiled variant can hide the resource peak
+    of the main kernel.
+    """
+    variants = compiled if isinstance(compiled, tuple) else (compiled,)
+    registers = [
+        value
+        for item in variants
+        if (value := getattr(item, "n_regs", None)) is not None
+    ]
+    spills = [
+        value
+        for item in variants
+        if (value := getattr(item, "n_spills", None)) is not None
+    ]
     return {
-        "registers_per_thread": getattr(compiled, "n_regs", None),
-        "spill_bytes": getattr(compiled, "n_spills", None),
+        "registers_per_thread": max(registers) if registers else None,
+        "spills": max(spills) if spills else None,
     }
 
 
@@ -595,10 +618,12 @@ def _production_rows(
                     "num_warps": None,
                     "num_stages": None,
                     "peak_allocated_mib": _peak_allocated_mib(call, device),
+                    "production_equal": True,
+                    "production_max_abs_diff": 0.0,
                     "max_abs_diff": max_abs_diff,
                     "rmse": rmse,
                     "registers_per_thread": None,
-                    "spill_bytes": None,
+                    "spills": None,
                     **timing,
                 }
             )
@@ -626,6 +651,17 @@ def _tile_rows(
 ) -> list[dict[str, Any]]:
     inputs = _launch_inputs(packed)
     output = torch.empty(packed.shape, device=device, dtype=torch.bfloat16)
+    production = torch.empty_like(output)
+    from tempokv.triton_ops import decode as decode_triton
+
+    decode_triton(
+        packed,
+        source=source,
+        output_dtype=torch.bfloat16,
+        output_tensor=production,
+        output_layout="BHSD",
+    )
+    torch.cuda.synchronize(device)
     rows: list[dict[str, Any]] = []
     for units, block_s, block_d, warps, stages in itertools.product(
         units_choices,
@@ -677,15 +713,18 @@ def _tile_rows(
                     "p90_ms": None,
                     "min_ms": None,
                     "peak_allocated_mib": None,
+                    "production_equal": None,
+                    "production_max_abs_diff": None,
                     "max_abs_diff": None,
                     "rmse": None,
                     "registers_per_thread": None,
-                    "spill_bytes": None,
+                    "spills": None,
                     "error": f"{type(error).__name__}: {error}",
                 }
             )
             continue
         max_abs_diff, rmse = _parity(output, reference)
+        production_max_abs_diff, _ = _parity(output, production)
         timing = _time(call, device, warmup, iterations)
         rows.append(
             {
@@ -697,6 +736,8 @@ def _tile_rows(
                 "num_warps": warps,
                 "num_stages": stages,
                 "peak_allocated_mib": _peak_allocated_mib(call, device),
+                "production_equal": bool(torch.equal(output, production)),
+                "production_max_abs_diff": production_max_abs_diff,
                 "max_abs_diff": max_abs_diff,
                 "rmse": rmse,
                 **_kernel_metrics(compiled),
@@ -758,8 +799,8 @@ def main(argv: list[str] | None = None) -> int:
         default="ieee",
         help="CrossKV tl.dot precision; run both values to measure the TF32 candidate",
     )
-    parser.add_argument("--block-s", type=int, nargs="+", default=(8, 16, 32))
-    parser.add_argument("--block-d", type=int, nargs="+", default=(16, 32, 64))
+    parser.add_argument("--block-s", type=int, nargs="+", default=(8, 16, 32, 64))
+    parser.add_argument("--block-d", type=int, nargs="+", default=(16, 32, 64, 128))
     parser.add_argument("--num-warps", type=int, nargs="+", default=(4,))
     parser.add_argument("--num-stages", type=int, nargs="+", default=(3,))
     parser.add_argument("--warmup", type=int, default=10)
