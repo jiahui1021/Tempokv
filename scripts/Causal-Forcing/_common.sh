@@ -132,7 +132,13 @@ config = config.get("codec", config)
 k_bits = override(4) or int(config.get("k_bits", DEFAULT_K_BITS))
 v_bits = override(5) or int(config.get("v_bits", DEFAULT_V_BITS))
 stride = override(6) or int(config.get("stride", DEFAULT_STRIDE))
-k_history = override(2) or config.get("k_history_length") or 3
+k_override = override(2)
+if k_override is None:
+    k_history = config.get("k_history_length")
+    if k_history is None:
+        k_history = 3
+else:
+    k_history = k_override
 v_history = override(3)
 if v_history is None:
     v_history = config.get("v_history_length", DEFAULT_V_HISTORY_LENGTH)

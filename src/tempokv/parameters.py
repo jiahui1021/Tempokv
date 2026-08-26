@@ -14,7 +14,7 @@ def _tensor(value: torch.Tensor | np.ndarray) -> torch.Tensor:
 
 @dataclass(frozen=True, slots=True)
 class TemporalParameters:
-    """Warm-up-aware multi-history K predictor parameters."""
+    """Warm-up-aware multi-history parameters, including zero-order K."""
 
     history_weights: torch.Tensor
     history_bias: torch.Tensor
@@ -34,7 +34,7 @@ class TemporalParameters:
             )
         history_axis = 1 if weights.ndim == 5 else 0
         history = int(weights.shape[history_axis])
-        if history < 1 or weights.shape[history_axis + 1] != history:
+        if history < 0 or weights.shape[history_axis + 1] != history:
             raise ValueError("history_weights must be square in its first two axes")
         if weights.ndim == 3:
             expected_bias = (history, weights.shape[-1])

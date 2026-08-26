@@ -23,8 +23,10 @@
 # 常用可选变量：
 #   TRACE_FILE   拟合输入（默认取该模型 collect_trace.sh 的输出）
 #   CONFIG       位宽等固定设置（默认取该模型的 INT4 配置）
-#   K_HISTORY    K 扫描点（默认 1,2,3,4；上限 8）
-#   V_HISTORY    V 扫描点（默认 0,1,2,3,4,5）
+#   K_HISTORY    K 扫描点（默认 0,1,2,3,4,5；0=直接量化）
+#   V_HISTORY    V 扫描点（默认 0,1,2,4,5）
+#   BITS / K_BITS / V_BITS  位宽 override（2/4/8）
+#   V_PREDICTOR  cross_kv 或 temporal
 #   BASELINE_K_HISTORY / BASELINE_V_HISTORY  扫另一侧时固定的取值
 #   MAX_SAMPLES  下采样空间位置数，先跑小规模时用
 #   MAX_FRAMES   截断时间轴
@@ -83,8 +85,10 @@ trace_file="$(resolve_path "${TRACE_FILE:-$default_trace}")"
 config_path="$(resolve_path "${CONFIG:-$default_config}")"
 output="$(resolve_path "${OUTPUT:-$default_output}")"
 
-K_HISTORY="${K_HISTORY:-1,2,3,4}"
-V_HISTORY="${V_HISTORY:-0,1,2,3,4,5}"
+K_HISTORY="${K_HISTORY:-0,1,2,3,4,5}"
+V_HISTORY="${V_HISTORY:-0,1,2,4,5}"
+K_BITS="$(resolve_bits K_BITS)"
+V_BITS="$(resolve_bits V_BITS)"
 ITERATIONS="${ITERATIONS:-2}"
 TEMPORAL_RIDGE="${TEMPORAL_RIDGE:-1.0}"
 CROSS_RIDGE="${CROSS_RIDGE:-0.1}"
@@ -108,6 +112,9 @@ sweep_command=(
   --device "$FIT_DEVICE"
   --output "$output"
 )
+[[ -n "${K_BITS:-}" ]] && sweep_command+=(--k-bits "$K_BITS")
+[[ -n "${V_BITS:-}" ]] && sweep_command+=(--v-bits "$V_BITS")
+[[ -n "${V_PREDICTOR:-}" ]] && sweep_command+=(--v-predictor-mode "$V_PREDICTOR")
 [[ -n "${BASELINE_K_HISTORY:-}" ]] && sweep_command+=(--baseline-k-history "$BASELINE_K_HISTORY")
 [[ -n "${BASELINE_V_HISTORY:-}" ]] && sweep_command+=(--baseline-v-history "$BASELINE_V_HISTORY")
 [[ -n "${MAX_SAMPLES:-}" ]] && sweep_command+=(--max-samples "$MAX_SAMPLES")

@@ -243,7 +243,13 @@ def _require_direct_persistent_routes(report: dict[str, object], codec: object) 
     routes = report.get("decode_routes")
     if not isinstance(routes, dict):
         raise RuntimeError("LongCat TempoKV report did not include decode routes")
-    required = ["temporal_persistent_direct_bhsd"]
+    k_route = (
+        "direct_persistent_direct_bhsd"
+        if getattr(getattr(codec, "config", None), "k_predictor_mode", "layer_head")
+        == "direct"
+        else "temporal_persistent_direct_bhsd"
+    )
+    required = [k_route]
     if getattr(codec, "predicts_v_from_key", False):
         required.append("cross_kv_persistent_direct_bhsd")
     missing = [name for name in required if int(routes.get(name) or 0) <= 0]

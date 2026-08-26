@@ -21,10 +21,11 @@ history is worth its parameter cost:
 Two sweeps are run:
 
 ``K``
-    ``k_history_length`` = N, using N reconstructed K frames. Dedicated (non
-    shared) parameters are fitted per length, so **each N is refitted from the
-    trace** — a parameter file fitted for one length cannot be re-pointed at
-    another, and reusing one would measure the wrong model.
+    ``k_history_length`` = N, using N reconstructed K frames. ``N=0`` is the
+    direct-quantization baseline. Dedicated (non shared) parameters are fitted
+    per positive length, so **each N is refitted from the trace** — a parameter
+    file fitted for one length cannot be re-pointed at another, and reusing one
+    would measure the wrong model.
 
 ``V``
     ``v_history_length`` = M *on top of* the CrossKV term. V is always predicted
@@ -63,12 +64,13 @@ from analyze_predictor import (  # noqa: E402
     attention_output_diff,
     energy_ratio,
     reconstruct_k,
+    reconstruct_temporal,
     reconstruct_v,
 )
 from tempokv.config import CodecConfig, config_from_mapping  # noqa: E402
 from tempokv.fitting import fit_predictors  # noqa: E402
 
-K_HISTORY_CHOICES = tuple(range(1, 9))
+K_HISTORY_CHOICES = tuple(range(0, 9))
 V_HISTORY_CHOICES = tuple(range(0, 6))
 
 
@@ -158,23 +160,32 @@ def measure(
         temporal_ridge=temporal_ridge,
         cross_ridge=cross_ridge,
         max_gain=max_gain,
+        v_history_mode="diagonal",
         coordinate_system="pre_rope_normalized",
     )
     fit_seconds = time.perf_counter() - started
 
     k_pred, k_res, k_rebuilt = reconstruct_k(keys, temporal, config)
-    v_pred, v_res, v_rebuilt, v_cross, v_hist = reconstruct_v(
-        keys, values, k_rebuilt, cross, config
-    )
-    # Ablation reconstructions: drop one V term and run the full quantization
-    # round-trip again, so each reduced predictor also reports a closed-loop
-    # reconstruction error, not just its residual.
-    _, _, v_rebuilt_cross_only, _, _ = reconstruct_v(
-        keys, values, k_rebuilt, cross, config, use_history=False
-    )
-    _, _, v_rebuilt_history_only, _, _ = reconstruct_v(
-        keys, values, k_rebuilt, cross, config, use_cross=False
-    )
+    temporal_v = config.v_predictor_mode == "temporal"
+    if temporal_v:
+        v_pred, v_res, v_rebuilt = reconstruct_temporal(
+            values, cross, config, bits=config.v_bits
+        )
+        v_cross = v_hist = None
+        v_rebuilt_cross_only = v_rebuilt_history_only = None
+    else:
+        v_pred, v_res, v_rebuilt, v_cross, v_hist = reconstruct_v(
+            keys, values, k_rebuilt, cross, config
+        )
+        # Ablation reconstructions: drop one V term and run the full quantization
+        # round-trip again, so each reduced predictor also reports a closed-loop
+        # reconstruction error, not just its residual.
+        _, _, v_rebuilt_cross_only, _, _ = reconstruct_v(
+            keys, values, k_rebuilt, cross, config, use_history=False
+        )
+        _, _, v_rebuilt_history_only, _, _ = reconstruct_v(
+            keys, values, k_rebuilt, cross, config, use_cross=False
+        )
     attention_error, _ = attention_output_diff(keys, values, k_rebuilt, v_rebuilt)
 
     # Frame 0 is the anchor; it has no predictor, so prediction statistics are
@@ -184,25 +195,30 @@ def measure(
     k_residual = energy_ratio(k_res[:, :, later], keys[:, :, later])
     v_residual = energy_ratio(v_res[:, :, later], values[:, :, later])
 
-    # Leave-one-out ablation of the two V prediction terms. Both are dropped
-    # from the *jointly fitted* model rather than refitted without each other,
-    # so these say what each term contributes to this predictor, not what a
-    # predictor trained without it would achieve. The terms are correlated, so
-    # the two residuals do not decompose the full one.
-    v_without_history = values[:, :, later] - (
-        v_pred[:, :, later] - v_hist[:, :, later]
-    )
-    v_without_cross = values[:, :, later] - (
-        v_pred[:, :, later] - v_cross[:, :, later]
-    )
-    v_without_terms = values[:, :, later] - (
-        v_pred[:, :, later] - v_cross[:, :, later] - v_hist[:, :, later]
-    )
-    v_residual_cross_only = energy_ratio(v_without_history, values[:, :, later])
-    v_residual_history_only = energy_ratio(v_without_cross, values[:, :, later])
-    # Pure-bias baseline with both terms dropped: what the V history and the
-    # CrossKV term each buy *from nothing*, not just on top of the other term.
-    v_residual_bias_only = energy_ratio(v_without_terms, values[:, :, later])
+    if temporal_v:
+        v_residual_cross_only = None
+        v_residual_history_only = v_residual
+        v_residual_bias_only = None
+    else:
+        # Leave-one-out ablation of the two V prediction terms. Both are dropped
+        # from the *jointly fitted* model rather than refitted without each other,
+        # so these say what each term contributes to this predictor, not what a
+        # predictor trained without it would achieve. The terms are correlated, so
+        # the two residuals do not decompose the full one.
+        v_without_history = values[:, :, later] - (
+            v_pred[:, :, later] - v_hist[:, :, later]
+        )
+        v_without_cross = values[:, :, later] - (
+            v_pred[:, :, later] - v_cross[:, :, later]
+        )
+        v_without_terms = values[:, :, later] - (
+            v_pred[:, :, later] - v_cross[:, :, later] - v_hist[:, :, later]
+        )
+        v_residual_cross_only = energy_ratio(v_without_history, values[:, :, later])
+        v_residual_history_only = energy_ratio(v_without_cross, values[:, :, later])
+        # Pure-bias baseline with both terms dropped: what the V history and the
+        # CrossKV term each buy *from nothing*, not just on top of the other term.
+        v_residual_bias_only = energy_ratio(v_without_terms, values[:, :, later])
     return {
         "k_history_length": temporal.history_length,
         "v_history_length": cross.history_length,
@@ -222,38 +238,63 @@ def measure(
                 v_pred[:, :, later], values[:, :, later]
             ),
             "reconstruction_error": energy_ratio(v_rebuilt - values, values),
-            # Descriptive split of the V prediction. The two terms are
-            # correlated, so these do not partition the prediction energy.
-            "cross_term_energy_ratio": energy_ratio(
-                v_cross[:, :, later], values[:, :, later]
+            # Descriptive split of the CrossKV prediction. Temporal-only V has
+            # no CrossKV term, so these fields are intentionally null there.
+            "cross_term_energy_ratio": (
+                None
+                if temporal_v
+                else energy_ratio(v_cross[:, :, later], values[:, :, later])
             ),
-            "history_term_energy_ratio": energy_ratio(
-                v_hist[:, :, later], values[:, :, later]
+            "history_term_energy_ratio": (
+                None
+                if temporal_v
+                else energy_ratio(v_hist[:, :, later], values[:, :, later])
             ),
             # Ablation: residual left when one term is removed from the fitted
             # predictor. Compare against `residual_energy_ratio` (both terms).
             "residual_cross_only": v_residual_cross_only,
             "residual_history_only": v_residual_history_only,
-            "cross_term_gain": v_residual_history_only - v_residual,
-            "history_term_gain": v_residual_cross_only - v_residual,
+            "cross_term_gain": (
+                None
+                if temporal_v
+                else v_residual_history_only - v_residual
+            ),
+            "history_term_gain": (
+                None
+                if temporal_v
+                else v_residual_cross_only - v_residual
+            ),
             # Closed-loop reconstruction error of the reduced predictors: drop
             # one V term and rerun the full quantization round-trip. These are
             # the end-to-end errors the model would actually read under that
             # ablation, unlike the residuals above.
-            "reconstruction_cross_only": energy_ratio(
-                v_rebuilt_cross_only - values, values
+            "reconstruction_cross_only": (
+                None
+                if temporal_v
+                else energy_ratio(v_rebuilt_cross_only - values, values)
             ),
-            "reconstruction_history_only": energy_ratio(
-                v_rebuilt_history_only - values, values
+            "reconstruction_history_only": (
+                energy_ratio(v_rebuilt - values, values)
+                if temporal_v
+                else energy_ratio(v_rebuilt_history_only - values, values)
             ),
             # Pure-bias baseline (both terms dropped) and each term's gain from
             # nothing. `cross_term_gain_vs_bias` is what CrossKV buys alone;
             # `history_term_gain_vs_bias` is what V history buys alone.
             "residual_bias_only": v_residual_bias_only,
-            "cross_term_gain_vs_bias": v_residual_bias_only - v_residual_cross_only,
-            "history_term_gain_vs_bias": v_residual_bias_only - v_residual_history_only,
+            "cross_term_gain_vs_bias": (
+                None
+                if temporal_v
+                else v_residual_bias_only - v_residual_cross_only
+            ),
+            "history_term_gain_vs_bias": (
+                None
+                if temporal_v
+                else v_residual_bias_only - v_residual_history_only
+            ),
         },
         "attention_output_error": attention_error,
+        "v_predictor_mode": config.v_predictor_mode,
     }
 
 
@@ -275,13 +316,30 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--k-history",
-        default="1,2,3,4",
+        default="0,1,2,3,4,5",
         help=f"K history lengths to sweep, from {K_HISTORY_CHOICES}",
     )
     parser.add_argument(
         "--v-history",
-        default="0,1,2,3,4,5",
+        default="0,1,2,4,5",
         help=f"V history lengths to sweep, from {V_HISTORY_CHOICES}",
+    )
+    parser.add_argument(
+        "--k-bits",
+        type=int,
+        choices=(2, 4, 8),
+        help="override K residual bit width while keeping the config family",
+    )
+    parser.add_argument(
+        "--v-bits",
+        type=int,
+        choices=(2, 4, 8),
+        help="override V residual bit width while keeping the config family",
+    )
+    parser.add_argument(
+        "--v-predictor-mode",
+        choices=("cross_kv", "temporal"),
+        help="V predictor family; temporal is the independent w/o-Cross baseline",
     )
     parser.add_argument(
         "--baseline-k-history",
@@ -332,6 +390,9 @@ def _format_table(title: str, swept: str, rows: list[dict[str, object]]) -> str:
 
 
 def _format_v_terms(rows: list[dict[str, object]]) -> str:
+    def value_text(value: object, width: int) -> str:
+        return "n/a".rjust(width) if value is None else f"{float(value):{width}.5f}"
+
     lines = [
         "",
         "--- V prediction terms (energy relative to clean V; correlated, not a partition) ---",
@@ -340,9 +401,9 @@ def _format_v_terms(rows: list[dict[str, object]]) -> str:
     for row in rows:
         lines.append(
             f"{row['swept_value']:>3}  "
-            f"{row['v']['cross_term_energy_ratio']:13.5f} "
-            f"{row['v']['history_term_energy_ratio']:13.5f} "
-            f"{row['v']['residual_energy_ratio']:11.5f}"
+            f"{value_text(row['v']['cross_term_energy_ratio'], 13)} "
+            f"{value_text(row['v']['history_term_energy_ratio'], 13)} "
+            f"{value_text(row['v']['residual_energy_ratio'], 11)}"
         )
     return "\n".join(lines)
 
@@ -350,6 +411,9 @@ def _format_v_terms(rows: list[dict[str, object]]) -> str:
 def _format_v_ablation(rows: list[dict[str, object]]) -> str:
     """Residual and reconstruction left when one term is dropped from the
     fitted V predictor."""
+    def value_text(value: object, width: int) -> str:
+        return "n/a".rjust(width) if value is None else f"{float(value):{width}.5f}"
+
     lines = [
         "",
         "--- V term ablation (residual energy and closed-loop reconstruction; "
@@ -361,11 +425,11 @@ def _format_v_ablation(rows: list[dict[str, object]]) -> str:
         v = row["v"]
         lines.append(
             f"{row['swept_value']:>3}  "
-            f"{v['reconstruction_error']:12.5f} "
-            f"{v['reconstruction_cross_only']:13.5f} "
-            f"{v['reconstruction_history_only']:12.5f} "
-            f"{v['residual_cross_only']:12.5f} "
-            f"{v['residual_history_only']:12.5f}"
+            f"{value_text(v['reconstruction_error'], 12)} "
+            f"{value_text(v['reconstruction_cross_only'], 13)} "
+            f"{value_text(v['reconstruction_history_only'], 12)} "
+            f"{value_text(v['residual_cross_only'], 12)} "
+            f"{value_text(v['residual_history_only'], 12)}"
         )
     lines.append(
         "    recon(both) = full predictor (history+cross+bias) closed-loop "
@@ -395,6 +459,19 @@ def main(argv: list[str] | None = None) -> int:
     )
     device = _resolve_device(args.device)
     base = _load_config(args.config)
+    config_updates = {}
+    if args.k_bits is not None:
+        config_updates["k_bits"] = args.k_bits
+    if args.v_bits is not None:
+        config_updates["v_bits"] = args.v_bits
+    if args.v_predictor_mode is not None:
+        config_updates["v_predictor_mode"] = args.v_predictor_mode
+        if args.v_predictor_mode == "temporal":
+            config_updates["cross_kv_weight_mode"] = "layer_head"
+    if config_updates:
+        base = replace(base, **config_updates)
+    if base.v_predictor_mode == "temporal" and 0 in v_values:
+        parser.error("temporal V requires v-history values >= 1")
 
     keys, values = load_trace(
         args.trace,
@@ -460,7 +537,21 @@ def main(argv: list[str] | None = None) -> int:
     k_rows: list[dict[str, object]] = []
     for value in k_values:
         print(f"[sweep] K history {value} (V held at {baseline_v}) ...", file=sys.stderr)
-        config = replace(base, k_history_length=value, v_history_length=baseline_v)
+        k_predictor_mode = (
+            "direct"
+            if value == 0
+            else (
+                "shared" if base.fit_mode == "legacy" else "layer_head"
+                if base.k_predictor_mode == "direct"
+                else base.k_predictor_mode
+            )
+        )
+        config = replace(
+            base,
+            k_history_length=value,
+            v_history_length=baseline_v,
+            k_predictor_mode=k_predictor_mode,
+        )
         record = measure(keys, values, config, **common)
         record["swept_value"] = value
         k_rows.append(record)
@@ -468,7 +559,21 @@ def main(argv: list[str] | None = None) -> int:
     v_rows: list[dict[str, object]] = []
     for value in v_values:
         print(f"[sweep] V history {value} (K held at {baseline_k}) ...", file=sys.stderr)
-        config = replace(base, k_history_length=baseline_k, v_history_length=value)
+        k_predictor_mode = (
+            "direct"
+            if baseline_k == 0
+            else (
+                "shared" if base.fit_mode == "legacy" else "layer_head"
+                if base.k_predictor_mode == "direct"
+                else base.k_predictor_mode
+            )
+        )
+        config = replace(
+            base,
+            k_history_length=baseline_k,
+            v_history_length=value,
+            k_predictor_mode=k_predictor_mode,
+        )
         record = measure(keys, values, config, **common)
         record["swept_value"] = value
         v_rows.append(record)
@@ -491,6 +596,8 @@ def main(argv: list[str] | None = None) -> int:
                 "group_size",
                 "stride",
                 "residual_mode",
+                "k_predictor_mode",
+                "v_predictor_mode",
             )
         },
         "fitting": {**common, "device": str(device)},

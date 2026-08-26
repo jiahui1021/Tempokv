@@ -370,6 +370,8 @@ def refine_attention(
         raise ValueError("refine_tensors must contain key, value, or both")
     if len(set(phases_to_run)) != len(phases_to_run):
         raise ValueError("refine_tensors must not contain duplicates")
+    if config.k_predictor_mode == "direct" and "key" in phases_to_run:
+        raise ValueError("direct K has no trainable predictor for attention refinement")
     if config.cross_kv_weight_mode != "layer_head" and "value" in phases_to_run:
         raise ValueError(
             "value refinement does not support "
@@ -1510,6 +1512,52 @@ def _quantization_roundtrip(
     )
 
 
+def _reconstruct_direct_trace(
+    clean_values: torch.Tensor,
+    config: CodecConfig,
+    *,
+    bits: int | None = None,
+) -> torch.Tensor:
+    """Quantize every non-anchor trace unit without a temporal predictor."""
+    residual_bits = config.k_bits if bits is None else bits
+    frame_count = int(clean_values.shape[-3])
+    reconstruction_dtype = {
+        "float32": torch.float32,
+        "float16": torch.float16,
+        "bfloat16": torch.bfloat16,
+    }[config.reconstruction_dtype]
+    legacy_math = config.fit_mode == "legacy"
+    rebuilt = torch.empty_like(
+        clean_values,
+        dtype=torch.float32 if legacy_math else reconstruction_dtype,
+    )
+
+    anchor = _quantization_roundtrip(
+        clean_values[..., 0, :, :],
+        bits=config.anchor_bits,
+        config=config,
+        symmetric=True,
+    )
+    rebuilt[..., 0, :, :] = (
+        anchor.to(torch.bfloat16).float()
+        if legacy_math
+        else anchor.to(reconstruction_dtype)
+    )
+    for frame in range(1, frame_count):
+        reconstructed_frame = _quantization_roundtrip(
+            clean_values[..., frame, :, :],
+            bits=residual_bits,
+            config=config,
+            symmetric=config.residual_mode == "symmetric",
+        )
+        rebuilt[..., frame, :, :] = (
+            reconstructed_frame.to(torch.bfloat16).float()
+            if legacy_math
+            else reconstructed_frame.to(reconstruction_dtype)
+        )
+    return rebuilt
+
+
 def _reconstruct_temporal_trace(
     clean_keys: torch.Tensor,
     parameters: TemporalParameters,
@@ -1527,6 +1575,8 @@ def _reconstruct_temporal_trace(
     frame_count = int(clean_keys.shape[-3])
     head_count = int(clean_keys.shape[-2])
     dim = int(clean_keys.shape[-1])
+    if parameters.history_length == 0:
+        return _reconstruct_direct_trace(clean_keys, config, bits=bits)
     if parameters.per_head:
         if tuple(parameters.history_weights.shape[-2:]) != (head_count, dim):
             raise ValueError(
@@ -2105,52 +2155,71 @@ def _fit_legacy_predictors(
     """Reproduce the legacy shared-K/Cross+previous-V fitter."""
     dim = int(keys.shape[-1])
     signature = config.format_signature()
-    initial_weights = torch.zeros(
-        history_length,
-        history_length,
-        dim,
-        dtype=torch.float32,
-        device=keys.device,
-    )
-    initial_weights[:, 0] = 1.0
-    temporal = TemporalParameters(
-        history_weights=initial_weights,
-        history_bias=torch.zeros(
+    direct_k = config.k_predictor_mode == "direct"
+    if direct_k:
+        temporal = TemporalParameters(
+            history_weights=torch.empty(
+                0, 0, dim, dtype=torch.float32, device=keys.device
+            ),
+            history_bias=torch.empty(0, dim, dtype=torch.float32, device=keys.device),
+            stride=config.stride,
+            codec_signature=signature,
+        )
+    else:
+        initial_weights = torch.zeros(
+            history_length,
             history_length,
             dim,
             dtype=torch.float32,
             device=keys.device,
-        ),
-        stride=config.stride,
-        codec_signature=signature,
-    )
+        )
+        initial_weights[:, 0] = 1.0
+        temporal = TemporalParameters(
+            history_weights=initial_weights,
+            history_bias=torch.zeros(
+                history_length,
+                dim,
+                dtype=torch.float32,
+                device=keys.device,
+            ),
+            stride=config.stride,
+            codec_signature=signature,
+        )
     effective_iterations = iterations if fit_history_source == "reconstructed" else 1
-    for _ in range(effective_iterations):
+    if direct_k:
+        reconstructed_keys = (
+            _reconstruct_direct_trace(keys, config)
+            if fit_history_source == "reconstructed"
+            else keys
+        )
+    else:
+        for _ in range(effective_iterations):
+            reconstructed_keys = (
+                _reconstruct_temporal_trace(keys, temporal, config)
+                if fit_history_source == "reconstructed"
+                else keys
+            )
+            fitted = fit_legacy_shared_temporal(
+                reconstructed_keys,
+                keys,
+                history_length=history_length,
+                ridge=temporal_ridge,
+                max_gain=max_gain,
+                stride=config.stride,
+            )
+            temporal = TemporalParameters(
+                fitted.history_weights,
+                fitted.history_bias,
+                fitted.stride,
+                codec_signature=signature,
+            )
+
+    if not direct_k:
         reconstructed_keys = (
             _reconstruct_temporal_trace(keys, temporal, config)
             if fit_history_source == "reconstructed"
             else keys
         )
-        fitted = fit_legacy_shared_temporal(
-            reconstructed_keys,
-            keys,
-            history_length=history_length,
-            ridge=temporal_ridge,
-            max_gain=max_gain,
-            stride=config.stride,
-        )
-        temporal = TemporalParameters(
-            fitted.history_weights,
-            fitted.history_bias,
-            fitted.stride,
-            codec_signature=signature,
-        )
-
-    reconstructed_keys = (
-        _reconstruct_temporal_trace(keys, temporal, config)
-        if fit_history_source == "reconstructed"
-        else keys
-    )
     if config.v_predictor_mode == "temporal":
         cross = _fit_legacy_shared_temporal_v(
             values,
@@ -2308,13 +2377,19 @@ def _fit_predictors(
     if isinstance(history_length, bool) or int(history_length) != history_length:
         raise ValueError(f"history_length must be a positive integer, got {history_length!r}")
     history_length = int(history_length)
-    if (
-        history_length <= 0
-        or history_length > 8
-        or history_length >= int(keys.shape[-3])
-    ):
+    if history_length < 0 or history_length > 8:
         raise ValueError(
-            "history_length must be in [1, min(8, T-1)], got "
+            "history_length must be in [0, 8], got "
+            f"{history_length} for T={int(keys.shape[-3])}"
+        )
+    if history_length == 0:
+        if resolved.k_predictor_mode != "direct":
+            raise ValueError(
+                "history_length=0 requires config.k_predictor_mode='direct'"
+            )
+    elif history_length >= int(keys.shape[-3]):
+        raise ValueError(
+            "history_length must be smaller than the trace frame count, got "
             f"{history_length} for T={int(keys.shape[-3])}"
         )
     if resolved.v_history_length >= int(keys.shape[-3]):
@@ -2360,54 +2435,65 @@ def _fit_predictors(
     layer_count = int(keys.shape[0])
     head_count = int(keys.shape[-2])
     dim = int(keys.shape[-1])
-    initial_weights = torch.zeros(
-        layer_count,
-        history_length,
-        history_length,
-        head_count,
-        dim,
-        dtype=torch.float32,
-        device=keys.device,
-    )
-    initial_weights[:, :, 0] = 1.0
-    temporal = TemporalParameters(
-        history_weights=initial_weights,
-        history_bias=torch.zeros(
+    if resolved.k_predictor_mode == "direct":
+        temporal = TemporalParameters(
+            history_weights=torch.empty(
+                0, 0, dim, dtype=torch.float32, device=keys.device
+            ),
+            history_bias=torch.empty(0, dim, dtype=torch.float32, device=keys.device),
+            stride=resolved.stride,
+            codec_signature=resolved.format_signature(),
+        )
+    else:
+        initial_weights = torch.zeros(
             layer_count,
+            history_length,
             history_length,
             head_count,
             dim,
             dtype=torch.float32,
             device=keys.device,
-        ),
-        stride=resolved.stride,
-        layer_ids=layer_ids,
-        codec_signature=resolved.format_signature(),
-    )
-
-    effective_iterations = iterations if fit_history_source == "reconstructed" else 1
-    for _ in range(effective_iterations):
-        reconstructed = (
-            _reconstruct_temporal_trace(keys, temporal, resolved)
-            if fit_history_source == "reconstructed"
-            else keys
         )
-        fitted_temporal = fit_temporal_layers(
-            reconstructed,
-            keys,
-            history_length=history_length,
-            ridge=temporal_ridge,
-            max_gain=max_gain,
+        initial_weights[:, :, 0] = 1.0
+        temporal = TemporalParameters(
+            history_weights=initial_weights,
+            history_bias=torch.zeros(
+                layer_count,
+                history_length,
+                head_count,
+                dim,
+                dtype=torch.float32,
+                device=keys.device,
+            ),
             stride=resolved.stride,
             layer_ids=layer_ids,
+            codec_signature=resolved.format_signature(),
         )
-        temporal = TemporalParameters(
-            fitted_temporal.history_weights,
-            fitted_temporal.history_bias,
-            fitted_temporal.stride,
-            fitted_temporal.layer_ids,
-            resolved.format_signature(),
-        )
+
+    effective_iterations = iterations if fit_history_source == "reconstructed" else 1
+    if resolved.k_predictor_mode != "direct":
+        for _ in range(effective_iterations):
+            reconstructed = (
+                _reconstruct_temporal_trace(keys, temporal, resolved)
+                if fit_history_source == "reconstructed"
+                else keys
+            )
+            fitted_temporal = fit_temporal_layers(
+                reconstructed,
+                keys,
+                history_length=history_length,
+                ridge=temporal_ridge,
+                max_gain=max_gain,
+                stride=resolved.stride,
+                layer_ids=layer_ids,
+            )
+            temporal = TemporalParameters(
+                fitted_temporal.history_weights,
+                fitted_temporal.history_bias,
+                fitted_temporal.stride,
+                fitted_temporal.layer_ids,
+                resolved.format_signature(),
+            )
 
     if resolved.v_predictor_mode == "temporal":
         # Temporal V reads its own reconstructed V history, so it needs neither

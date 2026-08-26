@@ -45,41 +45,141 @@ def _load_config(path: Path) -> CodecConfig:
     return config_from_mapping(payload)
 
 
+def reconstruct_temporal(
+    target: torch.Tensor,
+    temporal: TemporalParameters,
+    config: CodecConfig,
+    *,
+    bits: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Closed-loop temporal reconstruction for K or temporal-only V."""
+    if target.ndim < 4:
+        raise ValueError("temporal reconstruction needs [L, ..., T, H, D]")
+    layer_count = int(target.shape[0])
+    frame_count = int(target.shape[-3])
+    head_count = int(target.shape[-2])
+    dim = int(target.shape[-1])
+    residual_bits = config.k_bits if bits is None else bits
+    history_length = temporal.history_length
+    if history_length >= frame_count:
+        raise ValueError("temporal history must be smaller than the frame count")
+
+    reconstruction_dtype = {
+        "float32": torch.float32,
+        "float16": torch.float16,
+        "bfloat16": torch.bfloat16,
+    }[config.reconstruction_dtype]
+    legacy_math = config.fit_mode == "legacy"
+    prediction = torch.zeros_like(target)
+    residual = torch.zeros_like(target)
+    rebuilt = torch.empty_like(
+        target,
+        dtype=torch.float32 if legacy_math else reconstruction_dtype,
+    )
+    anchor = _quantization_roundtrip(
+        target[..., 0, :, :],
+        bits=config.anchor_bits,
+        config=config,
+        symmetric=True,
+    )
+    rebuilt[..., 0, :, :] = (
+        anchor.to(torch.bfloat16).float()
+        if legacy_math
+        else anchor.to(reconstruction_dtype)
+    )
+    if history_length == 0:
+        for frame in range(1, frame_count):
+            current = target[..., frame, :, :]
+            current_residual = current.float()
+            rebuilt_frame = _quantization_roundtrip(
+                current_residual,
+                bits=residual_bits,
+                config=config,
+                symmetric=config.residual_mode == "symmetric",
+            )
+            residual[..., frame, :, :] = current_residual
+            rebuilt[..., frame, :, :] = (
+                rebuilt_frame.to(torch.bfloat16).float()
+                if legacy_math
+                else rebuilt_frame.to(reconstruction_dtype)
+            )
+        return prediction, residual, rebuilt
+
+    prefix_dimensions = target.ndim - 4
+    layered_shape = (
+        layer_count,
+        *(1 for _ in range(prefix_dimensions)),
+        head_count,
+        dim,
+    )
+    per_head_shape = (
+        1,
+        *(1 for _ in range(prefix_dimensions)),
+        head_count,
+        dim,
+    )
+    channel_shape = (
+        1,
+        *(1 for _ in range(prefix_dimensions + 1)),
+        dim,
+    )
+    weights = temporal.history_weights.to(target.device)
+    bias = temporal.history_bias.to(target.device)
+    for frame in range(1, frame_count):
+        order = min(frame, history_length)
+        if temporal.layered:
+            current_bias = bias[:, order - 1]
+            selected = weights[:, order - 1, :order]
+            bias_view = current_bias.view(layered_shape)
+            coefficient_shape = layered_shape
+        elif temporal.per_head:
+            current_bias = bias[order - 1]
+            selected = weights[order - 1, :order]
+            bias_view = current_bias.view(per_head_shape)
+            coefficient_shape = per_head_shape
+        else:
+            current_bias = bias[order - 1]
+            selected = weights[order - 1, :order]
+            bias_view = current_bias.view(channel_shape)
+            coefficient_shape = channel_shape
+        current_prediction = torch.zeros(
+            target[..., frame, :, :].shape,
+            dtype=torch.float32,
+            device=target.device,
+        )
+        for lag in range(1, order + 1):
+            coefficient = (
+                selected[..., lag - 1, :, :]
+                if temporal.layered
+                else selected[lag - 1]
+            ).view(coefficient_shape)
+            current_prediction = current_prediction + (
+                rebuilt[..., frame - lag, :, :].float() * coefficient
+            )
+        current_prediction = current_prediction + bias_view
+        current_residual = target[..., frame, :, :].float() - current_prediction
+        rebuilt_residual = _quantization_roundtrip(
+            current_residual,
+            bits=residual_bits,
+            config=config,
+            symmetric=config.residual_mode == "symmetric",
+        )
+        prediction[..., frame, :, :] = current_prediction
+        residual[..., frame, :, :] = current_residual
+        reconstructed_frame = current_prediction + rebuilt_residual
+        rebuilt[..., frame, :, :] = (
+            reconstructed_frame.to(torch.bfloat16).float()
+            if legacy_math
+            else reconstructed_frame.to(reconstruction_dtype)
+        )
+    return prediction, residual, rebuilt
+
+
 def reconstruct_k(
     keys: torch.Tensor, temporal: TemporalParameters, config: CodecConfig
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Closed-loop K reconstruction; returns (pred, residual, rebuilt)."""
-    L, S, T, H, D = keys.shape
-    kh = temporal.history_length
-    pred = torch.zeros_like(keys)
-    resid = torch.zeros_like(keys)
-    rebuilt = torch.empty_like(keys)
-    rebuilt[:, :, 0] = _quantization_roundtrip(
-        keys[:, :, 0], bits=config.anchor_bits, config=config, symmetric=True
-    )
-    for frame in range(1, T):
-        order = min(frame, kh)
-        p = (
-            temporal.history_bias[:, order - 1]
-            .view(L, 1, H, D)
-            .expand_as(keys[:, :, frame])
-            .clone()
-        )
-        selected = temporal.history_weights[:, order - 1, :order]
-        for lag in range(1, order + 1):
-            coeff = selected[:, lag - 1].view(L, 1, H, D)
-            p = p + rebuilt[:, :, frame - lag] * coeff
-        r = keys[:, :, frame].float() - p
-        r_rebuilt = _quantization_roundtrip(
-            r,
-            bits=config.k_bits,
-            config=config,
-            symmetric=config.residual_mode == "symmetric",
-        )
-        pred[:, :, frame] = p
-        resid[:, :, frame] = r
-        rebuilt[:, :, frame] = p + r_rebuilt
-    return pred, resid, rebuilt
+    return reconstruct_temporal(keys, temporal, config)
 
 
 def reconstruct_v(
@@ -178,7 +278,8 @@ def attention_output_diff(
         into what attention then reads as a single causal sequence.
         """
         return (
-            tensor.reshape(-1, T, H, D)
+            tensor.float()
+            .reshape(-1, T, H, D)
             .permute(0, 2, 1, 3)
             .reshape(L * S * H, T, D)
         )
@@ -231,12 +332,21 @@ def main() -> None:
         values = torch.from_numpy(np.array(archive["values"], copy=True))
     config = _load_config(args.config)
     temporal = TemporalParameters.load(args.k_params)
-    cross = CrossKVParameters.load(args.v_params)
+    value_parameters = (
+        TemporalParameters.load(args.v_params)
+        if config.v_predictor_mode == "temporal"
+        else CrossKVParameters.load(args.v_params)
+    )
 
     k_pred, k_res, k_rebuilt = reconstruct_k(keys, temporal, config)
-    v_pred, v_res, v_rebuilt, _, _ = reconstruct_v(
-        keys, values, k_rebuilt, cross, config
-    )
+    if config.v_predictor_mode == "temporal":
+        v_pred, v_res, v_rebuilt = reconstruct_temporal(
+            values, value_parameters, config, bits=config.v_bits
+        )
+    else:
+        v_pred, v_res, v_rebuilt, _, _ = reconstruct_v(
+            keys, values, k_rebuilt, value_parameters, config
+        )
 
     # Prediction/residual stats on frames >= 1 (frame 0 is an anchor).
     k_pred_ratio = per_layer_ratio(k_pred[:, :, 1:], keys[:, :, 1:])
@@ -264,7 +374,9 @@ def main() -> None:
             "dim": keys.shape[4],
         },
         "k_history_length": temporal.history_length,
-        "v_history_length": cross.history_length,
+        "v_history_length": value_parameters.history_length,
+        "k_predictor_mode": config.k_predictor_mode,
+        "v_predictor_mode": config.v_predictor_mode,
         "stats": {
             "k": {
                 "pred_energy_ratio": k_pred_ratio,

@@ -462,11 +462,17 @@ def _encode(
         current = value[:, :, offset : offset + unit_length]
         if predictor_kind == "temporal":
             assert temporal is not None
-            prediction = predict_temporal(
-                [item[:, :, :unit_length] for item in history],
-                temporal,
-                legacy=config.fit_mode == "legacy",
-            )
+            if temporal.history_length == 0:
+                # Zero-order K is the direct-quantization ablation. Keep the
+                # temporal packed-state contract while spending all residual
+                # bits on the current unit.
+                prediction = torch.zeros_like(current, dtype=torch.float32)
+            else:
+                prediction = predict_temporal(
+                    [item[:, :, :unit_length] for item in history],
+                    temporal,
+                    legacy=config.fit_mode == "legacy",
+                )
         else:
             assert cross_kv is not None and source is not None
             prediction = predict_cross_kv(
@@ -502,11 +508,11 @@ def _encode(
             else reconstruction[:, :, offset : offset + unit_length]
         )
         if predictor_kind == "temporal":
-            assert temporal is not None
-            history = [
-                rebuilt_history,
-                *history[: temporal.history_length - 1],
-            ]
+            if temporal is not None and temporal.history_length:
+                history = [
+                    rebuilt_history,
+                    *history[: temporal.history_length - 1],
+                ]
         else:
             assert cross_kv is not None
             if cross_kv.history_length:
@@ -769,11 +775,21 @@ def decode_tensor(
     for unit_length in packed.unit_lengths[1:]:
         if packed.predictor_kind == "temporal":
             assert packed.temporal is not None
-            prediction = predict_temporal(
-                [item[:, :, :unit_length] for item in history],
-                packed.temporal,
-                legacy=packed.compatibility_mode == "legacy",
-            )
+            if packed.temporal.history_length == 0:
+                prediction = torch.zeros(
+                    output.shape[0],
+                    output.shape[1],
+                    unit_length,
+                    width,
+                    device=output.device,
+                    dtype=torch.float32,
+                )
+            else:
+                prediction = predict_temporal(
+                    [item[:, :, :unit_length] for item in history],
+                    packed.temporal,
+                    legacy=packed.compatibility_mode == "legacy",
+                )
         else:
             if source is None or packed.cross_kv is None:
                 raise ValueError("CrossKV decoding requires reconstructed K")
@@ -812,11 +828,11 @@ def decode_tensor(
             else output[:, :, offset : offset + unit_length]
         )
         if packed.predictor_kind == "temporal":
-            assert packed.temporal is not None
-            history = [
-                rebuilt_history,
-                *history[: packed.temporal.history_length - 1],
-            ]
+            if packed.temporal is not None and packed.temporal.history_length:
+                history = [
+                    rebuilt_history,
+                    *history[: packed.temporal.history_length - 1],
+                ]
         else:
             assert packed.cross_kv is not None
             if packed.cross_kv.history_length:

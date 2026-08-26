@@ -64,8 +64,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--k-history-length",
         type=int,
-        choices=range(1, 9),
-        help="number of reconstructed K frames used by the predictor",
+        choices=range(0, 9),
+        help="number of reconstructed K frames used by the predictor (0=direct K)",
     )
     parser.add_argument(
         "--v-history-length",
@@ -181,7 +181,17 @@ def _validate_parameters(
             "Self-Forcing K/V parameters must share a current parameter_set_id"
         )
     codec = TempoKVCodec(temporal, cross, config)
-    if config.k_predictor_mode == "shared":
+    if config.k_predictor_mode == "direct":
+        if temporal.layer_ids is not None:
+            raise ValueError("direct K parameters must not carry layer ids")
+        if tuple(temporal.history_weights.shape) != (0, 0, 128) or tuple(
+            temporal.history_bias.shape
+        ) != (0, 128):
+            raise ValueError(
+                "direct K parameters must contain empty [0,0,128] weights "
+                "and [0,128] bias"
+            )
+    elif config.k_predictor_mode == "shared":
         if temporal.layer_ids is not None:
             raise ValueError("legacy K parameters must be shared across layers")
     elif temporal.layer_ids != EXPECTED_LAYER_IDS:
@@ -1046,11 +1056,17 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         and not args.torch_decoder
         and generated_entries
     ):
-        required_routes = (
-            ("temporal_persistent_direct",)
-            if config.v_predictor_mode == "temporal"
-            else ("temporal_persistent_direct", "cross_kv_persistent_direct")
+        k_route = (
+            "direct_persistent_direct"
+            if config.k_predictor_mode == "direct"
+            else "temporal_persistent_direct"
         )
+        v_route = (
+            "temporal_persistent_direct"
+            if config.v_predictor_mode == "temporal"
+            else "cross_kv_persistent_direct"
+        )
+        required_routes = (k_route,) if k_route == v_route else (k_route, v_route)
         missing_routes = [
             route
             for route in required_routes

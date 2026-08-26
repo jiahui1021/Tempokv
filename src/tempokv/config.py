@@ -52,12 +52,15 @@ class CodecConfig:
     strict_triton: bool = False
     # Appended to preserve the positional argument order of older callers.
     v_history_length: int = 0
-    # None keeps legacy parameter-driven K history selection.
+    # None keeps parameter-driven K history selection for predictor modes that
+    # support it. Direct K spells out zero explicitly.
     k_history_length: int | None = None
     # The legacy predictor uses IEEE FP32 CrossKV projections. ``tf32``
     # retains the native TempoKV execution policy for other configurations.
     cross_matmul_precision: str = "tf32"
     # ``shared`` pools all Self-Forcing layers and heads into [P,P,D].
+    # ``direct`` is the zero-history baseline: non-anchor K units are quantized
+    # directly and the parameter file contains an empty temporal map.
     k_predictor_mode: str = "layer_head"
     # ``temporal`` predicts V from its own reconstructed history with the same
     # predictor K uses, so V needs no reconstructed K and no CrossKV matrix.
@@ -91,10 +94,10 @@ class CodecConfig:
         if self.k_history_length is not None and (
             isinstance(self.k_history_length, bool)
             or int(self.k_history_length) != self.k_history_length
-            or int(self.k_history_length) <= 0
+            or int(self.k_history_length) < 0
             or int(self.k_history_length) > 8
         ):
-            raise ValueError("k_history_length must be an integer from 1 to 8 or null")
+            raise ValueError("k_history_length must be an integer from 0 to 8 or null")
         if self.residual_mode not in {"symmetric", "asymmetric"}:
             raise ValueError("residual_mode must be symmetric or asymmetric")
         supported_dtypes = {"float32", "float16", "bfloat16"}
@@ -106,9 +109,18 @@ class CodecConfig:
             )
         if self.cross_matmul_precision not in {"ieee", "tf32"}:
             raise ValueError("cross_matmul_precision must be ieee or tf32")
-        if self.k_predictor_mode not in {"layer_head", "shared"}:
+        if self.k_predictor_mode not in {"layer_head", "shared", "direct"}:
             raise ValueError(
-                "k_predictor_mode must be layer_head or shared"
+                "k_predictor_mode must be layer_head, shared, or direct"
+            )
+        if self.k_predictor_mode == "direct":
+            if self.k_history_length != 0:
+                raise ValueError(
+                    "k_predictor_mode=direct requires k_history_length=0"
+                )
+        elif self.k_history_length == 0:
+            raise ValueError(
+                "k_history_length=0 requires k_predictor_mode=direct"
             )
         if self.v_predictor_mode not in {"cross_kv", "temporal"}:
             raise ValueError("v_predictor_mode must be cross_kv or temporal")
@@ -151,9 +163,9 @@ class CodecConfig:
                 "k_predictor_mode=shared requires fit_mode=legacy"
             )
         if self.fit_mode == "legacy":
-            if self.k_predictor_mode != "shared":
+            if self.k_predictor_mode not in {"shared", "direct"}:
                 raise ValueError(
-                    "legacy fitting requires k_predictor_mode=shared"
+                    "legacy fitting requires k_predictor_mode=shared or direct"
                 )
             if self.k_history_length is None:
                 raise ValueError(

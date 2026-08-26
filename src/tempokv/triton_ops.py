@@ -134,6 +134,95 @@ def _anchor_decode_kernel(
 
 
 @triton.jit
+def _direct_persistent_decode_kernel(
+    quant_ptr,
+    scale_ptr,
+    zero_ptr,
+    output_ptr,
+    output_stride_b,
+    output_stride_h,
+    output_stride_s,
+    output_stride_d,
+    sequence,
+    residual_sequence,
+    heads: tl.constexpr,
+    width: tl.constexpr,
+    packed_width: tl.constexpr,
+    scale_width: tl.constexpr,
+    stride: tl.constexpr,
+    start_unit: tl.constexpr,
+    chunk_units: tl.constexpr,
+    bits: tl.constexpr,
+    group_size: tl.constexpr,
+    asymmetric: tl.constexpr,
+    block_s: tl.constexpr,
+    block_d: tl.constexpr,
+):
+    """Decode several direct-quantized units in one launch."""
+    batch_head = tl.program_id(0)
+    token = tl.program_id(1) * block_s + tl.arange(0, block_s)
+    channel = tl.program_id(2) * block_d + tl.arange(0, block_d)
+    for chunk_index in tl.static_range(0, chunk_units):
+        unit_index = start_unit + chunk_index
+        current_token = unit_index * stride + token
+        residual_token = (unit_index - 1) * stride + token
+        valid = (
+            (token[:, None] < stride)
+            & (current_token[:, None] < sequence)
+            & (residual_token[:, None] < residual_sequence)
+            & (channel[None, :] < width)
+        )
+        if bits == 8:
+            quant_offset = (
+                batch_head * residual_sequence * width
+                + residual_token[:, None] * width
+                + channel[None, :]
+            )
+            unsigned = tl.load(quant_ptr + quant_offset, mask=valid, other=0).to(
+                tl.int32
+            )
+        else:
+            lanes = 8 // bits
+            packed_channel = channel // lanes
+            lane = channel - packed_channel * lanes
+            shift = bits * (lanes - lane - 1)
+            quant_offset = (
+                batch_head * residual_sequence * packed_width
+                + residual_token[:, None] * packed_width
+                + packed_channel[None, :]
+            )
+            byte = tl.load(quant_ptr + quant_offset, mask=valid, other=0).to(tl.int32)
+            unsigned = (byte >> shift[None, :]) & ((1 << bits) - 1)
+        group = channel // group_size
+        scale_offset = (
+            batch_head * residual_sequence * scale_width
+            + residual_token[:, None] * scale_width
+            + group[None, :]
+        )
+        scale = tl.load(scale_ptr + scale_offset, mask=valid, other=1.0).to(tl.float32)
+        if asymmetric:
+            zero = tl.load(zero_ptr + scale_offset, mask=valid, other=0).to(tl.float32)
+            value = (unsigned.to(tl.float32) - zero) * scale
+        else:
+            value = (unsigned - ((1 << (bits - 1)) - 1)).to(tl.float32) * scale
+        output_offset = _strided_bhsd_offsets(
+            batch_head,
+            current_token,
+            channel,
+            heads,
+            output_stride_b,
+            output_stride_h,
+            output_stride_s,
+            output_stride_d,
+        )
+        tl.store(
+            output_ptr + output_offset,
+            value.to(tl.bfloat16).to(tl.float32),
+            mask=valid,
+        )
+
+
+@triton.jit
 def _temporal_persistent_decode_kernel(
     quant_ptr,
     scale_ptr,
@@ -785,6 +874,49 @@ def decode(
     if packed.predictor_kind == "temporal":
         assert packed.temporal is not None
         parameters = packed.temporal.to(output.device)
+        if parameters.history_length == 0:
+            if output_dtype != torch.bfloat16:
+                _decline("direct_output_dtype")
+                return None
+            if not _uniform_layout(packed):
+                _decline("direct_unit_lengths")
+                return None
+            grid = (
+                batch_heads,
+                _ceil_div(packed.stride, block_s),
+                _ceil_div(width, block_d),
+            )
+            persistent_units = persistent_units_per_launch()
+            for start_unit in range(1, len(packed.unit_lengths), persistent_units):
+                chunk_units = min(
+                    persistent_units, len(packed.unit_lengths) - start_unit
+                )
+                _direct_persistent_decode_kernel[grid](
+                    quant,
+                    scale,
+                    zero,
+                    output,
+                    output_stride_b,
+                    output_stride_h,
+                    output_stride_s,
+                    output_stride_d,
+                    sequence,
+                    residual_sequence,
+                    heads,
+                    width,
+                    residual_packed_width,
+                    scale_width,
+                    packed.stride,
+                    start_unit,
+                    chunk_units,
+                    packed.bits,
+                    packed.group_size,
+                    asymmetric,
+                    block_s,
+                    block_d,
+                )
+            _record(_route_name("direct_persistent", direct_output_layout))
+            return _logical_bhsd_output(output, direct_output_layout)
         # Only the persistent route remains.  A span that misses this gate is
         # handed back to the Torch decoder by name instead of falling to a
         # second, per-unit kernel that production never reached.

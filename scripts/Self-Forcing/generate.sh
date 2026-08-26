@@ -58,6 +58,7 @@ V_BITS="$(resolve_bits V_BITS)"
 CONFIG="${CONFIG:-$default_codec_config}"
 script_dir="$self_forcing_dir"
 mode="${MODE:-tempokv}"
+k_predictor_mode="layer_head"
 
 # ---------- 模式与必需变量 ----------
 
@@ -84,6 +85,14 @@ import sys
 
 config = json.load(open(sys.argv[1], encoding="utf-8"))
 print(config.get("codec", config).get("v_predictor_mode", "cross_kv"))
+PY
+)"
+  k_predictor_mode="$("$python_bin" - "$(resolve_path "$CONFIG")" <<'PY'
+import json
+import sys
+
+config = json.load(open(sys.argv[1], encoding="utf-8"))
+print(config.get("codec", config).get("k_predictor_mode", "layer_head"))
 PY
 )"
   # V_PREDICTOR overrides the config so one file covers both predictors.
@@ -151,7 +160,11 @@ if (( (FRAMES + 3) % 12 != 0 )); then
   die "FRAMES 必须满足 (FRAMES + 3) % 12 == 0，保证视频帧精确对应完整的 3-frame latent block（当前值：${FRAMES}）"
 fi
 if [[ -n "${K_HISTORY_LENGTH:-}" ]]; then
-  check_int K_HISTORY_LENGTH 1
+  if [[ "$mode" == "tempokv" && "$k_predictor_mode" == "direct" ]]; then
+    check_int K_HISTORY_LENGTH 0
+  else
+    check_int K_HISTORY_LENGTH 1
+  fi
   (( K_HISTORY_LENGTH <= 8 )) || die "K_HISTORY_LENGTH 必须 <= 8（当前值：${K_HISTORY_LENGTH}）"
 fi
 if [[ -n "${V_HISTORY_LENGTH:-}" ]]; then

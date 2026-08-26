@@ -91,6 +91,29 @@ def temporal_rollout(
     if history_length >= frames:
         raise ValueError("history length must be smaller than the frame count")
 
+    if history_length == 0:
+        # Direct K is represented by an empty temporal map.  It still follows
+        # the same anchor/residual quantization protocol as the production
+        # codec, but every later unit is quantized without a prediction.
+        reconstructed = [
+            _round_trip(
+                target[..., 0, :, :],
+                bits=config.anchor_bits,
+                config=config,
+                symmetric=True,
+            ).to(torch.bfloat16).float()
+        ]
+        for frame in range(1, frames):
+            reconstructed.append(
+                _round_trip(
+                    target[..., frame, :, :],
+                    bits=bits,
+                    config=config,
+                    symmetric=config.residual_mode == "symmetric",
+                ).to(torch.bfloat16).float()
+            )
+        return torch.stack(reconstructed, dim=-3)
+
     reconstructed = [
         _round_trip(
             target[..., 0, :, :],

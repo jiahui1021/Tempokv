@@ -194,6 +194,16 @@ python scripts/evaluation/evaluate_quality.py \
   --output results/self_forcing/evaluation/quality.json
 ```
 
+### Self-Forcing 最终四卡消融
+
+需要把 K/V history、独立 temporal-V 对照、50 条视频和 cache/视频指标放在同一张表时，
+使用 [`run_history_ablation_4gpu.sh`](scripts/Self-Forcing/run_history_ablation_4gpu.sh)。
+默认配置是 K 轴 `h_K=0..5`、固定 CrossKV `h_V=1`，V 轴 CrossKV
+`h_V=0,1,2,4,5`、固定 `h_K=3`，以及 `w/o cross` 的 temporal V `h_V=1`。
+脚本要求四张卡，每个 variant 使用一张卡，并在
+[`history_ablation/README.md`](scripts/paper_experiments/history_ablation/README.md)
+中保存配置、参数、视频、日志和汇总格式。
+
 ## 详细说明
 
 - [Self-Forcing](scripts/Self-Forcing/README.md)
