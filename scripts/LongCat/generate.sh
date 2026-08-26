@@ -56,6 +56,12 @@ PY
   fi
   k_params="$(resolve_path "${K_PARAMS:-$param_dir/k_temporal.npz}")"
   v_params="$(resolve_path "${V_PARAMS:-$param_dir/$v_artifact_name}")"
+
+  # Use the validated Cross production launch size by default.  Temporal
+  # keeps the shared runtime default, and explicit overrides still win.
+  if [[ "$v_predictor_mode" == "cross_kv" ]]; then
+    export TEMPOKV_PERSISTENT_UNITS_PER_LAUNCH="${TEMPOKV_PERSISTENT_UNITS_PER_LAUNCH:-8}"
+  fi
 fi
 
 CONTEXT_PARALLEL_SIZE="${CONTEXT_PARALLEL_SIZE:-1}"

@@ -43,7 +43,8 @@
 #   PROFILE         记录每段 CUDA-event 耗时分解，0 或 1（默认 0）；结果写入
 #                   $OUTPUT_DIR/profile/rank-N.json，用
 #                   scripts/tools/profile_tempokv_runtime.py 查看
-#   TEMPOKV_PERSISTENT_UNITS_PER_LAUNCH  单次持续解码帧数（默认 16；范围 1 到 16）
+#   TEMPOKV_PERSISTENT_UNITS_PER_LAUNCH  单次持续解码单元数（Cross 默认 8，
+#                                       temporal 默认 16；范围 1 到 16）
 #
 set -euo pipefail
 
@@ -101,6 +102,12 @@ PY
 else
   param_dir=""
   result_label="bf16"
+fi
+
+# The Cross production kernel is validated at eight recurrent units per
+# launch.  Keep temporal's existing default and preserve explicit overrides.
+if [[ "$mode" == "tempokv" && "$v_predictor_mode" == "cross_kv" ]]; then
+  export TEMPOKV_PERSISTENT_UNITS_PER_LAUNCH="${TEMPOKV_PERSISTENT_UNITS_PER_LAUNCH:-8}"
 fi
 
 model_type="${MODEL_TYPE:-self_forcing}"

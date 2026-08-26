@@ -93,6 +93,12 @@ else
   result_label="bf16"
 fi
 
+# Use the validated Cross production launch size by default.  Temporal keeps
+# the shared runtime default, and callers can still override this explicitly.
+if [[ "$mode" == "tempokv" && "$v_predictor_mode" == "cross_kv" ]]; then
+  export TEMPOKV_PERSISTENT_UNITS_PER_LAUNCH="${TEMPOKV_PERSISTENT_UNITS_PER_LAUNCH:-8}"
+fi
+
 output_dir="$(resolve_path "${OUTPUT_DIR:-results/causal_forcing/$generation_mode/$result_label}")"
 if [[ "$output_dir" == "/" ]]; then
   die "OUTPUT_DIR 不能是文件系统根目录"
