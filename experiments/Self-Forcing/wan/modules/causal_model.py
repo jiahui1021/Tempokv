@@ -113,6 +113,91 @@ class CausalWanSelfAttention(nn.Module):
         self.norm_q = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
         self.norm_k = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
 
+    def _attention_with_incremental_cache(
+        self,
+        roped_query,
+        roped_key,
+        value,
+        kv_cache,
+        quantizer,
+        current_start,
+        current_end,
+        cache_size,
+        frame_seqlen,
+    ):
+        """Run attention against an append-only quantized KV cache.
+
+        Mirrors the Causal-Forcing integration of the shared kv_quant
+        baselines (RTN/KIVI/QuaRot-KV).  ``write_k/write_v`` inside the
+        quantizer state represents the current diffusion block; Self-Forcing
+        evaluates that block several times at different denoising timesteps,
+        and replacing this buffer is safe while older packed segments stay
+        immutable.
+        """
+        attention_space = hasattr(quantizer, "prepare_attention_qk")
+        if attention_space:
+            roped_query, roped_key = quantizer.prepare_attention_qk(roped_query, roped_key)
+
+        state = kv_cache.get("quant_state")
+        if state is None:
+            state = quantizer.init_state(
+                meta={
+                    "shape": (int(roped_key.shape[0]), 0, int(roped_key.shape[2]), int(roped_key.shape[3])),
+                    "tensor_dtype": value.dtype,
+                    "device": value.device,
+                    "attention_space": attention_space,
+                }
+            )
+
+        previous_global_end = _cache_index(kv_cache, "global_end_index")
+        previous_tokens = int(state.get("num_tokens", 0))
+        num_new_tokens = int(roped_key.shape[1])
+
+        if self.local_attn_size != -1 and current_end > previous_global_end:
+            requested_eviction = max(previous_tokens + num_new_tokens - int(cache_size), 0)
+            if requested_eviction > 0:
+                sink_tokens = int(self.sink_size * frame_seqlen)
+                if sink_tokens > 0 and hasattr(quantizer, "evict_range"):
+                    removed = quantizer.evict_range(state, sink_tokens, requested_eviction)
+                else:
+                    removed = quantizer.evict_prefix(state, requested_eviction)
+                # A partial packed block is intentionally retained.  The
+                # attention slice below still enforces the requested window.
+                if removed == 0:
+                    kv_cache["eviction_slack_tokens"] = int(requested_eviction)
+
+        quantizer.append_kv(
+            state,
+            roped_key,
+            value,
+            meta={
+                "tensor_dtype": value.dtype,
+                "absolute_start": int(current_start),
+                "absolute_end": int(current_end),
+                "already_rotated": attention_space,
+                "attention_space": attention_space,
+            },
+        )
+        cache_k, cache_v = quantizer.materialize_kv(
+            state,
+            meta={
+                "tensor_dtype": value.dtype,
+                "shape": (int(roped_key.shape[0]), 0, int(roped_key.shape[2]), int(roped_key.shape[3])),
+                "device": value.device,
+                "attention_space": attention_space,
+            },
+        )
+        local_end_index = int(state.get("num_tokens", cache_k.shape[1]))
+        attention_start = max(0, local_end_index - int(self.max_attention_size))
+        x = attention(
+            roped_query,
+            cache_k[:, attention_start:local_end_index],
+            cache_v[:, attention_start:local_end_index],
+        )
+
+        kv_cache["quant_state"] = state
+        return x, local_end_index
+
     def forward(
         self,
         x,
@@ -227,6 +312,41 @@ class CausalWanSelfAttention(nn.Module):
                 q, grid_sizes, freqs, start_frame=current_start_frame).type_as(v)
             current_end = current_start + roped_query.shape[1]
             num_new_tokens = roped_query.shape[1]
+
+            # Shared kv_quant baselines (RTN/KIVI/QuaRot-KV) take the same
+            # append-only incremental path used by the Causal-Forcing
+            # integration; the ChunkedKVCache below stays BF16-only.
+            quantizer = kv_cache.get("quantizer")
+            supports_incremental = (
+                quantizer is not None
+                and callable(getattr(quantizer, "init_state", None))
+                and callable(getattr(quantizer, "append_kv", None))
+                and callable(getattr(quantizer, "materialize_kv", None))
+            )
+            if supports_incremental:
+                roped_key = causal_rope_apply(
+                    k, grid_sizes, freqs,
+                    start_frame=current_start_frame).type_as(v)
+                cache_size = kv_cache.get("kv_cache_size")
+                if cache_size is None:
+                    cache_size = int(self.max_attention_size)
+                x, local_end_index = self._attention_with_incremental_cache(
+                    roped_query=roped_query,
+                    roped_key=roped_key,
+                    value=v,
+                    kv_cache=kv_cache,
+                    quantizer=quantizer,
+                    current_start=current_start,
+                    current_end=current_end,
+                    cache_size=int(cache_size),
+                    frame_seqlen=frame_seqlen,
+                )
+                _set_cache_index(kv_cache, "global_end_index", current_end)
+                _set_cache_index(kv_cache, "local_end_index", local_end_index)
+                x = x.flatten(2)
+                x = self.o(x)
+                return x
+
             global_end_index = _cache_index(kv_cache, "global_end_index")
             cached_local_end = _cache_index(kv_cache, "local_end_index")
             local_end_index = cached_local_end + current_end - global_end_index

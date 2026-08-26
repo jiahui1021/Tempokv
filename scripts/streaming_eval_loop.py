@@ -24,7 +24,7 @@ import time
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-EVAL_DIR = Path("/mnt/cpfs/epic-user/hujiahui-20260612/kv-quant-result/evaluation")
+EVAL_DIR = Path("/mnt/cpfs/epic-user/hujiahui-20260612/kv-quant-result/evaluation-tools")
 sys.path.insert(0, str(EVAL_DIR))
 
 from eval_quality import LpipsMetric, eval_video  # noqa: E402
