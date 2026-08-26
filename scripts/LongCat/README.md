@@ -36,7 +36,7 @@ Parallel rank 的 metadata 一致。因此 `CONTEXT_PARALLEL_SIZE=1/2/4` 可以�
 ## 拟合参数
 
 ```bash
-bash scripts/LongCat/fit_params.sh
+bash scripts/fit_params.sh longcat
 ```
 
 默认输出：
@@ -47,7 +47,7 @@ data/longcat/params/legacy-kh2-vh1-int4-layershared/v_cross_kv.npz
 ```
 
 目录名由 `CONFIG` 与 override 共同推导（与 Self-Forcing、Causal Forcing 一致）。
-换位宽用 `BITS=2`，会写到 `kh2-vh1-int2`，不会覆盖 INT4。
+换位宽用 `BITS=2`，会写到 `legacy-kh2-vh1-int2-layershared`，不会覆盖 INT4。
 `K_HISTORY_LENGTH` / `V_HISTORY_LENGTH` 会同时影响目录名和拟合参数。
 拟合输入用 `TRACE_FILE`，与 `collect_trace.sh` 的输出变量同名。
 
@@ -65,11 +65,13 @@ bash scripts/LongCat/run_bf16.sh
 
 ```bash
 CHECKPOINT_DIR=/models/LongCat-Video \
-K_PARAMS=data/longcat/params/legacy-kh2-vh1-int4-layershared/k_temporal.npz \
-V_PARAMS=data/longcat/params/legacy-kh2-vh1-int4-layershared/v_cross_kv.npz \
 PROMPT="a cinematic mountain road" \
 bash scripts/LongCat/run_tempokv.sh
 ```
+
+生成脚本会按 `CONFIG`、`BITS`、`KH`、`VH`、`V_PREDICTOR` 和
+`CACHE_STRIDE` 自动选择拟合生成的参数目录。`PARAM_DIR` 可覆盖整个目录；
+`K_PARAMS` 与 `V_PARAMS` 仍可同时设置，用于直接指定两个文件。
 
 默认输出到 `results/longcat/tempokv/`。
 

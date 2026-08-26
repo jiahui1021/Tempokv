@@ -5,6 +5,8 @@ set -euo pipefail
 # shellcheck source=scripts/LongCat/_common.sh
 source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)/_common.sh"
 
+K_HISTORY_LENGTH="$(resolve_history K_HISTORY_LENGTH KH)"
+V_HISTORY_LENGTH="$(resolve_history V_HISTORY_LENGTH VH)"
 K_BITS="$(resolve_bits K_BITS)"
 V_BITS="$(resolve_bits V_BITS)"
 CONFIG="${CONFIG:-$default_codec_config}"
@@ -16,8 +18,44 @@ case "$mode" in
 esac
 
 require_env CHECKPOINT_DIR
+
 if [[ "$mode" == "tempokv" ]]; then
-  require_env K_PARAMS V_PARAMS
+  config_path="$(resolve_path "$CONFIG")"
+  [[ -f "$config_path" ]] || die "CONFIG 不存在：$config_path"
+  if [[ -n "${V_PREDICTOR:-}" ]]; then
+    case "$V_PREDICTOR" in
+      cross_kv|temporal) ;;
+      *) die "V_PREDICTOR 必须是 cross_kv 或 temporal（当前值：${V_PREDICTOR}）" ;;
+    esac
+  fi
+  FIT_HISTORY_SOURCE="${FIT_HISTORY_SOURCE:-reconstructed}"
+  parameter_name="${PARAM_NAME:-$(
+    codec_slug "$config_path" \
+      "${K_HISTORY_LENGTH:-}" "${V_HISTORY_LENGTH:-}" \
+      "${K_BITS:-}" "${V_BITS:-}" "${CACHE_STRIDE:-}" \
+      "${V_PREDICTOR:-}" "$FIT_HISTORY_SOURCE"
+  )}"
+  param_dir="$(resolve_path "${PARAM_DIR:-data/longcat/params/$parameter_name}")"
+  v_predictor_mode="$("$python_bin" - "$config_path" <<'PY'
+import json
+import sys
+
+config = json.load(open(sys.argv[1], encoding="utf-8"))
+print(config.get("codec", config).get("v_predictor_mode", "cross_kv"))
+PY
+)"
+  v_predictor_mode="${V_PREDICTOR:-$v_predictor_mode}"
+  if [[ "$v_predictor_mode" == "temporal" ]]; then
+    v_artifact_name="v_temporal.npz"
+  else
+    v_artifact_name="v_cross_kv.npz"
+  fi
+  if [[ -n "${K_PARAMS:-}" || -n "${V_PARAMS:-}" ]]; then
+    [[ -n "${K_PARAMS:-}" && -n "${V_PARAMS:-}" ]] || \
+      die "K_PARAMS 与 V_PARAMS 必须同时设置"
+  fi
+  k_params="$(resolve_path "${K_PARAMS:-$param_dir/k_temporal.npz}")"
+  v_params="$(resolve_path "${V_PARAMS:-$param_dir/$v_artifact_name}")"
 fi
 
 CONTEXT_PARALLEL_SIZE="${CONTEXT_PARALLEL_SIZE:-1}"
@@ -76,15 +114,17 @@ args=(
 [[ "$OFFLOAD_KV_CACHE" == "1" ]] && args+=(--offload_kv_cache) || args+=(--no_offload_kv_cache)
 [[ "$ENABLE_COMPILE" == "1" ]] && args+=(--enable_compile)
 [[ -n "${CACHE_STRIDE:-}" ]] && args+=(--stride "$CACHE_STRIDE")
+[[ -n "${K_HISTORY_LENGTH:-}" ]] && args+=(--k-history-length "$K_HISTORY_LENGTH")
+[[ -n "${V_HISTORY_LENGTH:-}" ]] && args+=(--v-history-length "$V_HISTORY_LENGTH")
 [[ -n "${K_BITS:-}" ]] && args+=(--k-bits "$K_BITS")
 [[ -n "${V_BITS:-}" ]] && args+=(--v-bits "$V_BITS")
 [[ -n "${V_PREDICTOR:-}" ]] && args+=(--v-predictor-mode "$V_PREDICTOR")
 [[ -n "${TRITON_CACHE:-}" ]] && args+=(--triton-cache "$(resolve_path "$TRITON_CACHE")")
 if [[ "$mode" == "tempokv" ]]; then
   args+=(
-    --config "$(resolve_path "$CONFIG")"
-    --k-params "$(resolve_path "$K_PARAMS")"
-    --v-params "$(resolve_path "$V_PARAMS")"
+    --config "$config_path"
+    --k-params "$k_params"
+    --v-params "$v_params"
   )
 fi
 [[ -n "${TRACE_DIR:-}" ]] && args+=(--trace-dir "$(resolve_path "$TRACE_DIR")")
@@ -98,9 +138,9 @@ preflight_args=(
 [[ -n "${V_PREDICTOR:-}" ]] && preflight_args+=(--v-predictor-mode "$V_PREDICTOR")
 if [[ "$mode" == "tempokv" ]]; then
   preflight_args+=(
-    --config "$(resolve_path "$CONFIG")"
-    --k-parameters "$(resolve_path "$K_PARAMS")"
-    --v-parameters "$(resolve_path "$V_PARAMS")"
+    --config "$config_path"
+    --k-parameters "$k_params"
+    --v-parameters "$v_params"
   )
 fi
 

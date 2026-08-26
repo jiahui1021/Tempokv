@@ -76,12 +76,13 @@ def _parser() -> argparse.ArgumentParser:
             "1560 for CP=1 or runtime validation for CP>1"
         ),
     )
-    # Bit width, stride and the V predictor are overrides rather than one
-    # committed config per combination.  --stride is safe to fold in because the
-    # bridge checks the codec stride against the stride it derives from the real
-    # cache shape, which no command line can talk it out of.
+    # Bit width, history, stride and the V predictor are overrides rather than
+    # one committed config per combination.  --stride is safe to fold in
+    # because the bridge checks it against the real cache shape.
     parser.add_argument("--k-bits", type=int, choices=(2, 4, 8))
     parser.add_argument("--v-bits", type=int, choices=(2, 4, 8))
+    parser.add_argument("--k-history-length", type=int, choices=range(1, 9))
+    parser.add_argument("--v-history-length", type=int, choices=range(0, 6))
     parser.add_argument(
         "--v-predictor-mode",
         choices=("cross_kv", "temporal"),
@@ -96,6 +97,8 @@ def _codec_overrides(known) -> dict[str, object]:
         for name, value in (
             ("k_bits", known.k_bits),
             ("v_bits", known.v_bits),
+            ("k_history_length", known.k_history_length),
+            ("v_history_length", known.v_history_length),
             ("v_predictor_mode", known.v_predictor_mode),
             ("stride", known.stride),
         )
