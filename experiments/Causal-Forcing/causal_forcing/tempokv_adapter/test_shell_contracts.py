@@ -41,24 +41,24 @@ def test_legacy_fit_uses_layer_shared_cross_kv_end_to_end() -> None:
     assert "--v-predictor-mode cross_kv" in completed.stdout
 
 
-def test_native_fit_keeps_cross_kv_identity() -> None:
-    completed = _run(FIT_SCRIPT, CONFIG="configs/native.json")
+def test_legacy_fit_keeps_cross_kv_identity() -> None:
+    completed = _run(FIT_SCRIPT, CONFIG="configs/legacy.json")
 
     assert completed.returncode == 0, completed.stderr
-    assert "trace/chunkwise/clean_trace.npz" in completed.stdout
-    assert "params/chunkwise/kh2-vh1-int4" in completed.stdout
+    assert "trace/chunkwise_legacy/clean_trace.npz" in completed.stdout
+    assert "params/chunkwise/legacy-kh2-vh1-int4-layershared" in completed.stdout
     assert "--v-predictor-mode cross_kv" in completed.stdout
 
 
 def test_clean_fitting_state_has_an_isolated_parameter_directory() -> None:
     completed = _run(
         FIT_SCRIPT,
-        CONFIG="configs/native.json",
+        CONFIG="configs/legacy.json",
         FIT_HISTORY_SOURCE="clean",
     )
 
     assert completed.returncode == 0, completed.stderr
-    assert "params/chunkwise/kh2-vh1-int4-fitclean" in completed.stdout
+    assert "params/chunkwise/legacy-kh2-vh1-int4-layershared-fitclean" in completed.stdout
     assert "--fit-history-source clean" in completed.stdout
 
 
@@ -68,18 +68,18 @@ def test_generate_selects_clean_fitted_parameters_without_runtime_override() -> 
         CHECKPOINT="checkpoint.pt",
         MODEL_ROOT="model-root",
         PROMPTS="prompts.txt",
-        CONFIG="configs/native.json",
+        CONFIG="configs/legacy.json",
         FIT_HISTORY_SOURCE="clean",
     )
 
-    assert "params/chunkwise/kh2-vh1-int4-fitclean/k_temporal.npz" in completed.stdout
+    assert "params/chunkwise/legacy-kh2-vh1-int4-layershared-fitclean/k_temporal.npz" in completed.stdout
     assert "--fit-history-source" not in completed.stdout
 
 
 def test_invalid_fitting_state_is_rejected_by_the_shell_contract() -> None:
     completed = _run(
         FIT_SCRIPT,
-        CONFIG="configs/native.json",
+        CONFIG="configs/legacy.json",
         FIT_HISTORY_SOURCE="runtime",
     )
 
@@ -93,12 +93,6 @@ def test_invalid_fitting_state_is_rejected_by_the_shell_contract() -> None:
         (
             "configs/legacy.json",
             "legacy-kh2-vh1-int4-layershared",
-            "v_cross_kv.npz",
-            "cross_kv",
-        ),
-        (
-            "configs/native.json",
-            "kh2-vh1-int4",
             "v_cross_kv.npz",
             "cross_kv",
         ),
@@ -154,10 +148,10 @@ def test_attention_controls_are_forwarded_for_legacy_cross_kv() -> None:
     assert "--attention-steps 2" in completed.stdout
 
 
-def test_attention_refinement_controls_are_forwarded_for_native() -> None:
+def test_attention_refinement_controls_are_forwarded_for_legacy() -> None:
     completed = _run(
         FIT_SCRIPT,
-        CONFIG="configs/native.json",
+        CONFIG="configs/legacy.json",
         V_PREDICTOR="temporal",
         ATTENTION_STEPS="2",
     )
@@ -171,7 +165,7 @@ def test_attention_refinement_controls_are_forwarded_for_native() -> None:
 def test_attention_ablation_controls_are_forwarded() -> None:
     completed = _run(
         FIT_SCRIPT,
-        CONFIG="configs/native.json",
+        CONFIG="configs/legacy.json",
         ATTENTION_STEPS="1",
         ATTENTION_OPTIMIZER="sign_gradient",
         ATTENTION_RECONSTRUCTION_WEIGHT="1.0",
@@ -192,7 +186,6 @@ def test_attention_ablation_controls_are_forwarded() -> None:
     ("config", "expected_protocol", "expected_trace"),
     [
         ("configs/legacy.json", "--legacy-protocol", "trace/chunkwise_legacy"),
-        ("configs/native.json", None, "trace/chunkwise/raw"),
     ],
 )
 def test_trace_protocol_follows_config(
@@ -211,18 +204,8 @@ def test_trace_protocol_follows_config(
     assert ("--legacy-protocol" in completed.stdout) == bool(expected_protocol)
 
 
-def test_trace_protocol_override_cannot_conflict_with_config() -> None:
-    completed = _run(
-        TRACE_SCRIPT,
-        CHECKPOINT="checkpoint.pt",
-        MODEL_ROOT="model-root",
-        PROMPTS="prompts.txt",
-        CONFIG="configs/native.json",
-        LEGACY_PROTOCOL="1",
-    )
-
-    assert completed.returncode == 2
-    assert "与 CONFIG 的 fit_mode=native 冲突" in completed.stderr
+def test_native_config_is_not_shipped() -> None:
+    assert not (PROJECT_ROOT / "configs" / "native.json").exists()
 
 
 def test_common_fitter_accepts_layered_attention_refinement_controls(
@@ -236,7 +219,7 @@ def test_common_fitter_accepts_layered_attention_refinement_controls(
         [
             str(tmp_path / "missing-trace.npz"),
             "--config",
-            str(PROJECT_ROOT / "configs" / "native.json"),
+            str(PROJECT_ROOT / "configs" / "legacy.json"),
             "--output-dir",
             str(tmp_path / "params"),
             "--v-predictor-mode",

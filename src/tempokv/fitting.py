@@ -372,7 +372,11 @@ def refine_attention(
         raise ValueError("refine_tensors must not contain duplicates")
     if config.k_predictor_mode == "direct" and "key" in phases_to_run:
         raise ValueError("direct K has no trainable predictor for attention refinement")
-    if config.cross_kv_weight_mode != "layer_head" and "value" in phases_to_run:
+    if (
+        config.v_predictor_mode == "cross_kv"
+        and config.cross_kv_weight_mode != "layer_head"
+        and "value" in phases_to_run
+    ):
         raise ValueError(
             "value refinement does not support "
             f"cross_kv_weight_mode={config.cross_kv_weight_mode} because it "

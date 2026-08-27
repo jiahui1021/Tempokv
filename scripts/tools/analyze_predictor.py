@@ -317,7 +317,7 @@ def main() -> None:
         default=Path("data/self-forcing/trace/clean_trace.npz"),
     )
     parser.add_argument("--config", type=Path, default=Path("configs/legacy.json"))
-    parameter_root = Path("data/self-forcing/params/kh2-vh2-int2")
+    parameter_root = Path("data/self-forcing/params/legacy-kh2-vh2-int2-layershared")
     parser.add_argument(
         "--k-params", type=Path, default=parameter_root / "k_temporal.npz"
     )

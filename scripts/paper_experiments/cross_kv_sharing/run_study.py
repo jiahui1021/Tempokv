@@ -47,12 +47,16 @@ def _sha256_if_file(path: Path) -> str | None:
 
 def make_variant_configs(base_config: Path, output: Path) -> dict[str, Path]:
     codec = _read_codec(base_config)
-    if codec.get("fit_mode", "native") != "legacy":
+    if codec.get("fit_mode", "legacy") != "legacy":
         raise ValueError("base config must use fit_mode=legacy")
-    if codec.get("k_predictor_mode", "layer_head") != "shared":
+    if codec.get("k_predictor_mode", "shared") != "shared":
         raise ValueError("base config must use k_predictor_mode=shared")
     if codec.get("v_predictor_mode", "cross_kv") != "cross_kv":
         raise ValueError("base config must use v_predictor_mode=cross_kv")
+    if codec.get("cross_kv_weight_mode", "layer_shared") != "layer_shared":
+        raise ValueError(
+            "base config must use cross_kv_weight_mode=layer_shared"
+        )
     variants: dict[str, Path] = {}
     for mode in MODES:
         path = output / "configs" / f"cross_kv_{mode}.json"

@@ -64,9 +64,8 @@ INT2 使用同一个配置并设置 `BITS=2`；参数目录会自动切换到 IN
 `GENERATION_MODE` 会同时决定 `num_frame_per_block`（chunkwise=3，framewise=1）、
 默认的模型配置文件，以及 trace / 参数 / 结果的子目录，两种模式互不覆盖。
 
-采 trace 默认使用 legacy family 并写入 `trace/<模式>_legacy/`。显式传入
-`CONFIG=configs/native.json` 时写入 `trace/<模式>/`。手工设置 `LEGACY_PROTOCOL` 与
-config family 冲突会直接报错。
+采 trace 统一使用 legacy family 并写入 `trace/<模式>_legacy/`。手工设置
+`LEGACY_PROTOCOL` 与 legacy protocol 冲突会直接报错。
 
 `FRAMES` 必须让视频帧精确对应完整的 latent block：chunkwise 要求
 `(FRAMES + 3) % 12 == 0`，framewise 要求 `(FRAMES + 3) % 4 == 0`。
@@ -82,7 +81,6 @@ checkpoint、训练方式和 cache 分布不同，**必须重新采 trace 重新
 
 ```text
 data/causal-forcing/
-├── trace/<模式>/{raw,output,clean_trace.npz}
 ├── trace/<模式>_legacy/{raw,output,clean_trace.npz}
 └── params/<模式>/<参数方案>/{k_temporal.npz,v_cross_kv.npz 或 v_temporal.npz}
 
@@ -142,15 +140,14 @@ CPU 拟合同时会把方程降到 float64，比看上去慢得多，所以回�
 
 `V_PREDICTOR=cross_kv|temporal` 切换 V 预测器，也不需要单独的配置文件；它会同时
 决定参数目录名（`vh1` 与 `vt1`）和参数文件名（`v_cross_kv.npz` 与 `v_temporal.npz`），
-两者不会互相覆盖。基础 native fitter 可以产出 temporal V；attention refinement 同时支持
-native/layer-head 与 legacy/shared temporal K，V 可选 temporal、CrossKV only 或
-`CrossKV + V-history`，每种结构都必须从同一 trace 独立拟合。
+两者不会互相覆盖。两种 V 预测器都使用 legacy/shared temporal K；V 可选 temporal、
+CrossKV only 或 `CrossKV + V-history`，每种结构都必须从同一 trace 独立拟合。
 
 ## Attention proxy refinement
 
-`3340753` 起 Causal trace 同时保存采样位置的 post-RoPE Q/K。对 native/layer-head 或
-legacy/shared temporal K，以及 temporal 或 CrossKV V，可在基础 closed-loop least-squares
-fitting 后启用可选 refinement：
+`3340753` 起 Causal trace 同时保存采样位置的 post-RoPE Q/K。对 legacy/shared temporal K
+以及 temporal 或 CrossKV V，可在基础 closed-loop least-squares fitting 后启用可选
+refinement：
 
 ```bash
 CONFIG=configs/legacy.json PARAM_NAME=legacy-temporal-adam-r05-a05-kv \
@@ -167,12 +164,12 @@ bash scripts/Causal-Forcing/fit_params.sh
 objective/optimizer 消融使用同一入口，例如 reconstruction-only V phase 与历史 sign-gradient：
 
 ```bash
-CONFIG=configs/native.json PARAM_NAME=native-winner-adam-r1-a0-kv ATTENTION_STEPS=100 \
+CONFIG=configs/legacy.json PARAM_NAME=legacy-winner-adam-r1-a0-kv ATTENTION_STEPS=100 \
 ATTENTION_RECONSTRUCTION_WEIGHT=1 ATTENTION_OUTPUT_WEIGHT=0 \
 ATTENTION_REFINE_TENSORS=value \
 bash scripts/Causal-Forcing/fit_params.sh
 
-CONFIG=configs/native.json PARAM_NAME=native-winner-sign-r05-a05-kv ATTENTION_STEPS=1 \
+CONFIG=configs/legacy.json PARAM_NAME=legacy-winner-sign-r05-a05-kv ATTENTION_STEPS=1 \
 ATTENTION_OPTIMIZER=sign_gradient ATTENTION_SIGN_STEP_SIZES="0.001 0.01" \
 bash scripts/Causal-Forcing/fit_params.sh
 ```

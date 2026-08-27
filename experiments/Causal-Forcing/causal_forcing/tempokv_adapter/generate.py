@@ -150,7 +150,10 @@ def _load_config(path: Path):
         if len(payload) != 1 or not isinstance(payload["codec"], dict):
             raise ValueError("'codec' must be the only top-level config object")
         payload = payload["codec"]
-    return config_from_mapping(payload)
+    config = config_from_mapping(payload)
+    if config.fit_mode != "legacy":
+        raise ValueError("only fit_mode=legacy is supported")
+    return config
 
 
 def _validate_parameters(k_path: Path, v_path: Path, config) -> dict[str, object]:
@@ -203,15 +206,10 @@ def _validate_parameters(k_path: Path, v_path: Path, config) -> dict[str, object
         )
     codec = TempoKVCodec(temporal, cross, config)
     if temporal_v:
-        # A native temporal V fit keeps one coefficient set per layer and head,
-        # so the geometry is readable; legacy pools both axes away and the head
-        # count is then simply not knowable from the parameters.
+        # Legacy temporal V pools both axes away, so the head count is not part
+        # of the parameter geometry.
         head_dim = int(temporal.history_weights.shape[-1])
-        heads = (
-            int(temporal.history_weights.shape[-2])
-            if config.fit_mode != "legacy"
-            else None
-        )
+        heads = None
         parameter_tensors = (
             temporal.history_weights,
             temporal.history_bias,
@@ -425,7 +423,7 @@ def _require_tempokv_activity(report: dict[str, object]) -> None:
 def _require_direct_persistent_routes(
     routes: dict[str, object],
     v_predictor_mode: str = "cross_kv",
-    k_predictor_mode: str = "layer_head",
+    k_predictor_mode: str = "shared",
 ) -> None:
     """Reject a nominally accelerated run that missed the production kernels."""
     # The temporal V predictor never decodes a Cross(K) tensor, so it produces
@@ -546,7 +544,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             if value is not None
         }
         if overrides.get("v_predictor_mode") == "temporal":
-            overrides["cross_kv_weight_mode"] = "layer_head"
+            overrides["cross_kv_weight_mode"] = "layer_shared"
         if overrides:
             config = replace(config, **overrides)
         if 128 % config.group_size:

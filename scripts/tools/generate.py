@@ -25,6 +25,7 @@ from tempokv import (
     TemporalParameters,
     configure_triton_cache,
 )
+from tempokv.config import config_from_mapping
 
 
 CONFIG_FIELDS = tuple(CodecConfig.__dataclass_fields__)
@@ -87,7 +88,14 @@ def _load_config(path: Path, args: argparse.Namespace) -> CodecConfig:
     unknown = sorted(set(payload) - set(CONFIG_FIELDS))
     if unknown:
         raise ValueError(f"unknown codec config fields: {unknown}")
-    config = CodecConfig(**payload)
+    config = config_from_mapping(payload)
+    if config.fit_mode != "legacy":
+        raise ValueError("only fit_mode=legacy is supported")
+    if config.cross_kv_weight_mode != "layer_shared":
+        raise ValueError(
+            "production CrossKV parameters must use "
+            "cross_kv_weight_mode=layer_shared"
+        )
     overrides = {
         field: getattr(args, field)
         for field in CONFIG_FIELDS

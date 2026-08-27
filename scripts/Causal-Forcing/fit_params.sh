@@ -16,7 +16,7 @@
 # 常用可选变量：
 #   CONFIG          codec 配置 JSON（默认 configs/legacy.json）
 #   GENERATION_MODE  chunkwise（默认）或 framewise
-#   TRACE_FILE       拟合输入（默认按 CONFIG 选择 native/legacy trace 目录）
+#   TRACE_FILE       拟合输入（默认使用 legacy trace 目录）
 #   OUTPUT_DIR       输出目录（默认 data/causal-forcing/params/<模式>/<参数方案>）
 #   BITS / K_BITS / V_BITS  位宽 override（2/4/8；默认读取 CONFIG）
 #   K_HISTORY_LENGTH / V_HISTORY_LENGTH  历史长度（默认读取 CONFIG）

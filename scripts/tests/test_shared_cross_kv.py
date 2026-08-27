@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 import pytest
 import torch
 
@@ -23,6 +26,24 @@ def _legacy_config(**overrides: object) -> CodecConfig:
     return CodecConfig(**values)
 
 
+def test_default_and_shipped_configs_are_legacy_layer_shared() -> None:
+    default = CodecConfig()
+    assert default.fit_mode == "legacy"
+    assert default.k_predictor_mode == "shared"
+    assert default.cross_kv_weight_mode == "layer_shared"
+
+    root = Path(__file__).resolve().parents[2]
+    for path in sorted((root / "configs").glob("*.json")):
+        config = config_from_mapping(json.loads(path.read_text(encoding="utf-8")))
+        assert config.fit_mode == "legacy", path.name
+        assert config.cross_kv_weight_mode == "layer_shared", path.name
+
+
+def test_native_json_config_is_rejected() -> None:
+    with pytest.raises(ValueError, match="native fitting family is no longer supported"):
+        config_from_mapping({"fit_mode": "native"})
+
+
 def test_legacy_mapping_without_mode_defaults_to_layer_shared() -> None:
     config = config_from_mapping(
         {
@@ -37,7 +58,7 @@ def test_legacy_mapping_without_mode_defaults_to_layer_shared() -> None:
     assert '"cross_kv_weight_mode":"layer_shared"' in config.format_signature()
 
 
-def test_temporal_v_mapping_keeps_layer_head_cross_mode() -> None:
+def test_temporal_v_mapping_keeps_layer_shared_cross_mode() -> None:
     config = config_from_mapping(
         {
             "k_history_length": 2,
@@ -48,7 +69,7 @@ def test_temporal_v_mapping_keeps_layer_head_cross_mode() -> None:
         }
     )
 
-    assert config.cross_kv_weight_mode == "layer_head"
+    assert config.cross_kv_weight_mode == "layer_shared"
 
 
 @pytest.mark.parametrize("mode", ("layer_shared", "head_shared", "shared"))
@@ -61,13 +82,18 @@ def test_nondefault_modes_are_signature_separated_and_reject_wrong_families(
     assert baseline.cross_kv_weight_mode == "layer_head"
     assert '"cross_kv_weight_mode"' not in baseline.format_signature()
     assert f'"cross_kv_weight_mode":"{mode}"' in grouped.format_signature()
-    with pytest.raises(ValueError, match="requires fit_mode=legacy"):
-        CodecConfig(cross_kv_weight_mode=mode)
-    with pytest.raises(ValueError, match="requires v_predictor_mode=cross_kv"):
-        _legacy_config(
+    assert CodecConfig(cross_kv_weight_mode=mode).fit_mode == "legacy"
+    if mode == "layer_shared":
+        assert _legacy_config(
             cross_kv_weight_mode=mode,
             v_predictor_mode="temporal",
-        )
+        ).cross_kv_weight_mode == "layer_shared"
+    else:
+        with pytest.raises(ValueError, match="temporal V configurations"):
+            _legacy_config(
+                cross_kv_weight_mode=mode,
+                v_predictor_mode="temporal",
+            )
 
 
 @pytest.mark.parametrize("mode", ("layer_shared", "head_shared", "shared"))

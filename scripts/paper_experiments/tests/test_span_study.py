@@ -5,9 +5,6 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 
-import pytest
-
-
 ROOT = Path(__file__).resolve().parents[3]
 
 
@@ -19,7 +16,7 @@ def _module(name: str, relative: str):
     return module
 
 
-def _inputs(tmp_path: Path, *, fit_mode: str = "native") -> SimpleNamespace:
+def _inputs(tmp_path: Path, *, fit_mode: str = "legacy") -> SimpleNamespace:
     trace = tmp_path / "trace.npz"
     checkpoint = tmp_path / "model.pt"
     prompts = tmp_path / "prompts.txt"
@@ -38,7 +35,7 @@ def _inputs(tmp_path: Path, *, fit_mode: str = "native") -> SimpleNamespace:
                 "k_history_length": 2,
                 "v_history_length": 1,
                 "fit_mode": fit_mode,
-                "k_predictor_mode": "shared" if fit_mode == "legacy" else "layer_head",
+                "k_predictor_mode": "shared",
             }
         ),
         encoding="utf-8",
@@ -46,7 +43,6 @@ def _inputs(tmp_path: Path, *, fit_mode: str = "native") -> SimpleNamespace:
     return SimpleNamespace(
         trace=trace,
         base_config=config,
-        anchor_control_config=None,
         checkpoint=checkpoint,
         prompts=prompts,
         output=tmp_path / "study",
@@ -66,9 +62,9 @@ def test_manifest_has_independent_fit_before_every_nmse_and_generation(tmp_path)
     )
     manifest = run_study.build_manifest(_inputs(tmp_path))
     steps = manifest["steps"]
-    assert len(steps) == 62
+    assert len(steps) == 42
     positions = {step["id"]: index for index, step in enumerate(steps)}
-    for bits, anchor in ((2, 4), (4, 4), (2, 2)):
+    for bits, anchor in ((2, 4), (4, 4)):
         for span in (2, 4, 8, 12, 18):
             label = f"int{bits}_anchor{anchor}_span{span}"
             assert positions[f"fit_{label}"] < positions[f"nmse_{label}"]
@@ -116,14 +112,6 @@ def test_long_selection_uses_measured_best_and_worst_not_fixed_endpoints(tmp_pat
         (4, "best"): 8,
         (4, "worst"): 2,
     }
-
-
-def test_legacy_config_requires_native_anchor_control(tmp_path):
-    run_study = _module(
-        "span_run_study_legacy", "scripts/paper_experiments/span/run_study.py"
-    )
-    with pytest.raises(ValueError, match="anchor INT2"):
-        run_study.build_manifest(_inputs(tmp_path, fit_mode="legacy"))
 
 
 def test_synthetic_nmse_has_every_position_without_forcing_monotonicity():

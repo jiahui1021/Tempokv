@@ -17,6 +17,10 @@ WITHDRAWN_SETTINGS = {
 
 def config_from_mapping(payload: Mapping[str, Any]) -> "CodecConfig":
     """Build a codec config from parsed JSON, naming withdrawn settings."""
+    if payload.get("fit_mode") == "native":
+        raise ValueError(
+            "native fitting family is no longer supported; use fit_mode=legacy"
+        )
     withdrawn = sorted(set(payload) & set(WITHDRAWN_SETTINGS))
     if withdrawn:
         raise ValueError(
@@ -27,12 +31,12 @@ def config_from_mapping(payload: Mapping[str, Any]) -> "CodecConfig":
             + " — remove them and refit if the parameters were shared"
         )
     resolved = dict(payload)
-    if (
-        "cross_kv_weight_mode" not in resolved
-        and resolved.get("fit_mode", "native") == "legacy"
-        and resolved.get("v_predictor_mode", "cross_kv") == "cross_kv"
-    ):
-        resolved["cross_kv_weight_mode"] = "layer_shared"
+    # There is one repository-wide codec family now.  Keep omitted fields
+    # deterministic so hand-written configs cannot silently fall back to the
+    # retired native/layer-head identity.
+    resolved.setdefault("fit_mode", "legacy")
+    resolved.setdefault("k_predictor_mode", "shared")
+    resolved.setdefault("cross_kv_weight_mode", "layer_shared")
     return CodecConfig(**resolved)
 
 
@@ -55,28 +59,64 @@ class CodecConfig:
     # None keeps parameter-driven K history selection for predictor modes that
     # support it. Direct K spells out zero explicitly.
     k_history_length: int | None = None
-    # The legacy predictor uses IEEE FP32 CrossKV projections. ``tf32``
-    # retains the native TempoKV execution policy for other configurations.
-    cross_matmul_precision: str = "tf32"
-    # ``shared`` pools all Self-Forcing layers and heads into [P,P,D].
+    # Legacy is the repository-wide fitting family.  ``None`` is retained for
+    # positional compatibility with older programmatic callers; reference
+    # construction resolves it to legacy below.
+    cross_matmul_precision: str | None = None
+    # ``shared`` pools all layers and heads into [P,P,D].
     # ``direct`` is the zero-history baseline: non-anchor K units are quantized
     # directly and the parameter file contains an empty temporal map.
-    k_predictor_mode: str = "layer_head"
+    k_predictor_mode: str | None = None
     # ``temporal`` predicts V from its own reconstructed history with the same
     # predictor K uses, so V needs no reconstructed K and no CrossKV matrix.
     # ``cross_kv`` keeps the Cross(K) projection.
     v_predictor_mode: str = "cross_kv"
     # Select the legacy fixed-point/shared-K and direct temporal-V fitting math.
-    fit_mode: str = "native"
-    # Select whether legacy CrossKV projections are independent per layer/head,
-    # shared across layers, shared across heads, or shared across both axes.
-    # Production legacy CrossKV configs select layer_shared explicitly.  The
-    # generic dataclass keeps layer_head for native and temporal-V callers,
-    # whose fitters do not implement shared CrossKV constraints.  Appended so
-    # positional construction by older callers stays compatible.
-    cross_kv_weight_mode: str = "layer_head"
+    fit_mode: str | None = None
+    # Production CrossKV always uses layer_shared.  The other values remain
+    # available only to the explicit CrossKV sharing ablation.  ``None`` is
+    # retained for positional compatibility and resolves to layer_shared for
+    # legacy.
+    cross_kv_weight_mode: str | None = None
 
     def __post_init__(self) -> None:
+        # Resolve the remaining legacy defaults after the dataclass has kept
+        # positional compatibility with older callers.  Reference-shaped
+        # construction is the repository default.
+        implicit_family = self.fit_mode is None
+        if implicit_family:
+            legacy_shape = (
+                self.anchor_bits == 4
+                and self.group_size == 64
+                and self.residual_mode == "asymmetric"
+                and self.scale_dtype == "bfloat16"
+                and self.reconstruction_dtype == "bfloat16"
+            )
+            resolved_fit_mode = "legacy" if legacy_shape else "native"
+        else:
+            resolved_fit_mode = self.fit_mode
+        if resolved_fit_mode not in {"native", "legacy"}:
+            raise ValueError("fit_mode must be native or legacy")
+        resolved_k_predictor = self.k_predictor_mode
+        if resolved_k_predictor is None:
+            resolved_k_predictor = (
+                "shared" if resolved_fit_mode == "legacy" else "layer_head"
+            )
+        resolved_precision = self.cross_matmul_precision
+        if resolved_precision is None:
+            resolved_precision = "ieee" if resolved_fit_mode == "legacy" else "tf32"
+        resolved_cross_mode = self.cross_kv_weight_mode
+        if resolved_cross_mode is None:
+            resolved_cross_mode = (
+                "layer_shared" if resolved_fit_mode == "legacy" else "layer_head"
+            )
+        object.__setattr__(self, "fit_mode", resolved_fit_mode)
+        object.__setattr__(self, "k_predictor_mode", resolved_k_predictor)
+        object.__setattr__(self, "cross_matmul_precision", resolved_precision)
+        object.__setattr__(self, "cross_kv_weight_mode", resolved_cross_mode)
+        if resolved_fit_mode == "legacy" and self.k_history_length is None:
+            object.__setattr__(self, "k_history_length", 2)
+
         for name in ("k_bits", "v_bits", "anchor_bits"):
             value = int(getattr(self, name))
             if value not in (2, 4, 8):
@@ -141,20 +181,23 @@ class CodecConfig:
             raise ValueError(
                 "v_predictor_mode=temporal needs v_history_length >= 1"
             )
+        if (
+            self.fit_mode == "legacy"
+            and self.v_predictor_mode == "temporal"
+            and self.cross_kv_weight_mode != "layer_shared"
+        ):
+            raise ValueError(
+                "temporal V configurations must use "
+                "cross_kv_weight_mode=layer_shared"
+            )
         if self.fit_mode not in {"native", "legacy"}:
             raise ValueError("fit_mode must be native or legacy")
-        if self.cross_kv_weight_mode != "layer_head":
-            if self.v_predictor_mode != "cross_kv":
-                raise ValueError(
-                    f"cross_kv_weight_mode={self.cross_kv_weight_mode} "
-                    "requires v_predictor_mode=cross_kv"
-                )
-            if self.fit_mode != "legacy":
-                raise ValueError(
-                    f"cross_kv_weight_mode={self.cross_kv_weight_mode} "
-                    "requires fit_mode=legacy; "
-                    "native fitting does not support shared CrossKV weights"
-                )
+        if self.cross_kv_weight_mode != "layer_head" and self.fit_mode != "legacy":
+            raise ValueError(
+                f"cross_kv_weight_mode={self.cross_kv_weight_mode} "
+                "requires fit_mode=legacy; native fitting does not support "
+                "shared CrossKV weights"
+            )
         if (
             self.k_predictor_mode == "shared"
             and self.fit_mode != "legacy"

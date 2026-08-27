@@ -53,7 +53,7 @@ def temporal_rollout(
 ) -> torch.Tensor:
     """Replay the codec's closed loop while staying differentiable in the parameters.
 
-    Parameters may be shared ``[P,P,D]``, per-head ``[P,P,H,D]``, or native
+    Parameters may be shared ``[P,P,D]``, per-head ``[P,P,H,D]``, or layered
     per-layer/per-head ``[L,P,P,H,D]``.  ``detach_residual`` blocks gradients
     through the quantized residual, which is the straight-through proxy the
     refinement relies on: the residual is refreshed from the current

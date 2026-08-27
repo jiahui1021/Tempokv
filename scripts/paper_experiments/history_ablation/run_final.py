@@ -137,13 +137,19 @@ def _prompt_count(path: Path) -> int:
 
 
 def _variants(base: CodecConfig, *, k_baseline: int, v_baseline: int) -> tuple[Variant, ...]:
+    if base.fit_mode != "legacy":
+        raise ValueError("history ablation requires fit_mode=legacy")
+    if base.cross_kv_weight_mode != "layer_shared":
+        raise ValueError(
+            "history ablation requires cross_kv_weight_mode=layer_shared"
+        )
     if k_baseline not in K_HISTORY_VALUES:
         raise ValueError(f"k baseline must be one of {K_HISTORY_VALUES}")
     if v_baseline not in V_HISTORY_VALUES:
         raise ValueError(f"v baseline must be one of {V_HISTORY_VALUES}")
     positive_k_mode = base.k_predictor_mode
     if positive_k_mode == "direct":
-        positive_k_mode = "shared" if base.fit_mode == "legacy" else "layer_head"
+        positive_k_mode = "shared"
     variants = [
         Variant(
             name=f"k_h{history}_cross_vh{v_baseline}",
@@ -198,7 +204,7 @@ def _variant_config(base_payload: dict[str, Any], variant: Variant) -> CodecConf
         }
     )
     if variant.v_predictor_mode == "temporal":
-        payload["cross_kv_weight_mode"] = "layer_head"
+        payload["cross_kv_weight_mode"] = "layer_shared"
     return config_from_mapping(payload)
 
 

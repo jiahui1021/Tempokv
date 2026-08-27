@@ -65,14 +65,11 @@ import json
 import sys
 
 config = json.load(open(sys.argv[1], encoding="utf-8"))
-print(config.get("codec", config).get("fit_mode", "native"))
+print(config.get("codec", config).get("fit_mode", "legacy"))
 PY
 )"
-if [[ "$fit_mode" == "legacy" ]]; then
-  default_temporal_ridge=1.0
-else
-  default_temporal_ridge=0.1
-fi
+[[ "$fit_mode" == "legacy" ]] || die "仅支持 CONFIG 的 fit_mode=legacy"
+default_temporal_ridge=1.0
 TEMPORAL_RIDGE="${TEMPORAL_RIDGE:-$default_temporal_ridge}"
 CROSS_RIDGE="${CROSS_RIDGE:-0.1}"
 MAX_GAIN="${MAX_GAIN:-1.0}"

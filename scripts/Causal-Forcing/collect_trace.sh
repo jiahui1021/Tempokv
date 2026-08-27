@@ -27,7 +27,7 @@
 #   GENERATION_MODE  chunkwise（默认）或 framewise
 #   TRACE_DIR        trace 目录（默认 data/causal-forcing/trace/<模式>）
 #   TRACE_FILE       合并后的拟合输入（默认 <TRACE_DIR>/clean_trace.npz）
-#   TRACE_FRAMES     每个 prompt 生成的 latent 帧数（native 21，legacy 51）
+#   TRACE_FRAMES     每个 prompt 生成的 latent 帧数（legacy 默认 51）
 #   TRACE_TOKENS_PER_FRAME  每帧抽取的空间位置数（默认 8）
 #   NUM_GPUS / BASE_SEED / OVERWRITE / DRY_RUN
 #   USE_EMA          是否读取 checkpoint 的 generator_ema（默认 0，官方权重只有 generator）
@@ -56,25 +56,13 @@ else
 fi
 config_path="$(resolve_path "$CONFIG")"
 [[ -f "$config_path" ]] || die "CONFIG 不存在：$config_path"
-read -r fit_mode _ <<<"$(resolve_codec_modes "$config_path" "${V_PREDICTOR:-}")"
-expected_legacy_protocol=0
-[[ "$fit_mode" == "legacy" ]] && expected_legacy_protocol=1
-if [[ -n "${LEGACY_PROTOCOL:-}" && "$LEGACY_PROTOCOL" != "$expected_legacy_protocol" ]]; then
-  die "LEGACY_PROTOCOL=$LEGACY_PROTOCOL 与 CONFIG 的 fit_mode=$fit_mode 冲突"
+resolve_codec_modes "$config_path" "${V_PREDICTOR:-}" >/dev/null
+if [[ -n "${LEGACY_PROTOCOL:-}" && "$LEGACY_PROTOCOL" != "1" ]]; then
+  die "LEGACY_PROTOCOL 现在必须为 1"
 fi
-LEGACY_PROTOCOL="$expected_legacy_protocol"
-if [[ "$LEGACY_PROTOCOL" == "1" ]]; then
-  default_trace_frames=51
-else
-  default_trace_frames=21
-fi
-# The legacy protocol has its own trace layout, so it defaults to a separate
-# directory instead of overwriting the native one.
-if [[ "$LEGACY_PROTOCOL" == "1" ]]; then
-  default_trace_dir="data/causal-forcing/trace/${generation_mode}_legacy"
-else
-  default_trace_dir="data/causal-forcing/trace/$generation_mode"
-fi
+LEGACY_PROTOCOL=1
+default_trace_frames=51
+default_trace_dir="data/causal-forcing/trace/${generation_mode}_legacy"
 checkpoint="$(resolve_path "$CHECKPOINT")"
 model_root="$(resolve_path "$MODEL_ROOT")"
 prompts="$(resolve_path "$PROMPTS")"

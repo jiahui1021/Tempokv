@@ -459,6 +459,10 @@ def main(argv: list[str] | None = None) -> int:
     )
     device = _resolve_device(args.device)
     base = _load_config(args.config)
+    if base.fit_mode != "legacy":
+        parser.error("history sweep requires fit_mode=legacy")
+    if base.cross_kv_weight_mode != "layer_shared":
+        parser.error("history sweep requires cross_kv_weight_mode=layer_shared")
     config_updates = {}
     if args.k_bits is not None:
         config_updates["k_bits"] = args.k_bits
@@ -467,7 +471,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.v_predictor_mode is not None:
         config_updates["v_predictor_mode"] = args.v_predictor_mode
         if args.v_predictor_mode == "temporal":
-            config_updates["cross_kv_weight_mode"] = "layer_head"
+            config_updates["cross_kv_weight_mode"] = "layer_shared"
     if config_updates:
         base = replace(base, **config_updates)
     if base.v_predictor_mode == "temporal" and 0 in v_values:
@@ -541,7 +545,7 @@ def main(argv: list[str] | None = None) -> int:
             "direct"
             if value == 0
             else (
-                "shared" if base.fit_mode == "legacy" else "layer_head"
+                "shared"
                 if base.k_predictor_mode == "direct"
                 else base.k_predictor_mode
             )
@@ -563,7 +567,7 @@ def main(argv: list[str] | None = None) -> int:
             "direct"
             if baseline_k == 0
             else (
-                "shared" if base.fit_mode == "legacy" else "layer_head"
+                "shared"
                 if base.k_predictor_mode == "direct"
                 else base.k_predictor_mode
             )

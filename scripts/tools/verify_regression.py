@@ -146,7 +146,7 @@ def _triton_parity(args, directory: Path) -> dict:
 
     from diagnose_regression import _as_cache, _restride
     from tempokv.codec import TempoKVCodec, decode_tensor
-    from tempokv.config import CodecConfig
+    from tempokv.config import config_from_mapping
     from tempokv.parameters import CrossKVParameters, TemporalParameters
 
     if not torch.cuda.is_available():
@@ -167,7 +167,16 @@ def _triton_parity(args, directory: Path) -> dict:
     stride = int(keys.shape[1])
     temporal = _restride(TemporalParameters.load(directory / "k_temporal.npz"), stride)
     cross = _restride(CrossKVParameters.load(directory / "v_cross_kv.npz"), stride)
-    config = CodecConfig(**{**payload, "stride": stride, "use_triton": False})
+    config = config_from_mapping(
+        {**payload, "stride": stride, "use_triton": False}
+    )
+    if config.fit_mode != "legacy":
+        raise ValueError("only fit_mode=legacy is supported")
+    if config.cross_kv_weight_mode != "layer_shared":
+        raise ValueError(
+            "production CrossKV parameters must use "
+            "cross_kv_weight_mode=layer_shared"
+        )
     codec = TempoKVCodec(temporal, cross, config)
 
     results = {}

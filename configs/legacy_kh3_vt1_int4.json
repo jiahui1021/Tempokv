@@ -12,7 +12,7 @@
   "cross_matmul_precision": "ieee",
   "k_predictor_mode": "shared",
   "v_predictor_mode": "temporal",
-  "cross_kv_weight_mode": "layer_head",
+  "cross_kv_weight_mode": "layer_shared",
   "fit_mode": "legacy",
   "use_triton": true,
   "strict_triton": false

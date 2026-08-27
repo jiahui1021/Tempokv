@@ -99,11 +99,7 @@ def install(runtime_root: str | Path) -> type:
             )
             self.tempokv_codec = load_codec_from_env()
             config = self.tempokv_codec.config
-            self._tempokv_rope_precision = (
-                "complex64"
-                if getattr(config, "fit_mode", "native") == "legacy"
-                else "native"
-            )
+            self._tempokv_rope_precision = "complex64"
             self._apply_tempokv_rope_precision()
             if config.stride != self.frame_seq_length:
                 raise ValueError(

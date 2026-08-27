@@ -148,7 +148,10 @@ def _load_config(path: Path):
         if len(payload) != 1 or not isinstance(payload["codec"], dict):
             raise ValueError("'codec' must be the only top-level config object")
         payload = payload["codec"]
-    return config_from_mapping(payload)
+    config = config_from_mapping(payload)
+    if config.fit_mode != "legacy":
+        raise ValueError("only fit_mode=legacy is supported")
+    return config
 
 
 def _validate_parameters(
@@ -196,10 +199,9 @@ def _validate_parameters(
             raise ValueError("legacy K parameters must be shared across layers")
     elif temporal.layer_ids != EXPECTED_LAYER_IDS:
         raise ValueError("K parameters must contain layers 0 through 29")
-    # Both fitting families produce temporal V now: legacy pools every layer and
-    # head into one coefficient set, native keeps one per layer and head.
-    legacy_family = config.fit_mode == "legacy"
-    if temporal_v and legacy_family:
+    # The repository-wide fitting family pools legacy temporal parameters across
+    # layers and heads.
+    if temporal_v:
         if cross.layer_ids is not None:
             raise ValueError(
                 "legacy temporal V parameters must be shared across layers"
@@ -871,7 +873,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             if value is not None
         }
         if overrides.get("v_predictor_mode") == "temporal":
-            overrides["cross_kv_weight_mode"] = "layer_head"
+            overrides["cross_kv_weight_mode"] = "layer_shared"
         if overrides:
             config = replace(config, **overrides)
         if config.stride != 1560:

@@ -82,17 +82,12 @@ import sys
 
 config = json.load(open(sys.argv[1], encoding="utf-8"))
 config = config.get("codec", config)
-fit_mode = config.get("fit_mode", "native")
+fit_mode = config.get("fit_mode", "legacy")
 v_predictor = sys.argv[2] or config.get("v_predictor_mode")
 if v_predictor is None:
-    shared_cross = config.get("cross_kv_weight_mode", "layer_head") != "layer_head"
-    v_predictor = (
-        "cross_kv" if shared_cross else (
-            "temporal" if fit_mode == "legacy" else "cross_kv"
-        )
-    )
-if fit_mode not in {"native", "legacy"}:
-    raise SystemExit(f"unsupported fit_mode: {fit_mode}")
+    v_predictor = "cross_kv"
+if fit_mode != "legacy":
+    raise SystemExit("only fit_mode=legacy is supported")
 if v_predictor not in {"cross_kv", "temporal"}:
     raise SystemExit(f"unsupported v_predictor_mode: {v_predictor}")
 print(fit_mode, v_predictor)
@@ -145,10 +140,10 @@ if v_history is None:
     if v_history is None:
         v_history = 0
 
-# Legacy and native fits are not interchangeable, so they must not share a
-# parameter directory.  Native configs carry no prefix, so existing directory
-# names are unchanged.
-mode_label = "legacy-" if config.get("fit_mode") == "legacy" else ""
+# All shipped TempoKV parameter sets use the legacy fixed-point protocol.
+if config.get("fit_mode", "legacy") != "legacy":
+    raise SystemExit("only fit_mode=legacy is supported")
+mode_label = "legacy-"
 k_label = f"kh{int(k_history)}"
 # The V segment records the predictor structure: parameters fitted for the
 # temporal V predictor are not interchangeable with CrossKV ones.
@@ -157,28 +152,12 @@ v_predictor = sys.argv[7] or config.get(
 )
 v_prefix = "vt" if v_predictor == "temporal" else "vh"
 v_label = f"{v_prefix}{int(v_history)}"
-if v_predictor == "temporal":
-    cross_weight_mode = "layer_head"
-else:
-    default_cross_weight_mode = (
-        "layer_shared" if config.get("fit_mode") == "legacy" else "layer_head"
-    )
-    cross_weight_mode = config.get(
-        "cross_kv_weight_mode", default_cross_weight_mode
-    )
-cross_weight_labels = {
-    "layer_head": "",
-    "layer_shared": "-layershared",
-    "head_shared": "-headshared",
-    "shared": "-crossshared",
-}
-if cross_weight_mode not in cross_weight_labels:
+cross_weight_mode = config.get("cross_kv_weight_mode", "layer_shared")
+if cross_weight_mode != "layer_shared":
     raise SystemExit(
-        "cross_kv_weight_mode must be layer_head, layer_shared, "
-        "head_shared, or shared, got "
-        f"{cross_weight_mode!r}"
+        "production CrossKV parameters must use cross_kv_weight_mode=layer_shared"
     )
-cross_weight_label = cross_weight_labels[cross_weight_mode]
+cross_weight_label = "-layershared"
 if k_bits == v_bits:
     precision_label = f"int{k_bits}"
 else:

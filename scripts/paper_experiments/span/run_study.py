@@ -316,6 +316,14 @@ def build_manifest(args: argparse.Namespace) -> dict[str, Any]:
         )
 
     base_codec = _read_config(args.base_config)
+    if base_codec.get("fit_mode", "legacy") != "legacy":
+        raise ValueError("span study requires fit_mode=legacy")
+    if base_codec.get("k_predictor_mode", "shared") != "shared":
+        raise ValueError("span study requires k_predictor_mode=shared")
+    if base_codec.get("cross_kv_weight_mode", "layer_shared") != "layer_shared":
+        raise ValueError(
+            "span study requires cross_kv_weight_mode=layer_shared"
+        )
     if int(base_codec.get("anchor_bits", 4)) != 4:
         raise ValueError("base config must use the paper's INT4 anchor")
     variants: list[tuple[int, int, Path]] = []
@@ -327,23 +335,6 @@ def build_manifest(args: argparse.Namespace) -> dict[str, Any]:
             anchor_bits=4,
         )
         variants.append((bits, 4, path))
-    # The requested mixed-anchor control is meaningful only for residual INT2:
-    # compare all-INT2 against the default INT4-anchor/INT2-residual codec.
-    anchor_source = args.anchor_control_config or args.base_config
-    anchor_codec = _read_config(anchor_source)
-    if anchor_codec.get("fit_mode", "native") == "legacy":
-        raise ValueError(
-            "anchor INT2 is forbidden by legacy arithmetic; provide a native "
-            "--anchor-control-config"
-        )
-    anchor_path = _variant_config(
-        anchor_source,
-        configs / "residual_int2_anchor_int2.json",
-        bits=2,
-        anchor_bits=2,
-    )
-    variants.append((2, 2, anchor_path))
-
     for bits, anchor_bits, config in variants:
         for span in args.spans:
             label = f"int{bits}_anchor{anchor_bits}_span{span}"
@@ -472,7 +463,6 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--trace", type=Path, required=True)
     parser.add_argument("--base-config", type=Path, required=True)
-    parser.add_argument("--anchor-control-config", type=Path)
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--prompts", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)

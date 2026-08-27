@@ -38,8 +38,8 @@ class PackedTensor:
     residual_quant: torch.Tensor | None
     residual_scale: torch.Tensor | None
     residual_zero_point: torch.Tensor | None
-    cross_matmul_precision: str = "tf32"
-    compatibility_mode: str = "native"
+    cross_matmul_precision: str = "ieee"
+    compatibility_mode: str = "legacy"
     temporal: TemporalParameters | None = None
     cross_kv: CrossKVParameters | None = None
 
@@ -172,7 +172,7 @@ def cross_projection(
     source: torch.Tensor,
     parameters: CrossKVParameters,
     *,
-    matmul_precision: str = "tf32",
+    matmul_precision: str = "ieee",
 ) -> torch.Tensor:
     """Project a whole reconstructed-K span through Cross(K) in one GEMM.
 
@@ -211,8 +211,8 @@ def predict_cross_kv(
     parameters: CrossKVParameters,
     history: list[torch.Tensor] | tuple[torch.Tensor, ...] | None = None,
     *,
-    # Defaults follow CodecConfig so an implicit call keeps native semantics.
-    matmul_precision: str = "tf32",
+    # Defaults follow the repository-wide legacy codec semantics.
+    matmul_precision: str = "ieee",
     legacy: bool = False,
     projection: torch.Tensor | None = None,
 ) -> torch.Tensor:

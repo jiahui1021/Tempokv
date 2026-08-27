@@ -58,7 +58,7 @@ V_BITS="$(resolve_bits V_BITS)"
 CONFIG="${CONFIG:-$default_codec_config}"
 script_dir="$self_forcing_dir"
 mode="${MODE:-tempokv}"
-k_predictor_mode="layer_head"
+k_predictor_mode="shared"
 
 # ---------- 模式与必需变量 ----------
 
@@ -92,7 +92,7 @@ import json
 import sys
 
 config = json.load(open(sys.argv[1], encoding="utf-8"))
-print(config.get("codec", config).get("k_predictor_mode", "layer_head"))
+print(config.get("codec", config).get("k_predictor_mode", "shared"))
 PY
 )"
   # V_PREDICTOR overrides the config so one file covers both predictors.

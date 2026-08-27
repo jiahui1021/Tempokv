@@ -52,11 +52,11 @@ data/self-forcing/
 │   ├── output/                      采集过程输出
 │   └── clean_trace.npz              合并后的拟合输入
 └── params/
-    ├── legacy-kh2-vh1-int2/
+    ├── legacy-kh2-vh1-int2-layershared/
     │   ├── k_temporal.npz
     │   └── v_cross_kv.npz
-    ├── legacy-kh2-vh1-k2-v4/      K/V 使用不同位宽时
-    ├── legacy-kh3-vt1-int4/       temporal-V 兼容 preset
+    ├── legacy-kh2-vh1-k2-v4-layershared/      K/V 使用不同位宽时
+    ├── legacy-kh3-vt1-int4-layershared/       temporal-V preset
     └── <其他参数方案>/
 ```
 
@@ -122,17 +122,17 @@ VH=1 \
 bash scripts/Self-Forcing/fit_params.sh
 ```
 
-脚本根据配置自动生成参数方案名，例如 `legacy-kh2-vh1-int2`。默认读取
+脚本根据配置自动生成参数方案名，例如 `legacy-kh2-vh1-int2-layershared`。默认读取
 `data/self-forcing/trace/clean_trace.npz`，并写入：
 
 ```text
-data/self-forcing/params/legacy-kh2-vh1-int2/k_temporal.npz
-data/self-forcing/params/legacy-kh2-vh1-int2/v_cross_kv.npz
+data/self-forcing/params/legacy-kh2-vh1-int2-layershared/k_temporal.npz
+data/self-forcing/params/legacy-kh2-vh1-int2-layershared/v_cross_kv.npz
 ```
 
 可用 `TRACE_FILE`、`PARAM_NAME` 或 `OUTPUT_DIR` 覆盖默认位置。
 
-如果配置中的 K/V 位宽不同，方案名会使用 `legacy-kh2-vh1-k2-v4` 这样的格式。shared
+如果配置中的 K/V 位宽不同，方案名会使用 `legacy-kh2-vh1-k2-v4-layershared` 这样的格式。shared
 参数会保留配置中的最大 history length，并可在运行时选择不超过该上限的历史长度。
 拟合目录同时写入 `fit_report.json`，其中包含 `codec_config_sha256`，用于确认
 参数来自哪一份 codec 配置。
@@ -226,9 +226,9 @@ CPU 拟合同时会把方程降到 float64，比看上去慢得多，所以回�
 
 `V_PREDICTOR=cross_kv|temporal` 切换 V 预测器，也不需要单独的配置文件；它会同时
 决定参数目录名（`vh1` 与 `vt1`）和参数文件名（`v_cross_kv.npz` 与 `v_temporal.npz`），
-两者不会互相覆盖。native 与 legacy family 都能拟合 temporal V；但 sampled attention
-refinement 当前要求 legacy/shared temporal K，V 可选 temporal 或 `CrossKV + V-history`；
-其他 K predictor shape 会在读 trace 前报错。
+两者不会互相覆盖。两种 V 预测器都使用 legacy/shared temporal K；sampled attention
+refinement 可用于 temporal V 或 `CrossKV + V-history`，其他 K predictor shape 会在读
+trace 前报错。
 
 `TORCH_DECODER=1` 用 PyTorch 参考解码器代替 Triton，用来做数值对照；它同时关掉
 强制 Triton 的检查，所以不需要再配 `ALLOW_TRITON_FALLBACK`。两者共用同一套拟合

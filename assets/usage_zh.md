@@ -15,9 +15,11 @@ TempoKV 的代码按职责分为三层：
 1 采集并合并 clean trace  →  2 拟合参数  →  3 TempoKV 生成  →  4 BF16 对照
 ```
 
-参数目录名由 codec 配置推导（如 `kh2-vh1-int4`），换位宽或换历史长度都不会互相
+参数目录名由 codec 配置推导（如 `legacy-kh2-vh1-int4-layershared`），换位宽或换历史长度都不会互相
 覆盖；参数文件记录拟合时的 codec signature，加载时校验，用错参数会直接报错而不是
 产出错误结果。
+
+旧的 native 或非 layer-shared 参数不能与当前配置混用，需要按新的 legacy 配置重新拟合。
 
 历史帧数默认 `kh=2`、`vh=1`，写在各模型的 codec 配置里。命令行可以用 `KH=` / `VH=`
 覆盖（等价于长名 `K_HISTORY_LENGTH` / `V_HISTORY_LENGTH`），目录名会跟着变。
@@ -60,7 +62,7 @@ VH=1 \
 bash scripts/Self-Forcing/fit_params.sh
 ```
 
-输出 `data/self-forcing/params/kh2-vh1-int2/`。
+输出 `data/self-forcing/params/legacy-kh2-vh1-int2-layershared/`。
 
 ### 3. TempoKV 生成
 
@@ -120,7 +122,7 @@ CONFIG=configs/legacy.json \
 bash scripts/Causal-Forcing/fit_params.sh
 ```
 
-输出 `data/causal-forcing/params/chunkwise/kh2-vh1-int4/`。INT2 加 `BITS=2` 即可
+输出 `data/causal-forcing/params/chunkwise/legacy-kh2-vh1-int4-layershared/`。INT2 加 `BITS=2` 即可
 
 
 ### 3. TempoKV 生成
@@ -157,20 +159,20 @@ bash scripts/LongCat/collect_trace.sh
 ### 2. 拟合参数
 
 ```bash
-CONFIG=configs/native.json \
+CONFIG=configs/legacy.json \
 bash scripts/LongCat/fit_params.sh
 ```
 
-输出 `data/longcat/params/kh2-vh1-int4/`。加 `BITS=2` 会写到
-`kh2-vh1-int2`，不会覆盖 INT4。
+输出 `data/longcat/params/legacy-kh2-vh1-int4-layershared/`。加 `BITS=2` 会写到
+`legacy-kh2-vh1-int2-layershared`，不会覆盖 INT4。
 
 ### 3. TempoKV 生成
 
 ```bash
 CHECKPOINT_DIR=/models/LongCat-Video \
-CONFIG=configs/native.json \
-K_PARAMS=data/longcat/params/kh2-vh1-int4/k_temporal.npz \
-V_PARAMS=data/longcat/params/kh2-vh1-int4/v_cross_kv.npz \
+CONFIG=configs/legacy.json \
+K_PARAMS=data/longcat/params/legacy-kh2-vh1-int4-layershared/k_temporal.npz \
+V_PARAMS=data/longcat/params/legacy-kh2-vh1-int4-layershared/v_cross_kv.npz \
 PROMPT="a cinematic mountain road" \
 bash scripts/LongCat/run_tempokv.sh
 ```
@@ -244,9 +246,9 @@ pip install -e ".[metrics]"
 
 python scripts/evaluation/evaluate_quality.py \
   results/self_forcing/bf16/videos \
-  results/self_forcing/kh2-vh1-int2/videos \
+  results/self_forcing/legacy-kh2-vh1-int2-layershared/videos \
   --device cuda \
-  --output results/self_forcing/evaluation/kh2-vh1-int2/quality.json
+  --output results/self_forcing/evaluation/legacy-kh2-vh1-int2-layershared/quality.json
 ```
 
 该命令在一次配对解码中计算 PSNR、SSIM、LPIPS 和 2048 维 Inception frame FID。
@@ -258,8 +260,8 @@ smoke。这里的 FID 以同 prompt、同 seed 的 BF16 视频为 reference，�
 
 ```bash
 BASELINE_DIR=results/self_forcing/bf16/videos \
-CANDIDATE_DIR=results/self_forcing/kh2-vh1-int2/videos \
-CANDIDATE_NAME=kh2-vh1-int2 \
+CANDIDATE_DIR=results/self_forcing/legacy-kh2-vh1-int2-layershared/videos \
+CANDIDATE_NAME=legacy-kh2-vh1-int2-layershared \
 OUTPUT_DIR=results/self_forcing/evaluation \
 DEVICE=cuda \
 bash scripts/evaluation/evaluate_all.sh

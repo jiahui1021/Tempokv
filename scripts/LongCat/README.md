@@ -104,10 +104,9 @@ stride 校验。
 
 `V_PREDICTOR=cross_kv|temporal` 切换 V 预测器，也不需要单独的配置文件；它会同时
 决定参数目录名（`vh1` 与 `vt1`）和参数文件名（`v_cross_kv.npz` 与 `v_temporal.npz`），
-两者不会互相覆盖。native fitter 可以独立拟合 temporal V。核心 attention refinement 也已
-支持 native/layer-head 参数，但 LongCat trace 当前没有记录 `q_post_rope` / `k_post_rope`，
-因此 LongCat 尚不能直接运行 attention-objective refinement；请求时会明确要求重新采集包含
-这些数组的 trace。
+两者不会互相覆盖。两种 V 预测器都使用 legacy/shared temporal K。LongCat trace 当前
+没有记录 `q_post_rope` / `k_post_rope`，因此尚不能直接运行 attention-objective
+refinement；请求时会明确要求重新采集包含这些数组的 trace。
 
 ## 历史帧数敏感性实验
 

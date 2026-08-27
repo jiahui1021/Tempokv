@@ -17,8 +17,7 @@
 # K 扫 k_history_length（1 到 8），V 在 CrossKV 项之上再扫 v_history_length
 # （0 到 5），并额外拆出 V 预测里 CrossKV 项与 history 项各自的能量占比。
 #
-# 每个取值都会**重新拟合一次**：非 shared 参数的历史长度是拟合时固定的，
-# 拿一套参数改 N 得到的不是那个 N 的模型。
+# 每个取值都会**重新拟合一次**，确保每个历史长度都使用自己的 legacy/shared 参数。
 #
 # 常用可选变量：
 #   TRACE_FILE   拟合输入（默认取该模型 collect_trace.sh 的输出）

@@ -3,6 +3,9 @@
 set -euo pipefail
 
 export PATH="$HOME/miniconda3/envs/qvg/bin:$PATH"
+export SPAN_FRAMES=24
+export LOCAL_ATTN_SIZE=180
+export RETAIN_FINAL_CACHE=1
 QVG_ROOT="$HOME/kv-quant-4-videogen"
 CHECKPOINT_PATH="$HOME/checkpoints/chunkwise/longvideo.pt"
 DATA_PATH="$HOME/kv-quant-result/moviegen_128.txt"
@@ -22,6 +25,7 @@ run_qvg() {
     DATA_PATH="$DATA_PATH" \
     METHOD="$method" \
     NUM_OUTPUT_FRAMES=180 \
+    SPAN_FRAMES=24 \
     LOCAL_ATTN_SIZE=180 \
     OUTPUT_FOLDER="$out_dir" \
     PYTHON_BIN="$PYTHON_BIN" \

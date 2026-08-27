@@ -172,7 +172,7 @@ def _candidate_config(base_config: Path, output: Path) -> Path:
     codec = payload.get("codec", payload)
     if not isinstance(codec, dict):
         raise ValueError("base config must contain a codec object")
-    if codec.get("fit_mode", "native") != "legacy":
+    if codec.get("fit_mode", "legacy") != "legacy":
         raise ValueError("base config must use fit_mode=legacy")
     candidate = {
         **codec,

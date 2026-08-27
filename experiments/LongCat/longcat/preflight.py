@@ -106,9 +106,16 @@ def _read_codec_config(path: Path) -> tuple[dict[str, Any] | None, dict[str, obj
     if not isinstance(payload, dict):
         return None, _check(False, "config.codec must contain a JSON object", path=str(path))
     try:
-        from tempokv.config import CodecConfig
+        from tempokv.config import config_from_mapping
 
-        config = CodecConfig(**payload)
+        config = config_from_mapping(payload)
+        if config.fit_mode != "legacy":
+            raise ValueError("only fit_mode=legacy is supported")
+        if config.cross_kv_weight_mode != "layer_shared":
+            raise ValueError(
+                "production CrossKV parameters must use "
+                "cross_kv_weight_mode=layer_shared"
+            )
     except (ImportError, TypeError, ValueError) as error:
         return None, _check(False, f"invalid TempoKV codec configuration: {error}", path=str(path))
     # CodecConfig only rejects a non-positive stride, so a float or bool would
@@ -125,6 +132,9 @@ def _read_codec_config(path: Path) -> tuple[dict[str, Any] | None, dict[str, obj
     # CodecConfig default and that default is what the runtime uses.
     resolved = {
         **payload,
+        "fit_mode": config.fit_mode,
+        "k_predictor_mode": config.k_predictor_mode,
+        "cross_kv_weight_mode": config.cross_kv_weight_mode,
         "stride": int(config.stride),
         "v_predictor_mode": config.v_predictor_mode,
     }

@@ -73,7 +73,7 @@ layer-shared Cross 权重。常用覆盖项：
 
 | 变量 | 作用 |
 |---|---|
-| `CONFIG` | 选择 `configs/legacy.json` 或 `configs/native.json` |
+| `CONFIG` | 选择 `configs/legacy.json` |
 | `TRACE_FILE` | 指定采集好的 `clean_trace.npz` |
 | `OUTPUT_DIR` | 指定参数输出目录 |
 | `BITS=2/4/8` | 同时设置 K/V 位宽 |
@@ -103,6 +103,8 @@ data/longcat/params/<参数方案>/
 每个目录包含 `k_temporal.npz`、一个 V 参数文件和 `fit_report.json`。参数不能跨模型、
 stride 或配置复用。模型专用的旧入口仍可使用：
 `scripts/<Model>/fit_params.sh`。
+
+旧的 native 或非 layer-shared 参数不能与当前配置混用，需要按新的 legacy 配置重新拟合。
 
 高级拟合选项可查看：
 

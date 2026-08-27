@@ -86,6 +86,13 @@ def load_codec(
     if overrides:
         payload = {**payload, **overrides}
     config = config_from_mapping(payload)
+    if config.fit_mode != "legacy":
+        raise ValueError("only fit_mode=legacy is supported")
+    if config.cross_kv_weight_mode != "layer_shared":
+        raise ValueError(
+            "production CrossKV parameters must use "
+            "cross_kv_weight_mode=layer_shared"
+        )
     if config.use_triton:
         configure_triton_cache(triton_cache)
     temporal = TemporalParameters.load(k_parameters_path)

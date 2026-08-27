@@ -28,10 +28,10 @@ GENERATE = PROJECT_ROOT / "experiments/Self-Forcing/tempokv_adapter/generate.py"
 # Default parameter directories per method (relative to project root).
 PARAMS = {
     "BF16": None,
-    "TempoKV_INT2": "data/self-forcing/params/paper_exp5_mixed_bits/k4v4",
-    "TempoKV_INT4": "data/self-forcing/params/kh2-vh1-int4",
+    "TempoKV_INT2": "data/self-forcing/params/legacy-kh2-vh1-int2-layershared",
+    "TempoKV_INT4": "data/self-forcing/params/legacy-kh2-vh1-int4-layershared",
 }
-CONFIG = PROJECT_ROOT / "configs/native.json"
+CONFIG = PROJECT_ROOT / "configs/legacy.json"
 
 
 def _env(name: str) -> str:

@@ -3,10 +3,8 @@
 
 Computes per-video psnr/ssim/lpips/mse plus global metrics following the
 project convention: global PSNR from frame-weighted mean MSE, frame-weighted
-SSIM/LPIPS. Supports two naming conventions:
-
-  --mode index   videos named {idx}_0.mp4 in both dirs (TempoKV)
-  --mode prompt  videos named {prompt[:100]}.mp4 in both dirs (QVG)
+SSIM/LPIPS. Both directories must contain videos named {idx}_0.mp4; pairs are
+formed by numeric prompt index.
 
 Usage:
   python scripts/cf_compare_quality.py \
@@ -23,9 +21,6 @@ from pathlib import Path
 
 import numpy as np
 
-sys.path.insert(0, "/mnt/cpfs/epic-user/hujiahui-20260612/kv-quant-result/evaluation")
-from eval_quality import eval_video, LpipsMetric
-
 
 def parse_args():
     p = argparse.ArgumentParser()
@@ -33,28 +28,49 @@ def parse_args():
     p.add_argument("--tgt-dir", required=True)
     p.add_argument("--out-csv", required=True)
     p.add_argument("--name", required=True, help="method label written into the csv")
-    p.add_argument("--mode", choices=["index", "prompt"], required=True)
+    p.add_argument(
+        "--mode",
+        choices=["index"],
+        default="index",
+        help="Compatibility flag; formal evaluation always pairs by index",
+    )
     p.add_argument("--frame-stride", type=int, default=4)
     p.add_argument("--max-frames", type=int, default=None)
     p.add_argument("--device", choices=["cuda", "cpu"], default="cuda")
     return p.parse_args()
 
 
-def match_pairs(ref_dir: Path, tgt_dir: Path, mode: str) -> list[tuple[str, str, str]]:
+def _indexed_videos(directory: Path) -> dict[int, Path]:
+    videos: dict[int, Path] = {}
+    for path in directory.glob("*_0.mp4"):
+        parts = path.stem.split("_")
+        if len(parts) != 2 or parts[1] != "0":
+            continue
+        try:
+            index = int(parts[0])
+        except ValueError:
+            continue
+        videos[index] = path
+    return videos
+
+
+def match_pairs(
+    ref_dir: Path, tgt_dir: Path, mode: str = "index"
+) -> list[tuple[str, str, str]]:
     """Return [(video_name, ref_path, tgt_path)] sorted deterministically."""
-    if mode == "index":
-        refs = {p.stem.split("_")[0]: p for p in ref_dir.glob("*_0.mp4")}
-        tgts = {p.stem.split("_")[0]: p for p in tgt_dir.glob("*_0.mp4")}
-        keys = sorted(refs.keys() & tgts.keys(), key=int)
-        return [(k, str(refs[k]), str(tgts[k])) for k in keys]
-    refs = {p.name: p for p in ref_dir.glob("*.mp4")}
-    tgts = {p.name: p for p in tgt_dir.glob("*.mp4")}
+    if mode != "index":
+        raise ValueError("formal Causal-Forcing evaluation only supports index pairing")
+    refs = _indexed_videos(ref_dir)
+    tgts = _indexed_videos(tgt_dir)
     keys = sorted(refs.keys() & tgts.keys())
-    return [(k, str(refs[k]), str(tgts[k])) for k in keys]
+    return [(f"{key}_0.mp4", str(refs[key]), str(tgts[key])) for key in keys]
 
 
 def main():
     args = parse_args()
+    sys.path.insert(0, "/mnt/cpfs/epic-user/hujiahui-20260612/kv-quant-result/evaluation")
+    from eval_quality import eval_video, LpipsMetric
+
     ref_dir = Path(args.ref_dir)
     tgt_dir = Path(args.tgt_dir)
     pairs = match_pairs(ref_dir, tgt_dir, args.mode)

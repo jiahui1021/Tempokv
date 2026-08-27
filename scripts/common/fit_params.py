@@ -114,7 +114,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--cross-matmul-precision", choices=("ieee", "tf32"))
     parser.add_argument(
-        "--k-predictor-mode", choices=("layer_head", "shared")
+        "--k-predictor-mode", choices=("shared", "direct")
     )
     parser.add_argument("--v-predictor-mode", choices=("cross_kv", "temporal"))
     parser.add_argument(
@@ -182,7 +182,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=(0.01,),
         help="candidate step sizes for the historical sign-gradient scan",
     )
-    parser.add_argument("--fit-mode", choices=("native", "legacy"))
+    parser.add_argument("--fit-mode", choices=("legacy",))
     parser.add_argument(
         "--use-triton", action=argparse.BooleanOptionalAction, default=None
     )
@@ -219,15 +219,16 @@ def _codec_config(args: argparse.Namespace) -> CodecConfig:
         override = getattr(args, name, None)
         if override is not None:
             values[name] = override
-    # CrossKV sharing is irrelevant when V predicts from its own history.  A
-    # V_PREDICTOR=temporal override must therefore leave the shared-CrossKV
-    # production preset and return to the compatible baseline automatically.
+    # CrossKV sharing is irrelevant when V predicts from its own history, but
+    # keep the single repository-wide mode in the resolved identity.
     if values.get("v_predictor_mode") == "temporal":
-        values["cross_kv_weight_mode"] = "layer_head"
+        values["cross_kv_weight_mode"] = "layer_shared"
     try:
         config = config_from_mapping(values)
     except (TypeError, ValueError) as error:
         raise ValueError(f"invalid codec config: {error}") from error
+    if config.fit_mode != "legacy":
+        raise ValueError("only fit_mode=legacy is supported")
     return config
 
 
