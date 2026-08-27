@@ -232,7 +232,7 @@ def _validate_parameters(
                 "legacy K parameters must be shared across all layers "
                 "and heads"
             )
-    elif config.k_history_length is not None:
+    elif config.k_history_length is not None and config.k_history_length > 0:
         expected_k_history_shape = (
             30,
             config.k_history_length,
@@ -245,7 +245,9 @@ def _validate_parameters(
                 "K history parameters must match 30 layers, the configured history "
                 "length, 12 heads, and dimension 128"
             )
-    elif tuple(temporal.history_weights.shape[-2:]) != (12, 128):
+    elif config.k_history_length == 0 or tuple(temporal.history_weights.shape[-2:]) == (12, 128):
+        pass  # k_history_length=0 has no history weights; otherwise check heads/dim
+    else:
         raise ValueError("K parameters must contain 12 heads with dimension 128")
     if temporal_v:
         order = config.v_history_length
@@ -624,9 +626,15 @@ def _write_efficiency_record(
                 "peak_reset_after_prompt_index": int(args.start_index),
             },
             per_prompt_generation_seconds=[
-                float(batch["generation_seconds"]) for batch in batch_entries
+                float(batch["generation_seconds"])
+                for batch in batch_entries
+                if batch.get("generation_seconds") is not None
             ],
-            prompt_indices=[int(batch["prompt_index"]) for batch in batch_entries],
+            prompt_indices=[
+                int(batch["prompt_index"])
+                for batch in batch_entries
+                if batch.get("generation_seconds") is not None
+            ],
             segments_ms=segments,
             instrumentation=instrumentation,
         ),

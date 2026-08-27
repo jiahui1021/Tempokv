@@ -59,6 +59,7 @@ SUMMARY_FIELDS = (
     "psnr_db",
     "ssim",
     "lpips",
+    "fid",
     "videos",
     "generation_seconds",
     "status",
@@ -391,7 +392,7 @@ def _quality_jobs(
             str(paths["quality"]),
             "--device",
             args.quality_device,
-            "--no-fid",
+            "--allow-missing",
         ]
         if args.max_quality_frames is not None:
             command.extend(("--max-frames", str(args.max_quality_frames)))
@@ -513,6 +514,7 @@ def _summary_row(
         "psnr_db": quality["psnr_db"],
         "ssim": quality["ssim"],
         "lpips": quality["lpips"],
+        "fid": quality.get("fid"),
         "videos": quality["videos"],
         "generation_seconds": generation.get("generation_seconds"),
         "status": "complete",
@@ -826,8 +828,36 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
 
     _run_jobs(fit_jobs, args.gpus, dry_run=False)
     _run_jobs(cache_jobs, args.gpus, dry_run=False)
-    _run_jobs(generation_jobs, args.gpus, dry_run=False)
-    _run_jobs(quality_jobs, args.gpus, dry_run=False)
+
+    # Streaming quality evaluation: run generation in batches of 4 GPUs,
+    # then immediately run quality eval for each completed batch.
+    bf16_generation_jobs = [job for job in generation_jobs if job.name == "bf16"]
+    variant_generation_jobs = [job for job in generation_jobs if job.name != "bf16"]
+
+    _run_jobs(bf16_generation_jobs, args.gpus, dry_run=False)
+
+    # Process variant generation in batches of 4, with quality eval after each batch
+    batch_size = len(args.gpus)
+    for batch_start in range(0, len(variant_generation_jobs), batch_size):
+        batch_gen_jobs = variant_generation_jobs[batch_start : batch_start + batch_size]
+        _run_jobs(batch_gen_jobs, args.gpus, dry_run=False)
+
+        # Immediately run quality eval for this batch's variants
+        batch_variant_names = {job.name for job in batch_gen_jobs}
+        batch_qual_jobs = [job for job in quality_jobs if job.name in batch_variant_names]
+        if batch_qual_jobs:
+            _run_jobs(batch_qual_jobs, args.gpus, dry_run=False)
+
+    # On --resume, variants whose generation was already complete are not part of
+    # any batch, so their quality eval was skipped above. Run any still-missing
+    # quality jobs now so the aggregate does not crash on absent quality.json.
+    remaining_qual = [
+        job for job in quality_jobs
+        if not (root / "runs" / job.name / "quality.json").is_file()
+    ]
+    if remaining_qual:
+        _run_jobs(remaining_qual, args.gpus, dry_run=False)
+
     return _aggregate(args, root, variants, configs)
 
 

@@ -98,11 +98,19 @@ def evaluate(
         values = torch.from_numpy(np.array(archive["values"], copy=True)).to(
             device=device, dtype=torch.float32
         )
-    if keys.shape != values.shape or keys.ndim != 5:
+    if keys.shape != values.shape or keys.ndim < 4:
         raise ValueError(
-            "history-ablation cache evaluation expects matching [L,S,T,H,D] "
+            "history-ablation cache evaluation expects matching [L, ..., T, H, D] "
             f"arrays, got {tuple(keys.shape)} and {tuple(values.shape)}"
         )
+    if keys.ndim > 5:
+        layer_count = keys.shape[0]
+        frame_count = keys.shape[-3]
+        head_count = keys.shape[-2]
+        dim = keys.shape[-1]
+        sample_count = int(np.prod(keys.shape[1:-3]))
+        keys = keys.reshape(layer_count, sample_count, frame_count, head_count, dim)
+        values = values.reshape(layer_count, sample_count, frame_count, head_count, dim)
 
     temporal = TemporalParameters.load(k_params_path).to(device)
     if config.v_predictor_mode == "temporal":
