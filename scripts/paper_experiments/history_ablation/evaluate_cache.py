@@ -113,7 +113,7 @@ def evaluate(
         values = values.reshape(layer_count, sample_count, frame_count, head_count, dim)
 
     temporal = TemporalParameters.load(k_params_path).to(device)
-    if config.v_predictor_mode == "temporal":
+    if config.v_predictor_mode in {"temporal", "direct"}:
         value_parameters: TemporalParameters | CrossKVParameters = (
             TemporalParameters.load(v_params_path).to(device)
         )
@@ -134,7 +134,7 @@ def evaluate(
         raise ValueError("K and V parameters were not fitted together")
 
     k_prediction, _, rebuilt_keys = reconstruct_k(keys, temporal, config)
-    if config.v_predictor_mode == "temporal":
+    if config.v_predictor_mode in {"temporal", "direct"}:
         assert isinstance(value_parameters, TemporalParameters)
         v_prediction, _, rebuilt_values = reconstruct_temporal(
             values,

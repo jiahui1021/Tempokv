@@ -56,7 +56,7 @@ def build_parser() -> argparse.ArgumentParser:
         description="Generate Self-Forcing videos with TempoKV or bf16 KV caches."
     )
     parser.add_argument(
-        "--mode", choices=("tempokv", "bf16"), default="tempokv"
+        "--mode", choices=("tempokv", "bf16", "trace"), default="tempokv"
     )
     parser.add_argument("--config", type=Path)
     parser.add_argument("--k-params", type=Path)
@@ -164,7 +164,7 @@ def _validate_parameters(
     from tempokv.parameters import CrossKVParameters, TemporalParameters
 
     temporal = TemporalParameters.load(k_path)
-    temporal_v = config.v_predictor_mode == "temporal"
+    temporal_v = config.v_predictor_mode in {"temporal", "direct"}
     cross = (
         TemporalParameters.load(v_path)
         if temporal_v
@@ -254,6 +254,7 @@ def _validate_parameters(
         raise ValueError("K parameters must contain 12 heads with dimension 128")
     if temporal_v:
         order = config.v_history_length
+        legacy_family = config.fit_mode == "legacy"
         if legacy_family:
             # Legacy pools every layer and head, so the parameters carry
             # neither axis.
@@ -1086,6 +1087,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             "temporal": "temporal_persistent_direct",
             "cross_kv": "cross_kv_persistent_direct",
             "innovation": "innovation_persistent_direct",
+            "direct": "direct_persistent_direct",
         }[config.v_predictor_mode]
         required_routes = (k_route,) if k_route == v_route else (k_route, v_route)
         missing_routes = [

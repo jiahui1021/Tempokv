@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Literal
@@ -42,6 +43,9 @@ class PackedTensor:
     compatibility_mode: str = "legacy"
     temporal: TemporalParameters | None = None
     cross_kv: CrossKVParameters | None = None
+    # Mean-split K spans store the per-channel mean [B, H, D] subtracted
+    # before prediction; decode adds it back after reconstruction.
+    channel_mean: torch.Tensor | None = None
 
     def __post_init__(self) -> None:
         batch, heads, sequence, width = self.shape
@@ -102,6 +106,8 @@ class PackedTensor:
         """
         total = self.anchor_quant.numel() * self.anchor_quant.element_size()
         total += self.anchor_scale.numel() * self.anchor_scale.element_size()
+        if self.channel_mean is not None:
+            total += self.channel_mean.numel() * self.channel_mean.element_size()
         for component in (
             self.residual_quant,
             self.residual_scale,
@@ -408,12 +414,23 @@ def _encode(
     config: CodecConfig,
     reuse_input_for_reconstruction: bool = False,
     history_length: int | None = None,
+    channel_mean: bool = False,
 ) -> tuple[PackedTensor, torch.Tensor]:
     _validate_input(value, config)
     batch, heads, sequence, width = map(int, value.shape)
     stride = min(config.stride, sequence)
     scale_dtype = _dtype(config.scale_dtype)
     reconstruction_dtype = _dtype(config.reconstruction_dtype)
+    span_mean: torch.Tensor | None = None
+    if channel_mean:
+        if predictor_kind != "temporal":
+            raise ValueError("channel-mean encoding is only supported for K")
+        # The mean is stored at reconstruction dtype so encoder and decoder
+        # add back bit-identical values.
+        span_mean = (
+            value.float().mean(dim=2, keepdim=True).to(reconstruction_dtype)
+        )
+        value = (value.float() - span_mean).to(reconstruction_dtype)
     if reuse_input_for_reconstruction and value.dtype != reconstruction_dtype:
         raise ValueError(
             "in-place reconstruction requires input dtype to match "
@@ -626,6 +643,8 @@ def _encode(
         offset += unit_length
         del current, prediction, quant, scale, zero_point, residual_rebuilt, rebuilt
 
+    if span_mean is not None:
+        reconstruction.add_(span_mean)
     packed = PackedTensor(
         shape=(batch, heads, sequence, width),
         predictor_kind=predictor_kind,
@@ -645,6 +664,7 @@ def _encode(
         residual_zero_point=residual_zero_point,
         temporal=temporal,
         cross_kv=cross_kv,
+        channel_mean=(span_mean.squeeze(2) if span_mean is not None else None),
     )
     return packed, reconstruction
 
@@ -657,6 +677,7 @@ def encode_temporal(
     reuse_input_for_reconstruction: bool = False,
     bits: int | None = None,
     history_length: int | None = None,
+    channel_mean: bool = False,
 ) -> tuple[PackedTensor, torch.Tensor]:
     """Encode a temporally predicted tensor with its closed-loop reconstruction.
 
@@ -674,6 +695,7 @@ def encode_temporal(
         config=resolved,
         reuse_input_for_reconstruction=reuse_input_for_reconstruction,
         history_length=history_length,
+        channel_mean=channel_mean,
     )
 
 
@@ -848,6 +870,8 @@ def decode_tensor(
                 output_layout=output_layout,
             )
             if accelerated is not None:
+                if packed.channel_mean is not None:
+                    accelerated.add_(packed.channel_mean.unsqueeze(2))
                 return accelerated
             if effective_strict_triton:
                 raise RuntimeError("this packed layout is not supported by Triton")
@@ -882,6 +906,8 @@ def decode_tensor(
     )
     output[:, :, :anchor_length] = anchor
     if packed.residual_quant is None:
+        if packed.channel_mean is not None:
+            output.add_(packed.channel_mean.unsqueeze(2))
         return output
     assert packed.residual_scale is not None
     history = (
@@ -969,6 +995,8 @@ def decode_tensor(
         offset += unit_length
         residual_offset = end
         del prediction, zero_point, residual, rebuilt
+    if packed.channel_mean is not None:
+        output.add_(packed.channel_mean.unsqueeze(2))
     return output
 
 
@@ -982,7 +1010,10 @@ class TempoKVCodec:
         config: CodecConfig | None = None,
     ) -> None:
         self.config = config or CodecConfig()
-        expects_temporal_v = self.config.v_predictor_mode == "temporal"
+        # Experimental mean-split K path: subtract each span's per-channel
+        # mean before temporal prediction and store it as side information.
+        self.k_channel_mean = os.environ.get("TEMPOKV_K_MEAN_SPLIT") == "1"
+        expects_temporal_v = self.config.v_predictor_mode in {"temporal", "direct"}
         if expects_temporal_v != isinstance(cross_kv, TemporalParameters):
             expected = "TemporalParameters" if expects_temporal_v else "CrossKVParameters"
             raise ValueError(
@@ -1087,6 +1118,7 @@ class TempoKVCodec:
             temporal,
             self.config,
             reuse_input_for_reconstruction=reuse_input,
+            channel_mean=self.k_channel_mean,
         )
 
     @property

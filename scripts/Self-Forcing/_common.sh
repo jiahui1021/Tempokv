@@ -134,10 +134,11 @@ v_prefix = {
     "cross_kv": "vh",
     "temporal": "vt",
     "innovation": "vi",
+    "direct": "vd",
 }.get(v_predictor)
 if v_prefix is None:
     raise SystemExit(
-        "V_PREDICTOR must be cross_kv, temporal, or innovation, got "
+        "V_PREDICTOR must be cross_kv, temporal, innovation, or direct, got "
         f"{v_predictor!r}"
     )
 v_label = f"{v_prefix}{int(v_history)}"

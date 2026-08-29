@@ -2314,6 +2314,26 @@ def _fit_legacy_predictors(
             if fit_history_source == "reconstructed"
             else keys
         )
+    if config.v_predictor_mode == "direct":
+        # Pure quantization: no V predictor, mirroring the empty-history K
+        # direct parameters.  The decoder reconstructs V as the quantization
+        # round-trip alone (Triton direct kernel route).
+        cross = TemporalParameters(
+            history_weights=torch.empty(
+                0, 0, dim, dtype=torch.float32, device=values.device
+            ),
+            history_bias=torch.empty(
+                0, dim, dtype=torch.float32, device=values.device
+            ),
+            stride=config.stride,
+            codec_signature=signature,
+        )
+        return _stamp_parameter_identity(
+            temporal,
+            cross,
+            signature=signature,
+            coordinate_system=coordinate_system,
+        )
     if config.v_predictor_mode == "temporal":
         cross = _fit_legacy_shared_temporal_v(
             values,

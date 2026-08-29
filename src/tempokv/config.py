@@ -71,6 +71,8 @@ class CodecConfig:
     # predictor K uses, so V needs no reconstructed K and no CrossKV matrix.
     # ``cross_kv`` keeps the Cross(K) projection. ``innovation`` projects the
     # decoder-visible K temporal innovation and optionally adds V history.
+    # ``direct`` is the zero-predictor baseline: V units are quantized directly
+    # and the parameter file contains an empty temporal map.
     v_predictor_mode: str = "cross_kv"
     # Select the legacy fixed-point/shared-K and direct temporal-V fitting math.
     fit_mode: str | None = None
@@ -163,9 +165,19 @@ class CodecConfig:
             raise ValueError(
                 "k_history_length=0 requires k_predictor_mode=direct"
             )
-        if self.v_predictor_mode not in {"cross_kv", "temporal", "innovation"}:
+        if self.v_predictor_mode not in {
+            "cross_kv",
+            "temporal",
+            "innovation",
+            "direct",
+        }:
             raise ValueError(
-                "v_predictor_mode must be cross_kv, temporal, or innovation"
+                "v_predictor_mode must be cross_kv, temporal, innovation, or direct"
+            )
+        if self.v_predictor_mode == "direct" and self.v_history_length:
+            raise ValueError(
+                "v_predictor_mode=direct requires v_history_length=0 "
+                "(pure quantization, no V predictor)"
             )
         if self.cross_kv_weight_mode not in {
             "layer_head",

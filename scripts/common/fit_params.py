@@ -769,7 +769,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         )
     if temporal.history_length != int(requested_k_history):
         temporal = _pad_temporal_history(temporal, int(requested_k_history))
-    if config.v_predictor_mode == "temporal":
+    if config.v_predictor_mode in {"temporal", "direct"}:
         if cross.history_length != int(config.v_history_length):
             cross = _pad_temporal_history(cross, int(config.v_history_length))
     elif cross.history_length != int(config.v_history_length):
@@ -791,11 +791,13 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     temporal_path = output_dir / "k_temporal.npz"
     # The V file name states its structure, so a temporal V parameter set can
     # never be mistaken for a CrossKV one on disk.
-    temporal_v = config.v_predictor_mode == "temporal"
+    temporal_v = config.v_predictor_mode in {"temporal", "direct"}
     v_artifact_stem = {
         "temporal": "v_temporal",
         "cross_kv": "v_cross_kv",
         "innovation": "v_innovation",
+        # Direct V keeps an empty temporal map, so it shares the temporal file.
+        "direct": "v_temporal",
     }[config.v_predictor_mode]
     cross_path = output_dir / f"{v_artifact_stem}.npz"
     ls_temporal_path = output_dir / "k_temporal_ls.npz"
@@ -921,7 +923,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             # reads its own reconstructed V history instead of a Cross(K) map.
             "v_history_mode": (
                 "temporal"
-                if config.v_predictor_mode == "temporal"
+                if config.v_predictor_mode in {"temporal", "direct"}
                 else cross.history_mode
             ),
             "max_gain": float(args.max_gain),
