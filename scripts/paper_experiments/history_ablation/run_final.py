@@ -189,6 +189,24 @@ def _variants(base: CodecConfig, *, k_baseline: int, v_baseline: int) -> tuple[V
             ),
         )
     )
+    # Full V-history sweep with the temporal (no-CrossKV) predictor.  The
+    # temporal predictor needs h_V >= 1, and h_V=1 is already the `without_cross`
+    # control above, so this adds h_V = 2, 4, 5.
+    for history in V_HISTORY_VALUES:
+        if history <= 1:
+            continue
+        variants.append(
+            Variant(
+                name=f"v_h{history}_no_cross_kh{k_baseline}",
+                axis="v_history_no_cross",
+                k_history_length=k_baseline,
+                v_history_length=history,
+                v_predictor_mode="temporal",
+                k_predictor_mode=(
+                    "direct" if k_baseline == 0 else positive_k_mode
+                ),
+            )
+        )
     return tuple(variants)
 
 
@@ -220,7 +238,11 @@ def _variant_paths(root: Path, variant: Variant) -> dict[str, Path]:
 
 
 def _v_parameter_name(config: CodecConfig) -> str:
-    return "v_temporal.npz" if config.v_predictor_mode == "temporal" else "v_cross_kv.npz"
+    return (
+        "v_temporal.npz"
+        if config.v_predictor_mode in {"temporal", "direct"}
+        else "v_cross_kv.npz"
+    )
 
 
 def _generation_complete(path: Path, expected_videos: int) -> bool:
@@ -611,6 +633,10 @@ def _aggregate(
     ]
     v_rows.sort(key=lambda row: int(row["v_history_length"]))
     no_cross = [row for row in rows if row["axis"] == "without_cross"]
+    v_temporal_rows = [
+        row for row in rows if row["v_predictor_mode"] == "temporal"
+    ]
+    v_temporal_rows.sort(key=lambda row: int(row["v_history_length"]))
     cross_baseline = _find_row(
         rows, k=args.k_baseline, v=args.v_baseline, mode="cross_kv"
     )
@@ -666,6 +692,7 @@ def _aggregate(
             "k_history": k_rows,
             "v_history_cross_kv": v_rows,
             "without_cross": no_cross,
+            "v_history_no_cross": v_temporal_rows,
         },
         "cross_comparison": cross_comparison,
         "rows": rows,

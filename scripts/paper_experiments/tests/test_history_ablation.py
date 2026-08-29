@@ -238,13 +238,18 @@ def test_final_runner_dry_run_materializes_all_four_gpu_jobs(tmp_path: Path) -> 
     manifest = json.loads((output / "manifest.json").read_text(encoding="utf-8"))
     assert manifest["protocol"]["videos_per_variant"] == 50
     assert manifest["protocol"]["gpus"] == ["0", "1", "2", "3"]
-    assert len(manifest["variants"]) == 11
-    assert len(manifest["commands"]["fit"]) == 11
-    assert len(manifest["commands"]["cache"]) == 11
-    assert len(manifest["commands"]["generation"]) == 12
-    assert len(manifest["commands"]["quality"]) == 11
+    assert len(manifest["variants"]) == 14
+    assert len(manifest["commands"]["fit"]) == 14
+    assert len(manifest["commands"]["cache"]) == 14
+    assert len(manifest["commands"]["generation"]) == 15
+    assert len(manifest["commands"]["quality"]) == 14
     direct = next(item for item in manifest["variants"] if item["k_history_length"] == 0)
     assert direct["k_predictor_mode"] == "direct"
     no_cross = next(item for item in manifest["variants"] if item["axis"] == "without_cross")
     assert no_cross["v_predictor_mode"] == "temporal"
     assert no_cross["v_history_length"] == 1
+    v_no_cross = [
+        item for item in manifest["variants"] if item["axis"] == "v_history_no_cross"
+    ]
+    assert sorted(item["v_history_length"] for item in v_no_cross) == [2, 4, 5]
+    assert all(item["v_predictor_mode"] == "temporal" for item in v_no_cross)
