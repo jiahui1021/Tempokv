@@ -83,6 +83,14 @@ def build_parser() -> argparse.ArgumentParser:
             "(temporal), or decoder-visible K innovation plus V history"
         ),
     )
+    parser.add_argument(
+        "--predictor-direction",
+        choices=("k_to_v", "v_to_k"),
+        help=(
+            "which tensor carries the cross dependency: k_to_v predicts V from "
+            "reconstructed K (production), v_to_k mirrors the roles"
+        ),
+    )
     parser.add_argument("--k-bits", type=int, choices=(2, 4, 8))
     parser.add_argument("--v-bits", type=int, choices=(2, 4, 8))
     parser.add_argument(
@@ -888,6 +896,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                 ("k_bits", args.k_bits),
                 ("v_bits", args.v_bits),
                 ("v_predictor_mode", args.v_predictor_mode),
+                ("predictor_direction", args.predictor_direction),
                 ("use_triton", False if args.torch_decoder else None),
             )
             if value is not None

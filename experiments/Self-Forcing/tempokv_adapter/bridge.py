@@ -100,7 +100,7 @@ def install(runtime_root: str | Path) -> type:
             self.tempokv_codec = load_codec_from_env()
             config = self.tempokv_codec.config
             self._tempokv_rope_precision = "complex64"
-            self._apply_tempokv_rope_precision()
+            self._apply_tempokv_cache_settings()
             if config.stride != self.frame_seq_length:
                 raise ValueError(
                     f"TempoKV stride {config.stride} does not match Self-Forcing "
@@ -138,15 +138,29 @@ def install(runtime_root: str | Path) -> type:
 
             cache_module.set_quantized_decoder(decode_with_codec)
 
-        def _apply_tempokv_rope_precision(self) -> None:
+        def _apply_tempokv_cache_settings(self) -> None:
+            """Stamp the settings the attention layer has to read back.
+
+            The attention code decides which cache slot to decode first, and it
+            only has the cache entries to go on, so the direction travels with
+            them.  It is stamped on both slots because either one can be the
+            tensor that leads.
+            """
             if self.kv_cache1 is None:
                 return
+            # Read defensively, as this bridge already does for the other
+            # codec settings, so a config predating the field still installs.
+            direction = getattr(
+                self.tempokv_codec.config, "predictor_direction", "k_to_v"
+            )
             for layer in self.kv_cache1:
                 layer["k"].rope_precision = self._tempokv_rope_precision
+                for role in ("k", "v"):
+                    layer[role].tempokv_predictor_direction = direction
 
         def _initialize_kv_cache(self, *args: Any, **kwargs: Any) -> Any:
             result = super()._initialize_kv_cache(*args, **kwargs)
-            self._apply_tempokv_rope_precision()
+            self._apply_tempokv_cache_settings()
             return result
 
         def _patch_attention_windows(self) -> None:
@@ -179,42 +193,50 @@ def install(runtime_root: str | Path) -> type:
                 raise ValueError("TempoKV needs at least two cache units per span")
             started = time.perf_counter()
             with torch.no_grad():
+                # The cache slots are addressed by codec role, not by name:
+                # the primary tensor is the one predicted from its own temporal
+                # history, and its reconstruction is what the secondary tensor
+                # projects from.  Forward runs K then V; the mirrored direction
+                # runs V then K through the identical code path.
+                codec = self.tempokv_codec
+                primary_role = codec.primary_role
+                secondary_role = codec.secondary_role
                 for layer_index, layer in enumerate(self.kv_cache1):
-                    keys = layer["k"].read_bhsd(
+                    primary = layer[primary_role].read_bhsd(
                         tokens_to_quantize_start, tokens_to_quantize_end
                     )
                     if (
-                        keys.shape[1] != self.codec_shape.num_heads
-                        or keys.shape[-1] != self.codec_shape.head_dim
+                        primary.shape[1] != self.codec_shape.num_heads
+                        or primary.shape[-1] != self.codec_shape.head_dim
                     ):
                         raise ValueError("Self-Forcing cache shape changed unexpectedly")
-                    packed_key, reconstructed_key = self.tempokv_codec.encode_key(
-                        keys,
+                    packed_primary, reconstructed_primary = codec.encode_primary(
+                        primary,
                         layer=layer_index,
                         reuse_input=True,
                     )
-                    layer["k"].store_quantized(
+                    layer[primary_role].store_quantized(
                         tokens_to_quantize_start,
                         tokens_to_quantize_end,
-                        wrap_cache_state(packed_key),
+                        wrap_cache_state(packed_primary),
                     )
-                    del keys, packed_key
+                    del primary, packed_primary
 
-                    values = layer["v"].read_bhsd(
+                    secondary = layer[secondary_role].read_bhsd(
                         tokens_to_quantize_start, tokens_to_quantize_end
                     )
-                    packed_value = self.tempokv_codec.encode_value(
-                        values,
-                        reconstructed_key,
+                    packed_secondary = codec.encode_secondary(
+                        secondary,
+                        reconstructed_primary,
                         layer=layer_index,
                         reuse_input=True,
                     )
-                    layer["v"].store_quantized(
+                    layer[secondary_role].store_quantized(
                         tokens_to_quantize_start,
                         tokens_to_quantize_end,
-                        wrap_cache_state(packed_value),
+                        wrap_cache_state(packed_secondary),
                     )
-                    del values, packed_value, reconstructed_key
+                    del secondary, packed_secondary, reconstructed_primary
             self.summary["quantization_events"].append(
                 {
                     "tokens_start": int(tokens_to_quantize_start),

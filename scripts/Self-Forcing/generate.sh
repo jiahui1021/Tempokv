@@ -103,15 +103,31 @@ PY
     esac
     v_predictor_mode="$V_PREDICTOR"
   fi
-  case "$v_predictor_mode" in
-    # Direct V has no predictor; its empty temporal map shares the temporal layout.
-    temporal|direct) v_artifact_name="v_temporal.npz" ;;
-    innovation) v_artifact_name="v_innovation.npz" ;;
-    cross_kv) v_artifact_name="v_cross_kv.npz" ;;
-    # Keep command-only dry runs usable with PYTHON_BIN=/bin/echo; the Python
-    # generation preflight performs authoritative config validation.
-    *) v_artifact_name="v_cross_kv.npz" ;;
+  # DIRECTION mirrors the K/V roles; the artifacts are named for the role each
+  # parameter set plays, and --k-params/--v-params are positional by role
+  # (temporal first, cross projection second) rather than by tensor name.
+  predictor_direction="${DIRECTION:-k_to_v}"
+  case "$predictor_direction" in
+    k_to_v|v_to_k) ;;
+    *) die "DIRECTION 必须是 k_to_v 或 v_to_k（当前值：${predictor_direction}）" ;;
   esac
+  if [[ "$predictor_direction" == "v_to_k" ]]; then
+    [[ "$v_predictor_mode" == "cross_kv" ]] \
+      || die "DIRECTION=v_to_k 需要 V_PREDICTOR=cross_kv（当前值：${v_predictor_mode}）"
+    k_artifact_name="v_temporal_primary.npz"
+    v_artifact_name="k_cross_from_v.npz"
+  else
+    k_artifact_name="k_temporal.npz"
+    case "$v_predictor_mode" in
+      # Direct V has no predictor; its empty temporal map shares the temporal layout.
+      temporal|direct) v_artifact_name="v_temporal.npz" ;;
+      innovation) v_artifact_name="v_innovation.npz" ;;
+      cross_kv) v_artifact_name="v_cross_kv.npz" ;;
+      # Keep command-only dry runs usable with PYTHON_BIN=/bin/echo; the Python
+      # generation preflight performs authoritative config validation.
+      *) v_artifact_name="v_cross_kv.npz" ;;
+    esac
+  fi
 else
   param_dir=""
   result_label="bf16"
@@ -199,7 +215,7 @@ generate_command=(
 if [[ "$mode" == "tempokv" ]]; then
   generate_command+=(
     --config "$(resolve_path "$CONFIG")"
-    --k-params "$param_dir/k_temporal.npz"
+    --k-params "$param_dir/$k_artifact_name"
     --v-params "$param_dir/$v_artifact_name"
   )
   [[ -n "${K_HISTORY_LENGTH:-}" ]] && generate_command+=(--k-history-length "$K_HISTORY_LENGTH")
@@ -207,6 +223,7 @@ if [[ "$mode" == "tempokv" ]]; then
   [[ -n "${K_BITS:-}" ]] && generate_command+=(--k-bits "$K_BITS")
   [[ -n "${V_BITS:-}" ]] && generate_command+=(--v-bits "$V_BITS")
   [[ -n "${V_PREDICTOR:-}" ]] && generate_command+=(--v-predictor-mode "$V_PREDICTOR")
+  [[ -n "${DIRECTION:-}" ]] && generate_command+=(--predictor-direction "$predictor_direction")
   [[ "$TORCH_DECODER" == "1" ]] && generate_command+=(--torch-decoder)
 fi
 

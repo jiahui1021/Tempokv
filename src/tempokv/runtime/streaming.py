@@ -176,44 +176,56 @@ class StreamingTempoKVEncoder:
         token_start = start_frame * self.frame_seq_length
         token_end = token_start + num_frames * self.frame_seq_length
         with self.report.timer("encode_ms"), torch.no_grad():
+            # Slots are addressed by codec role rather than by name.  The
+            # primary tensor is the one predicted from its own temporal
+            # history; the secondary tensor is projected from the primary's
+            # reconstruction.  Forward runs K then V, and the mirrored
+            # direction runs V then K through this same loop.
+            primary_role = self.codec.primary_role
+            secondary_role = self.codec.secondary_role
+            direction = self.codec.config.predictor_direction
             for layer_index, layer in enumerate(caches):
-                keys = layer["k"].read_bhsd(token_start, token_end)
-                packed_key, reconstructed_key = self.codec.encode_key(
-                    keys,
+                # The attention layer decides its read order from the cache
+                # entries alone, so the direction has to travel with them.
+                for role in ("k", "v"):
+                    layer[role].tempokv_predictor_direction = direction
+                primary = layer[primary_role].read_bhsd(token_start, token_end)
+                packed_primary, reconstructed_primary = self.codec.encode_primary(
+                    primary,
                     layer=layer_index,
                     reuse_input=True,
                 )
-                layer["k"].store_quantized(
-                    token_start, token_end, self._wrap_state(packed_key)
+                layer[primary_role].store_quantized(
+                    token_start, token_end, self._wrap_state(packed_primary)
                 )
                 self.report.encode_key_calls += 1
                 self.report.record_span(
-                    ("k", layer_index, token_start),
-                    compressed_bytes=packed_key.storage_bytes(),
-                    uncompressed_bytes=bf16_bytes(tuple(packed_key.shape)),
+                    (primary_role, layer_index, token_start),
+                    compressed_bytes=packed_primary.storage_bytes(),
+                    uncompressed_bytes=bf16_bytes(tuple(packed_primary.shape)),
                 )
-                del keys, packed_key
+                del primary, packed_primary
 
-                # V is predicted from the *reconstructed* K the decoder will
-                # see, never from the clean K, so encoder and decoder stay on
-                # the same closed loop.
-                values = layer["v"].read_bhsd(token_start, token_end)
-                packed_value = self.codec.encode_value(
-                    values,
-                    reconstructed_key,
+                # The secondary tensor is predicted from the *reconstructed*
+                # primary the decoder will see, never from the clean one, so
+                # encoder and decoder stay on the same closed loop.
+                secondary = layer[secondary_role].read_bhsd(token_start, token_end)
+                packed_secondary = self.codec.encode_secondary(
+                    secondary,
+                    reconstructed_primary,
                     layer=layer_index,
                     reuse_input=True,
                 )
-                layer["v"].store_quantized(
-                    token_start, token_end, self._wrap_state(packed_value)
+                layer[secondary_role].store_quantized(
+                    token_start, token_end, self._wrap_state(packed_secondary)
                 )
                 self.report.encode_value_calls += 1
                 self.report.record_span(
-                    ("v", layer_index, token_start),
-                    compressed_bytes=packed_value.storage_bytes(),
-                    uncompressed_bytes=bf16_bytes(tuple(packed_value.shape)),
+                    (secondary_role, layer_index, token_start),
+                    compressed_bytes=packed_secondary.storage_bytes(),
+                    uncompressed_bytes=bf16_bytes(tuple(packed_secondary.shape)),
                 )
-                del values, packed_value, reconstructed_key
+                del secondary, packed_secondary, reconstructed_primary
 
 
 __all__ = ["StreamingTempoKVEncoder"]

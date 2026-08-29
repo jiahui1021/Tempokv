@@ -211,21 +211,28 @@ def decode_kv_cache(
             name="value_output",
         )
         start = 0
+        mirrored = codec.config.mirrored
         for packed_key, packed_value in zip(k_cache.spans, v_cache.spans):
             end = start + int(packed_key.shape[2])
             key_target = key[:, :, start:end, :]
             value_target = value[:, :, start:end, :]
-            key_part = decode_tensor(
-                packed_key,
-                output_tensor=key_target,
+            packed_primary, packed_secondary = (
+                (packed_value, packed_key) if mirrored else (packed_key, packed_value)
+            )
+            primary_target, secondary_target = (
+                (value_target, key_target) if mirrored else (key_target, value_target)
+            )
+            primary_part = decode_tensor(
+                packed_primary,
+                output_tensor=primary_target,
                 output_layout="BHSD",
                 use_triton=codec.config.use_triton,
                 strict_triton=codec.config.strict_triton,
             )
             decode_tensor(
-                packed_value,
-                source=key_part,
-                output_tensor=value_target,
+                packed_secondary,
+                source=primary_part,
+                output_tensor=secondary_target,
                 output_layout="BHSD",
                 use_triton=codec.config.use_triton,
                 strict_triton=codec.config.strict_triton,
@@ -247,17 +254,24 @@ def decode_kv_cache(
         device=v_cache.anchor_quant.device,
         name="value_output",
     )
-    decoded_key = decode_tensor(
-        k_cache,
-        output_tensor=key,
+    mirrored = codec.config.mirrored
+    packed_primary, packed_secondary = (
+        (v_cache, k_cache) if mirrored else (k_cache, v_cache)
+    )
+    primary_output, secondary_output = (
+        (value, key) if mirrored else (key, value)
+    )
+    decoded_primary = decode_tensor(
+        packed_primary,
+        output_tensor=primary_output,
         output_layout="BHSD",
         use_triton=codec.config.use_triton,
         strict_triton=codec.config.strict_triton,
     )
     decode_tensor(
-        v_cache,
-        source=decoded_key,
-        output_tensor=value,
+        packed_secondary,
+        source=decoded_primary,
+        output_tensor=secondary_output,
         output_layout="BHSD",
         use_triton=codec.config.use_triton,
         strict_triton=codec.config.strict_triton,
@@ -408,20 +422,31 @@ def encode_kv_cache(
                 value = value.to(target_device)
             key = key.contiguous()
             value = value.contiguous()
-            packed_key, reconstructed_key = codec.encode_key(
-                key, layer=int(layer_id), reuse_input=True
+            # Encode by codec role: the primary tensor is predicted from its
+            # own temporal history and the secondary one from the primary's
+            # reconstruction.  Forward is K then V; the mirrored direction is
+            # V then K through this same call pair.
+            mirrored = codec.config.mirrored
+            primary, secondary = (value, key) if mirrored else (key, value)
+            packed_primary, reconstructed_primary = codec.encode_primary(
+                primary, layer=int(layer_id), reuse_input=True
             )
-            packed_value = codec.encode_value(
-                value,
-                reconstructed_key,
+            packed_secondary = codec.encode_secondary(
+                secondary,
+                reconstructed_primary,
                 layer=int(layer_id),
                 reuse_input=True,
+            )
+            packed_key, packed_value = (
+                (packed_secondary, packed_primary)
+                if mirrored
+                else (packed_primary, packed_secondary)
             )
             if storage_device is not None:
                 packed_key = move_packed_tensor(packed_key, storage_device)
                 packed_value = move_packed_tensor(packed_value, storage_device)
             encoded[int(layer_id)] = (packed_key, packed_value)
-            del key, value, reconstructed_key
+            del key, value, reconstructed_primary
     storage_bytes = sum(
         packed.storage_bytes()
         for pair in encoded.values()

@@ -81,6 +81,13 @@ class CodecConfig:
     # retained for positional compatibility and resolves to layer_shared for
     # legacy.
     cross_kv_weight_mode: str | None = None
+    # Which tensor carries the cross dependency.  ``k_to_v`` is the production
+    # design: K is predicted from its own temporal history and V is predicted
+    # from the reconstructed K of the same span.  ``v_to_k`` mirrors it so V
+    # leads and K is projected from the reconstructed V, which exists to test
+    # the direction rather than to assume it.  The codec math is identical
+    # under the swap, so the mirror is a role exchange and not a second codec.
+    predictor_direction: str = "k_to_v"
 
     def __post_init__(self) -> None:
         # Resolve the remaining legacy defaults after the dataclass has kept
@@ -189,6 +196,23 @@ class CodecConfig:
                 "cross_kv_weight_mode must be layer_head, layer_shared, "
                 "head_shared, or shared"
             )
+        if self.predictor_direction not in {"k_to_v", "v_to_k"}:
+            raise ValueError("predictor_direction must be k_to_v or v_to_k")
+        if self.predictor_direction == "v_to_k":
+            # The mirror only means something when there is a cross term to
+            # point the other way; every other V mode ignores the source
+            # tensor entirely, so the flag would silently do nothing.
+            if self.v_predictor_mode != "cross_kv":
+                raise ValueError(
+                    "predictor_direction=v_to_k requires v_predictor_mode=cross_kv"
+                )
+            # The two tensors exchange roles wholesale, so unequal widths would
+            # move bits between them and confound the direction comparison.
+            if self.k_bits != self.v_bits:
+                raise ValueError(
+                    "predictor_direction=v_to_k requires k_bits == v_bits so the "
+                    "role exchange does not also reallocate bit width"
+                )
         # The temporal V predictor reads only its own reconstructed history, so
         # with no history it has nothing to predict from.  Say so here; both
         # fitters would otherwise fail on a zero-length parameter axis.
@@ -271,6 +295,21 @@ class CodecConfig:
                     "legacy fitting requires bfloat16 scales and reconstruction"
                 )
 
+    @property
+    def primary_tensor(self) -> str:
+        """The tensor predicted from its own temporal history, "k" or "v"."""
+        return "v" if self.predictor_direction == "v_to_k" else "k"
+
+    @property
+    def secondary_tensor(self) -> str:
+        """The tensor predicted from the reconstructed primary tensor."""
+        return "k" if self.predictor_direction == "v_to_k" else "v"
+
+    @property
+    def mirrored(self) -> bool:
+        """Whether K and V exchange roles relative to the production design."""
+        return self.predictor_direction == "v_to_k"
+
     def format_signature(self) -> str:
         """Return a stable identity for settings used during fitting."""
         payload = {
@@ -298,6 +337,11 @@ class CodecConfig:
         # fitted before this experiment switch existed.
         if self.cross_kv_weight_mode != "layer_head":
             payload["cross_kv_weight_mode"] = self.cross_kv_weight_mode
+        # Same reasoning: the production direction is omitted so every existing
+        # parameter archive keeps its signature, while a mirrored set can never
+        # be loaded into a forward-direction runtime.
+        if self.predictor_direction != "k_to_v":
+            payload["predictor_direction"] = self.predictor_direction
         return "tempokv-codec-v5:" + json.dumps(
             payload, sort_keys=True, separators=(",", ":")
         )

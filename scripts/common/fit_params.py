@@ -121,6 +121,15 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("cross_kv", "temporal", "innovation"),
     )
     parser.add_argument(
+        "--predictor-direction",
+        choices=("k_to_v", "v_to_k"),
+        help=(
+            "which tensor carries the cross dependency: k_to_v predicts V from "
+            "reconstructed K (production), v_to_k mirrors the roles so K is "
+            "projected from reconstructed V"
+        ),
+    )
+    parser.add_argument(
         "--attention-steps",
         type=int,
         help="maximum Adam steps per phase; any positive value enables refinement",
@@ -788,19 +797,27 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
     output_dir = args.output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
-    temporal_path = output_dir / "k_temporal.npz"
-    # The V file name states its structure, so a temporal V parameter set can
-    # never be mistaken for a CrossKV one on disk.
+    # The file names state which tensor each parameter set describes and how
+    # it is predicted, so a mirrored set can never be mistaken on disk for a
+    # production one.  Under v_to_k the temporal parameters describe V and the
+    # projection parameters describe K, which is the reverse of every other
+    # configuration.
     temporal_v = config.v_predictor_mode in {"temporal", "direct"}
-    v_artifact_stem = {
-        "temporal": "v_temporal",
-        "cross_kv": "v_cross_kv",
-        "innovation": "v_innovation",
-        # Direct V keeps an empty temporal map, so it shares the temporal file.
-        "direct": "v_temporal",
-    }[config.v_predictor_mode]
+    if config.predictor_direction == "v_to_k":
+        temporal_stem = "v_temporal_primary"
+        v_artifact_stem = "k_cross_from_v"
+    else:
+        temporal_stem = "k_temporal"
+        v_artifact_stem = {
+            "temporal": "v_temporal",
+            "cross_kv": "v_cross_kv",
+            "innovation": "v_innovation",
+            # Direct V keeps an empty temporal map, so it shares the temporal file.
+            "direct": "v_temporal",
+        }[config.v_predictor_mode]
+    temporal_path = output_dir / f"{temporal_stem}.npz"
     cross_path = output_dir / f"{v_artifact_stem}.npz"
-    ls_temporal_path = output_dir / "k_temporal_ls.npz"
+    ls_temporal_path = output_dir / f"{temporal_stem}_ls.npz"
     ls_cross_path = output_dir / f"{v_artifact_stem}_ls.npz"
     report_path = output_dir / "fit_report.json"
     parameter_tensors = (
@@ -979,11 +996,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "cross_weight_sharing": cross_weight_sharing,
         },
         "artifacts": {
-            "k_temporal": temporal_path.name,
+            temporal_stem: temporal_path.name,
             v_artifact_stem: cross_path.name,
             **(
                 {
-                    "k_temporal_ls": ls_temporal_path.name,
+                    f"{temporal_stem}_ls": ls_temporal_path.name,
                     f"{v_artifact_stem}_ls": ls_cross_path.name,
                 }
                 if refinement is not None

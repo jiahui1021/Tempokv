@@ -364,14 +364,28 @@ class CausalWanSelfAttention(nn.Module):
             # attention window: [sink] ∪ [recent].  The whole range is rotated at
             # absolute frame positions before slicing, so a gapped window keeps
             # each side on its own absolute RoPE timeline.
-            k_all = kv_cache["k"].read(0, local_end_index)
-            # CrossKV consumes reconstructed K before RoPE.  Decode V while
-            # that tensor is still cache-hot; rotating K first streams over a
-            # second full-span tensor and needlessly evicts the Cross source.
-            v_all = kv_cache["v"].read(
+            # The cross projection consumes the reconstructed primary tensor
+            # before RoPE, so decode the dependent tensor while that one is
+            # still cache-hot; rotating K first streams over a second full-span
+            # tensor and needlessly evicts the projection source.  Which slot
+            # leads follows the codec direction the bridge stamped on the cache,
+            # and defaults to the production K->V order for every other path.
+            direction = getattr(
+                kv_cache["k"], "tempokv_predictor_direction", "k_to_v"
+            )
+            primary_role, secondary_role = (
+                ("v", "k") if direction == "v_to_k" else ("k", "v")
+            )
+            primary_all = kv_cache[primary_role].read(0, local_end_index)
+            secondary_all = kv_cache[secondary_role].read(
                 0,
                 local_end_index,
-                source_tensor=k_all,
+                source_tensor=primary_all,
+            )
+            k_all, v_all = (
+                (secondary_all, primary_all)
+                if direction == "v_to_k"
+                else (primary_all, secondary_all)
             )
             absolute_k = causal_rope_apply_long_input(
                 k_all,

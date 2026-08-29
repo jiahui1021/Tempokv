@@ -2405,13 +2405,26 @@ def fit_predictors(
     coordinate_system: str | None = None,
     fit_history_source: str = "reconstructed",
 ) -> tuple[TemporalParameters, CrossKVParameters]:
-    """Fit deployable K and V predictors from reconstructed or clean history.
+    """Fit deployable predictors from reconstructed or clean history.
 
     The trace is scanned for non-finite values once here; everything below
     derives from it, so the per-layer and per-iteration fits skip the repeat
     scans, which are otherwise a sizeable share of the total runtime.
+
+    Under ``predictor_direction="v_to_k"`` the two tensors exchange roles: V is
+    predicted from its own temporal history and K is projected from the
+    reconstructed V.  The codec equations do not mention K or V anywhere, so
+    the mirror is applied by handing the fitter the pair in the other order
+    rather than by maintaining a second set of equations.  The returned
+    ``TemporalParameters`` therefore always describe the primary tensor and the
+    returned ``CrossKVParameters`` the secondary one; the direction is stamped
+    into the codec signature, so a mirrored set cannot load into a forward
+    runtime.
     """
     _check_pair(keys, values, minimum_dimensions=4, layout="[L, ..., T, H, D]")
+    resolved = config if config is not None else CodecConfig()
+    if resolved.mirrored:
+        keys, values = values, keys
     with _assume_finite():
         return _fit_predictors(
             keys,

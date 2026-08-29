@@ -328,14 +328,30 @@ class CausalWanSelfAttention(nn.Module):
                     attention_start = max(
                         0, local_end_index - self.local_attn_size * frame_seqlen
                     )
-                k_all = kv_cache["k"].read(attention_start, local_end_index)
-                # CrossKV consumes reconstructed K before RoPE.  Decode V
-                # immediately so the source remains cache-hot across the two
-                # cache reads; attention still sees the same rotated K below.
-                v_all = kv_cache["v"].read(
+                # The cross projection consumes the reconstructed primary
+                # tensor before RoPE.  Decode the dependent tensor immediately
+                # so the source stays cache-hot across the two reads; attention
+                # still sees the same rotated K below.  Which slot leads
+                # follows the codec direction stamped on the cache, and
+                # defaults to the production K->V order everywhere else.
+                direction = getattr(
+                    kv_cache["k"], "tempokv_predictor_direction", "k_to_v"
+                )
+                primary_role, secondary_role = (
+                    ("v", "k") if direction == "v_to_k" else ("k", "v")
+                )
+                primary_all = kv_cache[primary_role].read(
+                    attention_start, local_end_index
+                )
+                secondary_all = kv_cache[secondary_role].read(
                     attention_start,
                     local_end_index,
-                    source_tensor=k_all,
+                    source_tensor=primary_all,
+                )
+                k_all, v_all = (
+                    (secondary_all, primary_all)
+                    if direction == "v_to_k"
+                    else (primary_all, secondary_all)
                 )
                 absolute_k = apply_rope_by_span(
                     k_all,

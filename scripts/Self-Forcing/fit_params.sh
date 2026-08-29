@@ -3,7 +3,8 @@
 # fit_params.sh — 只拟合 TempoKV 参数（读 trace，不采集、不合并）
 #
 # 读取 <TRACE_FILE>（collect_trace.sh 采集并合并出的 self_forcing_trace.npz），
-# 调用 scripts/common/fit_params.py 拟合 k_temporal.npz 与对应的 V 参数文件。每个
+# 调用 scripts/common/fit_params.py 拟合 temporal 参数与对应的投影参数文件（文件名
+# 取决于 V_PREDICTOR 与 DIRECTION，见下方 k_artifact_name / v_artifact_name）。每个
 # k_history_length / v_history_length 配置拟合一套专属参数，用
 # --k-history-length / --v-history-length 显式指定，用不同 --output-dir 区分。
 #
@@ -70,15 +71,31 @@ if [[ -n "${V_PREDICTOR:-}" ]]; then
   esac
   v_predictor_mode="$V_PREDICTOR"
 fi
-case "$v_predictor_mode" in
-  # Direct V has no predictor; its empty temporal map shares the temporal layout.
-  temporal|direct) v_artifact_name="v_temporal.npz" ;;
-  innovation) v_artifact_name="v_innovation.npz" ;;
-  cross_kv) v_artifact_name="v_cross_kv.npz" ;;
-  # Keep command-only dry runs usable with PYTHON_BIN=/bin/echo; the Python
-  # fitter performs authoritative config validation in real runs.
-  *) v_artifact_name="v_cross_kv.npz" ;;
+# DIRECTION mirrors the K/V roles: v_to_k predicts K from the reconstructed V
+# instead of the other way round.  The artifacts are named for the role each
+# parameter set plays, so the two directions cannot be confused on disk.
+predictor_direction="${DIRECTION:-k_to_v}"
+case "$predictor_direction" in
+  k_to_v|v_to_k) ;;
+  *) die "DIRECTION 必须是 k_to_v 或 v_to_k（当前值：${predictor_direction}）" ;;
 esac
+if [[ "$predictor_direction" == "v_to_k" ]]; then
+  [[ "$v_predictor_mode" == "cross_kv" ]] \
+    || die "DIRECTION=v_to_k 需要 V_PREDICTOR=cross_kv（当前值：${v_predictor_mode}）"
+  k_artifact_name="v_temporal_primary.npz"
+  v_artifact_name="k_cross_from_v.npz"
+else
+  k_artifact_name="k_temporal.npz"
+  case "$v_predictor_mode" in
+    # Direct V has no predictor; its empty temporal map shares the temporal layout.
+    temporal|direct) v_artifact_name="v_temporal.npz" ;;
+    innovation) v_artifact_name="v_innovation.npz" ;;
+    cross_kv) v_artifact_name="v_cross_kv.npz" ;;
+    # Keep command-only dry runs usable with PYTHON_BIN=/bin/echo; the Python
+    # fitter performs authoritative config validation in real runs.
+    *) v_artifact_name="v_cross_kv.npz" ;;
+  esac
+fi
 
 if [[ "$output_dir" == "/" ]]; then
   die "OUTPUT_DIR 不能是文件系统根目录"
@@ -164,6 +181,7 @@ fi
 [[ -n "${K_BITS:-}" ]] && fit_command+=(--k-bits "$K_BITS")
 [[ -n "${V_BITS:-}" ]] && fit_command+=(--v-bits "$V_BITS")
 [[ -n "${V_PREDICTOR:-}" ]] && fit_command+=(--v-predictor-mode "$V_PREDICTOR")
+[[ -n "${DIRECTION:-}" ]] && fit_command+=(--predictor-direction "$predictor_direction")
 [[ -n "${SPAN_FRAMES:-}" ]] && fit_command+=(--span-frames "$SPAN_FRAMES")
 
 if [[ "$DRY_RUN" == "1" ]]; then
@@ -178,7 +196,7 @@ fi
 [[ -f "$trace_file" ]] || die "TRACE_FILE 不存在：$trace_file"
 
 if [[ "$OVERWRITE" != "1" ]]; then
-  for artifact in "$output_dir/k_temporal.npz" "$output_dir/$v_artifact_name"; do
+  for artifact in "$output_dir/$k_artifact_name" "$output_dir/$v_artifact_name"; do
     if [[ -e "$artifact" ]]; then
       die "已存在参数：${artifact}。设置 OVERWRITE=1 覆盖，或换一个 OUTPUT_DIR。"
     fi
@@ -190,9 +208,9 @@ mkdir -p -- "$output_dir"
 printf '\n[2/2] 拟合 TempoKV 参数 ...\n'
 "${fit_command[@]}"
 
-for artifact in "$output_dir/k_temporal.npz" "$output_dir/$v_artifact_name"; do
+for artifact in "$output_dir/$k_artifact_name" "$output_dir/$v_artifact_name"; do
   [[ -s "$artifact" ]] || die "拟合后未生成参数文件：$artifact"
 done
 
 printf '\n完成。参数已写入：\n  %s\n  %s\n' \
-  "$output_dir/k_temporal.npz" "$output_dir/$v_artifact_name"
+  "$output_dir/$k_artifact_name" "$output_dir/$v_artifact_name"

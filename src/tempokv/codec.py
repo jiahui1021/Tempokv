@@ -123,13 +123,29 @@ class PackedKV:
     key: PackedTensor
     value: PackedTensor
 
+    # Exactly one side carries the cross dependency, and which side that is
+    # depends on ``predictor_direction``: forward runs K temporal / V cross,
+    # mirrored runs V temporal / K cross.  Both orientations are accepted here
+    # and the pair is rejected only when neither side predicts temporally,
+    # which would leave the cross source undefined.
+    _SOURCE_KINDS = {"cross_kv", "innovation"}
+
     def __post_init__(self) -> None:
-        if self.key.predictor_kind != "temporal":
-            raise ValueError("PackedKV key must use temporal prediction")
-        if self.value.predictor_kind not in {"cross_kv", "temporal", "innovation"}:
-            raise ValueError(
-                "PackedKV value must use CrossKV, temporal, or innovation prediction"
-            )
+        kinds = (self.key.predictor_kind, self.value.predictor_kind)
+        if self.key.predictor_kind in self._SOURCE_KINDS:
+            if self.value.predictor_kind != "temporal":
+                raise ValueError(
+                    "a CrossKV-predicted K needs a temporally predicted V to "
+                    f"project from, got {kinds}"
+                )
+        elif self.value.predictor_kind in self._SOURCE_KINDS:
+            if self.key.predictor_kind != "temporal":
+                raise ValueError(
+                    "a CrossKV-predicted V needs a temporally predicted K to "
+                    f"project from, got {kinds}"
+                )
+        elif not set(kinds) <= {"temporal", "direct"}:
+            raise ValueError(f"unsupported PackedKV predictor pair {kinds}")
         if self.key.shape != self.value.shape:
             raise ValueError("packed K and V must have the same shape")
         if self.key.reconstruction_dtype != self.value.reconstruction_dtype:
@@ -1122,6 +1138,44 @@ class TempoKVCodec:
         )
 
     @property
+    def primary_role(self) -> str:
+        """Cache slot encoded first, whose reconstruction feeds the other."""
+        return self.config.primary_tensor
+
+    @property
+    def secondary_role(self) -> str:
+        """Cache slot encoded second, from the reconstructed primary tensor."""
+        return self.config.secondary_tensor
+
+    def encode_primary(
+        self,
+        tensor: torch.Tensor,
+        *,
+        layer: int = 0,
+        reuse_input: bool = False,
+    ) -> tuple[PackedTensor, torch.Tensor]:
+        """Encode the temporally predicted tensor and return its reconstruction.
+
+        Callers address the cache by role rather than by name so a runtime does
+        not have to know which direction it is running; ``primary_role`` says
+        which slot to read.
+        """
+        return self.encode_key(tensor, layer=layer, reuse_input=reuse_input)
+
+    def encode_secondary(
+        self,
+        tensor: torch.Tensor,
+        reconstructed_primary: torch.Tensor | None,
+        *,
+        layer: int = 0,
+        reuse_input: bool = False,
+    ) -> PackedTensor:
+        """Encode the tensor that is predicted from the reconstructed primary."""
+        return self.encode_value(
+            tensor, reconstructed_primary, layer=layer, reuse_input=reuse_input
+        )
+
+    @property
     def cross_kv(self) -> CrossKVParameters:
         """The CrossKV parameters, when this codec predicts V from K."""
         parameters = self.v_parameters
@@ -1192,9 +1246,19 @@ class TempoKVCodec:
             raise ValueError("K and V must have the same shape")
         if key.device != value.device:
             raise ValueError("K and V must be on the same device")
-        key_state, key_rebuilt = self.encode_key(key, layer=layer)
-        value_state = self.encode_value(value, key_rebuilt, layer=layer)
-        return PackedKV(key_state, value_state)
+        # Under the mirrored direction V leads and K is projected from it, so
+        # address the pair by role and put the results back under their own
+        # names.
+        primary, secondary = (
+            (value, key) if self.config.mirrored else (key, value)
+        )
+        primary_state, primary_rebuilt = self.encode_primary(primary, layer=layer)
+        secondary_state = self.encode_secondary(
+            secondary, primary_rebuilt, layer=layer
+        )
+        if self.config.mirrored:
+            return PackedKV(secondary_state, primary_state)
+        return PackedKV(primary_state, secondary_state)
 
     def decode(
         self, packed: PackedKV, *, output_dtype: torch.dtype | None = None

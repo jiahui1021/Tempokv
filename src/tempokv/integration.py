@@ -84,6 +84,14 @@ def load_codec(
     one committed config can serve every bit width instead of needing a second
     file per combination.  The override participates in the codec signature, so
     a mismatched parameter directory still fails the check below.
+
+    The two parameter arguments are positional by *role*, not by tensor name:
+    the first holds the temporal predictor and the second the cross projection.
+    Under ``predictor_direction="v_to_k"`` those describe V and K respectively,
+    so the caller passes the mirrored artifacts in the same order.  The
+    direction is part of the codec signature, so passing a forward parameter
+    set to a mirrored config is rejected here rather than silently running the
+    wrong predictor.
     """
     with Path(config_path).open("r", encoding="utf-8") as handle:
         payload = json.load(handle)
