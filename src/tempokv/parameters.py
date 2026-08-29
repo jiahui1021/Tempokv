@@ -2,10 +2,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 import torch
+
+
+ProjectionSource = Literal["cross_kv", "innovation"]
 
 
 def _tensor(value: torch.Tensor | np.ndarray) -> torch.Tensor:
@@ -218,7 +221,7 @@ class TemporalParameters:
 
 @dataclass(frozen=True, slots=True)
 class CrossKVParameters:
-    """Per-head K/current-V-history projection parameters."""
+    """Per-head source/current-V-history projection parameters."""
 
     weight: torch.Tensor
     bias: torch.Tensor
@@ -228,6 +231,8 @@ class CrossKVParameters:
     parameter_set_id: str | None = None
     coordinate_system: str | None = None
     history_weights: torch.Tensor | np.ndarray | None = None
+    # Old archives predate this field and always project reconstructed K.
+    projection_source: ProjectionSource = "cross_kv"
 
     def __post_init__(self) -> None:
         weight = _tensor(self.weight)
@@ -321,6 +326,8 @@ class CrossKVParameters:
             raise ValueError("parameter_set_id must be non-empty")
         if self.coordinate_system is not None and not str(self.coordinate_system):
             raise ValueError("coordinate_system must be non-empty")
+        if self.projection_source not in {"cross_kv", "innovation"}:
+            raise ValueError("projection_source must be cross_kv or innovation")
 
     @property
     def layered(self) -> bool:
@@ -371,6 +378,7 @@ class CrossKVParameters:
             parameter_set_id=self.parameter_set_id,
             coordinate_system=self.coordinate_system,
             history_weights=self.history_weights[index],
+            projection_source=self.projection_source,
         )
 
     def to(self, device: torch.device | str) -> "CrossKVParameters":
@@ -390,6 +398,7 @@ class CrossKVParameters:
             self.parameter_set_id,
             self.coordinate_system,
             self.history_weights.to(resolved_device),
+            self.projection_source,
         )
 
     def save(self, path: str | Path) -> None:
@@ -410,6 +419,7 @@ class CrossKVParameters:
             codec_signature=np.asarray(self.codec_signature or ""),
             parameter_set_id=np.asarray(self.parameter_set_id or ""),
             coordinate_system=np.asarray(self.coordinate_system or ""),
+            projection_source=np.asarray(self.projection_source),
         )
 
     @classmethod
@@ -450,6 +460,11 @@ class CrossKVParameters:
                 if "history_mode" in data
                 else None
             )
+            projection_source = (
+                str(np.asarray(data["projection_source"]).item())
+                if "projection_source" in data
+                else "cross_kv"
+            )
             # Name the withdrawn shared-history layout explicitly: its history
             # weights are [H,D], so the constructor would otherwise reject them
             # as a malformed diagonal map instead of asking for a refit.
@@ -467,6 +482,7 @@ class CrossKVParameters:
                 parameter_set_id,
                 coordinate_system,
                 history_weights,
+                projection_source,
             )
             if declared_history_mode is not None:
                 if declared_history_mode != parameters.history_mode:

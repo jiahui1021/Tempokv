@@ -18,7 +18,7 @@ from .runtime import configure_triton_cache
 
 def check_parameters_match_config(
     temporal: TemporalParameters,
-    cross_kv: CrossKVParameters,
+    cross_kv: CrossKVParameters | TemporalParameters,
     config: CodecConfig,
 ) -> None:
     """Refuse parameters that were fitted for a different codec configuration.
@@ -58,6 +58,16 @@ def check_parameters_match_config(
             "K and V parameters use different coordinate systems: "
             f"{temporal.coordinate_system!r} vs {cross_kv.coordinate_system!r}"
         )
+    if isinstance(cross_kv, CrossKVParameters):
+        expected_source = (
+            "innovation" if config.v_predictor_mode == "innovation" else "cross_kv"
+        )
+        if cross_kv.projection_source != expected_source:
+            raise ValueError(
+                f"v_predictor_mode={config.v_predictor_mode} requires V "
+                f"projection_source={expected_source}, got "
+                f"{cross_kv.projection_source}"
+            )
 
 
 def load_codec(

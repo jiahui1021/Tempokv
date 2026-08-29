@@ -77,8 +77,11 @@ def build_parser() -> argparse.ArgumentParser:
     # instead of one committed config per combination.
     parser.add_argument(
         "--v-predictor-mode",
-        choices=("cross_kv", "temporal"),
-        help="predict V from reconstructed K (cross_kv) or from its own history",
+        choices=("cross_kv", "temporal", "innovation"),
+        help=(
+            "predict V from reconstructed K (cross_kv), its own history "
+            "(temporal), or decoder-visible K innovation plus V history"
+        ),
     )
     parser.add_argument("--k-bits", type=int, choices=(2, 4, 8))
     parser.add_argument("--v-bits", type=int, choices=(2, 4, 8))
@@ -271,13 +274,18 @@ def _validate_parameters(
             )
     elif tuple(cross.weight.shape[-3:]) != (12, 128, 128):
         raise ValueError("V parameters must contain 12 heads with 128x128 weights")
+    elif cross.projection_source != config.v_predictor_mode:
+        raise ValueError(
+            "V parameter projection source does not match v_predictor_mode: "
+            f"{cross.projection_source!r} vs {config.v_predictor_mode!r}"
+        )
     elif config.v_history_length:
         expected_v_history_shape = (30, config.v_history_length, 12, 128)
         if tuple(cross.history_weights.shape) != expected_v_history_shape:
             raise ValueError(
                 "Self-Forcing requires fast diagonal V history parameters matching "
                 "30 layers, the configured history length, 12 heads, and dimension "
-                "128; refit v_cross_kv.npz with the current fitter"
+                "128; refit the selected V parameter artifact with the current fitter"
             )
     parameter_tensors = (
         (
@@ -320,6 +328,9 @@ def _validate_parameters(
             False
             if temporal_v
             else cross.history_diagonal
+        ),
+        "v_projection_source": (
+            "temporal" if temporal_v else cross.projection_source
         ),
         "predictor_parameter_bytes": predictor_parameter_bytes,
         "predictor_parameter_mib": predictor_parameter_bytes / (1024**2),
@@ -880,7 +891,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             )
             if value is not None
         }
-        if overrides.get("v_predictor_mode") == "temporal":
+        if overrides.get("v_predictor_mode") in {"temporal", "innovation"}:
             overrides["cross_kv_weight_mode"] = "layer_shared"
         if overrides:
             config = replace(config, **overrides)
@@ -937,7 +948,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             # launch batch where the reference implementation does.
             "v": (
                 min(requested_persistent_units, 8)
-                if config.v_predictor_mode == "cross_kv"
+                if config.v_predictor_mode != "temporal"
                 else requested_persistent_units
             ),
             "v_backend": "triton",
@@ -1071,11 +1082,11 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             if config.k_predictor_mode == "direct"
             else "temporal_persistent_direct"
         )
-        v_route = (
-            "temporal_persistent_direct"
-            if config.v_predictor_mode == "temporal"
-            else "cross_kv_persistent_direct"
-        )
+        v_route = {
+            "temporal": "temporal_persistent_direct",
+            "cross_kv": "cross_kv_persistent_direct",
+            "innovation": "innovation_persistent_direct",
+        }[config.v_predictor_mode]
         required_routes = (k_route,) if k_route == v_route else (k_route, v_route)
         missing_routes = [
             route

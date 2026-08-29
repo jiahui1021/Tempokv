@@ -10,6 +10,9 @@ htmlcov/
 
 # Local verification files
 /tests/
+# Figure-generation artifacts are intentionally kept under tests/ and excluded from commits.
+/tests/figures/
+/tests/visual-composer/
 .planning/
 
 # Build and packaging output

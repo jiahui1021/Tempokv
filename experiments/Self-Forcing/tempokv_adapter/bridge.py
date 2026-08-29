@@ -115,7 +115,7 @@ def install(runtime_root: str | Path) -> type:
             ):
                 raise ValueError(
                     "Self-Forcing requires fast diagonal V history parameters; "
-                    "refit v_cross_kv.npz with the current fitter"
+                    "refit the selected V parameter artifact with the current fitter"
                 )
             if getattr(self.quant_config, "kv_cache_cpu_offload", False):
                 raise ValueError("TempoKV Self-Forcing bridge does not support cache offload")

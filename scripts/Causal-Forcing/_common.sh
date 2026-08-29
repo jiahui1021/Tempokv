@@ -150,7 +150,16 @@ k_label = f"kh{int(k_history)}"
 v_predictor = sys.argv[7] or config.get(
     "v_predictor_mode", DEFAULT_V_PREDICTOR_MODE
 )
-v_prefix = "vt" if v_predictor == "temporal" else "vh"
+v_prefix = {
+    "cross_kv": "vh",
+    "temporal": "vt",
+    "innovation": "vi",
+}.get(v_predictor)
+if v_prefix is None:
+    raise SystemExit(
+        "V_PREDICTOR must be cross_kv, temporal, or innovation, got "
+        f"{v_predictor!r}"
+    )
 v_label = f"{v_prefix}{int(v_history)}"
 cross_weight_mode = config.get("cross_kv_weight_mode", "layer_shared")
 if cross_weight_mode != "layer_shared":

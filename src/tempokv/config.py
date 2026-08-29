@@ -69,7 +69,8 @@ class CodecConfig:
     k_predictor_mode: str | None = None
     # ``temporal`` predicts V from its own reconstructed history with the same
     # predictor K uses, so V needs no reconstructed K and no CrossKV matrix.
-    # ``cross_kv`` keeps the Cross(K) projection.
+    # ``cross_kv`` keeps the Cross(K) projection. ``innovation`` projects the
+    # decoder-visible K temporal innovation and optionally adds V history.
     v_predictor_mode: str = "cross_kv"
     # Select the legacy fixed-point/shared-K and direct temporal-V fitting math.
     fit_mode: str | None = None
@@ -162,8 +163,10 @@ class CodecConfig:
             raise ValueError(
                 "k_history_length=0 requires k_predictor_mode=direct"
             )
-        if self.v_predictor_mode not in {"cross_kv", "temporal"}:
-            raise ValueError("v_predictor_mode must be cross_kv or temporal")
+        if self.v_predictor_mode not in {"cross_kv", "temporal", "innovation"}:
+            raise ValueError(
+                "v_predictor_mode must be cross_kv, temporal, or innovation"
+            )
         if self.cross_kv_weight_mode not in {
             "layer_head",
             "layer_shared",
@@ -181,6 +184,18 @@ class CodecConfig:
             raise ValueError(
                 "v_predictor_mode=temporal needs v_history_length >= 1"
             )
+        if self.v_predictor_mode == "innovation":
+            if self.fit_mode != "legacy":
+                raise ValueError("v_predictor_mode=innovation requires fit_mode=legacy")
+            if self.k_predictor_mode != "shared":
+                raise ValueError(
+                    "v_predictor_mode=innovation requires k_predictor_mode=shared"
+                )
+            if self.cross_kv_weight_mode != "layer_shared":
+                raise ValueError(
+                    "v_predictor_mode=innovation requires "
+                    "cross_kv_weight_mode=layer_shared"
+                )
         if (
             self.fit_mode == "legacy"
             and self.v_predictor_mode == "temporal"

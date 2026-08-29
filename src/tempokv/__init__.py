@@ -6,6 +6,7 @@ from .codec import (
     TempoKVCodec,
     decode_tensor,
     encode_cross_kv,
+    encode_innovation,
     encode_temporal,
 )
 
@@ -34,6 +35,7 @@ __all__ = [
     "TemporalParameters",
     "decode_tensor",
     "encode_cross_kv",
+    "encode_innovation",
     "encode_temporal",
     "fit_cross_kv",
     "fit_closed_loop",

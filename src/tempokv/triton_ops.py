@@ -732,7 +732,7 @@ def _supported(packed: "PackedTensor", source: torch.Tensor | None) -> bool:
         return False
     if packed.bits not in (2, 4, 8) or packed.anchor_bits not in (2, 4, 8):
         return False
-    if packed.predictor_kind == "cross_kv":
+    if packed.predictor_kind in {"cross_kv", "innovation"}:
         return source is not None and source.is_cuda and packed.cross_kv is not None
     return packed.temporal is not None
 
@@ -1097,5 +1097,10 @@ def decode(
                 cross_block_d,
                 block_k,
             )
-    _record(_route_name("cross_kv_persistent", direct_output_layout))
+    route = (
+        "innovation_persistent"
+        if packed.predictor_kind == "innovation"
+        else "cross_kv_persistent"
+    )
+    _record(_route_name(route, direct_output_layout))
     return _logical_bhsd_output(output, direct_output_layout)

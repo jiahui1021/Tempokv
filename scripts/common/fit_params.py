@@ -116,7 +116,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--k-predictor-mode", choices=("shared", "direct")
     )
-    parser.add_argument("--v-predictor-mode", choices=("cross_kv", "temporal"))
+    parser.add_argument(
+        "--v-predictor-mode",
+        choices=("cross_kv", "temporal", "innovation"),
+    )
     parser.add_argument(
         "--attention-steps",
         type=int,
@@ -221,7 +224,7 @@ def _codec_config(args: argparse.Namespace) -> CodecConfig:
             values[name] = override
     # CrossKV sharing is irrelevant when V predicts from its own history, but
     # keep the single repository-wide mode in the resolved identity.
-    if values.get("v_predictor_mode") == "temporal":
+    if values.get("v_predictor_mode") in {"temporal", "innovation"}:
         values["cross_kv_weight_mode"] = "layer_shared"
     try:
         config = config_from_mapping(values)
@@ -482,6 +485,7 @@ def _pad_cross_history(
         parameters.layer_ids,
         coordinate_system=parameters.coordinate_system,
         history_weights=padded,
+        projection_source=parameters.projection_source,
     )
 
 
@@ -540,12 +544,18 @@ def _bind_requested_config(
             parameter_set_id,
             coordinate_system,
             value_parameters.history_weights,
+            value_parameters.projection_source,
         )
     return rebound_temporal, rebound_value
 
 
 def run(args: argparse.Namespace) -> dict[str, Any]:
     config = _codec_config(args)
+    if config.v_predictor_mode == "innovation" and args.attention_steps is not None:
+        raise ValueError(
+            "attention refinement does not support v_predictor_mode=innovation; "
+            "fit innovation parameters without --attention-steps"
+        )
     temporal_ridge = (
         1.0
         if args.temporal_ridge is None and config.fit_mode == "legacy"
@@ -782,11 +792,14 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     # The V file name states its structure, so a temporal V parameter set can
     # never be mistaken for a CrossKV one on disk.
     temporal_v = config.v_predictor_mode == "temporal"
-    cross_path = output_dir / ("v_temporal.npz" if temporal_v else "v_cross_kv.npz")
+    v_artifact_stem = {
+        "temporal": "v_temporal",
+        "cross_kv": "v_cross_kv",
+        "innovation": "v_innovation",
+    }[config.v_predictor_mode]
+    cross_path = output_dir / f"{v_artifact_stem}.npz"
     ls_temporal_path = output_dir / "k_temporal_ls.npz"
-    ls_cross_path = output_dir / (
-        "v_temporal_ls.npz" if temporal_v else "v_cross_kv_ls.npz"
-    )
+    ls_cross_path = output_dir / f"{v_artifact_stem}_ls.npz"
     report_path = output_dir / "fit_report.json"
     parameter_tensors = (
         (temporal.history_weights, temporal.history_bias,
@@ -893,6 +906,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 if config.v_predictor_mode == "cross_kv"
                 else None
             ),
+            "innovation_k_input": (
+                args.fit_history_source
+                if config.v_predictor_mode == "innovation"
+                else None
+            ),
             "temporal_ridge": float(temporal_ridge),
             "cross_ridge": float(cross_ridge),
             "v_history_ridge": float(v_history_ridge),
@@ -935,9 +953,21 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 }
                 if temporal_v
                 else {
-                    "cross_weight_shape": list(cross.weight.shape),
-                    "cross_history_weight_shape": list(cross.history_weights.shape),
-                    "cross_bias_shape": list(cross.bias.shape),
+                    (
+                        "innovation_weight_shape"
+                        if config.v_predictor_mode == "innovation"
+                        else "cross_weight_shape"
+                    ): list(cross.weight.shape),
+                    (
+                        "innovation_history_weight_shape"
+                        if config.v_predictor_mode == "innovation"
+                        else "cross_history_weight_shape"
+                    ): list(cross.history_weights.shape),
+                    (
+                        "innovation_bias_shape"
+                        if config.v_predictor_mode == "innovation"
+                        else "cross_bias_shape"
+                    ): list(cross.bias.shape),
                 }
             ),
             "bytes": parameter_bytes,
@@ -948,13 +978,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         },
         "artifacts": {
             "k_temporal": temporal_path.name,
-            "v_temporal" if temporal_v else "v_cross_kv": cross_path.name,
+            v_artifact_stem: cross_path.name,
             **(
                 {
                     "k_temporal_ls": ls_temporal_path.name,
-                    (
-                        "v_temporal_ls" if temporal_v else "v_cross_kv_ls"
-                    ): ls_cross_path.name,
+                    f"{v_artifact_stem}_ls": ls_cross_path.name,
                 }
                 if refinement is not None
                 else {}

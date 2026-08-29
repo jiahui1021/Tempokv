@@ -336,6 +336,8 @@ def refine_attention(
     inside the same rollout and parameter protocol.  Candidate selection and
     guardrails use the same normalized objective weights as training.
     """
+    if config.v_predictor_mode == "innovation":
+        raise ValueError("attention refinement does not support innovation V")
     if steps <= 0:
         raise ValueError("refinement steps must be positive")
     learning_rate = _check_scalar("learning_rate", learning_rate, positive=True)
@@ -1255,12 +1257,15 @@ def fit_legacy_cross_kv(
     stride: int | None = None,
     layer_ids: tuple[int, ...] | None = None,
     weight_mode: str = "layer_shared",
+    projection_source: str = "cross_kv",
 ) -> CrossKVParameters:
-    """Fit the legacy Cross(K) backbone in FP64.
+    """Fit the legacy source-to-V projection backbone in FP64.
 
     ``weight_mode="layer_head"`` preserves the reference fit.  The other modes
     pool across layers (``layer_shared``), heads (``head_shared``), or both
     (``shared``), then broadcast W and bias to the deployed tensor shapes.
+    ``projection_source`` records whether the supplied source is reconstructed
+    K or its decoder-visible temporal innovation.
     """
     _check_pair(
         reconstructed_keys,
@@ -1282,6 +1287,8 @@ def fit_legacy_cross_kv(
         raise ValueError(
             "weight_mode must be layer_head, layer_shared, head_shared, or shared"
         )
+    if projection_source not in {"cross_kv", "innovation"}:
+        raise ValueError("projection_source must be cross_kv or innovation")
     work_device = (
         torch.device("cpu")
         if reconstructed_keys.device.type == "mps"
@@ -1388,6 +1395,7 @@ def fit_legacy_cross_kv(
             bias=expanded_bias.to(values.device).contiguous(),
             stride=stride,
             layer_ids=layer_ids,
+            projection_source=projection_source,
         )
 
     all_weights: list[torch.Tensor] = []
@@ -1450,6 +1458,7 @@ def fit_legacy_cross_kv(
         bias=torch.stack(all_biases).to(values.device).contiguous(),
         stride=stride,
         layer_ids=layer_ids,
+        projection_source=projection_source,
     )
 
 
@@ -1683,6 +1692,84 @@ def _reconstruct_temporal_trace(
             else reconstructed_frame.to(reconstruction_dtype)
         )
     return rebuilt
+
+
+def _reconstructed_key_innovation_trace(
+    reconstructed_keys: torch.Tensor,
+    parameters: TemporalParameters,
+    config: CodecConfig,
+) -> torch.Tensor:
+    """Build the BF16 K innovation that the legacy decoder can reproduce."""
+    if config.fit_mode != "legacy":
+        raise ValueError("innovation fitting only supports legacy codec math")
+    if parameters.history_length < 1:
+        raise ValueError("K innovation requires a temporal K predictor")
+    layer_count = int(reconstructed_keys.shape[0])
+    frame_count = int(reconstructed_keys.shape[-3])
+    head_count = int(reconstructed_keys.shape[-2])
+    dim = int(reconstructed_keys.shape[-1])
+    if parameters.per_head:
+        if tuple(parameters.history_weights.shape[-2:]) != (head_count, dim):
+            raise ValueError(
+                "per-head temporal parameters do not match trace heads/head dimension"
+            )
+    elif int(parameters.history_weights.shape[-1]) != dim:
+        raise ValueError("shared temporal parameters do not match trace dimension")
+    if parameters.layered and int(parameters.history_weights.shape[0]) != layer_count:
+        raise ValueError("temporal parameters do not match trace layer count")
+
+    innovation = torch.zeros_like(reconstructed_keys, dtype=torch.float32)
+    prefix_dimensions = reconstructed_keys.ndim - 4
+    layered_shape = (
+        layer_count,
+        *(1 for _ in range(prefix_dimensions)),
+        head_count,
+        dim,
+    )
+    per_head_shape = (
+        1,
+        *(1 for _ in range(prefix_dimensions)),
+        head_count,
+        dim,
+    )
+    channel_shape = (
+        1,
+        *(1 for _ in range(prefix_dimensions + 1)),
+        dim,
+    )
+    temporal_weight = parameters.history_weights.to(reconstructed_keys.device)
+    temporal_bias = parameters.history_bias.to(reconstructed_keys.device)
+    for frame in range(1, frame_count):
+        order = min(frame, parameters.history_length)
+        if parameters.layered:
+            bias = temporal_bias[:, order - 1].view(layered_shape)
+            selected = temporal_weight[:, order - 1, :order]
+            coefficient_shape = layered_shape
+        elif parameters.per_head:
+            bias = temporal_bias[order - 1].view(per_head_shape)
+            selected = temporal_weight[order - 1, :order]
+            coefficient_shape = per_head_shape
+        else:
+            bias = temporal_bias[order - 1].view(channel_shape)
+            selected = temporal_weight[order - 1, :order]
+            coefficient_shape = channel_shape
+        prediction = torch.zeros_like(
+            reconstructed_keys[..., frame, :, :], dtype=torch.float32
+        )
+        for lag in range(1, order + 1):
+            coefficient = (
+                selected[..., lag - 1, :, :]
+                if parameters.layered
+                else selected[lag - 1]
+            ).view(coefficient_shape)
+            prediction = prediction + (
+                reconstructed_keys[..., frame - lag, :, :].float() * coefficient
+            )
+        prediction = prediction + bias
+        innovation[..., frame, :, :] = (
+            reconstructed_keys[..., frame, :, :].float() - prediction
+        ).to(torch.bfloat16).float()
+    return innovation
 
 
 def _reconstruct_legacy_cross_kv_record(
@@ -1925,6 +2012,7 @@ def fit_legacy_temporal_v_alpha(
             stride=cross.stride,
             layer_ids=cross.layer_ids,
             history_weights=alpha,
+            projection_source=cross.projection_source,
         )
         rebuilt_values = (
             _reconstruct_cross_kv_trace(
@@ -2030,6 +2118,7 @@ def fit_legacy_temporal_v_alpha(
         stride=cross.stride,
         layer_ids=cross.layer_ids,
         history_weights=alpha.contiguous(),
+        projection_source=cross.projection_source,
     )
 
 
@@ -2080,6 +2169,7 @@ def _stamp_parameter_identity(
         parameter_set_id,
         coordinate_system,
         cross.history_weights,
+        cross.projection_source,
     )
 
 
@@ -2241,17 +2331,27 @@ def _fit_legacy_predictors(
             signature=signature,
             coordinate_system=coordinate_system,
         )
+    projection_source = reconstructed_keys
+    if config.v_predictor_mode == "innovation":
+        projection_source = _reconstructed_key_innovation_trace(
+            reconstructed_keys,
+            temporal,
+            config,
+        )
     cross = fit_legacy_cross_kv(
-        reconstructed_keys,
+        projection_source,
         values,
         ridge=cross_ridge,
         stride=config.stride,
         layer_ids=layer_ids,
         weight_mode=config.cross_kv_weight_mode,
+        projection_source=(
+            "innovation" if config.v_predictor_mode == "innovation" else "cross_kv"
+        ),
     )
     if config.v_history_length:
         cross = fit_legacy_temporal_v_alpha(
-            reconstructed_keys,
+            projection_source,
             values,
             cross,
             config,
@@ -2402,7 +2502,7 @@ def _fit_predictors(
         )
     if resolved.fit_mode == "legacy":
         if (
-            resolved.v_predictor_mode == "cross_kv"
+            resolved.v_predictor_mode in {"cross_kv", "innovation"}
             and resolved.v_history_length
             and v_history_mode != "diagonal"
         ):
@@ -2649,6 +2749,7 @@ def _fit_predictors(
         parameter_set_id,
         coordinate_system,
         fitted_cross.history_weights,
+        fitted_cross.projection_source,
     )
     return temporal, cross
 

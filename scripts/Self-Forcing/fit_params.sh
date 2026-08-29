@@ -3,7 +3,7 @@
 # fit_params.sh — 只拟合 TempoKV 参数（读 trace，不采集、不合并）
 #
 # 读取 <TRACE_FILE>（collect_trace.sh 采集并合并出的 self_forcing_trace.npz），
-# 调用 scripts/common/fit_params.py 拟合 k_temporal.npz 与 v_cross_kv.npz。每个
+# 调用 scripts/common/fit_params.py 拟合 k_temporal.npz 与对应的 V 参数文件。每个
 # k_history_length / v_history_length 配置拟合一套专属参数，用
 # --k-history-length / --v-history-length 显式指定，用不同 --output-dir 区分。
 #
@@ -65,16 +65,19 @@ PY
 # V_PREDICTOR overrides the config so one file covers both predictors.
 if [[ -n "${V_PREDICTOR:-}" ]]; then
   case "$V_PREDICTOR" in
-    cross_kv|temporal) ;;
-    *) die "V_PREDICTOR 必须是 cross_kv 或 temporal（当前值：${V_PREDICTOR}）" ;;
+    cross_kv|temporal|innovation) ;;
+    *) die "V_PREDICTOR 必须是 cross_kv、temporal 或 innovation（当前值：${V_PREDICTOR}）" ;;
   esac
   v_predictor_mode="$V_PREDICTOR"
 fi
-if [[ "$v_predictor_mode" == "temporal" ]]; then
-  v_artifact_name="v_temporal.npz"
-else
-  v_artifact_name="v_cross_kv.npz"
-fi
+case "$v_predictor_mode" in
+  temporal) v_artifact_name="v_temporal.npz" ;;
+  innovation) v_artifact_name="v_innovation.npz" ;;
+  cross_kv) v_artifact_name="v_cross_kv.npz" ;;
+  # Keep command-only dry runs usable with PYTHON_BIN=/bin/echo; the Python
+  # fitter performs authoritative config validation in real runs.
+  *) v_artifact_name="v_cross_kv.npz" ;;
+esac
 
 if [[ "$output_dir" == "/" ]]; then
   die "OUTPUT_DIR 不能是文件系统根目录"
@@ -113,6 +116,9 @@ check_flag DRY_RUN
 check_int ITERATIONS 1
 check_int ATTENTION_LAYER_CHUNK 1
 if [[ -n "${ATTENTION_STEPS:-}" ]]; then
+  if [[ "$v_predictor_mode" == "innovation" ]]; then
+    die "innovation 暂不支持 ATTENTION_STEPS，请关闭 attention refinement"
+  fi
   check_int ATTENTION_STEPS 1
   check_int ATTENTION_PATIENCE 1
   [[ -z "${ATTENTION_MAX_TOKENS:-}" ]] || check_int ATTENTION_MAX_TOKENS 1

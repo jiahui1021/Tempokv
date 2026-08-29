@@ -98,16 +98,19 @@ PY
   # V_PREDICTOR overrides the config so one file covers both predictors.
   if [[ -n "${V_PREDICTOR:-}" ]]; then
     case "$V_PREDICTOR" in
-      cross_kv|temporal) ;;
-      *) die "V_PREDICTOR 必须是 cross_kv 或 temporal（当前值：${V_PREDICTOR}）" ;;
+      cross_kv|temporal|innovation) ;;
+      *) die "V_PREDICTOR 必须是 cross_kv、temporal 或 innovation（当前值：${V_PREDICTOR}）" ;;
     esac
     v_predictor_mode="$V_PREDICTOR"
   fi
-  if [[ "$v_predictor_mode" == "temporal" ]]; then
-    v_artifact_name="v_temporal.npz"
-  else
-    v_artifact_name="v_cross_kv.npz"
-  fi
+  case "$v_predictor_mode" in
+    temporal) v_artifact_name="v_temporal.npz" ;;
+    innovation) v_artifact_name="v_innovation.npz" ;;
+    cross_kv) v_artifact_name="v_cross_kv.npz" ;;
+    # Keep command-only dry runs usable with PYTHON_BIN=/bin/echo; the Python
+    # generation preflight performs authoritative config validation.
+    *) v_artifact_name="v_cross_kv.npz" ;;
+  esac
 else
   param_dir=""
   result_label="bf16"
@@ -115,7 +118,7 @@ fi
 
 # The Cross production kernel is validated at eight recurrent units per
 # launch.  Keep temporal's existing default and preserve explicit overrides.
-if [[ "$mode" == "tempokv" && "$v_predictor_mode" == "cross_kv" ]]; then
+if [[ "$mode" == "tempokv" && "$v_predictor_mode" != "temporal" ]]; then
   export TEMPOKV_PERSISTENT_UNITS_PER_LAUNCH="${TEMPOKV_PERSISTENT_UNITS_PER_LAUNCH:-8}"
 fi
 
