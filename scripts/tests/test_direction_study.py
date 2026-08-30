@@ -31,6 +31,7 @@ def _module(name: str):
 
 protocol = _module("protocol")
 plot_figure = _module("plot_figure")
+make_split = _module("make_split")
 
 
 def _base(**updates):
@@ -332,3 +333,116 @@ def test_reconstruction_rows_carry_the_total_used_for_ranking() -> None:
     }
     row = plot_figure.reconstruction_rows(report)[0]
     assert row["total_nmse"] == pytest.approx(0.3)
+
+
+# --------------------------------------------------------------------------
+# Splitting one collected trace into two disjoint ones
+# --------------------------------------------------------------------------
+
+
+def _write_trace(path: Path, *, records: int, layers=2, frames=4, heads=2, dim=128):
+    rng = np.random.default_rng(0)
+    shape = (layers, records, frames, heads, dim)
+    np.savez(
+        path,
+        keys=rng.normal(size=shape).astype(np.float32),
+        values=rng.normal(size=shape).astype(np.float32),
+        layer_ids=np.arange(layers, dtype=np.int32),
+        trace_stride=np.asarray(16, dtype=np.int32),
+        coordinate_system=np.asarray("pre_rope_normalized"),
+    )
+    return path
+
+
+def test_a_positional_split_produces_disjoint_traces(tmp_path: Path) -> None:
+    """Fitting and scoring must not share a prompt."""
+    trace = _write_trace(tmp_path / "pool.npz", records=12)
+    report = make_split.run(
+        make_split.build_parser().parse_args(
+            [
+                "--trace", str(trace),
+                "--output-dir", str(tmp_path / "out"),
+                "--prompt-count", "6",
+                "--calibration-prompts", "4",
+            ]
+        )
+    )
+    assert report["records_per_prompt"] == 2
+    calibration = set(report["calibration"]["prompts"])
+    heldout = set(report["heldout"]["prompts"])
+    assert calibration == {0, 1, 2, 3}
+    assert heldout == {4, 5}
+    assert not calibration & heldout
+    for side in ("calibration", "heldout"):
+        with np.load(report[side]["path"], allow_pickle=False) as archive:
+            assert archive["keys"].shape[1] == len(report[side]["prompts"]) * 2
+
+
+def test_a_split_that_leaves_nothing_held_out_is_refused(tmp_path: Path) -> None:
+    trace = _write_trace(tmp_path / "pool.npz", records=8)
+    with pytest.raises(ValueError, match="at least one held-out prompt"):
+        make_split.run(
+            make_split.build_parser().parse_args(
+                [
+                    "--trace", str(trace),
+                    "--output-dir", str(tmp_path / "out"),
+                    "--prompt-count", "4",
+                    "--calibration-prompts", "4",
+                ]
+            )
+        )
+
+
+def test_the_two_ways_of_dividing_prompts_are_mutually_exclusive(
+    tmp_path: Path,
+) -> None:
+    trace = _write_trace(tmp_path / "pool.npz", records=8)
+    groups = tmp_path / "groups.json"
+    groups.write_text(
+        json.dumps(
+            {
+                "prompt_count": 4,
+                "groups": {"calibration": [0, 1], "heldout": [2, 3]},
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="not both"):
+        make_split.run(
+            make_split.build_parser().parse_args(
+                [
+                    "--trace", str(trace),
+                    "--output-dir", str(tmp_path / "out"),
+                    "--prompt-groups", str(groups),
+                    "--prompt-count", "4",
+                    "--calibration-prompts", "2",
+                ]
+            )
+        )
+
+
+def test_a_groups_file_from_another_collection_run_is_refused(
+    tmp_path: Path,
+) -> None:
+    """A record count that does not divide is the signature of a mismatch."""
+    trace = _write_trace(tmp_path / "pool.npz", records=10)
+    groups = tmp_path / "groups.json"
+    groups.write_text(
+        json.dumps(
+            {
+                "prompt_count": 4,
+                "groups": {"calibration": [0, 1], "heldout": [2, 3]},
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="do not divide evenly"):
+        make_split.run(
+            make_split.build_parser().parse_args(
+                [
+                    "--trace", str(trace),
+                    "--output-dir", str(tmp_path / "out"),
+                    "--prompt-groups", str(groups),
+                ]
+            )
+        )

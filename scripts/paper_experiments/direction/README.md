@@ -64,12 +64,38 @@ projection second — so the mirrored artifacts are passed in the same order.
 
 ## Running it
 
+### Step 0 — split one collected trace into two disjoint traces
+
+A trace bridge writes a single archive, but the study needs to fit on one set
+of prompts and score on another. `make_split.py` slices a collected trace by
+prompt, reusing the calibration study's `PoolTrace` rather than reimplementing
+"which records belong to which prompt":
+
+```bash
+# a trace collected without a groups file (e.g. the 12-prompt legacy trace)
+python scripts/paper_experiments/direction/make_split.py \
+    --trace data/self-forcing/trace/clean_trace.npz \
+    --prompt-count 12 --calibration-prompts 8 \
+    --output-dir data/direction
+
+# or reuse a calibration pool and its named groups
+python scripts/paper_experiments/direction/make_split.py \
+    --trace data/calibration/self-forcing_pool.npz \
+    --prompt-groups data/calibration/prompt_groups.json \
+    --output-dir data/direction
+```
+
+It writes `calibration.npz`, `heldout.npz` and a `split.json` recording which
+prompts went where. It refuses a trace whose record count does not divide by
+the prompt count, which is what a trace and a groups file from different
+collection runs look like.
+
 ### Reconstruction (no GPU needed beyond fitting)
 
 ```bash
 python scripts/paper_experiments/direction/run_reconstruction.py \
-    --calibration-trace data/self-forcing/trace/clean_trace.npz \
-    --evaluation-trace  data/self-forcing/trace/heldout_trace.npz \
+    --calibration-trace data/direction/calibration.npz \
+    --evaluation-trace  data/direction/heldout.npz \
     --output-dir results/direction/reconstruction
 ```
 
@@ -88,7 +114,7 @@ python scripts/paper_experiments/direction/run_quality.py \
     --checkpoint /models/self_forcing_dmd.pt \
     --wan-model-dir /models/Wan2.1-T2V-1.3B \
     --prompts assets/moviegen128_first30.txt \
-    --trace data/self-forcing/trace/clean_trace.npz \
+    --trace data/direction/calibration.npz \
     --output-root results/direction/quality
 ```
 
