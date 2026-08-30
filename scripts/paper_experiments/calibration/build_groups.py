@@ -146,12 +146,24 @@ def main(argv: list[str] | None = None) -> int:
     )
     args.output_dir.mkdir(parents=True, exist_ok=True)
     pool_file = args.output_dir / "pool_prompts.txt"
+    # Record paths relative to the repository when the output lives inside it,
+    # so a committed manifest still describes itself after a fresh checkout on
+    # another machine.
+    project_root = Path(__file__).resolve().parents[3]
+
+    def _portable(path: Path) -> str:
+        resolved = path.resolve()
+        try:
+            return str(resolved.relative_to(project_root))
+        except ValueError:
+            return str(resolved)
+
     pool_file.write_text(
         "\n".join(prompts[index] for index in indices) + "\n", encoding="utf-8"
     )
     manifest = {
-        "prompts_file": str(pool_file),
-        "source_prompts_file": str(args.prompts),
+        "prompts_file": _portable(pool_file),
+        "source_prompts_file": _portable(args.prompts),
         "prompt_count": len(indices),
         "prompt_indices": indices,
         "groups": groups,

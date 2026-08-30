@@ -7,7 +7,8 @@
 #
 # 必需变量：
 #   SF_POOL_TRACE      Self-Forcing pool trace（.npz）
-#   PROMPT_GROUPS      build_groups.py 产出并经人工确认的 prompt_groups.json
+#   PROMPT_GROUPS      经人工确认的 prompt_groups.json（默认用仓库内已提交的
+#                      assets/calibration/prompt_groups.json）
 #
 # 可选变量：
 #   CF_POOL_TRACE      Causal-Forcing pool trace；缺省则模块 3 跳过该模型
@@ -52,7 +53,9 @@ resolve_path() {
 }
 
 [[ -n "${SF_POOL_TRACE:-}" ]] || die "缺少必需变量 SF_POOL_TRACE"
-[[ -n "${PROMPT_GROUPS:-}" ]] || die "缺少必需变量 PROMPT_GROUPS"
+# The prompt pool and its groups are committed, so a fresh checkout on a GPU
+# host already has the reviewed manifest that the collected trace must match.
+PROMPT_GROUPS="${PROMPT_GROUPS:-assets/calibration/prompt_groups.json}"
 
 sf_pool="$(resolve_path "$SF_POOL_TRACE")"
 groups="$(resolve_path "$PROMPT_GROUPS")"

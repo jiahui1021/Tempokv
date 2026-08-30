@@ -43,17 +43,31 @@ transferred matrix would measure that mismatch rather than the protocol. Module
 3 transfers the *protocol* and compares `MSE(N) / MSE(N_max)`, which removes
 each model's KV scale from the comparison.
 
-## Step 1 — choose the prompt pool
+## Step 1 — the prompt pool (already committed)
+
+`assets/calibration/pool_prompts.txt` and
+`assets/calibration/prompt_groups.json` are **checked into the repository**, so
+a fresh checkout on a GPU host already has them and `run_study.sh` defaults to
+them.
+
+That is deliberate rather than incidental. The pool prompt *order* determines
+the order of the records inside every collected trace, and the A/B labels carry
+a human review. Regenerating them separately on each machine would let the two
+drift apart silently, and a trace collected against one ordering cannot be
+sliced with another.
+
+Regenerate them only when you mean to change the pool, and commit the result:
 
 ```bash
 python scripts/paper_experiments/calibration/build_groups.py \
     --prompts assets/moviegen128.txt \
-    --output-dir data/calibration \
+    --output-dir assets/calibration \
     --calibration-size 32 --heldout-size 32
 ```
 
-This writes `pool_prompts.txt` (the prompts to collect, in pool order) and
-`prompt_groups.json`, which names six groups addressed by pool position:
+Anything already collected against the previous pool must be recollected.
+
+The manifest names six groups addressed by pool position:
 
 - `calibration` / `heldout` — the disjoint sets module 1 draws from and scores on
 - `action_calibration` / `action_heldout` — the human/action distribution, A

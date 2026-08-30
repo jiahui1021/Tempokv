@@ -1,0 +1,599 @@
+{
+  "prompts_file": "assets/calibration/pool_prompts.txt",
+  "source_prompts_file": "assets/moviegen128.txt",
+  "prompt_count": 64,
+  "prompt_indices": [
+    0,
+    3,
+    1,
+    4,
+    2,
+    5,
+    7,
+    6,
+    8,
+    9,
+    13,
+    10,
+    14,
+    11,
+    16,
+    12,
+    19,
+    15,
+    22,
+    17,
+    26,
+    18,
+    29,
+    20,
+    30,
+    21,
+    33,
+    23,
+    34,
+    24,
+    37,
+    25,
+    38,
+    27,
+    40,
+    28,
+    43,
+    31,
+    46,
+    32,
+    47,
+    35,
+    48,
+    36,
+    49,
+    39,
+    50,
+    41,
+    53,
+    42,
+    55,
+    44,
+    56,
+    45,
+    60,
+    51,
+    61,
+    52,
+    64,
+    54,
+    65,
+    57,
+    68,
+    58
+  ],
+  "groups": {
+    "calibration": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31
+    ],
+    "heldout": [
+      32,
+      33,
+      34,
+      35,
+      36,
+      37,
+      38,
+      39,
+      40,
+      41,
+      42,
+      43,
+      44,
+      45,
+      46,
+      47,
+      48,
+      49,
+      50,
+      51,
+      52,
+      53,
+      54,
+      55,
+      56,
+      57,
+      58,
+      59,
+      60,
+      61,
+      62,
+      63
+    ],
+    "action_calibration": [
+      0,
+      2,
+      4,
+      6,
+      8,
+      10,
+      12,
+      14,
+      16,
+      18,
+      20,
+      22,
+      24,
+      26,
+      28,
+      30
+    ],
+    "action_heldout": [
+      32,
+      34,
+      36,
+      38,
+      40,
+      42,
+      44,
+      46,
+      48,
+      50,
+      52,
+      54,
+      56,
+      58,
+      60,
+      62
+    ],
+    "scene_calibration": [
+      1,
+      3,
+      5,
+      7,
+      9,
+      11,
+      13,
+      15,
+      17,
+      19,
+      21,
+      23,
+      25,
+      27,
+      29,
+      31
+    ],
+    "scene_heldout": [
+      33,
+      35,
+      37,
+      39,
+      41,
+      43,
+      45,
+      47,
+      49,
+      51,
+      53,
+      55,
+      57,
+      59,
+      61,
+      63
+    ]
+  },
+  "prompts": [
+    {
+      "pool_position": 0,
+      "source_index": 0,
+      "distribution": "action",
+      "prompt": "A stylish woman walks down a Tokyo street filled with warm glowing neon and animated city signage. She wears a black leather jacket, a long red dress, and black boots, and carries a black purse. She wears sunglasses and red lipstick. She walks confidently and casually. The street is damp and reflective, creating a mirror effect of the colorful lights. Many pedestrians walk about."
+    },
+    {
+      "pool_position": 1,
+      "source_index": 3,
+      "distribution": "scene",
+      "prompt": "Drone view of waves crashing against the rugged cliffs along Big Sur’s garay point beach. The crashing blue waters create white-tipped waves, while the golden light of the setting sun illuminates the rocky shore. A small island with a lighthouse sits in the distance, and green shrubbery covers the cliff’s edge. The steep drop from the road down to the beach is a dramatic feat, with the cliff’s edges jutting out over the sea. This is a view that captures the raw beauty of the coast and the rugged landscape of the Pacific Coast Highway."
+    },
+    {
+      "pool_position": 2,
+      "source_index": 1,
+      "distribution": "action",
+      "prompt": "Several giant wooly mammoths approach treading through a snowy meadow, their long wooly fur lightly blows in the wind as they walk, snow covered trees and dramatic snow capped mountains in the distance, mid afternoon light with wispy clouds and a sun high in the distance creates a warm glow, the low camera view is stunning capturing the large furry mammal with beautiful photography, depth of field."
+    },
+    {
+      "pool_position": 3,
+      "source_index": 4,
+      "distribution": "scene",
+      "prompt": "Animated scene features a close-up of a short fluffy monster kneeling beside a melting red candle. The art style is 3D and realistic, with a focus on lighting and texture. The mood of the painting is one of wonder and curiosity, as the monster gazes at the flame with wide eyes and open mouth. Its pose and expression convey a sense of innocence and playfulness, as if it is exploring the world around it for the first time. The use of warm colors and dramatic lighting further enhances the cozy atmosphere of the image."
+    },
+    {
+      "pool_position": 4,
+      "source_index": 2,
+      "distribution": "action",
+      "prompt": "A movie trailer featuring the adventures of the 30 year old space man wearing a red wool knitted motorcycle helmet, blue sky, salt desert, cinematic style, shot on 35mm film, vivid colors."
+    },
+    {
+      "pool_position": 5,
+      "source_index": 5,
+      "distribution": "scene",
+      "prompt": "A gorgeously rendered papercraft world of a coral reef, rife with colorful fish and sea creatures."
+    },
+    {
+      "pool_position": 6,
+      "source_index": 7,
+      "distribution": "action",
+      "prompt": "Photorealistic closeup video of two pirate ships battling each other as they sail inside a cup of coffee."
+    },
+    {
+      "pool_position": 7,
+      "source_index": 6,
+      "distribution": "scene",
+      "prompt": "This close-up shot of a Victoria crowned pigeon showcases its striking blue plumage and red chest. Its crest is made of delicate, lacy feathers, while its eye is a striking red color. The bird’s head is tilted slightly to the side, giving the impression of it looking regal and majestic. The background is blurred, drawing attention to the bird’s striking appearance."
+    },
+    {
+      "pool_position": 8,
+      "source_index": 8,
+      "distribution": "action",
+      "prompt": "A young man at his 20s is sitting on a piece of cloud in the sky, reading a book."
+    },
+    {
+      "pool_position": 9,
+      "source_index": 9,
+      "distribution": "scene",
+      "prompt": "Historical footage of California during the gold rush."
+    },
+    {
+      "pool_position": 10,
+      "source_index": 13,
+      "distribution": "action",
+      "prompt": "A beautiful homemade video showing the people of Lagos, Nigeria in the year 2056. Shot with a mobile phone camera."
+    },
+    {
+      "pool_position": 11,
+      "source_index": 10,
+      "distribution": "scene",
+      "prompt": "A close up view of a glass sphere that has a zen garden within it. There is a small dwarf in the sphere who is raking the zen garden and creating patterns in the sand."
+    },
+    {
+      "pool_position": 12,
+      "source_index": 14,
+      "distribution": "action",
+      "prompt": "A petri dish with a bamboo forest growing within it that has tiny red pandas running around."
+    },
+    {
+      "pool_position": 13,
+      "source_index": 11,
+      "distribution": "scene",
+      "prompt": "Extreme close up of a 24 year old woman’s eye blinking, standing in Marrakech during magic hour, cinematic film shot in 70mm, depth of field, vivid colors, cinematic"
+    },
+    {
+      "pool_position": 14,
+      "source_index": 16,
+      "distribution": "action",
+      "prompt": "3D animation of a small, round, fluffy creature with big, expressive eyes explores a vibrant, enchanted forest. The creature, a whimsical blend of a rabbit and a squirrel, has soft blue fur and a bushy, striped tail. It hops along a sparkling stream, its eyes wide with wonder. The forest is alive with magical elements: flowers that glow and change colors, trees with leaves in shades of purple and silver, and small floating lights that resemble fireflies. The creature stops to interact playfully with a group of tiny, fairy-like beings dancing around a mushroom ring. The creature looks up in awe at a large, glowing tree that seems to be the heart of the forest."
+    },
+    {
+      "pool_position": 15,
+      "source_index": 12,
+      "distribution": "scene",
+      "prompt": "A cartoon kangaroo disco dances."
+    },
+    {
+      "pool_position": 16,
+      "source_index": 19,
+      "distribution": "action",
+      "prompt": "A drone camera circles around a beautiful historic church built on a rocky outcropping along the Amalfi Coast, the view showcases historic and magnificent architectural details and tiered pathways and patios, waves are seen crashing against the rocks below as the view overlooks the horizon of the coastal waters and hilly landscapes of the Amalfi Coast Italy, several distant people are seen walking and enjoying vistas on patios of the dramatic ocean views, the warm glow of the afternoon sun creates a magical and romantic feeling to the scene, the view is stunning captured with beautiful photography."
+    },
+    {
+      "pool_position": 17,
+      "source_index": 15,
+      "distribution": "scene",
+      "prompt": "The camera rotates around a large stack of vintage televisions all showing different programs — 1950s sci-fi movies, horror movies, news, static, a 1970s sitcom, etc, set inside a large New York museum gallery."
+    },
+    {
+      "pool_position": 18,
+      "source_index": 22,
+      "distribution": "action",
+      "prompt": "A cat waking up its sleeping owner demanding breakfast. The owner tries to ignore the cat, but the cat tries new tactics and finally the owner pulls out a secret stash of treats from under the pillow to hold the cat off a little longer."
+    },
+    {
+      "pool_position": 19,
+      "source_index": 17,
+      "distribution": "scene",
+      "prompt": "The camera follows behind a white vintage SUV with a black roof rack as it speeds up a steep dirt road surrounded by pine trees on a steep mountain slope, dust kicks up from it’s tires, the sunlight shines on the SUV as it speeds along the dirt road, casting a warm glow over the scene. The dirt road curves gently into the distance, with no other cars or vehicles in sight. The trees on either side of the road are redwoods, with patches of greenery scattered throughout. The car is seen from the rear following the curve with ease, making it seem as if it is on a rugged drive through the rugged terrain. The dirt road itself is surrounded by steep hills and mountains, with a clear blue sky above with wispy clouds."
+    },
+    {
+      "pool_position": 20,
+      "source_index": 26,
+      "distribution": "action",
+      "prompt": "Beautiful, snowy Tokyo city is bustling. The camera moves through the bustling city street, following several people enjoying the beautiful snowy weather and shopping at nearby stalls. Gorgeous sakura petals are flying through the wind along with snowflakes."
+    },
+    {
+      "pool_position": 21,
+      "source_index": 18,
+      "distribution": "scene",
+      "prompt": "Reflections in the window of a train traveling through the Tokyo suburbs."
+    },
+    {
+      "pool_position": 22,
+      "source_index": 29,
+      "distribution": "action",
+      "prompt": "An extreme close-up of an gray-haired man with a beard in his 60s, he is deep in thought pondering the history of the universe as he sits at a cafe in Paris, his eyes focus on people offscreen as they walk as he sits mostly motionless, he is dressed in a wool coat suit coat with a button-down shirt , he wears a brown beret and glasses and has a very professorial appearance, and the end he offers a subtle closed-mouth smile as if he found the answer to the mystery of life, the lighting is very cinematic with the golden light and the Parisian streets and city in the background, depth of field, cinematic 35mm film."
+    },
+    {
+      "pool_position": 23,
+      "source_index": 20,
+      "distribution": "scene",
+      "prompt": "A large orange octopus is seen resting on the bottom of the ocean floor, blending in with the sandy and rocky terrain. Its tentacles are spread out around its body, and its eyes are closed. The octopus is unaware of a king crab that is crawling towards it from behind a rock, its claws raised and ready to attack. The crab is brown and spiny, with long legs and antennae. The scene is captured from a wide angle, showing the vastness and depth of the ocean. The water is clear and blue, with rays of sunlight filtering through. The shot is sharp and crisp, with a high dynamic range. The octopus and the crab are in focus, while the background is slightly blurred, creating a depth of field effect."
+    },
+    {
+      "pool_position": 24,
+      "source_index": 30,
+      "distribution": "action",
+      "prompt": "A beautiful silhouette animation shows a wolf howling at the moon, feeling lonely, until it finds its pack."
+    },
+    {
+      "pool_position": 25,
+      "source_index": 21,
+      "distribution": "scene",
+      "prompt": "A flock of paper airplanes flutters through a dense jungle, weaving around trees as if they were migrating birds."
+    },
+    {
+      "pool_position": 26,
+      "source_index": 33,
+      "distribution": "action",
+      "prompt": "Step-printing scene of a person running, cinematic film shot in 35mm."
+    },
+    {
+      "pool_position": 27,
+      "source_index": 23,
+      "distribution": "scene",
+      "prompt": "Borneo wildlife on the Kinabatangan River"
+    },
+    {
+      "pool_position": 28,
+      "source_index": 34,
+      "distribution": "action",
+      "prompt": "Five gray wolf pups frolicking and chasing each other around a remote gravel road, surrounded by grass. The pups run and leap, chasing each other, and nipping at each other, playing."
+    },
+    {
+      "pool_position": 29,
+      "source_index": 24,
+      "distribution": "scene",
+      "prompt": "A Chinese Lunar New Year celebration video with Chinese Dragon."
+    },
+    {
+      "pool_position": 30,
+      "source_index": 37,
+      "distribution": "action",
+      "prompt": "A grandmother with neatly combed grey hair stands behind a colorful birthday cake with numerous candles at a wood dining room table, expression is one of pure joy and happiness, with a happy glow in her eye. She leans forward and blows out the candles with a gentle puff, the cake has pink frosting and sprinkles and the candles cease to flicker, the grandmother wears a light blue blouse adorned with floral patterns, several happy friends and family sitting at the table can be seen celebrating, out of focus. The scene is beautifully captured, cinematic, showing a 3/4 view of the grandmother and the dining room. Warm color tones and soft lighting enhance the mood."
+    },
+    {
+      "pool_position": 31,
+      "source_index": 25,
+      "distribution": "scene",
+      "prompt": "Tour of an art gallery with many beautiful works of art in different styles."
+    },
+    {
+      "pool_position": 32,
+      "source_index": 38,
+      "distribution": "action",
+      "prompt": "The camera directly faces colorful buildings in Burano Italy. An adorable dalmation looks through a window on a building on the ground floor. Many people are walking and cycling along the canal streets in front of the buildings."
+    },
+    {
+      "pool_position": 33,
+      "source_index": 27,
+      "distribution": "scene",
+      "prompt": "A stop motion animation of a flower growing out of the windowsill of a suburban house."
+    },
+    {
+      "pool_position": 34,
+      "source_index": 40,
+      "distribution": "action",
+      "prompt": "An adorable happy otter confidently stands on a surfboard wearing a yellow lifejacket, riding along turquoise tropical waters near lush tropical islands, 3D digital render art style."
+    },
+    {
+      "pool_position": 35,
+      "source_index": 28,
+      "distribution": "scene",
+      "prompt": "The story of a robot’s life in a cyberpunk setting."
+    },
+    {
+      "pool_position": 36,
+      "source_index": 43,
+      "distribution": "action",
+      "prompt": "A white and orange tabby cat is seen happily darting through a dense garden, as if chasing something. Its eyes are wide and happy as it jogs forward, scanning the branches, flowers, and leaves as it walks. The path is narrow as it makes its way between all the plants. the scene is captured from a ground-level angle, following the cat closely, giving a low and intimate perspective. The image is cinematic with warm tones and a grainy texture. The scattered daylight between the leaves and plants above creates a warm contrast, accentuating the cat’s orange fur. The shot is clear and sharp, with a shallow depth of field."
+    },
+    {
+      "pool_position": 37,
+      "source_index": 31,
+      "distribution": "scene",
+      "prompt": "New York City submerged like Atlantis. Fish, whales, sea turtles and sharks swim through the streets of New York."
+    },
+    {
+      "pool_position": 38,
+      "source_index": 46,
+      "distribution": "action",
+      "prompt": "A giant, towering cloud in the shape of a man looms over the earth. The cloud man shoots lighting bolts down to the earth."
+    },
+    {
+      "pool_position": 39,
+      "source_index": 32,
+      "distribution": "scene",
+      "prompt": "A litter of golden retriever puppies playing in the snow. Their heads pop out of the snow, covered in."
+    },
+    {
+      "pool_position": 40,
+      "source_index": 47,
+      "distribution": "action",
+      "prompt": "A Samoyed and a Golden Retriever dog are playfully romping through a futuristic neon city at night. The neon lights emitted from the nearby buildings glistens off of their fur."
+    },
+    {
+      "pool_position": 41,
+      "source_index": 35,
+      "distribution": "scene",
+      "prompt": "Basketball through hoop then explodes."
+    },
+    {
+      "pool_position": 42,
+      "source_index": 48,
+      "distribution": "action",
+      "prompt": "Chef chopping onions in the kitchen for the preparation of the dish"
+    },
+    {
+      "pool_position": 43,
+      "source_index": 36,
+      "distribution": "scene",
+      "prompt": "Archeologists discover a generic plastic chair in the desert, excavating and dusting it with great care."
+    },
+    {
+      "pool_position": 44,
+      "source_index": 49,
+      "distribution": "action",
+      "prompt": "A little man with blocks visiting an art gallery"
+    },
+    {
+      "pool_position": 45,
+      "source_index": 39,
+      "distribution": "scene",
+      "prompt": "The Glenfinnan Viaduct is a historic railway bridge in Scotland, UK, that crosses over the west highland line between the towns of Mallaig and Fort William. It is a stunning sight as a steam train leaves the bridge, traveling over the arch-covered viaduct. The landscape is dotted with lush greenery and rocky mountains, creating a picturesque backdrop for the train journey. The sky is blue and the sun is shining, making for a beautiful day to explore this majestic spot."
+    },
+    {
+      "pool_position": 46,
+      "source_index": 50,
+      "distribution": "action",
+      "prompt": "A white cat driving in a car through a busy downtown street with tall buildings and pedestrians in the background"
+    },
+    {
+      "pool_position": 47,
+      "source_index": 41,
+      "distribution": "scene",
+      "prompt": "This close-up shot of a chameleon showcases its striking color changing capabilities. The background is blurred, drawing attention to the animal’s striking appearance."
+    },
+    {
+      "pool_position": 48,
+      "source_index": 53,
+      "distribution": "action",
+      "prompt": "A Chinese boy wearing glasses enjoys a delicious cheeseburger with his eyes closed in a fast food restaurant"
+    },
+    {
+      "pool_position": 49,
+      "source_index": 42,
+      "distribution": "scene",
+      "prompt": "A corgi vlogging itself in tropical Maui."
+    },
+    {
+      "pool_position": 50,
+      "source_index": 55,
+      "distribution": "action",
+      "prompt": "A Chinese man sits at a table and eats noodles with chopsticks"
+    },
+    {
+      "pool_position": 51,
+      "source_index": 44,
+      "distribution": "scene",
+      "prompt": "Aerial view of Santorini during the blue hour, showcasing the stunning architecture of white Cycladic buildings with blue domes. The caldera views are breathtaking, and the lighting creates a beautiful, serene atmosphere."
+    },
+    {
+      "pool_position": 52,
+      "source_index": 56,
+      "distribution": "action",
+      "prompt": "A man and woman walking hand in hand under a starry sky with a bucket in the background"
+    },
+    {
+      "pool_position": 53,
+      "source_index": 45,
+      "distribution": "scene",
+      "prompt": "Tiltshift of a construction site filled with workers, equipment, and heavy machinery."
+    },
+    {
+      "pool_position": 54,
+      "source_index": 60,
+      "distribution": "action",
+      "prompt": "An astronaut runs on the surface of the moon, the low angle shot shows the vast background of the moon, the movement is smooth and appears lightweight"
+    },
+    {
+      "pool_position": 55,
+      "source_index": 51,
+      "distribution": "scene",
+      "prompt": "Macro shot of a volcano erupting in a coffee cup"
+    },
+    {
+      "pool_position": 56,
+      "source_index": 61,
+      "distribution": "action",
+      "prompt": "Little boy riding his bike in the garden through the changing seasons of fall, winter, spring and summer."
+    },
+    {
+      "pool_position": 57,
+      "source_index": 52,
+      "distribution": "scene",
+      "prompt": "Dew on blue rose petals, HD, close up, detail"
+    },
+    {
+      "pool_position": 58,
+      "source_index": 64,
+      "distribution": "action",
+      "prompt": "A man riding a horse through the Gobi Desert with a beautiful sunset behind him, movie quality."
+    },
+    {
+      "pool_position": 59,
+      "source_index": 54,
+      "distribution": "scene",
+      "prompt": "A corgi wearing sunglasses walks on the beach of a tropical island"
+    },
+    {
+      "pool_position": 60,
+      "source_index": 65,
+      "distribution": "action",
+      "prompt": "Panda playing the guitar"
+    },
+    {
+      "pool_position": 61,
+      "source_index": 57,
+      "distribution": "scene",
+      "prompt": "Give me a cappuccino."
+    },
+    {
+      "pool_position": 62,
+      "source_index": 68,
+      "distribution": "action",
+      "prompt": "The rabbit who reads the newspaper and wears glasses"
+    },
+    {
+      "pool_position": 63,
+      "source_index": 58,
+      "distribution": "scene",
+      "prompt": "A tropical fish swimming in ocean reefs"
+    }
+  ]
+}
