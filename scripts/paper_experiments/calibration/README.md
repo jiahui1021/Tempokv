@@ -114,10 +114,28 @@ to work with what each one allows:
   small, so give module 3 a size grid that fits (for example
   `--sizes 2 4 8` with 8 calibration and 4 held-out prompts).
 - **LongCat** collects one prompt per invocation (`PROMPT=...`), not a prompt
-  file. Build its pool by running `collect_trace.sh` once per prompt with the
-  **same `TRACE_DIR`**, in pool order; the events accumulate under that root
-  and the final merge picks all of them up. It already writes the plain
-  `[L,S,T,H,D]` layout.
+  file, and it refuses to write into a `TRACE_DIR` that already holds events.
+  So give each prompt **its own** `TRACE_DIR` under a shared parent, then merge
+  the parent once:
+
+  ```bash
+  i=0
+  while IFS= read -r line; do
+    PROMPT="$line" PROMPT_IDX=$i \
+    TRACE_DIR="data/longcat/pool/p$(printf '%02d' "$i")" \
+    CHECKPOINT_DIR=... \
+    bash scripts/LongCat/collect_trace.sh
+    i=$((i + 1))
+  done < assets/calibration/pool_prompts.txt
+
+  python experiments/LongCat/longcat/prepare_trace.py \
+      data/longcat/pool data/calibration/longcat_pool.npz
+  ```
+
+  The merge recurses and takes the event directories in sorted path order, so
+  the **zero padding is required**: without it `p10` sorts before `p2` and the
+  records are silently attributed to the wrong prompts. LongCat already writes
+  the plain `[L,S,T,H,D]` layout.
 
 In every case `PoolTrace` refuses a trace whose record count does not divide by
 the prompt count, so a mis-accumulated pool fails loudly instead of silently
