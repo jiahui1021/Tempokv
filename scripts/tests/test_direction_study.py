@@ -143,16 +143,36 @@ def test_the_codec_round_trips_in_either_direction(direction: str) -> None:
     )
     assert (packed.key.predictor_kind, packed.value.predictor_kind) == expected_kinds
 
+    # Decode through the public API.  An earlier version of this test decoded
+    # by hand in role order, which is exactly why a codec.decode() that always
+    # decoded K first went unnoticed under the mirrored direction.
+    rebuilt_keys, rebuilt_values = codec.decode(packed)
+    assert rebuilt_keys.shape == span_keys.shape
+    assert rebuilt_values.shape == span_values.shape
+    assert torch.isfinite(rebuilt_keys).all()
+    assert torch.isfinite(rebuilt_values).all()
+
+    # ...and it must agree with decoding by hand in role order.
     primary = packed.value if direction == "v_to_k" else packed.key
     secondary_state = packed.key if direction == "v_to_k" else packed.value
-    rebuilt_primary = decode_tensor(primary, use_triton=False)
-    rebuilt_secondary = decode_tensor(
-        secondary_state, source=rebuilt_primary, use_triton=False
+    manual_primary = decode_tensor(primary, use_triton=False)
+    manual_secondary = decode_tensor(
+        secondary_state, source=manual_primary, use_triton=False
     )
-    assert rebuilt_primary.shape == span_keys.shape
-    assert rebuilt_secondary.shape == span_keys.shape
-    assert torch.isfinite(rebuilt_primary).all()
-    assert torch.isfinite(rebuilt_secondary).all()
+    manual_keys, manual_values = (
+        (manual_secondary, manual_primary)
+        if direction == "v_to_k"
+        else (manual_primary, manual_secondary)
+    )
+    torch.testing.assert_close(rebuilt_keys, manual_keys, rtol=0, atol=0)
+    torch.testing.assert_close(rebuilt_values, manual_values, rtol=0, atol=0)
+
+    # Each rebuilt tensor must track its own reference, never the other one.
+    def error(rebuilt, reference):
+        return float((rebuilt.double() - reference.double()).square().sum())
+
+    assert error(rebuilt_keys, span_keys) < error(rebuilt_keys, span_values)
+    assert error(rebuilt_values, span_values) < error(rebuilt_values, span_keys)
 
 
 def test_the_codec_addresses_the_cache_by_role() -> None:

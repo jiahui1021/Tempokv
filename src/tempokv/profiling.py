@@ -30,6 +30,7 @@ is only trustworthy for the default VAE path.
 from __future__ import annotations
 
 from contextlib import contextmanager
+import contextvars
 import functools
 from statistics import median
 import sys
@@ -261,6 +262,16 @@ def _wrap_function(module: Any, name: str, profile: RuntimeProfile, section: str
     setattr(module, name, wrapper)
 
 
+# The decode callback runs inside a cache read but is handed only the packed
+# state, which does not say which tensor it is: a temporal V looks exactly like
+# a temporal K, and the mirrored direction swaps which one carries the cross
+# term.  The cache read knows the role, so it publishes it here for the decode
+# wrapper nested inside it.
+_ACTIVE_CACHE_ROLE: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "tempokv_active_cache_role", default=None
+)
+
+
 def _wrap_method(
     cls: type,
     name: str,
@@ -302,14 +313,23 @@ def install(profile: RuntimeProfile) -> dict[str, str]:
     def patch_cache_read() -> None:
         from .runtime.cache import ChunkedKVCache
 
-        _wrap_method(
-            ChunkedKVCache,
-            "_read_layout",
-            profile,
-            lambda cache: (
-                CACHE_READ_V if cache.cache_role == "V" else CACHE_READ_K
-            ),
-        )
+        owner = _defining_class(ChunkedKVCache, "_read_layout")
+        if owner is None:
+            raise AttributeError("ChunkedKVCache has no method _read_layout")
+        original = vars(owner)["_read_layout"]
+
+        @functools.wraps(original)
+        def wrapper(self: Any, *args: Any, **kwargs: Any) -> Any:
+            role = "V" if self.cache_role == "V" else "K"
+            section = CACHE_READ_V if role == "V" else CACHE_READ_K
+            token = _ACTIVE_CACHE_ROLE.set(role)
+            try:
+                with profile.section(section):
+                    return original(self, *args, **kwargs)
+            finally:
+                _ACTIVE_CACHE_ROLE.reset(token)
+
+        setattr(owner, "_read_layout", wrapper)
 
     def patch_rope() -> None:
         from .runtime import rope
@@ -327,10 +347,23 @@ def install(profile: RuntimeProfile) -> dict[str, str]:
 
         @functools.wraps(original)
         def wrapper(state: Any, **kwargs: Any) -> Any:
-            kind = getattr(state, "predictor_kind", None)
-            if kind is None and isinstance(state, dict):
-                kind = state.get("predictor_kind")
-            section = DECODE_K if kind == "temporal" else DECODE_V
+            role = _ACTIVE_CACHE_ROLE.get()
+            if role is None:
+                # Decoded outside a profiled cache read.  Fall back to the
+                # predictor kind and the codec direction, which is exact
+                # whenever a cross term exists and only ambiguous when both
+                # tensors are predicted temporally.
+                kind = getattr(state, "predictor_kind", None)
+                if kind is None and isinstance(state, dict):
+                    kind = state.get("predictor_kind")
+                direction = getattr(
+                    getattr(kwargs.get("codec"), "config", None),
+                    "predictor_direction",
+                    "k_to_v",
+                )
+                primary_is_key = direction != "v_to_k"
+                role = "K" if (kind == "temporal") == primary_is_key else "V"
+            section = DECODE_V if role == "V" else DECODE_K
             with profile.section(section):
                 return original(state, **kwargs)
 

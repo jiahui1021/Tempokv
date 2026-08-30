@@ -30,6 +30,18 @@ _SCALE_DTYPES = {
 }
 
 
+def _reconstruction_dtype(config: CodecConfig) -> torch.dtype:
+    """The dtype the codec actually stores reconstructions in.
+
+    The rollout has to round exactly where the encoder rounds, so this follows
+    the config instead of assuming bfloat16; a float32 codec was otherwise
+    simulated at a precision it never uses, and the refinement objective was
+    optimizing against a slightly different codec from the deployed one.
+    """
+    return _SCALE_DTYPES[config.reconstruction_dtype]
+
+
+
 def _round_trip(
     value: torch.Tensor, *, bits: int, config: CodecConfig, symmetric: bool
 ) -> torch.Tensor:
@@ -101,7 +113,7 @@ def temporal_rollout(
                 bits=config.anchor_bits,
                 config=config,
                 symmetric=True,
-            ).to(torch.bfloat16).float()
+            ).to(_reconstruction_dtype(config)).float()
         ]
         for frame in range(1, frames):
             reconstructed.append(
@@ -110,7 +122,7 @@ def temporal_rollout(
                     bits=bits,
                     config=config,
                     symmetric=config.residual_mode == "symmetric",
-                ).to(torch.bfloat16).float()
+                ).to(_reconstruction_dtype(config)).float()
             )
         return torch.stack(reconstructed, dim=-3)
 
@@ -120,7 +132,7 @@ def temporal_rollout(
             bits=config.anchor_bits,
             config=config,
             symmetric=True,
-        ).to(torch.bfloat16).float()
+        ).to(_reconstruction_dtype(config)).float()
     ]
     for frame in range(1, frames):
         order = min(frame, history_length)
@@ -176,7 +188,7 @@ def temporal_rollout(
         )
         if detach_residual:
             residual = residual.detach()
-        reconstructed.append((prediction + residual).to(torch.bfloat16).float())
+        reconstructed.append((prediction + residual).to(_reconstruction_dtype(config)).float())
     return torch.stack(reconstructed, dim=-3)
 
 
@@ -229,7 +241,7 @@ def cross_kv_rollout(
             bits=config.anchor_bits,
             config=config,
             symmetric=True,
-        ).to(torch.bfloat16).float()
+        ).to(_reconstruction_dtype(config)).float()
     ]
     for frame in range(1, frames):
         current_source = source[..., frame, :, :].float()
@@ -290,7 +302,7 @@ def cross_kv_rollout(
         )
         if detach_residual:
             residual = residual.detach()
-        reconstructed.append((prediction + residual).to(torch.bfloat16).float())
+        reconstructed.append((prediction + residual).to(_reconstruction_dtype(config)).float())
     return torch.stack(reconstructed, dim=-3)
 
 

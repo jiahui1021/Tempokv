@@ -127,8 +127,17 @@ class CodecConfig:
         if resolved_fit_mode == "legacy" and self.k_history_length is None:
             object.__setattr__(self, "k_history_length", 2)
 
+        # Coerce the integral settings before anything reads them.  A float
+        # that happens to be whole (``4.0`` from JSON) used to survive into the
+        # config, reach quantization or a reshape as a float, and produce a
+        # different parameter signature from the identical integer config.
+        for name in ("k_bits", "v_bits", "anchor_bits", "group_size", "stride"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or int(value) != value:
+                raise ValueError(f"{name} must be a whole number, got {value!r}")
+            object.__setattr__(self, name, int(value))
         for name in ("k_bits", "v_bits", "anchor_bits"):
-            value = int(getattr(self, name))
+            value = getattr(self, name)
             if value not in (2, 4, 8):
                 raise ValueError(f"{name} must be 2, 4, or 8, got {value}")
         if self.group_size <= 0:

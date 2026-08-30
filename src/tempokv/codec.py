@@ -1263,17 +1263,30 @@ class TempoKVCodec:
     def decode(
         self, packed: PackedKV, *, output_dtype: torch.dtype | None = None
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        key = decode_tensor(
-            packed.key,
+        """Decode a packed pair, mirroring the order ``encode`` used.
+
+        The dependent tensor is decoded from the reconstruction of the tensor
+        it was projected from, so the order follows the codec direction rather
+        than the K/V names: forward decodes K then V, and the mirrored
+        direction decodes V then K.
+        """
+        mirrored = self.config.mirrored
+        packed_primary, packed_secondary = (
+            (packed.value, packed.key) if mirrored else (packed.key, packed.value)
+        )
+        primary = decode_tensor(
+            packed_primary,
             output_dtype=output_dtype,
             use_triton=self.config.use_triton,
             strict_triton=self.config.strict_triton,
         )
-        value = decode_tensor(
-            packed.value,
-            source=key if self.predicts_v_from_key else None,
+        secondary = decode_tensor(
+            packed_secondary,
+            source=primary if self.predicts_v_from_key else None,
             output_dtype=output_dtype,
             use_triton=self.config.use_triton,
             strict_triton=self.config.strict_triton,
         )
-        return key, value
+        if mirrored:
+            return secondary, primary
+        return primary, secondary

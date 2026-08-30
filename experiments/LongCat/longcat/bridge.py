@@ -179,12 +179,27 @@ def decode_kv_cache(
             value_output.copy_(v_cache)
             v_cache = value_output
         return k_cache, v_cache
-    if k_cache.predictor_kind != "temporal":
-        raise ValueError("LongCat K cache must use temporal TempoKV prediction")
-    if v_cache.predictor_kind not in ("cross_kv", "temporal"):
-        raise ValueError(
-            "LongCat V cache must use cross_kv or temporal TempoKV prediction"
-        )
+    # Exactly one side is predicted temporally and supplies the projection
+    # source for the other.  Which side that is follows the codec direction:
+    # forward is K temporal / V cross, mirrored is V temporal / K cross.
+    kinds = (k_cache.predictor_kind, v_cache.predictor_kind)
+    if codec.config.mirrored:
+        if v_cache.predictor_kind != "temporal":
+            raise ValueError(
+                "mirrored LongCat caches need a temporal V to project K from, "
+                f"got {kinds}"
+            )
+        if k_cache.predictor_kind != "cross_kv":
+            raise ValueError(
+                f"mirrored LongCat K cache must use cross_kv prediction, got {kinds}"
+            )
+    else:
+        if k_cache.predictor_kind != "temporal":
+            raise ValueError("LongCat K cache must use temporal TempoKV prediction")
+        if v_cache.predictor_kind not in ("cross_kv", "temporal"):
+            raise ValueError(
+                "LongCat V cache must use cross_kv or temporal TempoKV prediction"
+            )
     if isinstance(k_cache, PackedTensorSpanSet) != isinstance(v_cache, PackedTensorSpanSet):
         raise TypeError("LongCat K and V span formats must match")
     if isinstance(k_cache, PackedTensorSpanSet):

@@ -54,16 +54,39 @@ def quantize_symmetric(
     # Round the scale to its stored precision *before* quantizing against it.
     # The decoder only ever sees the stored scale, so quantizing against a
     # higher-precision one leaves a gain error the residual never absorbs.
-    scale = (
-        groups.abs()
-        .amax(dim=-1)
-        .clamp_min(1e-12)
-        .div(qmax)
-        .to(scale_dtype)
+    scale = _checked_scale(
+        groups.abs().amax(dim=-1).clamp_min(1e-12).div(qmax), scale_dtype
     )
     quant = torch.round(groups / scale.float().unsqueeze(-1)).clamp(-qmax, qmax)
     unsigned = (quant + qmax).to(torch.uint8).reshape_as(value)
     return _pack(unsigned, bits), scale
+
+
+# float16 tops out at 65504, so it is the only supported scale dtype a finite
+# float32 group can overflow; float32 and bfloat16 share float32's exponent
+# range.  Restricting the check to float16 keeps the production bfloat16 path
+# free of an extra reduction on the quantization hot path.
+_NARROW_SCALE_DTYPES = (torch.float16,)
+
+
+def _checked_scale(scale: "torch.Tensor", scale_dtype: "torch.dtype") -> "torch.Tensor":
+    """Round a scale to its stored dtype, refusing one that does not survive.
+
+    Storing the scale in float16 silently overflows to ``inf`` once the group
+    magnitude is large enough, and every value dequantized against it comes
+    back NaN.  Failing here names the cause; the alternative is a run that
+    produces NaN video and no explanation.
+    """
+    stored = scale.to(scale_dtype)
+    if scale_dtype in _NARROW_SCALE_DTYPES and not torch.isfinite(stored).all():
+        finite = scale[torch.isfinite(scale)]
+        largest = float(finite.max()) if finite.numel() else float("inf")
+        raise ValueError(
+            f"quantization scale overflows {scale_dtype}: the largest finite "
+            f"scale is {largest:g}. Use a wider scale_dtype, a smaller "
+            "group_size, or rescale the input."
+        )
+    return stored
 
 
 def dequantize_symmetric(
@@ -95,12 +118,7 @@ def quantize_asymmetric(
     qmax = (1 << bits) - 1
     # Same ordering as the symmetric path: the zero point and the codes must be
     # derived from the scale the decoder will actually use.
-    scale = (
-        (high - low)
-        .clamp_min(1e-12)
-        .div(qmax)
-        .to(scale_dtype)
-    )
+    scale = _checked_scale((high - low).clamp_min(1e-12).div(qmax), scale_dtype)
     zero_point = torch.round(-low / scale.float()).clamp(0, qmax)
     quant = torch.round(groups / scale.float() + zero_point).clamp(0, qmax)
     packed = _pack(quant.to(torch.uint8).reshape_as(value), bits)
