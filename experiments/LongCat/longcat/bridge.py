@@ -574,7 +574,11 @@ def encode_kv_cache_spans(
                     sum(item.shape[2] for item in key_spans),
                     key_spans[0].shape[3],
                 ),
-                predictor_kind="temporal",
+                # Take the kind from the spans themselves.  Re-deriving it
+                # from the codec assumed K is always the temporal side, which
+                # the mirrored direction reverses, and a label that disagrees
+                # with the packed state routes the decode wrongly.
+                predictor_kind=key_spans[0].predictor_kind,
                 spans=key_spans,
             ),
             PackedTensorSpanSet(
@@ -584,9 +588,7 @@ def encode_kv_cache_spans(
                     sum(item.shape[2] for item in value_spans),
                     value_spans[0].shape[3],
                 ),
-                predictor_kind=(
-                    "cross_kv" if codec.predicts_v_from_key else "temporal"
-                ),
+                predictor_kind=value_spans[0].predictor_kind,
                 spans=value_spans,
             ),
         )

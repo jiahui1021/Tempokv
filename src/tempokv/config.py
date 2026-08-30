@@ -131,7 +131,11 @@ class CodecConfig:
         # that happens to be whole (``4.0`` from JSON) used to survive into the
         # config, reach quantization or a reshape as a float, and produce a
         # different parameter signature from the identical integer config.
-        for name in ("k_bits", "v_bits", "anchor_bits", "group_size", "stride"):
+        integral = ["k_bits", "v_bits", "anchor_bits", "group_size", "stride",
+                    "v_history_length"]
+        if self.k_history_length is not None:
+            integral.append("k_history_length")
+        for name in integral:
             value = getattr(self, name)
             if isinstance(value, bool) or int(value) != value:
                 raise ValueError(f"{name} must be a whole number, got {value!r}")
