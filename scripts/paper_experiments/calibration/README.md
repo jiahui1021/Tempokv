@@ -80,7 +80,7 @@ NUM_GPUS=1 \
 bash scripts/Self-Forcing/collect_trace.sh
 ```
 
-Two settings are not optional:
+Two settings are not optional **for Self-Forcing**:
 
 - `LEGACY_PROTOCOL=0`. The legacy event protocol is pinned to exactly 12
   prompts, which cannot express a 64-prompt pool. The flat layout carries the
@@ -90,9 +90,24 @@ Two settings are not optional:
   pool can no longer be sliced by prompt. The recorded activations are
   identical either way; only the record order changes.
 
-Repeat for `scripts/Causal-Forcing/collect_trace.sh` and
-`scripts/LongCat/collect_trace.sh` if you want panel (c). LongCat already
-writes the plain `[L,S,T,H,D]` layout.
+The other two collectors do **not** take the same options, and panel (c) has
+to work with what each one allows:
+
+- **Causal-Forcing** forces `LEGACY_PROTOCOL=1` and refuses any other value, so
+  its pool is exactly 12 prompts in the seven-dimensional event layout.
+  `PoolTrace` collapses that layout to the same `[L,S,T,H,D]` records, so it
+  slices by prompt normally -- but with 12 prompts the calibration group is
+  small, so give module 3 a size grid that fits (for example
+  `--sizes 2 4 8` with 8 calibration and 4 held-out prompts).
+- **LongCat** collects one prompt per invocation (`PROMPT=...`), not a prompt
+  file. Build its pool by running `collect_trace.sh` once per prompt with the
+  **same `TRACE_DIR`**, in pool order; the events accumulate under that root
+  and the final merge picks all of them up. It already writes the plain
+  `[L,S,T,H,D]` layout.
+
+In every case `PoolTrace` refuses a trace whose record count does not divide by
+the prompt count, so a mis-accumulated pool fails loudly instead of silently
+misattributing records to the wrong prompt.
 
 `PoolTrace` checks that the record count divides evenly by the pool prompt
 count and fails with a clear message when the trace and the prompt groups
