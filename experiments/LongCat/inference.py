@@ -57,6 +57,14 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--attn_sink_frames", type=int, default=0)
     parser.add_argument("--quant_type", choices=("none", "tempokv"), default="none")
     parser.add_argument("--enable_compile", action="store_true")
+    parser.add_argument(
+        "--save_segment_snapshots",
+        action="store_true",
+        help=(
+            "save cumulative intermediate videos in a sibling directory; the "
+            "main output directory always contains final videos only"
+        ),
+    )
     cache = parser.add_mutually_exclusive_group()
     cache.add_argument("--offload_kv_cache", action="store_true")
     cache.add_argument("--no_offload_kv_cache", action="store_false", dest="offload_kv_cache")
@@ -206,6 +214,7 @@ def generate(args: argparse.Namespace) -> None:
     generator = torch.Generator(device=local_rank).manual_seed(args.seed)
     output_dir = args.output_dir.expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
+    snapshot_dir = output_dir.parent / f"{output_dir.name}_segments"
 
     if args.init_video_path is None:
         initial = pipeline.generate_t2v(
@@ -220,9 +229,9 @@ def generate(args: argparse.Namespace) -> None:
         )[0]
         current_video = _to_pil_frames(initial)
         all_frames = list(current_video)
-        if global_rank == 0:
+        if global_rank == 0 and args.save_segment_snapshots:
             _write_video(
-                output_dir / "segment_000.mp4",
+                snapshot_dir / "segment_000.mp4",
                 all_frames,
                 fps=args.fps,
                 crf=args.crf,
@@ -258,9 +267,9 @@ def generate(args: argparse.Namespace) -> None:
         ]
         all_frames.extend(new_video[args.num_cond_frames :])
         current_video = new_video
-        if global_rank == 0:
+        if global_rank == 0 and args.save_segment_snapshots:
             _write_video(
-                output_dir / f"segment_{segment_index:03d}.mp4",
+                snapshot_dir / f"segment_{segment_index:03d}.mp4",
                 all_frames,
                 fps=args.fps,
                 crf=args.crf,

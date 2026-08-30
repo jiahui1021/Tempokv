@@ -128,7 +128,7 @@ def _layer_ids(
     text: str,
     layers: int,
     temporal: TemporalParameters,
-    cross: CrossKVParameters,
+    value_parameters: CrossKVParameters | TemporalParameters,
 ) -> tuple[int, ...]:
     if text.strip():
         result = tuple(int(item.strip()) for item in text.split(",") if item.strip())
@@ -136,8 +136,8 @@ def _layer_ids(
         candidates = []
         if temporal.layered:
             candidates.append(temporal.layer_ids)
-        if cross.layered:
-            candidates.append(cross.layer_ids)
+        if value_parameters.layered:
+            candidates.append(value_parameters.layer_ids)
         if candidates and any(item != candidates[0] for item in candidates[1:]):
             raise ValueError("K and V parameter layer IDs do not match")
         result = candidates[0] if candidates else tuple(range(layers))
@@ -176,7 +176,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         configure_triton_cache(args.triton_cache)
 
     temporal = TemporalParameters.load(args.k_params)
-    cross = CrossKVParameters.load(args.v_params)
+    value_parameters: CrossKVParameters | TemporalParameters
+    if config.v_predictor_mode in {"temporal", "direct"}:
+        value_parameters = TemporalParameters.load(args.v_params)
+    else:
+        value_parameters = CrossKVParameters.load(args.v_params)
     with np.load(args.input, allow_pickle=False) as data:
         if args.k_key not in data or args.v_key not in data:
             raise KeyError(
@@ -188,8 +192,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError("keys and values must have the same layout and shape")
 
     layers = int(keys.shape[0])
-    layer_ids = _layer_ids(args.layer_ids, layers, temporal, cross)
-    codec = TempoKVCodec(temporal, cross, config)
+    layer_ids = _layer_ids(args.layer_ids, layers, temporal, value_parameters)
+    codec = TempoKVCodec(temporal, value_parameters, config)
     rebuilt_keys = []
     rebuilt_values = []
     per_layer = []

@@ -73,6 +73,7 @@ DRY_RUN="${DRY_RUN:-0}"
 PREFLIGHT="${PREFLIGHT:-1}"
 OFFLOAD_KV_CACHE="${OFFLOAD_KV_CACHE:-0}"
 ENABLE_COMPILE="${ENABLE_COMPILE:-0}"
+SAVE_SEGMENT_SNAPSHOTS="${SAVE_SEGMENT_SNAPSHOTS:-0}"
 
 check_int CONTEXT_PARALLEL_SIZE 1
 check_int NUM_GPUS 1
@@ -83,6 +84,7 @@ check_flag DRY_RUN
 check_flag PREFLIGHT
 check_flag OFFLOAD_KV_CACHE
 check_flag ENABLE_COMPILE
+check_flag SAVE_SEGMENT_SNAPSHOTS
 
 if (( (NUM_FRAMES - 1) % 4 != 0 )); then
   die "NUM_FRAMES 必须满足 (NUM_FRAMES - 1) 能被 4 整除"
@@ -119,6 +121,7 @@ args=(
   args+=(--init_video_path "$(resolve_path "$INIT_VIDEO_PATH")")
 [[ "$OFFLOAD_KV_CACHE" == "1" ]] && args+=(--offload_kv_cache) || args+=(--no_offload_kv_cache)
 [[ "$ENABLE_COMPILE" == "1" ]] && args+=(--enable_compile)
+[[ "$SAVE_SEGMENT_SNAPSHOTS" == "1" ]] && args+=(--save_segment_snapshots)
 [[ -n "${CACHE_STRIDE:-}" ]] && args+=(--stride "$CACHE_STRIDE")
 [[ -n "${K_HISTORY_LENGTH:-}" ]] && args+=(--k-history-length "$K_HISTORY_LENGTH")
 [[ -n "${V_HISTORY_LENGTH:-}" ]] && args+=(--v-history-length "$V_HISTORY_LENGTH")

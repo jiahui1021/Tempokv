@@ -25,3 +25,11 @@ def test_cuda_peak_memory_reset_initializes_requested_device() -> None:
 
     empty.assert_called_once_with(0, device=device)
     reset.assert_called_once_with(device)
+
+
+def test_common_fitter_accepts_direct_v_predictor() -> None:
+    args = FIT_PARAMS.build_parser().parse_args(
+        ["trace.npz", "--v-predictor-mode", "direct"]
+    )
+
+    assert args.v_predictor_mode == "direct"

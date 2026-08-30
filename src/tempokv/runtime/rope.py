@@ -91,6 +91,17 @@ def apply_rope_by_span(
     ``x`` is ``[B, S, H, D]`` holding the spans back to back in the order
     given, which is the order :meth:`ChunkedKVCache.spans` returns.
     """
+    if x.ndim != 4:
+        raise ValueError("RoPE input must have shape [B,S,H,D]")
+    if grid_sizes.ndim != 2 or grid_sizes.shape[1] != 3:
+        raise ValueError("grid_sizes must have shape [B,3]")
+    if grid_sizes.shape[0] != x.shape[0]:
+        raise ValueError(
+            f"grid_sizes batch {grid_sizes.shape[0]} does not match input batch "
+            f"{x.shape[0]}"
+        )
+    if torch.any(grid_sizes <= 0):
+        raise ValueError("grid sizes must be positive")
     spans = list(spans)
     if not spans:
         raise ValueError("RoPE requires at least one cache span")

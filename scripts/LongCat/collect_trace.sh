@@ -15,11 +15,13 @@ CONTEXT_PARALLEL_SIZE="${CONTEXT_PARALLEL_SIZE:-1}"
 NUM_GPUS="${NUM_GPUS:-$CONTEXT_PARALLEL_SIZE}"
 DRY_RUN="${DRY_RUN:-0}"
 PREFLIGHT="${PREFLIGHT:-1}"
+OVERWRITE="${OVERWRITE:-0}"
 
 check_int CONTEXT_PARALLEL_SIZE 1
 check_int NUM_GPUS 1
 check_flag DRY_RUN
 check_flag PREFLIGHT
+check_flag OVERWRITE
 
 args=(
   --mode trace
@@ -88,6 +90,21 @@ if [[ "$PREFLIGHT" == "1" ]]; then
   "$python_bin" "$adapter_root/preflight.py" "${preflight_args[@]}"
 fi
 
+if [[ "$OVERWRITE" != "1" ]]; then
+  if [[ -e "$trace_file" ]]; then
+    die "已存在拟合输入：${trace_file}。设置 OVERWRITE=1 覆盖，或换一个 TRACE_FILE。"
+  fi
+  if [[ -d "$raw_trace_dir" ]]; then
+    existing="$(find "$raw_trace_dir" -type d -name 'event_*' -print -quit)"
+    if [[ -n "$existing" ]]; then
+      die "已存在 LongCat trace 事件：${existing}。设置 OVERWRITE=1 覆盖，或换一个 TRACE_DIR。"
+    fi
+  fi
+fi
+
+if [[ "$OVERWRITE" == "1" ]]; then
+  rm -rf -- "$raw_trace_dir" "$output_dir"
+fi
 mkdir -p -- "$raw_trace_dir" "$output_dir"
 "${collect_command[@]}"
 "${merge_command[@]}"

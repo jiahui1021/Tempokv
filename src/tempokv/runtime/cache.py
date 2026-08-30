@@ -75,8 +75,10 @@ def uncompress_single_kv_cache(
     source_tensor: torch.Tensor | None = None,
     output_tensor: torch.Tensor | None = None,
     output_layout: str = "BSHD",
+    decoder: Callable[..., torch.Tensor] | None = None,
 ) -> torch.Tensor:
-    if _quantized_decoder is None:
+    resolved_decoder = decoder if decoder is not None else _quantized_decoder
+    if resolved_decoder is None:
         raise RuntimeError("no TempoKV decoder is installed for this cache span")
     kwargs: dict[str, Any] = {
         "source_tensor": source_tensor,
@@ -86,7 +88,7 @@ def uncompress_single_kv_cache(
     # decoder only needs the new keyword when a BHSD target is requested.
     if output_layout != "BSHD":
         kwargs["output_layout"] = output_layout
-    return _quantized_decoder(state, **kwargs)
+    return resolved_decoder(state, **kwargs)
 
 
 class ChunkedKVCache:
@@ -104,6 +106,7 @@ class ChunkedKVCache:
         *,
         layout: str = "BSHD",
         cache_role: str | None = None,
+        quantized_decoder: Callable[..., torch.Tensor] | None = None,
     ) -> None:
         if layout not in {"BSHD", "BHSD"}:
             raise ValueError(f"unsupported cache layout: {layout}")
@@ -124,6 +127,10 @@ class ChunkedKVCache:
         self.device = device
         self.layout = layout
         self.cache_role = cache_role
+        # A cache may outlive the pipeline that created the next cache in the
+        # same process.  Keep its decoder on the instance so installing a
+        # second pipeline cannot silently redirect old packed spans.
+        self._quantized_decoder = quantized_decoder
         # The TempoKV bridge switches reconstructed K to the legacy complex64
         # cached-key RoPE without changing native/BF16 cache behavior.
         self.rope_precision = "native"
@@ -136,6 +143,16 @@ class ChunkedKVCache:
         # slot is free. Without eviction this is the identity mapping, so the
         # BF16 baseline behaves exactly as it did before spans existed.
         self.global_frames: list[int | None] = [None] * max_num_chunks
+
+    def set_quantized_decoder(
+        self, decoder: Callable[..., torch.Tensor] | None
+    ) -> None:
+        """Bind packed-span decoding to this cache instance.
+
+        The module-level setter remains as a compatibility fallback for older
+        integrations and direct callers.
+        """
+        self._quantized_decoder = decoder
 
     @property
     def kv_cache_size(self) -> int:
@@ -410,6 +427,7 @@ class ChunkedKVCache:
                 source_tensor=source,
                 output_tensor=direct_output,
                 output_layout=output_layout,
+                decoder=self._quantized_decoder,
             )
             expected_shape = (
                 self.batch_size,

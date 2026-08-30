@@ -77,10 +77,11 @@ def build_parser() -> argparse.ArgumentParser:
     # instead of one committed config per combination.
     parser.add_argument(
         "--v-predictor-mode",
-        choices=("cross_kv", "temporal", "innovation"),
+        choices=("cross_kv", "temporal", "innovation", "direct"),
         help=(
             "predict V from reconstructed K (cross_kv), its own history "
-            "(temporal), or decoder-visible K innovation plus V history"
+            "(temporal), decoder-visible K innovation plus V history, or "
+            "quantize it without a predictor (direct)"
         ),
     )
     parser.add_argument(

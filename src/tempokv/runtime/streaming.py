@@ -124,6 +124,7 @@ class StreamingTempoKVEncoder:
         """
         if num_frames < 1:
             raise ValueError("finalize needs at least one frame")
+        self._validate_caches(caches)
         self._finalized_frame += int(num_frames)
         self.report.finalized_frames += int(num_frames)
         # Measure before packing as well: the moment just before a span is
@@ -134,8 +135,32 @@ class StreamingTempoKVEncoder:
             return 0
         return self.flush(caches)
 
+    def _validate_caches(self, caches: Sequence[Mapping[str, Any]]) -> None:
+        if len(caches) != self.num_layers:
+            raise ValueError(
+                f"expected {self.num_layers} cache layers, got {len(caches)}"
+            )
+        for layer_index, layer in enumerate(caches):
+            for role in ("k", "v"):
+                if role not in layer:
+                    raise ValueError(
+                        f"cache layer {layer_index} is missing {role.upper()}"
+                    )
+                cache = layer[role]
+                for method in (
+                    "bf16_resident_bytes",
+                    "read_bhsd",
+                    "store_quantized",
+                ):
+                    if not callable(getattr(cache, method, None)):
+                        raise TypeError(
+                            f"cache layer {layer_index} {role.upper()} does not "
+                            f"support {method}"
+                        )
+
     def flush(self, caches: Sequence[Mapping[str, Any]], *, force: bool = False) -> int:
         """Pack every complete span; with ``force`` also pack a partial one."""
+        self._validate_caches(caches)
         packed_frames = 0
         while True:
             available = self.pending_frames
@@ -169,10 +194,6 @@ class StreamingTempoKVEncoder:
         start_frame: int,
         num_frames: int,
     ) -> None:
-        if len(caches) != self.num_layers:
-            raise ValueError(
-                f"expected {self.num_layers} cache layers, got {len(caches)}"
-            )
         token_start = start_frame * self.frame_seq_length
         token_end = token_start + num_frames * self.frame_seq_length
         with self.report.timer("encode_ms"), torch.no_grad():

@@ -28,6 +28,9 @@ data/longcat/trace/output/
 data/longcat/trace/clean_trace.npz
 ```
 
+重跑同一个 `TRACE_DIR` 时默认拒绝已有 trace，避免把新旧校准数据混在一起。
+确认需要重新采集时设置 `OVERWRITE=1`。
+
 合并阶段默认从 trace 文件中的 `trace_stride` 读取空间步长，并检查所有 Context
 Parallel rank 的 metadata 一致。因此 `CONTEXT_PARALLEL_SIZE=1/2/4` 可以分别使用
 `1560/780/390`，不需要手动修改合并命令。只有处理旧 trace 或强制校验时才设置
@@ -73,7 +76,9 @@ bash scripts/LongCat/run_tempokv.sh
 `CACHE_STRIDE` 自动选择拟合生成的参数目录。`PARAM_DIR` 可覆盖整个目录；
 `K_PARAMS` 与 `V_PARAMS` 仍可同时设置，用于直接指定两个文件。
 
-默认输出到 `results/longcat/tempokv/`。
+默认输出到 `results/longcat/tempokv/`，目录中只保存最终的
+`longcat.mp4`，可直接用于质量评测。需要保存累计的阶段快照时设置
+`SAVE_SEGMENT_SNAPSHOTS=1`，快照会写入同级的 `tempokv_segments/`目录。
 
 三种模式都会先从 prompt 生成首段视频，然后在本仓库内执行 video
 continuation。若希望从现有视频开始，可额外设置：
@@ -84,7 +89,7 @@ INIT_VIDEO_PATH=/data/input.mp4
 
 常用可选变量：`NUM_SEGMENTS`、`NUM_FRAMES`、`NUM_COND_FRAMES`、
 `NUM_INFERENCE_STEPS`、`CONTEXT_PARALLEL_SIZE`、`NUM_GPUS`、`SEED`、
-`OUTPUT_DIR`、`DRY_RUN`。
+`OUTPUT_DIR`、`SAVE_SEGMENT_SNAPSHOTS`、`DRY_RUN`。
 
 `FIT_DEVICE` 默认 `auto`：有 CUDA 就用 GPU，没有则回退 CPU 并在 stderr 打出告警——
 CPU 拟合同时会把方程降到 float64，比看上去慢得多，所以回退不会静默发生。

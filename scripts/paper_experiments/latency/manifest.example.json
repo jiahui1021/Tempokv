@@ -2,7 +2,7 @@
   "schema_version": "tempokv.latency-manifest.v1",
   "experiment_id": "self-forcing-a100-latency-v1",
   "output_dir": "results/paper_experiments/latency-v1",
-  "horizons": [180, 360, 540, 717, 1050, 1400],
+  "horizons": [105, 177, 357, 717, 1053, 1401],
   "fixed_frames": 717,
   "repeats": 5,
   "session_scope": "coordinator_session_multiple_processes",
