@@ -77,8 +77,27 @@ axis the curve is measured along.
 
 ### Methods
 
-Only what this repository implements. Externally published baselines that are
-not implemented here are deliberately absent rather than approximated.
+Only what **this** repository implements — the TempoKV predictor family.
+
+> **Comparing against BF16, RTN, KIVI, QuaRot and QVG?** Those live in the
+> `kv-quant-4-videogen` repository, so the cross-method comparison lives there
+> too and reads the trace collected here:
+>
+> ```bash
+> cd ../kv-quant-4-videogen
+> python scripts/paper_experiments/reconstruction/run_reconstruction.py \
+>     --trace             ../Tempokv/data/long-horizon/1401f/clean_trace.npz \
+>     --calibration-trace ../Tempokv/data/self-forcing/trace/clean_trace.npz \
+>     --tempokv-root      ../Tempokv \
+>     --output-dir        results/reconstruction/1401f
+> ```
+>
+> One trace, every method, one measurement path. The module here stays useful
+> for comparing TempoKV's own predictor variants, which that one does not
+> cover.
+
+Externally published baselines that are not implemented here are deliberately
+absent from *this* module rather than approximated.
 
 | `--methods` | What it is |
 | --- | --- |
