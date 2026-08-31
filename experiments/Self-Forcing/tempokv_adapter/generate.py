@@ -77,10 +77,19 @@ def build_parser() -> argparse.ArgumentParser:
     # instead of one committed config per combination.
     parser.add_argument(
         "--v-predictor-mode",
-        choices=("cross_kv", "temporal", "innovation", "direct"),
+        choices=(
+            "cross_kv",
+            "temporal",
+            "identity",
+            "taylor",
+            "taylor2",
+            "innovation",
+            "direct",
+        ),
         help=(
             "predict V from reconstructed K (cross_kv), its own history "
-            "(temporal), decoder-visible K innovation plus V history, or "
+            "(temporal/identity/taylor/taylor2), decoder-visible K innovation "
+            "plus V history, or "
             "quantize it without a predictor (direct)"
         ),
     )
@@ -173,7 +182,9 @@ def _validate_parameters(
     from tempokv.parameters import CrossKVParameters, TemporalParameters
 
     temporal = TemporalParameters.load(k_path)
-    temporal_v = config.v_predictor_mode in {"temporal", "direct"}
+    temporal_v = config.v_predictor_mode in {
+        "temporal", "identity", "taylor", "taylor2", "direct"
+    }
     cross = (
         TemporalParameters.load(v_path)
         if temporal_v
@@ -902,7 +913,9 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             )
             if value is not None
         }
-        if overrides.get("v_predictor_mode") in {"temporal", "innovation"}:
+        if overrides.get("v_predictor_mode") in {
+            "temporal", "identity", "taylor", "taylor2", "innovation"
+        }:
             overrides["cross_kv_weight_mode"] = "layer_shared"
         if overrides:
             config = replace(config, **overrides)
@@ -959,7 +972,8 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             # launch batch where the reference implementation does.
             "v": (
                 min(requested_persistent_units, 8)
-                if config.v_predictor_mode != "temporal"
+                if config.v_predictor_mode
+                not in {"temporal", "identity", "taylor", "taylor2", "direct"}
                 else requested_persistent_units
             ),
             "v_backend": "triton",
@@ -1095,6 +1109,9 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         )
         v_route = {
             "temporal": "temporal_persistent_direct",
+            "identity": "temporal_persistent_direct",
+            "taylor": "temporal_persistent_direct",
+            "taylor2": "temporal_persistent_direct",
             "cross_kv": "cross_kv_persistent_direct",
             "innovation": "innovation_persistent_direct",
             "direct": "direct_persistent_direct",

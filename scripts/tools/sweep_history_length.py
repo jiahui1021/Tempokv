@@ -67,7 +67,12 @@ from analyze_predictor import (  # noqa: E402
     reconstruct_temporal,
     reconstruct_v,
 )
-from tempokv.config import CodecConfig, config_from_mapping  # noqa: E402
+from tempokv.config import (  # noqa: E402
+    FIXED_TEMPORAL_V_MIN_HISTORY,
+    CodecConfig,
+    config_from_mapping,
+    is_temporal_v_predictor,
+)
 from tempokv.fitting import fit_predictors  # noqa: E402
 
 K_HISTORY_CHOICES = tuple(range(0, 9))
@@ -166,7 +171,7 @@ def measure(
     fit_seconds = time.perf_counter() - started
 
     k_pred, k_res, k_rebuilt = reconstruct_k(keys, temporal, config)
-    temporal_v = config.v_predictor_mode == "temporal"
+    temporal_v = is_temporal_v_predictor(config.v_predictor_mode)
     if temporal_v:
         v_pred, v_res, v_rebuilt = reconstruct_temporal(
             values, cross, config, bits=config.v_bits
@@ -338,8 +343,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--v-predictor-mode",
-        choices=("cross_kv", "temporal"),
-        help="V predictor family; temporal is the independent w/o-Cross baseline",
+        choices=(
+            "cross_kv",
+            "temporal",
+            "identity",
+            "taylor",
+            "taylor2",
+            "innovation",
+            "direct",
+        ),
+        help=(
+            "V predictor family; temporal/identity/taylor/taylor2 use V's own "
+            "history, while cross_kv/innovation use a K-derived source"
+        ),
     )
     parser.add_argument(
         "--baseline-k-history",
@@ -470,12 +486,25 @@ def main(argv: list[str] | None = None) -> int:
         config_updates["v_bits"] = args.v_bits
     if args.v_predictor_mode is not None:
         config_updates["v_predictor_mode"] = args.v_predictor_mode
-        if args.v_predictor_mode == "temporal":
+        if (
+            is_temporal_v_predictor(args.v_predictor_mode)
+            and args.v_predictor_mode != "direct"
+        ):
             config_updates["cross_kv_weight_mode"] = "layer_shared"
     if config_updates:
         base = replace(base, **config_updates)
-    if base.v_predictor_mode == "temporal" and 0 in v_values:
-        parser.error("temporal V requires v-history values >= 1")
+    if (
+        is_temporal_v_predictor(base.v_predictor_mode)
+        and base.v_predictor_mode != "direct"
+    ):
+        minimum_history = FIXED_TEMPORAL_V_MIN_HISTORY.get(
+            base.v_predictor_mode, 1
+        )
+        if any(value < minimum_history for value in v_values):
+            parser.error(
+                f"{base.v_predictor_mode} V requires v-history values >= "
+                f"{minimum_history}"
+            )
 
     keys, values = load_trace(
         args.trace,
@@ -505,10 +534,13 @@ def main(argv: list[str] | None = None) -> int:
 
     # Baselines are chosen from the surviving lengths, so the sweep never holds
     # one axis at a length the trace cannot fit.
+    minimum_v_history = FIXED_TEMPORAL_V_MIN_HISTORY.get(
+        base.v_predictor_mode, 0
+    )
     baseline_v = (
         args.baseline_v_history
         if args.baseline_v_history is not None
-        else min(base.v_history_length, predicted_frames)
+        else max(min(base.v_history_length, predicted_frames), minimum_v_history)
     )
     baseline_k = (
         args.baseline_k_history if args.baseline_k_history is not None else max(k_values)

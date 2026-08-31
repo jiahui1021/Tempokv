@@ -86,6 +86,19 @@ def _video_files(directory: Path) -> list[Path]:
     )
 
 
+def _v_parameter_filename(config_path: Path) -> str:
+    """Return the V artifact name selected by a codec config."""
+    payload = json.loads(config_path.read_text(encoding="utf-8"))
+    if "codec" in payload:
+        payload = payload["codec"]
+    mode = payload.get("v_predictor_mode", "cross_kv")
+    if mode in {"temporal", "identity", "taylor", "taylor2", "direct"}:
+        return "v_temporal.npz"
+    if mode == "innovation":
+        return "v_innovation.npz"
+    return "v_cross_kv.npz"
+
+
 def run(args: argparse.Namespace) -> dict[str, object]:
     config = args.config.resolve()
     if not config.is_file():
@@ -110,7 +123,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         if not trace.is_file():
             raise ValueError(f"trace file does not exist: {trace}")
         k_params = parameter_dir / "k_temporal.npz"
-        v_params = parameter_dir / "v_cross_kv.npz"
+        v_params = parameter_dir / _v_parameter_filename(config)
 
     for path in (k_params, v_params):
         if args.skip_fit and not path.is_file():

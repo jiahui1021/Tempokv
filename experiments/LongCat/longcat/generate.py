@@ -85,8 +85,19 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--v-history-length", type=int, choices=range(0, 6))
     parser.add_argument(
         "--v-predictor-mode",
-        choices=("cross_kv", "temporal"),
-        help="predict V from reconstructed K (cross_kv) or from its own history",
+        choices=(
+            "cross_kv",
+            "temporal",
+            "identity",
+            "taylor",
+            "taylor2",
+            "innovation",
+            "direct",
+        ),
+        help=(
+            "predict V from reconstructed K (cross_kv), its own learned or "
+            "fixed temporal history, innovation, or direct quantization"
+        ),
     )
     return parser
 
@@ -238,7 +249,9 @@ def _enforce_accelerated_codec(bridge: object) -> None:
     codec.config = replace(config, use_triton=True, strict_triton=True)
 
 
-def _require_direct_persistent_routes(report: dict[str, object], codec: object) -> None:
+def _require_direct_persistent_routes(
+    report: dict[str, object], codec: object | None = None
+) -> None:
     """Reject production runs that missed LongCat's fused direct decoders."""
     routes = report.get("decode_routes")
     if not isinstance(routes, dict):
@@ -249,9 +262,18 @@ def _require_direct_persistent_routes(report: dict[str, object], codec: object) 
         == "direct"
         else "temporal_persistent_direct_bhsd"
     )
-    required = [k_route]
-    if getattr(codec, "predicts_v_from_key", False):
-        required.append("cross_kv_persistent_direct_bhsd")
+    v_predictor_mode = getattr(
+        getattr(codec, "config", None), "v_predictor_mode", "cross_kv"
+    )
+    if v_predictor_mode == "innovation":
+        v_route = "innovation_persistent_direct_bhsd"
+    elif v_predictor_mode == "cross_kv" or getattr(codec, "predicts_v_from_key", False):
+        v_route = "cross_kv_persistent_direct_bhsd"
+    elif getattr(getattr(codec, "v_parameters", None), "history_length", 1) == 0:
+        v_route = "direct_persistent_direct_bhsd"
+    else:
+        v_route = "temporal_persistent_direct_bhsd"
+    required = list(dict.fromkeys((k_route, v_route)))
     missing = [name for name in required if int(routes.get(name) or 0) <= 0]
     if missing:
         raise RuntimeError(

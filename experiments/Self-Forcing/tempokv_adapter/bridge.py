@@ -109,7 +109,8 @@ def install(runtime_root: str | Path) -> type:
             if config.reconstruction_dtype != "bfloat16":
                 raise ValueError("Self-Forcing requires bfloat16 reconstruction")
             if (
-                getattr(config, "v_predictor_mode", "cross_kv") != "temporal"
+                getattr(config, "v_predictor_mode", "cross_kv")
+                not in {"temporal", "identity", "taylor", "taylor2", "direct"}
                 and getattr(config, "v_history_length", 0)
                 and not self.tempokv_codec.v_parameters.history_diagonal
             ):

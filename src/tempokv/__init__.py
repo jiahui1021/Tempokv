@@ -12,6 +12,7 @@ from .codec import (
 
 from .config import CodecConfig
 from .fitting import (
+    build_fixed_temporal_parameters,
     fit_closed_loop,
     fit_cross_kv,
     fit_predictors,
@@ -34,6 +35,7 @@ __all__ = [
     "TempoKVCodec",
     "TemporalParameters",
     "decode_tensor",
+    "build_fixed_temporal_parameters",
     "encode_cross_kv",
     "encode_innovation",
     "encode_temporal",

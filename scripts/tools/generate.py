@@ -25,7 +25,7 @@ from tempokv import (
     TemporalParameters,
     configure_triton_cache,
 )
-from tempokv.config import config_from_mapping
+from tempokv.config import config_from_mapping, is_temporal_v_predictor
 
 
 CONFIG_FIELDS = tuple(CodecConfig.__dataclass_fields__)
@@ -177,7 +177,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
     temporal = TemporalParameters.load(args.k_params)
     value_parameters: CrossKVParameters | TemporalParameters
-    if config.v_predictor_mode in {"temporal", "direct"}:
+    if is_temporal_v_predictor(config.v_predictor_mode):
         value_parameters = TemporalParameters.load(args.v_params)
     else:
         value_parameters = CrossKVParameters.load(args.v_params)

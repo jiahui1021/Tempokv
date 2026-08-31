@@ -79,7 +79,7 @@ layer-shared Cross 权重。常用覆盖项：
 | `BITS=2/4/8` | 同时设置 K/V 位宽 |
 | `K_BITS`、`V_BITS` | 分别设置 K/V 位宽 |
 | `KH`、`VH` | 设置 K/V history length |
-| `V_PREDICTOR` | `cross_kv` 或 `temporal` |
+| `V_PREDICTOR` | `cross_kv`、`temporal`、`identity`、`taylor`、`taylor2`、`innovation` 或 `direct` |
 | `CACHE_STRIDE` | LongCat Context Parallel 的 local stride |
 | `FIT_DEVICE` | `cuda`、`cpu` 或 `auto` |
 | `DRY_RUN=1` | 只显示最终命令，不执行拟合 |
@@ -213,4 +213,5 @@ python scripts/evaluation/evaluate_quality.py \
 - [LongCat](scripts/LongCat/README.md)
 - [脚本目录](scripts/README.md)
 - [CrossKV sharing 实验](scripts/paper_experiments/cross_kv_sharing/README.md)
+- [Predictor replacement 实验](scripts/paper_experiments/predictor_ablation/README.md)
 - [latency 实验](scripts/paper_experiments/latency/README.md)

@@ -63,11 +63,11 @@ config = json.load(open(sys.argv[1], encoding="utf-8"))
 print(config.get("codec", config).get("v_predictor_mode", "cross_kv"))
 PY
 )"
-# V_PREDICTOR overrides the config so one file covers both predictors.
+# V_PREDICTOR overrides the config so one file covers all supported predictors.
 if [[ -n "${V_PREDICTOR:-}" ]]; then
   case "$V_PREDICTOR" in
-    cross_kv|temporal|innovation|direct) ;;
-    *) die "V_PREDICTOR 必须是 cross_kv、temporal、innovation 或 direct（当前值：${V_PREDICTOR}）" ;;
+    cross_kv|temporal|identity|taylor|taylor2|innovation|direct) ;;
+    *) die "V_PREDICTOR 必须是 cross_kv、temporal、identity、taylor、taylor2、innovation 或 direct（当前值：${V_PREDICTOR}）" ;;
   esac
   v_predictor_mode="$V_PREDICTOR"
 fi
@@ -88,7 +88,7 @@ else
   k_artifact_name="k_temporal.npz"
   case "$v_predictor_mode" in
     # Direct V has no predictor; its empty temporal map shares the temporal layout.
-    temporal|direct) v_artifact_name="v_temporal.npz" ;;
+    temporal|identity|taylor|taylor2|direct) v_artifact_name="v_temporal.npz" ;;
     innovation) v_artifact_name="v_innovation.npz" ;;
     cross_kv) v_artifact_name="v_cross_kv.npz" ;;
     # Keep command-only dry runs usable with PYTHON_BIN=/bin/echo; the Python
@@ -134,8 +134,14 @@ check_flag DRY_RUN
 check_int ITERATIONS 1
 check_int ATTENTION_LAYER_CHUNK 1
 if [[ -n "${ATTENTION_STEPS:-}" ]]; then
-  if [[ "$v_predictor_mode" == "innovation" ]]; then
-    die "innovation 暂不支持 ATTENTION_STEPS，请关闭 attention refinement"
+  if [[ "$v_predictor_mode" == "innovation" ||
+        "$v_predictor_mode" == "identity" ||
+        "$v_predictor_mode" == "taylor" ||
+        "$v_predictor_mode" == "taylor2" ]]; then
+    if [[ "$v_predictor_mode" == "innovation" ]]; then
+      die "innovation 暂不支持 ATTENTION_STEPS，请关闭 attention refinement"
+    fi
+    die "固定 predictor=$v_predictor_mode 不支持 ATTENTION_STEPS，请关闭 attention refinement"
   fi
   check_int ATTENTION_STEPS 1
   check_int ATTENTION_PATIENCE 1

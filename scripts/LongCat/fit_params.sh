@@ -4,7 +4,7 @@
 #
 # 读取 collect_trace.sh 合并出的 clean_trace.npz，调用通用的
 # scripts/common/fit_params.py 拟合 k_temporal.npz 与 V 参数
-#（v_cross_kv.npz 或 v_temporal.npz，取决于 v_predictor_mode）。
+#（v_cross_kv.npz、v_innovation.npz 或 v_temporal.npz，取决于 v_predictor_mode）。
 #
 # 输出目录默认从 CONFIG 推导（与 Self-Forcing、Causal Forcing 一致），因此
 # INT4 与 INT2 不会互相覆盖。
@@ -36,11 +36,11 @@ K_HISTORY_LENGTH="$(resolve_history K_HISTORY_LENGTH KH)"
 V_HISTORY_LENGTH="$(resolve_history V_HISTORY_LENGTH VH)"
 K_BITS="$(resolve_bits K_BITS)"
 V_BITS="$(resolve_bits V_BITS)"
-# V_PREDICTOR overrides the config so one file covers both predictors.
+# V_PREDICTOR overrides the config so one file covers all supported predictors.
 if [[ -n "${V_PREDICTOR:-}" ]]; then
   case "$V_PREDICTOR" in
-    cross_kv|temporal) ;;
-    *) die "V_PREDICTOR 必须是 cross_kv 或 temporal（当前值：${V_PREDICTOR}）" ;;
+    cross_kv|temporal|identity|taylor|taylor2|innovation|direct) ;;
+    *) die "V_PREDICTOR 必须是 cross_kv、temporal、identity、taylor、taylor2、innovation 或 direct（当前值：${V_PREDICTOR}）" ;;
   esac
 fi
 

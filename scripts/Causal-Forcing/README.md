@@ -9,7 +9,7 @@ scripts/Causal-Forcing/
 ├── download_models.sh   下载 Wan2.1 base 与 Causal Forcing 权重
 ├── collect_trace.sh     采集 clean K/V trace 并合并成拟合输入
 ├── fit_params.sh        调用通用拟合器产出 k_temporal.npz 与 V 参数
-│                       （v_cross_kv.npz 或 v_temporal.npz，取决于 v_predictor_mode）
+│                       （v_cross_kv.npz、v_innovation.npz 或 v_temporal.npz，取决于 v_predictor_mode）
 ├── run_bf16.sh          BF16 基线
 ├── run_tempokv.sh       TempoKV 生成
 └── generate.sh          run_bf16.sh / run_tempokv.sh 的共同实现
@@ -82,7 +82,7 @@ checkpoint、训练方式和 cache 分布不同，**必须重新采 trace 重新
 ```text
 data/causal-forcing/
 ├── trace/<模式>_legacy/{raw,output,clean_trace.npz}
-└── params/<模式>/<参数方案>/{k_temporal.npz,v_cross_kv.npz 或 v_temporal.npz}
+└── params/<模式>/<参数方案>/{k_temporal.npz,v_cross_kv.npz、v_innovation.npz 或 v_temporal.npz}
 
 results/causal_forcing/<模式>/<量化标签>/
 ├── videos/
@@ -138,10 +138,12 @@ CPU 拟合同时会把方程降到 float64，比看上去慢得多，所以回�
 `K_BITS` / `V_BITS` 分别设（混合精度用）。`BITS` 与某一侧设成不同值会直接报错。
 位宽会进入参数目录名，所以 INT2 与 INT4 的参数互不覆盖。
 
-`V_PREDICTOR=cross_kv|temporal` 切换 V 预测器，也不需要单独的配置文件；它会同时
-决定参数目录名（`vh1` 与 `vt1`）和参数文件名（`v_cross_kv.npz` 与 `v_temporal.npz`），
-两者不会互相覆盖。两种 V 预测器都使用 legacy/shared temporal K；V 可选 temporal、
-CrossKV only 或 `CrossKV + V-history`，每种结构都必须从同一 trace 独立拟合。
+`V_PREDICTOR=cross_kv|temporal|identity|taylor|taylor2|innovation|direct` 切换 V 预测器，也不需要单独的配置文件；它会同时
+决定参数目录名（如 `vh1`、`vt1`、`vid2`、`vty2`、`vty23`）和参数文件名：
+CrossKV/innovation 使用 `v_cross_kv.npz`/`v_innovation.npz`，其余 temporal
+家族使用 `v_temporal.npz`，不会互相覆盖。`identity`、`taylor` 和 `taylor2`
+使用固定解析系数，不从 trace 拟合；`temporal`、CrossKV 和 innovation 仍按各自
+协议从同一 trace 独立拟合。
 
 ## Attention proxy refinement
 

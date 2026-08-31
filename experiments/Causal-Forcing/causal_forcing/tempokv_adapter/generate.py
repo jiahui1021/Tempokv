@@ -76,8 +76,19 @@ def build_parser() -> argparse.ArgumentParser:
     # committed config per combination.
     parser.add_argument(
         "--v-predictor-mode",
-        choices=("cross_kv", "temporal"),
-        help="predict V from reconstructed K (cross_kv) or from its own history",
+        choices=(
+            "cross_kv",
+            "temporal",
+            "identity",
+            "taylor",
+            "taylor2",
+            "innovation",
+            "direct",
+        ),
+        help=(
+            "predict V from reconstructed K (cross_kv), its own learned or "
+            "fixed temporal history, innovation, or direct quantization"
+        ),
     )
     parser.add_argument("--k-bits", type=int, choices=(2, 4, 8))
     parser.add_argument("--v-bits", type=int, choices=(2, 4, 8))
@@ -163,7 +174,9 @@ def _validate_parameters(k_path: Path, v_path: Path, config) -> dict[str, object
     temporal = TemporalParameters.load(k_path)
     # The temporal V predictor reads its own reconstructed V history, so its
     # parameters are a TemporalParameters set rather than a Cross(K) map.
-    temporal_v = config.v_predictor_mode == "temporal"
+    temporal_v = config.v_predictor_mode in {
+        "temporal", "identity", "taylor", "taylor2", "direct"
+    }
     cross = (
         TemporalParameters.load(v_path)
         if temporal_v
@@ -426,15 +439,22 @@ def _require_direct_persistent_routes(
     k_predictor_mode: str = "shared",
 ) -> None:
     """Reject a nominally accelerated run that missed the production kernels."""
-    # The temporal V predictor never decodes a Cross(K) tensor, so it produces
-    # only the temporal persistent route.
-    required = [
+    k_route = (
         "direct_persistent_direct"
         if k_predictor_mode == "direct"
         else "temporal_persistent_direct"
-    ]
-    if v_predictor_mode != "temporal":
-        required.append("cross_kv_persistent_direct")
+    )
+    if v_predictor_mode == "direct":
+        v_route = "direct_persistent_direct"
+    elif v_predictor_mode in {
+        "temporal", "identity", "taylor", "taylor2"
+    }:
+        v_route = "temporal_persistent_direct"
+    elif v_predictor_mode == "innovation":
+        v_route = "innovation_persistent_direct"
+    else:
+        v_route = "cross_kv_persistent_direct"
+    required = list(dict.fromkeys((k_route, v_route)))
     missing = [name for name in required if int(routes.get(name) or 0) <= 0]
     if missing:
         raise RuntimeError(
@@ -543,7 +563,9 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             )
             if value is not None
         }
-        if overrides.get("v_predictor_mode") == "temporal":
+        if overrides.get("v_predictor_mode") in {
+            "temporal", "identity", "taylor", "taylor2", "innovation"
+        }:
             overrides["cross_kv_weight_mode"] = "layer_shared"
         if overrides:
             config = replace(config, **overrides)

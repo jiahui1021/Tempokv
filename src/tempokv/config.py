@@ -15,6 +15,31 @@ WITHDRAWN_SETTINGS = {
 }
 
 
+# V predictors that consume their own reconstructed temporal history and are
+# therefore stored as TemporalParameters.  ``direct`` is the existing
+# zero-predictor quantization corner; the other fixed modes are analytic
+# predictor ablations whose coefficients are written deterministically by the
+# fitter rather than estimated from a trace.
+TEMPORAL_V_PREDICTOR_MODES = frozenset(
+    {"temporal", "identity", "taylor", "taylor2", "direct"}
+)
+FIXED_TEMPORAL_V_PREDICTOR_MODES = frozenset({"identity", "taylor", "taylor2"})
+V_PREDICTOR_MODES = frozenset(
+    {"cross_kv", "innovation", *TEMPORAL_V_PREDICTOR_MODES}
+)
+FIXED_TEMPORAL_V_MIN_HISTORY = {"identity": 1, "taylor": 2, "taylor2": 3}
+
+
+def is_temporal_v_predictor(mode: str) -> bool:
+    """Return whether a V mode uses ``TemporalParameters`` at runtime."""
+    return mode in TEMPORAL_V_PREDICTOR_MODES
+
+
+def is_fixed_temporal_v_predictor(mode: str) -> bool:
+    """Return whether a V mode has deterministic, non-fitted coefficients."""
+    return mode in FIXED_TEMPORAL_V_PREDICTOR_MODES
+
+
 def config_from_mapping(payload: Mapping[str, Any]) -> "CodecConfig":
     """Build a codec config from parsed JSON, naming withdrawn settings."""
     if payload.get("fit_mode") == "native":
@@ -69,6 +94,8 @@ class CodecConfig:
     k_predictor_mode: str | None = None
     # ``temporal`` predicts V from its own reconstructed history with the same
     # predictor K uses, so V needs no reconstructed K and no CrossKV matrix.
+    # ``identity`` is a fixed one-step hold; ``taylor`` and ``taylor2`` are
+    # fixed first- and second-order backward finite-difference extrapolators.
     # ``cross_kv`` keeps the Cross(K) projection. ``innovation`` projects the
     # decoder-visible K temporal innovation and optionally adds V history.
     # ``direct`` is the zero-predictor baseline: V units are quantized directly
@@ -185,14 +212,10 @@ class CodecConfig:
             raise ValueError(
                 "k_history_length=0 requires k_predictor_mode=direct"
             )
-        if self.v_predictor_mode not in {
-            "cross_kv",
-            "temporal",
-            "innovation",
-            "direct",
-        }:
+        if self.v_predictor_mode not in V_PREDICTOR_MODES:
             raise ValueError(
-                "v_predictor_mode must be cross_kv, temporal, innovation, or direct"
+                "v_predictor_mode must be cross_kv, temporal, identity, taylor, "
+                "taylor2, innovation, or direct"
             )
         if self.v_predictor_mode == "direct" and self.v_history_length:
             raise ValueError(
@@ -226,12 +249,22 @@ class CodecConfig:
                     "predictor_direction=v_to_k requires k_bits == v_bits so the "
                     "role exchange does not also reallocate bit width"
                 )
-        # The temporal V predictor reads only its own reconstructed history, so
-        # with no history it has nothing to predict from.  Say so here; both
-        # fitters would otherwise fail on a zero-length parameter axis.
-        if self.v_predictor_mode == "temporal" and self.v_history_length < 1:
+        # A V predictor that reads its own history has nothing to consume when
+        # the history is empty.  Fixed Taylor modes also require enough history
+        # to express the requested finite-difference order; silently falling
+        # back to identity would make the named ablation misleading.
+        if is_temporal_v_predictor(self.v_predictor_mode) and (
+            self.v_predictor_mode != "direct" and self.v_history_length < 1
+        ):
             raise ValueError(
-                "v_predictor_mode=temporal needs v_history_length >= 1"
+                f"v_predictor_mode={self.v_predictor_mode} needs "
+                "v_history_length >= 1"
+            )
+        minimum_history = FIXED_TEMPORAL_V_MIN_HISTORY.get(self.v_predictor_mode)
+        if minimum_history is not None and self.v_history_length < minimum_history:
+            raise ValueError(
+                f"v_predictor_mode={self.v_predictor_mode} needs "
+                f"v_history_length >= {minimum_history}"
             )
         if self.v_predictor_mode == "innovation":
             if self.fit_mode != "legacy":
@@ -247,7 +280,8 @@ class CodecConfig:
                 )
         if (
             self.fit_mode == "legacy"
-            and self.v_predictor_mode == "temporal"
+            and is_temporal_v_predictor(self.v_predictor_mode)
+            and self.v_predictor_mode != "direct"
             and self.cross_kv_weight_mode != "layer_shared"
         ):
             raise ValueError(

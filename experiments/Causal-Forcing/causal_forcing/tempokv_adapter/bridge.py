@@ -186,7 +186,8 @@ def install(runtime_root: str | Path | None = None) -> type:
             # The temporal V predictor has no Cross(K) map, so the diagonal
             # requirement applies only to the CrossKV route.
             if (
-                getattr(config, "v_predictor_mode", "cross_kv") != "temporal"
+                getattr(config, "v_predictor_mode", "cross_kv")
+                not in {"temporal", "identity", "taylor", "taylor2", "direct"}
                 and getattr(config, "v_history_length", 0)
                 and not self.tempokv_codec.cross_kv.history_diagonal
             ):

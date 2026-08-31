@@ -83,19 +83,24 @@ if [[ "$mode" == "tempokv" ]]; then
   parameter_name="${PARAM_NAME:-$(codec_slug "$config_path" "${K_HISTORY_LENGTH:-}" "${V_HISTORY_LENGTH:-}" "${K_BITS:-}" "${V_BITS:-}" "" "$v_predictor_mode" "$FIT_HISTORY_SOURCE")}"
   param_dir="$(resolve_path "${PARAM_DIR:-data/causal-forcing/params/$generation_mode/$parameter_name}")"
   result_label="$parameter_name"
-  if [[ "$v_predictor_mode" == "temporal" ]]; then
-    v_artifact_name="v_temporal.npz"
-  else
-    v_artifact_name="v_cross_kv.npz"
-  fi
+  case "$v_predictor_mode" in
+    temporal|identity|taylor|taylor2|direct) v_artifact_name="v_temporal.npz" ;;
+    innovation) v_artifact_name="v_innovation.npz" ;;
+    cross_kv) v_artifact_name="v_cross_kv.npz" ;;
+    *) v_artifact_name="v_cross_kv.npz" ;;
+  esac
 else
   param_dir=""
   result_label="bf16"
 fi
 
-# Use the validated Cross production launch size by default.  Temporal keeps
-# the shared runtime default, and callers can still override this explicitly.
-if [[ "$mode" == "tempokv" && "$v_predictor_mode" == "cross_kv" ]]; then
+# Use the validated Cross production launch size by default.  Temporal and
+# fixed temporal predictors keep the shared runtime default, and callers can
+# still override this explicitly.
+if [[ "$mode" == "tempokv" && (
+      "$v_predictor_mode" == "cross_kv" ||
+      "$v_predictor_mode" == "innovation"
+    ) ]]; then
   export TEMPOKV_PERSISTENT_UNITS_PER_LAUNCH="${TEMPOKV_PERSISTENT_UNITS_PER_LAUNCH:-8}"
 fi
 

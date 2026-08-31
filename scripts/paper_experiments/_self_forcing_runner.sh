@@ -53,8 +53,8 @@ paper_init() {
   [[ -z "$ATTENTION_STEPS" ]] || check_int ATTENTION_STEPS 1
 
   case "$V_PREDICTOR" in
-    cross_kv|temporal) ;;
-    *) die "V_PREDICTOR 必须是 cross_kv 或 temporal" ;;
+    cross_kv|temporal|identity|taylor|taylor2|innovation|direct) ;;
+    *) die "V_PREDICTOR 必须是 cross_kv、temporal、identity、taylor、taylor2、innovation 或 direct" ;;
   esac
 
   if [[ "$DRY_RUN" != "1" ]]; then

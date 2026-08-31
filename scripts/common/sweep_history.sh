@@ -25,7 +25,7 @@
 #   K_HISTORY    K 扫描点（默认 0,1,2,3,4,5；0=直接量化）
 #   V_HISTORY    V 扫描点（默认 0,1,2,4,5）
 #   BITS / K_BITS / V_BITS  位宽 override（2/4/8）
-#   V_PREDICTOR  cross_kv 或 temporal
+#   V_PREDICTOR  cross_kv、temporal、identity、taylor、taylor2、innovation 或 direct
 #   BASELINE_K_HISTORY / BASELINE_V_HISTORY  扫另一侧时固定的取值
 #   MAX_SAMPLES  下采样空间位置数，先跑小规模时用
 #   MAX_FRAMES   截断时间轴

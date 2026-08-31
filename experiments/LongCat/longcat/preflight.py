@@ -440,7 +440,10 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             else None
         )
         expected_v_kind = (
-            "temporal" if resolved_v_predictor == "temporal" else "cross_kv"
+            "temporal"
+            if resolved_v_predictor
+            in {"temporal", "identity", "taylor", "taylor2", "direct"}
+            else "cross_kv"
         )
         parameter_checks = {
             "k_parameters": _parameter_file_check(
@@ -496,7 +499,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     # The V predictor decides which kind of parameter file to expect, and it
     # is a command-line override, so preflight has to be told about it too.
     parser.add_argument(
-        "--v-predictor-mode", choices=("cross_kv", "temporal")
+        "--v-predictor-mode",
+        choices=(
+            "cross_kv",
+            "temporal",
+            "identity",
+            "taylor",
+            "taylor2",
+            "innovation",
+            "direct",
+        ),
     )
     args = parser.parse_args(argv)
     if args.context_parallel_size <= 0:

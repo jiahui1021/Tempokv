@@ -19,7 +19,7 @@ Common overrides:
   BITS=2|4|8              Set K/V bit width together
   K_BITS=... V_BITS=...   Set K/V bit width separately
   KH=... VH=...           K/V history length
-  V_PREDICTOR=cross_kv|temporal
+  V_PREDICTOR=cross_kv|temporal|identity|taylor|taylor2|innovation|direct
   FIT_DEVICE=auto|cuda|cpu
   DRY_RUN=1               Print the resolved fitting command
 

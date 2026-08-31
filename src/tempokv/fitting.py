@@ -23,7 +23,12 @@ from .attention_objective import (
     temporal_rollout,
 )
 from .codec import _cuda_matmul_precision
-from .config import CodecConfig
+from .config import (
+    FIXED_TEMPORAL_V_PREDICTOR_MODES,
+    CodecConfig,
+    is_fixed_temporal_v_predictor,
+    is_temporal_v_predictor,
+)
 from .parameters import CrossKVParameters, TemporalParameters
 from .quantization import (
     dequantize_asymmetric,
@@ -39,6 +44,108 @@ _SCALE_DTYPES = {
     "float16": torch.float16,
     "bfloat16": torch.bfloat16,
 }
+
+
+_FIXED_TEMPORAL_DEGREES = {
+    "identity": 0,
+    "taylor": 1,
+    "taylor2": 2,
+}
+
+
+@torch.no_grad()
+def build_fixed_temporal_parameters(
+    predictor_mode: str,
+    *,
+    history_length: int,
+    dim: int,
+    stride: int | None = None,
+    device: torch.device | str = "cpu",
+    signature: str | None = None,
+    layer_ids: tuple[int, ...] | None = None,
+    head_count: int | None = None,
+) -> TemporalParameters:
+    """Build deterministic temporal coefficients for predictor ablations.
+
+    The history is ordered newest-to-oldest.  ``identity`` is a zero-order
+    hold, while ``taylor`` and ``taylor2`` use one- and two-step backward finite
+    differences respectively:
+
+    ``x[t+1] = x[t]``;
+    ``x[t+1] = 2*x[t] - x[t-1]``; and
+    ``x[t+1] = 3*x[t] - 3*x[t-1] + x[t-2]``.
+
+    Warm-up rows use the highest order supported by the history available at
+    that point.  The returned object has the same layout as fitted temporal
+    parameters, so the encoder, decoder, Triton path, and parameter checks all
+    exercise the identical recurrence.
+    """
+    if predictor_mode not in FIXED_TEMPORAL_V_PREDICTOR_MODES:
+        raise ValueError(
+            "predictor_mode must be identity, taylor, or taylor2"
+        )
+    if isinstance(history_length, bool) or int(history_length) != history_length:
+        raise ValueError("history_length must be a positive integer")
+    history_length = int(history_length)
+    minimum_history = _FIXED_TEMPORAL_DEGREES[predictor_mode] + 1
+    if history_length < minimum_history:
+        raise ValueError(
+            f"predictor_mode={predictor_mode} needs history_length >= "
+            f"{minimum_history}"
+        )
+    if isinstance(dim, bool) or int(dim) != dim or int(dim) <= 0:
+        raise ValueError("dim must be a positive integer")
+    dim = int(dim)
+    if layer_ids is not None:
+        layer_ids = tuple(int(item) for item in layer_ids)
+        if not layer_ids:
+            raise ValueError("layer_ids must not be empty for layered parameters")
+        if head_count is None or isinstance(head_count, bool):
+            raise ValueError("head_count is required for layered parameters")
+        if int(head_count) != head_count or int(head_count) <= 0:
+            raise ValueError("head_count must be a positive integer")
+        head_count = int(head_count)
+    elif head_count is not None:
+        raise ValueError("head_count is only valid with layer_ids")
+
+    base_weights = torch.zeros(
+        history_length, history_length, dim, dtype=torch.float32, device=device
+    )
+    degree = _FIXED_TEMPORAL_DEGREES[predictor_mode]
+    for order in range(1, history_length + 1):
+        active_degree = min(degree, order - 1)
+        coefficients = torch.tensor(
+            [
+                ((-1) ** lag) * math.comb(active_degree + 1, lag + 1)
+                for lag in range(active_degree + 1)
+            ],
+            dtype=base_weights.dtype,
+            device=base_weights.device,
+        )
+        base_weights[order - 1, : active_degree + 1] = coefficients[:, None]
+
+    if layer_ids is None:
+        weights = base_weights
+        bias = torch.zeros(history_length, dim, dtype=torch.float32, device=device)
+    else:
+        weights = base_weights[:, :, None, :].expand(
+            history_length, history_length, head_count, dim
+        )
+        weights = weights.unsqueeze(0).expand(
+            len(layer_ids), history_length, history_length, head_count, dim
+        ).clone()
+        bias = torch.zeros(
+            len(layer_ids), history_length, head_count, dim,
+            dtype=torch.float32,
+            device=device,
+        )
+    return TemporalParameters(
+        history_weights=weights,
+        history_bias=bias,
+        stride=stride,
+        layer_ids=layer_ids,
+        codec_signature=signature,
+    )
 
 
 def _check_scalar(name: str, value: float, *, positive: bool = False) -> float:
@@ -195,7 +302,7 @@ def _objective_sums(
             bits=config.k_bits,
             config=config,
         )
-        if config.v_predictor_mode == "temporal":
+        if is_temporal_v_predictor(config.v_predictor_mode):
             chunk_value_weight = (
                 value_weight[start:stop] if value_weight.ndim == 5 else value_weight
             )
@@ -338,6 +445,10 @@ def refine_attention(
     """
     if config.v_predictor_mode == "innovation":
         raise ValueError("attention refinement does not support innovation V")
+    if is_fixed_temporal_v_predictor(config.v_predictor_mode):
+        raise ValueError(
+            f"attention refinement does not support fixed {config.v_predictor_mode} V"
+        )
     if steps <= 0:
         raise ValueError("refinement steps must be positive")
     learning_rate = _check_scalar("learning_rate", learning_rate, positive=True)
@@ -391,10 +502,12 @@ def refine_attention(
         if not math.isfinite(step_size) or step_size <= 0.0:
             raise ValueError("sign-gradient step sizes must be positive and finite")
 
-    if config.v_predictor_mode == "temporal" and not isinstance(
+    if is_temporal_v_predictor(config.v_predictor_mode) and not isinstance(
         value_parameters, TemporalParameters
     ):
-        raise TypeError("temporal V refinement requires TemporalParameters")
+        raise TypeError(
+            f"{config.v_predictor_mode} V refinement requires TemporalParameters"
+        )
     if config.v_predictor_mode == "cross_kv" and not isinstance(
         value_parameters, CrossKVParameters
     ):
@@ -2245,7 +2358,7 @@ def _fit_legacy_predictors(
     layer_ids: tuple[int, ...] | None,
     coordinate_system: str | None,
     fit_history_source: str,
-) -> tuple[TemporalParameters, CrossKVParameters]:
+) -> tuple[TemporalParameters, CrossKVParameters | TemporalParameters]:
     """Reproduce the legacy shared-K/Cross+previous-V fitter."""
     dim = int(keys.shape[-1])
     signature = config.format_signature()
@@ -2334,6 +2447,24 @@ def _fit_legacy_predictors(
             signature=signature,
             coordinate_system=coordinate_system,
         )
+    if is_fixed_temporal_v_predictor(config.v_predictor_mode):
+        # The fixed family deliberately never reads the calibration trace for
+        # its coefficients.  It still emits a normal TemporalParameters archive
+        # so deployment and the learned temporal baseline use the same decoder.
+        cross = build_fixed_temporal_parameters(
+            config.v_predictor_mode,
+            history_length=config.v_history_length,
+            dim=dim,
+            stride=config.stride,
+            device=values.device,
+            signature=signature,
+        )
+        return _stamp_parameter_identity(
+            temporal,
+            cross,
+            signature=signature,
+            coordinate_system=coordinate_system,
+        )
     if config.v_predictor_mode == "temporal":
         cross = _fit_legacy_shared_temporal_v(
             values,
@@ -2404,7 +2535,7 @@ def fit_predictors(
     layer_ids: tuple[int, ...] | None = None,
     coordinate_system: str | None = None,
     fit_history_source: str = "reconstructed",
-) -> tuple[TemporalParameters, CrossKVParameters]:
+) -> tuple[TemporalParameters, CrossKVParameters | TemporalParameters]:
     """Fit deployable predictors from reconstructed or clean history.
 
     The trace is scanned for non-finite values once here; everything below
@@ -2459,7 +2590,7 @@ def _fit_predictors(
     layer_ids: tuple[int, ...] | None = None,
     coordinate_system: str | None = None,
     fit_history_source: str = "reconstructed",
-) -> tuple[TemporalParameters, CrossKVParameters]:
+) -> tuple[TemporalParameters, CrossKVParameters | TemporalParameters]:
     """Fit deployable K and V predictors from reconstructed or clean history.
 
     ``v_history_mode`` selects the V-history map: ``"dense"`` fits a full
@@ -2632,6 +2763,64 @@ def _fit_predictors(
                 resolved.format_signature(),
             )
 
+    if resolved.v_predictor_mode == "direct":
+        # Keep native direct V usable with the same role-based codec API as the
+        # learned and fixed temporal families.  The empty map is layered so a
+        # multi-layer native runtime can select every layer without a special
+        # case in the decoder.
+        native_layer_ids = (
+            tuple(range(layer_count)) if layer_ids is None else layer_ids
+        )
+        temporal_v = TemporalParameters(
+            history_weights=torch.empty(
+                layer_count,
+                0,
+                0,
+                head_count,
+                dim,
+                dtype=torch.float32,
+                device=values.device,
+            ),
+            history_bias=torch.empty(
+                layer_count,
+                0,
+                head_count,
+                dim,
+                dtype=torch.float32,
+                device=values.device,
+            ),
+            stride=resolved.stride,
+            layer_ids=native_layer_ids,
+            codec_signature=resolved.format_signature(),
+        )
+        return _stamp_parameter_identity(
+            temporal,
+            temporal_v,
+            signature=resolved.format_signature(),
+            coordinate_system=coordinate_system,
+        )
+
+    if is_fixed_temporal_v_predictor(resolved.v_predictor_mode):
+        native_layer_ids = (
+            tuple(range(layer_count)) if layer_ids is None else layer_ids
+        )
+        temporal_v = build_fixed_temporal_parameters(
+            resolved.v_predictor_mode,
+            history_length=resolved.v_history_length,
+            dim=dim,
+            stride=resolved.stride,
+            device=values.device,
+            signature=resolved.format_signature(),
+            layer_ids=native_layer_ids,
+            head_count=head_count,
+        )
+        return _stamp_parameter_identity(
+            temporal,
+            temporal_v,
+            signature=resolved.format_signature(),
+            coordinate_system=coordinate_system,
+        )
+
     if resolved.v_predictor_mode == "temporal":
         # Temporal V reads its own reconstructed V history, so it needs neither
         # the reconstructed K nor a Cross(K) map.  The loop below is the K loop
@@ -2794,6 +2983,7 @@ fit_closed_loop = fit_predictors
 
 
 __all__ = [
+    "build_fixed_temporal_parameters",
     "fit_cross_kv",
     "fit_cross_kv_parameters",
     "fit_closed_loop",

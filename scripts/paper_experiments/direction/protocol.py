@@ -36,7 +36,11 @@ SOURCE_ROOT = PROJECT_ROOT / "src"
 if SOURCE_ROOT.is_dir() and str(SOURCE_ROOT) not in sys.path:
     sys.path.insert(0, str(SOURCE_ROOT))
 
-from tempokv.config import CodecConfig, config_from_mapping  # noqa: E402
+from tempokv.config import (  # noqa: E402
+    CodecConfig,
+    config_from_mapping,
+    is_temporal_v_predictor,
+)
 from tempokv.fitting import (  # noqa: E402
     _reconstruct_cross_kv_trace,
     _reconstruct_temporal_trace,
@@ -176,7 +180,7 @@ def reconstruct(
     measured by different code would not separate the direction from the
     measurement.
     """
-    if arm_spec.v_predictor_mode == "temporal":
+    if is_temporal_v_predictor(arm_spec.v_predictor_mode):
         # No cross term: each tensor closes its own loop, V with its own bits.
         rebuilt_keys = _reconstruct_temporal_trace(keys, temporal, config)
         rebuilt_values = _reconstruct_temporal_trace(

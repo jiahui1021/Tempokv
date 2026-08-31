@@ -27,7 +27,11 @@ from analyze_predictor import (  # noqa: E402
     reconstruct_temporal,
     reconstruct_v,
 )
-from tempokv.config import CodecConfig, config_from_mapping  # noqa: E402
+from tempokv.config import (  # noqa: E402
+    CodecConfig,
+    config_from_mapping,
+    is_temporal_v_predictor,
+)
 from tempokv.parameters import CrossKVParameters, TemporalParameters  # noqa: E402
 
 
@@ -113,7 +117,7 @@ def evaluate(
         values = values.reshape(layer_count, sample_count, frame_count, head_count, dim)
 
     temporal = TemporalParameters.load(k_params_path).to(device)
-    if config.v_predictor_mode in {"temporal", "direct"}:
+    if is_temporal_v_predictor(config.v_predictor_mode):
         value_parameters: TemporalParameters | CrossKVParameters = (
             TemporalParameters.load(v_params_path).to(device)
         )
@@ -134,7 +138,7 @@ def evaluate(
         raise ValueError("K and V parameters were not fitted together")
 
     k_prediction, _, rebuilt_keys = reconstruct_k(keys, temporal, config)
-    if config.v_predictor_mode in {"temporal", "direct"}:
+    if is_temporal_v_predictor(config.v_predictor_mode):
         assert isinstance(value_parameters, TemporalParameters)
         v_prediction, _, rebuilt_values = reconstruct_temporal(
             values,

@@ -126,8 +126,8 @@ if config.get("fit_mode", "legacy") != "legacy":
     raise SystemExit("only fit_mode=legacy is supported")
 mode_label = "legacy-"
 k_label = f"kh{int(k_history)}"
-# The V segment records the predictor structure: parameters fitted for the
-# temporal V predictor are not interchangeable with CrossKV ones.
+# The V segment records the predictor structure: parameters fitted for one
+# predictor family are not interchangeable with another.
 v_predictor = sys.argv[7] or config.get(
     "v_predictor_mode", DEFAULT_V_PREDICTOR_MODE
 )
@@ -135,10 +135,15 @@ v_prefix = {
     "cross_kv": "vh",
     "temporal": "vt",
     "innovation": "vi",
+    "direct": "vd",
+    "identity": "vid",
+    "taylor": "vty",
+    "taylor2": "vty2",
 }.get(v_predictor)
 if v_prefix is None:
     raise SystemExit(
-        "V_PREDICTOR must be cross_kv, temporal, or innovation, got "
+        "V_PREDICTOR must be cross_kv, temporal, identity, taylor, taylor2, "
+        "innovation, or direct, got "
         f"{v_predictor!r}"
     )
 v_label = f"{v_prefix}{int(v_history)}"

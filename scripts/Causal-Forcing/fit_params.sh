@@ -65,11 +65,12 @@ trace_file="$(resolve_path "${TRACE_FILE:-$default_trace_file}")"
 FIT_HISTORY_SOURCE="${FIT_HISTORY_SOURCE:-reconstructed}"
 parameter_name="${PARAM_NAME:-$(codec_slug "$config_path" "${K_HISTORY_LENGTH:-}" "${V_HISTORY_LENGTH:-}" "${K_BITS:-}" "${V_BITS:-}" "" "$v_predictor_mode" "$FIT_HISTORY_SOURCE")}"
 output_dir="$(resolve_path "${OUTPUT_DIR:-data/causal-forcing/params/$generation_mode/$parameter_name}")"
-if [[ "$v_predictor_mode" == "temporal" ]]; then
-  v_artifact_name="v_temporal.npz"
-else
-  v_artifact_name="v_cross_kv.npz"
-fi
+case "$v_predictor_mode" in
+  temporal|identity|taylor|taylor2|direct) v_artifact_name="v_temporal.npz" ;;
+  innovation) v_artifact_name="v_innovation.npz" ;;
+  cross_kv) v_artifact_name="v_cross_kv.npz" ;;
+  *) v_artifact_name="v_cross_kv.npz" ;;
+esac
 
 if [[ "$output_dir" == "/" ]]; then
   die "OUTPUT_DIR 不能是文件系统根目录"

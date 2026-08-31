@@ -222,7 +222,7 @@ def _variant_config(base_payload: dict[str, Any], variant: Variant) -> CodecConf
             "v_predictor_mode": variant.v_predictor_mode,
         }
     )
-    if variant.v_predictor_mode == "temporal":
+    if variant.v_predictor_mode in {"temporal", "identity", "taylor", "taylor2"}:
         payload["cross_kv_weight_mode"] = "layer_shared"
     return config_from_mapping(payload)
 
@@ -238,11 +238,13 @@ def _variant_paths(root: Path, variant: Variant) -> dict[str, Path]:
 
 
 def _v_parameter_name(config: CodecConfig) -> str:
-    return (
-        "v_temporal.npz"
-        if config.v_predictor_mode in {"temporal", "direct"}
-        else "v_cross_kv.npz"
-    )
+    if config.v_predictor_mode in {
+        "temporal", "identity", "taylor", "taylor2", "direct"
+    }:
+        return "v_temporal.npz"
+    if config.v_predictor_mode == "innovation":
+        return "v_innovation.npz"
+    return "v_cross_kv.npz"
 
 
 def _generation_complete(path: Path, expected_videos: int) -> bool:

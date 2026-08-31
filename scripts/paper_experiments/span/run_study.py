@@ -55,11 +55,12 @@ def _variant_config(
 
 
 def _v_name(codec: dict[str, Any]) -> str:
-    return (
-        "v_temporal.npz"
-        if codec.get("v_predictor_mode", "cross_kv") == "temporal"
-        else "v_cross_kv.npz"
-    )
+    mode = codec.get("v_predictor_mode", "cross_kv")
+    if mode in {"temporal", "identity", "taylor", "taylor2", "direct"}:
+        return "v_temporal.npz"
+    if mode == "innovation":
+        return "v_innovation.npz"
+    return "v_cross_kv.npz"
 
 
 def _fit_command(

@@ -36,7 +36,7 @@
 #   LOCAL_ATTN_SIZE 局部注意力窗口（latent 帧数；小于总帧数时启用滑动窗口）
 #   SINK_SIZE       注意力 sink 帧数（窗口前固定的历史帧，默认 0）
 #   K_HISTORY_LENGTH  K 使用的历史帧数（1 到 8；默认读取 CONFIG）
-#   V_HISTORY_LENGTH  V 使用的历史帧数（0 到 2；默认读取 CONFIG）
+#   V_HISTORY_LENGTH  V 使用的历史帧数（0 到 5；默认读取 CONFIG）
 #   BITS            K/V 位宽（2/4/8；默认读取 CONFIG）；K_BITS / V_BITS 可分别设
 #   TORCH_DECODER   用 PyTorch 参考解码器代替 Triton，0 或 1（默认 0）
 #   BENCHMARK       要求本次完整生成且不允许跳过已有视频，0 或 1（默认 0）
@@ -95,11 +95,11 @@ config = json.load(open(sys.argv[1], encoding="utf-8"))
 print(config.get("codec", config).get("k_predictor_mode", "shared"))
 PY
 )"
-  # V_PREDICTOR overrides the config so one file covers both predictors.
+  # V_PREDICTOR overrides the config so one file covers all supported predictors.
   if [[ -n "${V_PREDICTOR:-}" ]]; then
     case "$V_PREDICTOR" in
-      cross_kv|temporal|innovation|direct) ;;
-      *) die "V_PREDICTOR 必须是 cross_kv、temporal、innovation 或 direct（当前值：${V_PREDICTOR}）" ;;
+      cross_kv|temporal|identity|taylor|taylor2|innovation|direct) ;;
+      *) die "V_PREDICTOR 必须是 cross_kv、temporal、identity、taylor、taylor2、innovation 或 direct（当前值：${V_PREDICTOR}）" ;;
     esac
     v_predictor_mode="$V_PREDICTOR"
   fi
@@ -120,7 +120,7 @@ PY
     k_artifact_name="k_temporal.npz"
     case "$v_predictor_mode" in
       # Direct V has no predictor; its empty temporal map shares the temporal layout.
-      temporal|direct) v_artifact_name="v_temporal.npz" ;;
+      temporal|identity|taylor|taylor2|direct) v_artifact_name="v_temporal.npz" ;;
       innovation) v_artifact_name="v_innovation.npz" ;;
       cross_kv) v_artifact_name="v_cross_kv.npz" ;;
       # Keep command-only dry runs usable with PYTHON_BIN=/bin/echo; the Python
@@ -135,8 +135,11 @@ fi
 
 # The Cross production kernel is validated at eight recurrent units per
 # launch.  Keep temporal's existing default and preserve explicit overrides.
-if [[ "$mode" == "tempokv" && "$v_predictor_mode" != "temporal" ]]; then
-  export TEMPOKV_PERSISTENT_UNITS_PER_LAUNCH="${TEMPOKV_PERSISTENT_UNITS_PER_LAUNCH:-8}"
+if [[ "$mode" == "tempokv" ]]; then
+  case "$v_predictor_mode" in
+    temporal|identity|taylor|taylor2|direct) ;;
+    *) export TEMPOKV_PERSISTENT_UNITS_PER_LAUNCH="${TEMPOKV_PERSISTENT_UNITS_PER_LAUNCH:-8}" ;;
+  esac
 fi
 
 model_type="${MODEL_TYPE:-self_forcing}"

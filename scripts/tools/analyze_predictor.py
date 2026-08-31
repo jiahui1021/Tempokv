@@ -31,7 +31,11 @@ SOURCE_ROOT = PROJECT_ROOT / "src"
 if SOURCE_ROOT.is_dir() and str(SOURCE_ROOT) not in sys.path:
     sys.path.insert(0, str(SOURCE_ROOT))
 
-from tempokv.config import CodecConfig, config_from_mapping  # noqa: E402
+from tempokv.config import (  # noqa: E402
+    CodecConfig,
+    config_from_mapping,
+    is_temporal_v_predictor,
+)
 from tempokv.fitting import _quantization_roundtrip  # noqa: E402
 from tempokv.parameters import CrossKVParameters, TemporalParameters  # noqa: E402
 
@@ -334,12 +338,12 @@ def main() -> None:
     temporal = TemporalParameters.load(args.k_params)
     value_parameters = (
         TemporalParameters.load(args.v_params)
-        if config.v_predictor_mode == "temporal"
+        if is_temporal_v_predictor(config.v_predictor_mode)
         else CrossKVParameters.load(args.v_params)
     )
 
     k_pred, k_res, k_rebuilt = reconstruct_k(keys, temporal, config)
-    if config.v_predictor_mode == "temporal":
+    if is_temporal_v_predictor(config.v_predictor_mode):
         v_pred, v_res, v_rebuilt = reconstruct_temporal(
             values, value_parameters, config, bits=config.v_bits
         )

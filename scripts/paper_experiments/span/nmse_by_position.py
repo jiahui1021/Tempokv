@@ -19,7 +19,7 @@ SOURCE_ROOT = PROJECT_ROOT / "src"
 if str(SOURCE_ROOT) not in sys.path:
     sys.path.insert(0, str(SOURCE_ROOT))
 
-from tempokv.config import config_from_mapping  # noqa: E402
+from tempokv.config import config_from_mapping, is_temporal_v_predictor  # noqa: E402
 from tempokv.fitting import (  # noqa: E402
     _reconstruct_cross_kv_trace,
     _reconstruct_temporal_trace,
@@ -98,7 +98,7 @@ def evaluate(
     if temporal.codec_signature != config.format_signature():
         raise ValueError("K parameters do not match the requested codec config")
     rebuilt_keys = _reconstruct_temporal_trace(keys, temporal, config)
-    if config.v_predictor_mode == "temporal":
+    if is_temporal_v_predictor(config.v_predictor_mode):
         value_parameters = TemporalParameters.load(v_params).to(device)
         rebuilt_values = _reconstruct_temporal_trace(
             values, value_parameters, config, bits=config.v_bits

@@ -8,7 +8,7 @@ import warnings
 
 import torch
 
-from .config import CodecConfig
+from .config import CodecConfig, is_temporal_v_predictor
 from .parameters import CrossKVParameters, TemporalParameters
 from .quantization import (
     dequantize_asymmetric,
@@ -1029,7 +1029,7 @@ class TempoKVCodec:
         # Experimental mean-split K path: subtract each span's per-channel
         # mean before temporal prediction and store it as side information.
         self.k_channel_mean = os.environ.get("TEMPOKV_K_MEAN_SPLIT") == "1"
-        expects_temporal_v = self.config.v_predictor_mode in {"temporal", "direct"}
+        expects_temporal_v = is_temporal_v_predictor(self.config.v_predictor_mode)
         if expects_temporal_v != isinstance(cross_kv, TemporalParameters):
             expected = "TemporalParameters" if expects_temporal_v else "CrossKVParameters"
             raise ValueError(
