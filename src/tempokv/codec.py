@@ -8,7 +8,11 @@ import warnings
 
 import torch
 
-from .config import CodecConfig, is_temporal_v_predictor
+from .config import (
+    CodecConfig,
+    is_cross_kv_v_predictor,
+    is_temporal_v_predictor,
+)
 from .parameters import CrossKVParameters, TemporalParameters
 from .quantization import (
     dequantize_asymmetric,
@@ -1189,7 +1193,7 @@ class TempoKVCodec:
     @property
     def predicts_v_from_key(self) -> bool:
         """Whether encoding V requires the reconstructed K of the same span."""
-        return self.config.v_predictor_mode in {"cross_kv", "innovation"}
+        return is_cross_kv_v_predictor(self.config.v_predictor_mode)
 
     def encode_value(
         self,

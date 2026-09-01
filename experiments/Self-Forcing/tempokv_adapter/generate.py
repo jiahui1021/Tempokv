@@ -21,6 +21,10 @@ if SOURCE_ROOT.is_dir() and str(SOURCE_ROOT) not in sys.path:
     sys.path.insert(0, str(SOURCE_ROOT))
 
 from tempokv.runtime import persistent_units_per_launch  # noqa: E402
+from tempokv.config import (  # noqa: E402
+    is_fixed_temporal_predictor,
+    is_temporal_v_predictor,
+)
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import efficiency_record as efficiency  # noqa: E402
@@ -83,13 +87,16 @@ def build_parser() -> argparse.ArgumentParser:
             "identity",
             "taylor",
             "taylor2",
+            "cross_kv_identity",
+            "cross_kv_taylor",
+            "cross_kv_taylor2",
             "innovation",
             "direct",
         ),
         help=(
             "predict V from reconstructed K (cross_kv), its own history "
-            "(temporal/identity/taylor/taylor2), decoder-visible K innovation "
-            "plus V history, or "
+            "(temporal/identity/taylor/taylor2), CrossKV plus a fixed V "
+            "history, decoder-visible K innovation plus V history, or "
             "quantize it without a predictor (direct)"
         ),
     )
@@ -182,9 +189,7 @@ def _validate_parameters(
     from tempokv.parameters import CrossKVParameters, TemporalParameters
 
     temporal = TemporalParameters.load(k_path)
-    temporal_v = config.v_predictor_mode in {
-        "temporal", "identity", "taylor", "taylor2", "direct"
-    }
+    temporal_v = is_temporal_v_predictor(config.v_predictor_mode)
     cross = (
         TemporalParameters.load(v_path)
         if temporal_v
@@ -217,7 +222,9 @@ def _validate_parameters(
                 "direct K parameters must contain empty [0,0,128] weights "
                 "and [0,128] bias"
             )
-    elif config.k_predictor_mode == "shared":
+    elif config.k_predictor_mode == "shared" or is_fixed_temporal_predictor(
+        config.k_predictor_mode
+    ):
         if temporal.layer_ids is not None:
             raise ValueError("legacy K parameters must be shared across layers")
     elif temporal.layer_ids != EXPECTED_LAYER_IDS:
@@ -240,7 +247,9 @@ def _validate_parameters(
         raise ValueError(
             "Self-Forcing parameters must use pre_rope_normalized coordinates"
         )
-    if config.k_predictor_mode == "shared":
+    if config.k_predictor_mode == "shared" or is_fixed_temporal_predictor(
+        config.k_predictor_mode
+    ):
         expected_k_history_shape = (
             config.k_history_length,
             config.k_history_length,
@@ -295,7 +304,9 @@ def _validate_parameters(
             )
     elif tuple(cross.weight.shape[-3:]) != (12, 128, 128):
         raise ValueError("V parameters must contain 12 heads with 128x128 weights")
-    elif cross.projection_source != config.v_predictor_mode:
+    elif cross.projection_source != (
+        "innovation" if config.v_predictor_mode == "innovation" else "cross_kv"
+    ):
         raise ValueError(
             "V parameter projection source does not match v_predictor_mode: "
             f"{cross.projection_source!r} vs {config.v_predictor_mode!r}"
@@ -914,7 +925,14 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             if value is not None
         }
         if overrides.get("v_predictor_mode") in {
-            "temporal", "identity", "taylor", "taylor2", "innovation"
+            "temporal",
+            "identity",
+            "taylor",
+            "taylor2",
+            "innovation",
+            "cross_kv_identity",
+            "cross_kv_taylor",
+            "cross_kv_taylor2",
         }:
             overrides["cross_kv_weight_mode"] = "layer_shared"
         if overrides:
@@ -1112,6 +1130,9 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             "identity": "temporal_persistent_direct",
             "taylor": "temporal_persistent_direct",
             "taylor2": "temporal_persistent_direct",
+            "cross_kv_identity": "cross_kv_persistent_direct",
+            "cross_kv_taylor": "cross_kv_persistent_direct",
+            "cross_kv_taylor2": "cross_kv_persistent_direct",
             "cross_kv": "cross_kv_persistent_direct",
             "innovation": "innovation_persistent_direct",
             "direct": "direct_persistent_direct",

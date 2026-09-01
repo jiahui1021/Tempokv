@@ -68,9 +68,11 @@ from analyze_predictor import (  # noqa: E402
     reconstruct_v,
 )
 from tempokv.config import (  # noqa: E402
-    FIXED_TEMPORAL_V_MIN_HISTORY,
+    FIXED_TEMPORAL_PREDICTOR_MIN_HISTORY,
     CodecConfig,
     config_from_mapping,
+    fixed_temporal_predictor_mode,
+    is_cross_kv_v_predictor,
     is_temporal_v_predictor,
 )
 from tempokv.fitting import fit_predictors  # noqa: E402
@@ -349,6 +351,9 @@ def build_parser() -> argparse.ArgumentParser:
             "identity",
             "taylor",
             "taylor2",
+            "cross_kv_identity",
+            "cross_kv_taylor",
+            "cross_kv_taylor2",
             "innovation",
             "direct",
         ),
@@ -486,20 +491,19 @@ def main(argv: list[str] | None = None) -> int:
         config_updates["v_bits"] = args.v_bits
     if args.v_predictor_mode is not None:
         config_updates["v_predictor_mode"] = args.v_predictor_mode
-        if (
+        if is_cross_kv_v_predictor(args.v_predictor_mode) or (
             is_temporal_v_predictor(args.v_predictor_mode)
             and args.v_predictor_mode != "direct"
         ):
             config_updates["cross_kv_weight_mode"] = "layer_shared"
     if config_updates:
         base = replace(base, **config_updates)
-    if (
+    fixed_mode = fixed_temporal_predictor_mode(base.v_predictor_mode)
+    if base.v_predictor_mode != "direct" and (
         is_temporal_v_predictor(base.v_predictor_mode)
-        and base.v_predictor_mode != "direct"
+        or fixed_mode is not None
     ):
-        minimum_history = FIXED_TEMPORAL_V_MIN_HISTORY.get(
-            base.v_predictor_mode, 1
-        )
+        minimum_history = FIXED_TEMPORAL_PREDICTOR_MIN_HISTORY.get(fixed_mode, 1)
         if any(value < minimum_history for value in v_values):
             parser.error(
                 f"{base.v_predictor_mode} V requires v-history values >= "
@@ -534,9 +538,7 @@ def main(argv: list[str] | None = None) -> int:
 
     # Baselines are chosen from the surviving lengths, so the sweep never holds
     # one axis at a length the trace cannot fit.
-    minimum_v_history = FIXED_TEMPORAL_V_MIN_HISTORY.get(
-        base.v_predictor_mode, 0
-    )
+    minimum_v_history = FIXED_TEMPORAL_PREDICTOR_MIN_HISTORY.get(fixed_mode, 0)
     baseline_v = (
         args.baseline_v_history
         if args.baseline_v_history is not None

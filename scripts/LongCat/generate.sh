@@ -24,8 +24,8 @@ if [[ "$mode" == "tempokv" ]]; then
   [[ -f "$config_path" ]] || die "CONFIG 不存在：$config_path"
   if [[ -n "${V_PREDICTOR:-}" ]]; then
     case "$V_PREDICTOR" in
-      cross_kv|temporal|identity|taylor|taylor2|innovation|direct) ;;
-      *) die "V_PREDICTOR 必须是 cross_kv、temporal、identity、taylor、taylor2、innovation 或 direct（当前值：${V_PREDICTOR}）" ;;
+      cross_kv|temporal|identity|taylor|taylor2|cross_kv_identity|cross_kv_taylor|cross_kv_taylor2|innovation|direct) ;;
+      *) die "V_PREDICTOR 必须是 cross_kv、temporal、identity、taylor、taylor2、cross_kv_identity、cross_kv_taylor、cross_kv_taylor2、innovation 或 direct（当前值：${V_PREDICTOR}）" ;;
     esac
   fi
   FIT_HISTORY_SOURCE="${FIT_HISTORY_SOURCE:-reconstructed}"
@@ -47,6 +47,7 @@ PY
   v_predictor_mode="${V_PREDICTOR:-$v_predictor_mode}"
   case "$v_predictor_mode" in
     temporal|identity|taylor|taylor2|direct) v_artifact_name="v_temporal.npz" ;;
+    cross_kv_identity|cross_kv_taylor|cross_kv_taylor2) v_artifact_name="v_cross_kv.npz" ;;
     innovation) v_artifact_name="v_innovation.npz" ;;
     cross_kv) v_artifact_name="v_cross_kv.npz" ;;
     *) v_artifact_name="v_cross_kv.npz" ;;
@@ -62,6 +63,9 @@ PY
   # fixed temporal predictors keep the shared runtime default, and explicit
   # overrides still win.
   if [[ "$v_predictor_mode" == "cross_kv" ||
+        "$v_predictor_mode" == "cross_kv_identity" ||
+        "$v_predictor_mode" == "cross_kv_taylor" ||
+        "$v_predictor_mode" == "cross_kv_taylor2" ||
         "$v_predictor_mode" == "innovation" ]]; then
     export TEMPOKV_PERSISTENT_UNITS_PER_LAUNCH="${TEMPOKV_PERSISTENT_UNITS_PER_LAUNCH:-8}"
   fi

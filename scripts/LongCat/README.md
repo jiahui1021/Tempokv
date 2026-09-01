@@ -107,9 +107,9 @@ CP=2 是 780）。它同时决定 codec 的 stride 和参数目录名的 `-sN` �
 CP 度数各存一个配置文件。设错不会静默跑：bridge 会对着从实际 cache 形状算出的
 stride 校验。
 
-`V_PREDICTOR=cross_kv|temporal|identity|taylor|taylor2|innovation|direct` 切换 V 预测器，也不需要单独的配置文件；它会同时
+`V_PREDICTOR=cross_kv|temporal|identity|taylor|taylor2|cross_kv_identity|cross_kv_taylor|cross_kv_taylor2|innovation|direct` 切换 V 预测器，也不需要单独的配置文件；它会同时
 决定参数目录名（如 `vh1`、`vt1`、`vid2`、`vty2`、`vty23`）和参数文件名：
-CrossKV/innovation 使用 `v_cross_kv.npz`/`v_innovation.npz`，其余 temporal
+CrossKV/innovation 及 `cross_kv_*` 使用对应的 CrossKV 参数文件，其余 temporal
 家族使用 `v_temporal.npz`，不会互相覆盖。`identity`、`taylor` 和 `taylor2`
 使用固定解析系数，不从 trace 拟合；`temporal`、CrossKV 和 innovation 仍按各自
 协议从 trace 拟合。LongCat trace 当前

@@ -15,19 +15,27 @@ WITHDRAWN_SETTINGS = {
 }
 
 
-# V predictors that consume their own reconstructed temporal history and are
-# therefore stored as TemporalParameters.  ``direct`` is the existing
-# zero-predictor quantization corner; the other fixed modes are analytic
-# predictor ablations whose coefficients are written deterministically by the
-# fitter rather than estimated from a trace.
+# Fixed temporal predictors are used symmetrically for K and V.  CrossKV V
+# variants add the source projection while retaining the selected fixed V
+# history recurrence.
+FIXED_TEMPORAL_PREDICTOR_MODES = frozenset({"identity", "taylor", "taylor2"})
+FIXED_TEMPORAL_PREDICTOR_MIN_HISTORY = {"identity": 1, "taylor": 2, "taylor2": 3}
+FIXED_TEMPORAL_V_PREDICTOR_MODES = FIXED_TEMPORAL_PREDICTOR_MODES
+FIXED_CROSS_KV_V_PREDICTOR_MODES = frozenset(
+    {f"cross_kv_{mode}" for mode in FIXED_TEMPORAL_PREDICTOR_MODES}
+)
+FIXED_V_PREDICTOR_MODES = (
+    FIXED_TEMPORAL_V_PREDICTOR_MODES | FIXED_CROSS_KV_V_PREDICTOR_MODES
+)
 TEMPORAL_V_PREDICTOR_MODES = frozenset(
-    {"temporal", "identity", "taylor", "taylor2", "direct"}
+    {"temporal", "direct", *FIXED_TEMPORAL_V_PREDICTOR_MODES}
 )
-FIXED_TEMPORAL_V_PREDICTOR_MODES = frozenset({"identity", "taylor", "taylor2"})
+CROSS_KV_V_PREDICTOR_MODES = frozenset(
+    {"cross_kv", "innovation", *FIXED_CROSS_KV_V_PREDICTOR_MODES}
+)
 V_PREDICTOR_MODES = frozenset(
-    {"cross_kv", "innovation", *TEMPORAL_V_PREDICTOR_MODES}
+    {*TEMPORAL_V_PREDICTOR_MODES, *CROSS_KV_V_PREDICTOR_MODES}
 )
-FIXED_TEMPORAL_V_MIN_HISTORY = {"identity": 1, "taylor": 2, "taylor2": 3}
 
 
 def is_temporal_v_predictor(mode: str) -> bool:
@@ -35,9 +43,33 @@ def is_temporal_v_predictor(mode: str) -> bool:
     return mode in TEMPORAL_V_PREDICTOR_MODES
 
 
+def is_cross_kv_v_predictor(mode: str) -> bool:
+    """Return whether a V mode consumes the reconstructed K source."""
+    return mode in CROSS_KV_V_PREDICTOR_MODES
+
+
+def is_fixed_temporal_predictor(mode: str) -> bool:
+    """Return whether a predictor uses deterministic temporal coefficients."""
+    return mode in FIXED_TEMPORAL_PREDICTOR_MODES
+
+
 def is_fixed_temporal_v_predictor(mode: str) -> bool:
     """Return whether a V mode has deterministic, non-fitted coefficients."""
     return mode in FIXED_TEMPORAL_V_PREDICTOR_MODES
+
+
+def is_fixed_v_predictor(mode: str) -> bool:
+    """Return whether a V mode has deterministic temporal coefficients."""
+    return mode in FIXED_V_PREDICTOR_MODES
+
+
+def fixed_temporal_predictor_mode(mode: str) -> str | None:
+    """Return the base fixed temporal family represented by a V mode."""
+    if mode in FIXED_TEMPORAL_PREDICTOR_MODES:
+        return mode
+    if mode in FIXED_CROSS_KV_V_PREDICTOR_MODES:
+        return mode.removeprefix("cross_kv_")
+    return None
 
 
 def config_from_mapping(payload: Mapping[str, Any]) -> "CodecConfig":
@@ -88,7 +120,8 @@ class CodecConfig:
     # positional compatibility with older programmatic callers; reference
     # construction resolves it to legacy below.
     cross_matmul_precision: str | None = None
-    # ``shared`` pools all layers and heads into [P,P,D].
+    # ``shared`` pools all layers and heads into [P,P,D].  The fixed temporal
+    # modes use the same shared layout but write analytic coefficients.
     # ``direct`` is the zero-history baseline: non-anchor K units are quantized
     # directly and the parameter file contains an empty temporal map.
     k_predictor_mode: str | None = None
@@ -96,8 +129,10 @@ class CodecConfig:
     # predictor K uses, so V needs no reconstructed K and no CrossKV matrix.
     # ``identity`` is a fixed one-step hold; ``taylor`` and ``taylor2`` are
     # fixed first- and second-order backward finite-difference extrapolators.
-    # ``cross_kv`` keeps the Cross(K) projection. ``innovation`` projects the
-    # decoder-visible K temporal innovation and optionally adds V history.
+    # ``cross_kv`` keeps the learned Cross(K) projection.  The
+    # ``cross_kv_<fixed>`` modes add the same projection to a fixed V-history
+    # predictor. ``innovation`` projects the decoder-visible K temporal
+    # innovation and optionally adds V history.
     # ``direct`` is the zero-predictor baseline: V units are quantized directly
     # and the parameter file contains an empty temporal map.
     v_predictor_mode: str = "cross_kv"
@@ -199,9 +234,15 @@ class CodecConfig:
             )
         if self.cross_matmul_precision not in {"ieee", "tf32"}:
             raise ValueError("cross_matmul_precision must be ieee or tf32")
-        if self.k_predictor_mode not in {"layer_head", "shared", "direct"}:
+        if self.k_predictor_mode not in {
+            "layer_head",
+            "shared",
+            "direct",
+            *FIXED_TEMPORAL_PREDICTOR_MODES,
+        }:
             raise ValueError(
-                "k_predictor_mode must be layer_head, shared, or direct"
+                "k_predictor_mode must be layer_head, shared, identity, taylor, "
+                "taylor2, or direct"
             )
         if self.k_predictor_mode == "direct":
             if self.k_history_length != 0:
@@ -212,10 +253,23 @@ class CodecConfig:
             raise ValueError(
                 "k_history_length=0 requires k_predictor_mode=direct"
             )
+        k_minimum_history = FIXED_TEMPORAL_PREDICTOR_MIN_HISTORY.get(
+            self.k_predictor_mode
+        )
+        if (
+            k_minimum_history is not None
+            and self.k_history_length is not None
+            and self.k_history_length < k_minimum_history
+        ):
+            raise ValueError(
+                f"k_predictor_mode={self.k_predictor_mode} needs "
+                f"k_history_length >= {k_minimum_history}"
+            )
         if self.v_predictor_mode not in V_PREDICTOR_MODES:
             raise ValueError(
                 "v_predictor_mode must be cross_kv, temporal, identity, taylor, "
-                "taylor2, innovation, or direct"
+                "taylor2, cross_kv_identity, cross_kv_taylor, "
+                "cross_kv_taylor2, innovation, or direct"
             )
         if self.v_predictor_mode == "direct" and self.v_history_length:
             raise ValueError(
@@ -260,7 +314,9 @@ class CodecConfig:
                 f"v_predictor_mode={self.v_predictor_mode} needs "
                 "v_history_length >= 1"
             )
-        minimum_history = FIXED_TEMPORAL_V_MIN_HISTORY.get(self.v_predictor_mode)
+        minimum_history = FIXED_TEMPORAL_PREDICTOR_MIN_HISTORY.get(
+            fixed_temporal_predictor_mode(self.v_predictor_mode)
+        )
         if minimum_history is not None and self.v_history_length < minimum_history:
             raise ValueError(
                 f"v_predictor_mode={self.v_predictor_mode} needs "
@@ -278,10 +334,17 @@ class CodecConfig:
                     "v_predictor_mode=innovation requires "
                     "cross_kv_weight_mode=layer_shared"
                 )
+        requires_shared_cross = (
+            self.v_predictor_mode in FIXED_CROSS_KV_V_PREDICTOR_MODES
+            or self.v_predictor_mode == "innovation"
+            or (
+                is_temporal_v_predictor(self.v_predictor_mode)
+                and self.v_predictor_mode != "direct"
+            )
+        )
         if (
             self.fit_mode == "legacy"
-            and is_temporal_v_predictor(self.v_predictor_mode)
-            and self.v_predictor_mode != "direct"
+            and requires_shared_cross
             and self.cross_kv_weight_mode != "layer_shared"
         ):
             raise ValueError(
@@ -304,9 +367,14 @@ class CodecConfig:
                 "k_predictor_mode=shared requires fit_mode=legacy"
             )
         if self.fit_mode == "legacy":
-            if self.k_predictor_mode not in {"shared", "direct"}:
+            if self.k_predictor_mode not in {
+                "shared",
+                "direct",
+                *FIXED_TEMPORAL_PREDICTOR_MODES,
+            }:
                 raise ValueError(
-                    "legacy fitting requires k_predictor_mode=shared or direct"
+                    "legacy fitting requires k_predictor_mode=shared, identity, "
+                    "taylor, taylor2, or direct"
                 )
             if self.k_history_length is None:
                 raise ValueError(

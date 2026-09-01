@@ -242,6 +242,10 @@ def _v_parameter_name(config: CodecConfig) -> str:
         "temporal", "identity", "taylor", "taylor2", "direct"
     }:
         return "v_temporal.npz"
+    if config.v_predictor_mode in {
+        "cross_kv_identity", "cross_kv_taylor", "cross_kv_taylor2"
+    }:
+        return "v_cross_kv.npz"
     if config.v_predictor_mode == "innovation":
         return "v_innovation.npz"
     return "v_cross_kv.npz"

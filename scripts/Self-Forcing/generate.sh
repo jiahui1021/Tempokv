@@ -98,8 +98,8 @@ PY
   # V_PREDICTOR overrides the config so one file covers all supported predictors.
   if [[ -n "${V_PREDICTOR:-}" ]]; then
     case "$V_PREDICTOR" in
-      cross_kv|temporal|identity|taylor|taylor2|innovation|direct) ;;
-      *) die "V_PREDICTOR 必须是 cross_kv、temporal、identity、taylor、taylor2、innovation 或 direct（当前值：${V_PREDICTOR}）" ;;
+      cross_kv|temporal|identity|taylor|taylor2|cross_kv_identity|cross_kv_taylor|cross_kv_taylor2|innovation|direct) ;;
+      *) die "V_PREDICTOR 必须是 cross_kv、temporal、identity、taylor、taylor2、cross_kv_identity、cross_kv_taylor、cross_kv_taylor2、innovation 或 direct（当前值：${V_PREDICTOR}）" ;;
     esac
     v_predictor_mode="$V_PREDICTOR"
   fi
@@ -121,6 +121,7 @@ PY
     case "$v_predictor_mode" in
       # Direct V has no predictor; its empty temporal map shares the temporal layout.
       temporal|identity|taylor|taylor2|direct) v_artifact_name="v_temporal.npz" ;;
+      cross_kv_identity|cross_kv_taylor|cross_kv_taylor2) v_artifact_name="v_cross_kv.npz" ;;
       innovation) v_artifact_name="v_innovation.npz" ;;
       cross_kv) v_artifact_name="v_cross_kv.npz" ;;
       # Keep command-only dry runs usable with PYTHON_BIN=/bin/echo; the Python

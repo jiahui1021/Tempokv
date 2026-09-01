@@ -442,7 +442,13 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         expected_v_kind = (
             "temporal"
             if resolved_v_predictor
-            in {"temporal", "identity", "taylor", "taylor2", "direct"}
+            in {
+                "temporal",
+                "identity",
+                "taylor",
+                "taylor2",
+                "direct",
+            }
             else "cross_kv"
         )
         parameter_checks = {
@@ -506,6 +512,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             "identity",
             "taylor",
             "taylor2",
+            "cross_kv_identity",
+            "cross_kv_taylor",
+            "cross_kv_taylor2",
             "innovation",
             "direct",
         ),

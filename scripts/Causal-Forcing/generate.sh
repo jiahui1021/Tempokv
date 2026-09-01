@@ -85,6 +85,7 @@ if [[ "$mode" == "tempokv" ]]; then
   result_label="$parameter_name"
   case "$v_predictor_mode" in
     temporal|identity|taylor|taylor2|direct) v_artifact_name="v_temporal.npz" ;;
+    cross_kv_identity|cross_kv_taylor|cross_kv_taylor2) v_artifact_name="v_cross_kv.npz" ;;
     innovation) v_artifact_name="v_innovation.npz" ;;
     cross_kv) v_artifact_name="v_cross_kv.npz" ;;
     *) v_artifact_name="v_cross_kv.npz" ;;
@@ -99,6 +100,9 @@ fi
 # still override this explicitly.
 if [[ "$mode" == "tempokv" && (
       "$v_predictor_mode" == "cross_kv" ||
+      "$v_predictor_mode" == "cross_kv_identity" ||
+      "$v_predictor_mode" == "cross_kv_taylor" ||
+      "$v_predictor_mode" == "cross_kv_taylor2" ||
       "$v_predictor_mode" == "innovation"
     ) ]]; then
   export TEMPOKV_PERSISTENT_UNITS_PER_LAUNCH="${TEMPOKV_PERSISTENT_UNITS_PER_LAUNCH:-8}"

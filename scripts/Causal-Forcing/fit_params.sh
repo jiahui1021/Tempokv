@@ -67,6 +67,7 @@ parameter_name="${PARAM_NAME:-$(codec_slug "$config_path" "${K_HISTORY_LENGTH:-}
 output_dir="$(resolve_path "${OUTPUT_DIR:-data/causal-forcing/params/$generation_mode/$parameter_name}")"
 case "$v_predictor_mode" in
   temporal|identity|taylor|taylor2|direct) v_artifact_name="v_temporal.npz" ;;
+  cross_kv_identity|cross_kv_taylor|cross_kv_taylor2) v_artifact_name="v_cross_kv.npz" ;;
   innovation) v_artifact_name="v_innovation.npz" ;;
   cross_kv) v_artifact_name="v_cross_kv.npz" ;;
   *) v_artifact_name="v_cross_kv.npz" ;;

@@ -79,7 +79,8 @@ layer-shared Cross 权重。常用覆盖项：
 | `BITS=2/4/8` | 同时设置 K/V 位宽 |
 | `K_BITS`、`V_BITS` | 分别设置 K/V 位宽 |
 | `KH`、`VH` | 设置 K/V history length |
-| `V_PREDICTOR` | `cross_kv`、`temporal`、`identity`、`taylor`、`taylor2`、`innovation` 或 `direct` |
+| `k_predictor_mode` | 配置中的 `shared`、`identity`、`taylor`、`taylor2` 或 `direct` |
+| `V_PREDICTOR` | `cross_kv`、`temporal`、`identity`、`taylor`、`taylor2`、`cross_kv_identity`、`cross_kv_taylor`、`cross_kv_taylor2`、`innovation` 或 `direct` |
 | `CACHE_STRIDE` | LongCat Context Parallel 的 local stride |
 | `FIT_DEVICE` | `cuda`、`cpu` 或 `auto` |
 | `DRY_RUN=1` | 只显示最终命令，不执行拟合 |

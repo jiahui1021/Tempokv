@@ -138,9 +138,9 @@ CPU 拟合同时会把方程降到 float64，比看上去慢得多，所以回�
 `K_BITS` / `V_BITS` 分别设（混合精度用）。`BITS` 与某一侧设成不同值会直接报错。
 位宽会进入参数目录名，所以 INT2 与 INT4 的参数互不覆盖。
 
-`V_PREDICTOR=cross_kv|temporal|identity|taylor|taylor2|innovation|direct` 切换 V 预测器，也不需要单独的配置文件；它会同时
+`V_PREDICTOR=cross_kv|temporal|identity|taylor|taylor2|cross_kv_identity|cross_kv_taylor|cross_kv_taylor2|innovation|direct` 切换 V 预测器，也不需要单独的配置文件；它会同时
 决定参数目录名（如 `vh1`、`vt1`、`vid2`、`vty2`、`vty23`）和参数文件名：
-CrossKV/innovation 使用 `v_cross_kv.npz`/`v_innovation.npz`，其余 temporal
+CrossKV/innovation 及 `cross_kv_*` 使用对应的 CrossKV 参数文件，其余 temporal
 家族使用 `v_temporal.npz`，不会互相覆盖。`identity`、`taylor` 和 `taylor2`
 使用固定解析系数，不从 trace 拟合；`temporal`、CrossKV 和 innovation 仍按各自
 协议从同一 trace 独立拟合。

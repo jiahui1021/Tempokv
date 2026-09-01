@@ -224,13 +224,17 @@ CPU 拟合同时会把方程降到 float64，比看上去慢得多，所以回�
 `K_BITS` / `V_BITS` 分别设（混合精度用）。`BITS` 与某一侧设成不同值会直接报错。
 位宽会进入参数目录名，所以 INT2 与 INT4 的参数互不覆盖。
 
-`V_PREDICTOR=cross_kv|temporal|identity|taylor|taylor2|innovation|direct` 切换 V 预测器，也不需要单独的配置文件；它会同时
+`V_PREDICTOR=cross_kv|temporal|identity|taylor|taylor2|cross_kv_identity|cross_kv_taylor|cross_kv_taylor2|innovation|direct` 切换 V 预测器，也不需要单独的配置文件；它会同时
 决定参数目录名（如 `vh1`、`vt1`、`vid2`、`vty2`、`vty23`）和参数文件名：
-CrossKV/innovation 使用 `v_cross_kv.npz`/`v_innovation.npz`，其余 temporal
+CrossKV/innovation 及 `cross_kv_*` 使用对应的 CrossKV 参数文件，其余 temporal
 家族使用 `v_temporal.npz`，不会互相覆盖。`identity` 是固定系数 1，`taylor`
 是一阶 `2V[t-1]-V[t-2]`，`taylor2` 是二阶 `3V[t-1]-3V[t-2]+V[t-3]`，这些
 固定模式不读取 trace 拟合系数。sampled attention refinement 只用于可学习
 predictor。
+
+K predictor 由配置中的 `k_predictor_mode` 选择，支持 `shared`（可学习）、
+`identity`、`taylor`、`taylor2` 和 `direct`；K/V fixed predictor 使用同一套
+固定系数定义。
 
 `TORCH_DECODER=1` 用 PyTorch 参考解码器代替 Triton，用来做数值对照；它同时关掉
 强制 Triton 的检查，所以不需要再配 `ALLOW_TRITON_FALLBACK`。两者共用同一套拟合

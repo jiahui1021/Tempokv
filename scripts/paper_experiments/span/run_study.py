@@ -58,6 +58,8 @@ def _v_name(codec: dict[str, Any]) -> str:
     mode = codec.get("v_predictor_mode", "cross_kv")
     if mode in {"temporal", "identity", "taylor", "taylor2", "direct"}:
         return "v_temporal.npz"
+    if mode in {"cross_kv_identity", "cross_kv_taylor", "cross_kv_taylor2"}:
+        return "v_cross_kv.npz"
     if mode == "innovation":
         return "v_innovation.npz"
     return "v_cross_kv.npz"

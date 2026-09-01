@@ -125,9 +125,18 @@ if v_history is None:
 if config.get("fit_mode", "legacy") != "legacy":
     raise SystemExit("only fit_mode=legacy is supported")
 mode_label = "legacy-"
-k_label = f"kh{int(k_history)}"
-# The V segment records the predictor structure: parameters fitted for one
+# The K/V segments record the predictor structures: parameters fitted for one
 # predictor family are not interchangeable with another.
+k_predictor = config.get("k_predictor_mode", "shared")
+k_prefix = {
+    "identity": "ki",
+    "taylor": "kty",
+    "taylor2": "kty2",
+}.get(k_predictor)
+if k_prefix is None:
+    k_label = f"kh{int(k_history)}"
+else:
+    k_label = f"{k_prefix}{int(k_history)}"
 v_predictor = sys.argv[7] or config.get(
     "v_predictor_mode", DEFAULT_V_PREDICTOR_MODE
 )
@@ -139,11 +148,15 @@ v_prefix = {
     "identity": "vid",
     "taylor": "vty",
     "taylor2": "vty2",
+    "cross_kv_identity": "cvid",
+    "cross_kv_taylor": "cvty",
+    "cross_kv_taylor2": "cvty2",
 }.get(v_predictor)
 if v_prefix is None:
     raise SystemExit(
         "V_PREDICTOR must be cross_kv, temporal, identity, taylor, taylor2, "
-        "innovation, or direct, got "
+        "cross_kv_identity, cross_kv_taylor, cross_kv_taylor2, innovation, "
+        "or direct, got "
         f"{v_predictor!r}"
     )
 v_label = f"{v_prefix}{int(v_history)}"

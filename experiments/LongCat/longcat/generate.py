@@ -91,12 +91,16 @@ def _parser() -> argparse.ArgumentParser:
             "identity",
             "taylor",
             "taylor2",
+            "cross_kv_identity",
+            "cross_kv_taylor",
+            "cross_kv_taylor2",
             "innovation",
             "direct",
         ),
         help=(
             "predict V from reconstructed K (cross_kv), its own learned or "
-            "fixed temporal history, innovation, or direct quantization"
+            "fixed temporal history, CrossKV plus fixed V history, innovation, "
+            "or direct quantization"
         ),
     )
     return parser

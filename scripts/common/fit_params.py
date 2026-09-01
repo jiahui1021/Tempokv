@@ -25,9 +25,13 @@ if SOURCE_ROOT.is_dir() and str(SOURCE_ROOT) not in sys.path:
 
 from tempokv.config import (  # noqa: E402
     CodecConfig,
-    FIXED_TEMPORAL_V_PREDICTOR_MODES,
+    FIXED_CROSS_KV_V_PREDICTOR_MODES,
     TEMPORAL_V_PREDICTOR_MODES,
     config_from_mapping,
+    fixed_temporal_predictor_mode,
+    is_cross_kv_v_predictor,
+    is_fixed_temporal_predictor,
+    is_fixed_v_predictor,
     is_temporal_v_predictor,
 )
 from tempokv.fitting import fit_predictors, refine_attention  # noqa: E402
@@ -120,7 +124,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--cross-matmul-precision", choices=("ieee", "tf32"))
     parser.add_argument(
-        "--k-predictor-mode", choices=("shared", "direct")
+        "--k-predictor-mode",
+        choices=("shared", "identity", "taylor", "taylor2", "direct"),
     )
     parser.add_argument(
         "--v-predictor-mode",
@@ -130,11 +135,15 @@ def build_parser() -> argparse.ArgumentParser:
             "identity",
             "taylor",
             "taylor2",
+            "cross_kv_identity",
+            "cross_kv_taylor",
+            "cross_kv_taylor2",
             "innovation",
             "direct",
         ),
         help=(
             "V predictor: cross_kv, temporal, identity, taylor, taylor2, "
+            "cross_kv_identity, cross_kv_taylor, cross_kv_taylor2, "
             "innovation, or direct"
         ),
     )
@@ -249,10 +258,15 @@ def _codec_config(args: argparse.Namespace) -> CodecConfig:
         override = getattr(args, name, None)
         if override is not None:
             values[name] = override
-    # CrossKV sharing is irrelevant when V predicts from its own history, but
-    # keep the single repository-wide mode in the resolved identity.
-    if values.get("v_predictor_mode") in (
-        (TEMPORAL_V_PREDICTOR_MODES - {"direct"}) | {"innovation"}
+    # Fixed V-history modes without CrossKV do not use this map; the composite
+    # cross_kv_* modes do, and all of the new paired experiments use the
+    # repository-wide layer-shared CrossKV layout.
+    if (
+        values.get("v_predictor_mode") in (
+            (TEMPORAL_V_PREDICTOR_MODES - {"direct"})
+            | {"innovation"}
+            | FIXED_CROSS_KV_V_PREDICTOR_MODES
+        )
     ):
         values["cross_kv_weight_mode"] = "layer_shared"
     try:
@@ -586,7 +600,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "fit innovation parameters without --attention-steps"
         )
     if (
-        config.v_predictor_mode in FIXED_TEMPORAL_V_PREDICTOR_MODES
+        is_fixed_v_predictor(config.v_predictor_mode)
         and args.attention_steps is not None
     ):
         raise ValueError(
@@ -831,6 +845,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     # projection parameters describe K, which is the reverse of every other
     # configuration.
     temporal_v = is_temporal_v_predictor(config.v_predictor_mode)
+    fixed_v_mode = fixed_temporal_predictor_mode(config.v_predictor_mode)
     if config.predictor_direction == "v_to_k":
         temporal_stem = "v_temporal_primary"
         v_artifact_stem = "k_cross_from_v"
@@ -845,6 +860,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "identity": "v_temporal",
             "taylor": "v_temporal",
             "taylor2": "v_temporal",
+            "cross_kv_identity": "v_cross_kv",
+            "cross_kv_taylor": "v_cross_kv",
+            "cross_kv_taylor2": "v_cross_kv",
         }[config.v_predictor_mode]
     temporal_path = output_dir / f"{temporal_stem}.npz"
     cross_path = output_dir / f"{v_artifact_stem}.npz"
@@ -936,6 +954,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 config.k_history_length
             ).history_length,
             "k_predictor_mode": config.k_predictor_mode,
+            "k_predictor_fitting": (
+                "fixed"
+                if is_fixed_temporal_predictor(config.k_predictor_mode)
+                else "regression"
+            ),
             "iterations": int(args.iterations),
             "requested_iterations": int(args.iterations),
             "fit_history_source": args.fit_history_source,
@@ -949,24 +972,38 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 if args.fit_history_source == "reconstructed"
                 else 1
             ),
-            "v_regression_solves": (
+            "k_regression_solves": (
                 0
-                if config.v_predictor_mode in FIXED_TEMPORAL_V_PREDICTOR_MODES
+                if is_fixed_temporal_predictor(config.k_predictor_mode)
                 else (
                     int(args.iterations)
                     if args.fit_history_source == "reconstructed"
                     else 1
                 )
             ),
-            "k_history_input": args.fit_history_source,
+            "v_regression_solves": (
+                0
+                if is_fixed_v_predictor(config.v_predictor_mode)
+                else (
+                    int(args.iterations)
+                    if args.fit_history_source == "reconstructed"
+                    else 1
+                )
+            ),
+            "k_history_input": (
+                None
+                if is_fixed_temporal_predictor(config.k_predictor_mode)
+                else args.fit_history_source
+            ),
             "v_history_input": (
                 None
-                if config.v_predictor_mode in FIXED_TEMPORAL_V_PREDICTOR_MODES
+                if is_fixed_v_predictor(config.v_predictor_mode)
                 else args.fit_history_source
             ),
             "cross_k_input": (
                 args.fit_history_source
-                if config.v_predictor_mode == "cross_kv"
+                if is_cross_kv_v_predictor(config.v_predictor_mode)
+                and config.v_predictor_mode != "innovation"
                 else None
             ),
             "innovation_k_input": (
@@ -983,17 +1020,17 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             # The temporal V predictor has no dense/diagonal distinction; it
             # reads its own reconstructed V history instead of a Cross(K) map.
             "v_history_mode": (
-                (
-                    "fixed_" + config.v_predictor_mode
-                    if config.v_predictor_mode in FIXED_TEMPORAL_V_PREDICTOR_MODES
-                    else "temporal"
-                )
+                "fixed_" + fixed_v_mode
+                if fixed_v_mode is not None
+                else "temporal"
                 if temporal_v
                 else cross.history_mode
             ),
             "v_predictor_fitting": (
-                "fixed"
-                if config.v_predictor_mode in FIXED_TEMPORAL_V_PREDICTOR_MODES
+                "fixed_history+cross_kv_regression"
+                if config.v_predictor_mode in FIXED_CROSS_KV_V_PREDICTOR_MODES
+                else "fixed"
+                if is_fixed_v_predictor(config.v_predictor_mode)
                 else "regression"
             ),
             "max_gain": float(args.max_gain),

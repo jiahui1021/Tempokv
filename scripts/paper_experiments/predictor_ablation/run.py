@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Run the 60-prompt Self-Forcing predictor ablation on four GPUs.
+"""Run the 60-prompt Self-Forcing K/V predictor ablation on four GPUs.
 
-The runner generates only the predictor variants listed in ``VARIANTS``.  BF16
-and the existing production TempoKV videos are supplied as reference
-directories and are never regenerated here.  Generation runs four variants in
-parallel, one visible GPU per process.  As soon as a generation batch finishes,
-quality workers start in another four-GPU batch and append one row per video to
-the CSV while the video frames are being decoded.
+The runner varies K and V temporal predictors together and treats CrossKV as an
+independent V-side switch.  BF16 and the existing production TempoKV videos are
+supplied as reference directories and are never regenerated here.  Generation
+runs four variants in parallel, one visible GPU per process.  As soon as a
+generation batch finishes, quality workers start in another four-GPU batch and
+append one row per video to the CSV while the video frames are being decoded.
 
 Typical invocation::
 
@@ -54,7 +54,7 @@ GENERATE_SCRIPT = PROJECT_ROOT / "scripts" / "Self-Forcing" / "generate.sh"
 PROMPTS_DEFAULT = PROJECT_ROOT / "assets" / "moviegen128.txt"
 VIDEO_COUNT = 60
 START_INDEX = 0
-SCHEMA = "tempokv.predictor_ablation.v1"
+SCHEMA = "tempokv.predictor_ablation.v2"
 
 
 def _shell_binary() -> str:
@@ -69,50 +69,127 @@ BASH_BIN = _shell_binary()
 
 @dataclass(frozen=True)
 class Variant:
-    """One predictor family to generate and score."""
+    """One K/V predictor pair and CrossKV choice to generate and score."""
 
     name: str
-    v_predictor_mode: str
+    k_predictor_mode: str
+    k_history_length: int
+    v_temporal_predictor_mode: str
     v_history_length: int
-    coefficient_source: str
+    use_cross_kv: bool
     interpretation: str
 
     @property
+    def v_predictor_mode(self) -> str:
+        if not self.use_cross_kv:
+            return self.v_temporal_predictor_mode
+        if self.v_temporal_predictor_mode == "temporal":
+            return "cross_kv"
+        return f"cross_kv_{self.v_temporal_predictor_mode}"
+
+    @property
     def v_artifact(self) -> str:
-        # All four variants use the temporal execution path.  Their family is
-        # carried by the config signature and the fit report, not by a second
-        # binary parameter format.
-        return "v_temporal.npz"
+        return "v_cross_kv.npz" if self.use_cross_kv else "v_temporal.npz"
+
+    @property
+    def k_coefficient_source(self) -> str:
+        return (
+            "fixed"
+            if self.k_predictor_mode in {"identity", "taylor", "taylor2"}
+            else "regression"
+        )
+
+    @property
+    def v_coefficient_source(self) -> str:
+        return (
+            "fixed"
+            if self.v_temporal_predictor_mode in {"identity", "taylor", "taylor2"}
+            else "regression"
+        )
+
+    def record(self) -> dict[str, Any]:
+        return {
+            **asdict(self),
+            "v_predictor_mode": self.v_predictor_mode,
+            "v_artifact": self.v_artifact,
+            "k_coefficient_source": self.k_coefficient_source,
+            "v_coefficient_source": self.v_coefficient_source,
+            "cross_kv_fitting": "regression" if self.use_cross_kv else "disabled",
+        }
 
 
 VARIANTS: tuple[Variant, ...] = (
     Variant(
-        "learned_temporal_vh2",
+        "learned_no_cross_vh2",
+        "shared",
+        2,
         "temporal",
         2,
-        "regression",
-        "learned temporal predictor with the matched VH2 history budget",
+        False,
+        "learned K + learned V temporal predictors without CrossKV",
     ),
     Variant(
-        "identity_vh2",
+        "learned_cross_vh2",
+        "shared",
+        2,
+        "temporal",
+        2,
+        True,
+        "learned K + learned V temporal predictors with CrossKV",
+    ),
+    Variant(
+        "identity_no_cross_vh2",
         "identity",
         2,
-        "fixed",
-        "fixed identity / zero-order hold; no V coefficient fitting",
+        "identity",
+        2,
+        False,
+        "fixed identity K/V predictors without CrossKV",
     ),
     Variant(
-        "taylor_vh2",
+        "identity_cross_vh2",
+        "identity",
+        2,
+        "identity",
+        2,
+        True,
+        "fixed identity K/V predictors with CrossKV",
+    ),
+    Variant(
+        "taylor_no_cross_vh2",
         "taylor",
         2,
-        "fixed",
-        "fixed first-order Taylor extrapolation; no V coefficient fitting",
+        "taylor",
+        2,
+        False,
+        "fixed first-order Taylor K/V predictors without CrossKV",
     ),
     Variant(
-        "taylor2_vh3",
+        "taylor_cross_vh2",
+        "taylor",
+        2,
+        "taylor",
+        2,
+        True,
+        "fixed first-order Taylor K/V predictors with CrossKV",
+    ),
+    Variant(
+        "taylor2_no_cross_vh3",
         "taylor2",
         3,
-        "fixed",
-        "fixed second-order Taylor extrapolation; no V coefficient fitting",
+        "taylor2",
+        3,
+        False,
+        "fixed second-order Taylor K/V predictors without CrossKV",
+    ),
+    Variant(
+        "taylor2_cross_vh3",
+        "taylor2",
+        3,
+        "taylor2",
+        3,
+        True,
+        "fixed second-order Taylor K/V predictors with CrossKV",
     ),
 )
 
@@ -221,7 +298,6 @@ def _variant_config(
     base: CodecConfig,
     variant: Variant,
     *,
-    k_history_length: int,
     k_bits: int,
     v_bits: int,
 ) -> CodecConfig:
@@ -230,17 +306,15 @@ def _variant_config(
         {
             "k_bits": k_bits,
             "v_bits": v_bits,
-            "k_history_length": k_history_length,
+            "k_history_length": variant.k_history_length,
             "v_history_length": variant.v_history_length,
-            "k_predictor_mode": "shared",
+            "k_predictor_mode": variant.k_predictor_mode,
             "v_predictor_mode": variant.v_predictor_mode,
             "cross_kv_weight_mode": "layer_shared",
             "fit_mode": "legacy",
         }
     )
     config = config_from_mapping(payload)
-    if config.k_predictor_mode != "shared":
-        raise ValueError("predictor ablation requires shared temporal K")
     if config.fit_mode != "legacy":
         raise ValueError("predictor ablation requires fit_mode=legacy")
     # ``base`` is used to make the validation intent explicit and to catch a
@@ -334,7 +408,6 @@ def _fit_jobs(
     args: argparse.Namespace,
     root: Path,
     *,
-    k_history_length: int,
     k_bits: int,
     v_bits: int,
 ) -> list[Job]:
@@ -353,7 +426,7 @@ def _fit_jobs(
                     "CONFIG": str(paths["config"].resolve()),
                     "TRACE_FILE": str(args.trace.expanduser().resolve()),
                     "OUTPUT_DIR": str(paths["params"].resolve()),
-                    "KH": str(k_history_length),
+                    "KH": str(variant.k_history_length),
                     "VH": str(variant.v_history_length),
                     "K_BITS": str(k_bits),
                     "V_BITS": str(v_bits),
@@ -727,7 +800,6 @@ def _quality_report(
 
 def _summary_rows(
     root: Path,
-    configs: dict[str, CodecConfig],
     references: dict[str, Path],
 ) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
@@ -739,11 +811,7 @@ def _summary_rows(
             quality = _read_json(quality_path)
             rows.append(
                 {
-                    "variant": variant.name,
-                    "v_predictor_mode": variant.v_predictor_mode,
-                    "v_history_length": variant.v_history_length,
-                    "coefficient_source": variant.coefficient_source,
-                    "interpretation": variant.interpretation,
+                    **variant.record(),
                     "reference": reference_name,
                     "videos": quality.get("videos"),
                     "frames": quality.get("frames"),
@@ -762,9 +830,15 @@ def _write_summary_csv(path: Path, rows: list[dict[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fields = (
         "variant",
+        "k_predictor_mode",
+        "k_history_length",
+        "v_temporal_predictor_mode",
         "v_predictor_mode",
         "v_history_length",
-        "coefficient_source",
+        "use_cross_kv",
+        "k_coefficient_source",
+        "v_coefficient_source",
+        "cross_kv_fitting",
         "interpretation",
         "reference",
         "videos",
@@ -826,17 +900,9 @@ def _validate_main(args: argparse.Namespace) -> tuple[CodecConfig, int, int]:
     base = config_from_mapping(base_payload)
     if base.fit_mode != "legacy":
         raise ValueError("predictor ablation requires fit_mode=legacy")
-    if base.k_predictor_mode != "shared":
-        raise ValueError("predictor ablation requires k_predictor_mode=shared")
     if base.cross_kv_weight_mode != "layer_shared":
         raise ValueError("predictor ablation requires cross_kv_weight_mode=layer_shared")
     k_bits, v_bits = _resolve_bits(args, base)
-    if args.k_history_length is None:
-        k_history_length = int(base.k_history_length or 2)
-    else:
-        k_history_length = args.k_history_length
-    if not 1 <= k_history_length <= 8:
-        raise ValueError("--k-history-length must be in [1, 8]")
     # CodecConfig performs the bit-width validation; constructing every variant
     # here also catches Taylor history mistakes before any job starts.
     for variant in VARIANTS:
@@ -844,7 +910,6 @@ def _validate_main(args: argparse.Namespace) -> tuple[CodecConfig, int, int]:
             base_payload,
             base,
             variant,
-            k_history_length=k_history_length,
             k_bits=k_bits,
             v_bits=v_bits,
         )
@@ -861,20 +926,22 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
             f"output root is not empty: {root}; use --resume or choose another root"
         )
     root.mkdir(parents=True, exist_ok=True)
+    manifest_path = root / "manifest.json"
+    if args.resume and manifest_path.is_file():
+        existing_manifest = _read_json(manifest_path)
+        if existing_manifest.get("schema") != SCHEMA:
+            raise ValueError(
+                f"cannot resume manifest schema {existing_manifest.get('schema')!r}; "
+                f"expected {SCHEMA!r}"
+            )
 
     base_payload = _codec_payload(args.config)
-    k_history_length = (
-        int(base.k_history_length or 2)
-        if args.k_history_length is None
-        else int(args.k_history_length)
-    )
     configs: dict[str, CodecConfig] = {}
     for variant in VARIANTS:
         config = _variant_config(
             base_payload,
             base,
             variant,
-            k_history_length=k_history_length,
             k_bits=k_bits,
             v_bits=v_bits,
         )
@@ -891,7 +958,6 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
     fit_jobs = _fit_jobs(
         args,
         root,
-        k_history_length=k_history_length,
         k_bits=k_bits,
         v_bits=v_bits,
     )
@@ -913,7 +979,15 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
             "seed": args.seed,
             "k_bits": k_bits,
             "v_bits": v_bits,
-            "k_history_length": k_history_length,
+            "k_history_length_by_variant": {
+                variant.name: variant.k_history_length for variant in VARIANTS
+            },
+            "v_history_length_by_variant": {
+                variant.name: variant.v_history_length for variant in VARIANTS
+            },
+            "cross_kv_by_variant": {
+                variant.name: variant.use_cross_kv for variant in VARIANTS
+            },
             "gpus": list(args.gpus),
             "generation_parallelism": 4,
             "quality_streaming": bool(args.quality),
@@ -924,7 +998,7 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
         "references": {name: str(path) for name, path in references.items()},
         "variants": [
             {
-                **asdict(variant),
+                **variant.record(),
                 "config": str(_paths(root, variant)["config"].resolve()),
                 "params": str(_paths(root, variant)["params"].resolve()),
                 "run": str(_paths(root, variant)["run"].resolve()),
@@ -939,7 +1013,7 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
             "quality": [_job_record(job, i % 4) for i, job in enumerate(quality_jobs)],
         },
     }
-    _write_json(root / "manifest.json", manifest)
+    _write_json(manifest_path, manifest)
 
     if args.dry_run:
         for title, jobs in (
@@ -949,27 +1023,23 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
         ):
             print(f"\n--- {title} ({len(jobs)} jobs, four-GPU batches) ---")
             _run_jobs(jobs, args.gpus, root=root, dry_run=True)
-        print(f"\n[dry-run] manifest: {root / 'manifest.json'}")
+        print(f"\n[dry-run] manifest: {manifest_path}")
         return None
 
     _run_jobs(fit_jobs, args.gpus, root=root, dry_run=False)
 
-    # Generation uses four predictor jobs in parallel.  Quality starts as soon
-    # as that batch is complete, so long video runs do not accumulate all
-    # decoded frames or postpone every metric until the end.
+    # Generation uses four predictor jobs in parallel.  Once all generation
+    # batches finish, quality workers stream one video at a time and do not
+    # accumulate decoded frames in memory.
     _run_jobs(generation_jobs, args.gpus, root=root, dry_run=False)
     _run_jobs(quality_jobs, args.gpus, root=root, dry_run=False)
 
-    rows = _summary_rows(
-        root,
-        configs,
-        references,
-    )
+    rows = _summary_rows(root, references)
     summary = {
         "schema": SCHEMA,
         "status": "complete",
         "created_at": datetime.now(timezone.utc).isoformat(),
-        "manifest": str((root / "manifest.json").resolve()),
+        "manifest": str(manifest_path.resolve()),
         "protocol": manifest["protocol"],
         "references": manifest["references"],
         "variants": manifest["variants"],
@@ -978,7 +1048,7 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
     _write_json(root / "summary.json", summary)
     _write_summary_csv(root / "summary.csv", rows)
     manifest["status"] = "complete"
-    _write_json(root / "manifest.json", manifest)
+    _write_json(manifest_path, manifest)
     print(f"[complete] summary: {root / 'summary.json'}")
     return summary
 
@@ -1000,7 +1070,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--gpus", help="exactly four GPU ids, e.g. 0,1,2,3")
     parser.add_argument("--frames", type=int, default=717)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--k-history-length", type=int)
     parser.add_argument("--bits", type=int, choices=(2, 4, 8))
     parser.add_argument("--k-bits", type=int, choices=(2, 4, 8))
     parser.add_argument("--v-bits", type=int, choices=(2, 4, 8))

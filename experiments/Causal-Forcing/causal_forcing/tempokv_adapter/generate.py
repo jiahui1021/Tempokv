@@ -41,6 +41,8 @@ REQUIRED_RUNTIME_FILES = (
 EXPECTED_COORDINATE_SYSTEM = "pre_rope_normalized"
 VIDEO_FRAMES_PER_LATENT = 4
 
+from tempokv.config import is_temporal_v_predictor  # noqa: E402
+
 
 def latent_frames_for(video_frames: int, num_frame_per_block: int) -> int:
     """Convert a video frame count to whole latent blocks.
@@ -82,12 +84,16 @@ def build_parser() -> argparse.ArgumentParser:
             "identity",
             "taylor",
             "taylor2",
+            "cross_kv_identity",
+            "cross_kv_taylor",
+            "cross_kv_taylor2",
             "innovation",
             "direct",
         ),
         help=(
             "predict V from reconstructed K (cross_kv), its own learned or "
-            "fixed temporal history, innovation, or direct quantization"
+            "fixed temporal history, CrossKV plus fixed V history, innovation, "
+            "or direct quantization"
         ),
     )
     parser.add_argument("--k-bits", type=int, choices=(2, 4, 8))
@@ -174,9 +180,7 @@ def _validate_parameters(k_path: Path, v_path: Path, config) -> dict[str, object
     temporal = TemporalParameters.load(k_path)
     # The temporal V predictor reads its own reconstructed V history, so its
     # parameters are a TemporalParameters set rather than a Cross(K) map.
-    temporal_v = config.v_predictor_mode in {
-        "temporal", "identity", "taylor", "taylor2", "direct"
-    }
+    temporal_v = is_temporal_v_predictor(config.v_predictor_mode)
     cross = (
         TemporalParameters.load(v_path)
         if temporal_v
@@ -564,7 +568,14 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             if value is not None
         }
         if overrides.get("v_predictor_mode") in {
-            "temporal", "identity", "taylor", "taylor2", "innovation"
+            "temporal",
+            "identity",
+            "taylor",
+            "taylor2",
+            "innovation",
+            "cross_kv_identity",
+            "cross_kv_taylor",
+            "cross_kv_taylor2",
         }:
             overrides["cross_kv_weight_mode"] = "layer_shared"
         if overrides:
