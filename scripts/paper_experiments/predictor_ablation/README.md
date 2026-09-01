@@ -1,8 +1,8 @@
 # Self-Forcing predictor ablation: 60 prompts
 
 `run.py` runs the new predictor groups on the first 60 prompt lines in
-`assets/moviegen128.txt`. It schedules four Self-Forcing generation processes
-at once, assigning one GPU to each process:
+`assets/moviegen128.txt`. It schedules one Self-Forcing generation process per
+selected GPU:
 
 | Group | K predictor | V predictor | CrossKV | History |
 | --- | --- | --- | :---: | ---: |
@@ -42,15 +42,16 @@ python scripts/paper_experiments/predictor_ablation/run.py \
   --bf16-videos results/self_forcing/bf16/videos \
   --tempokv-videos results/self_forcing/legacy-kh2-vh1-int4-layershared/videos \
   --output-root results/self_forcing/predictor_ablation_60p \
-  --gpus 0,1,2,3
+  --gpus 0,1
 ```
 
 The defaults use `configs/legacy.json`, the bit widths in that config, 717
 video frames, seed 0, and `fit_history_source=reconstructed`. K/V history is
 matched to the Taylor order in each group. Use
-`--resume` after an interrupted run. Use `--dry-run` to write the complete
-four-GPU command matrix without requiring the checkpoint, model directory, or
-reference video directories.
+`--gpus 0,1` for two-card parallelism, or omit it to use
+`CUDA_VISIBLE_DEVICES` and otherwise GPU 0. Use `--resume` after an interrupted
+run. Use `--dry-run` to write the complete selected-GPU command matrix without
+requiring the checkpoint, model directory, or reference video directories.
 
 Outputs:
 

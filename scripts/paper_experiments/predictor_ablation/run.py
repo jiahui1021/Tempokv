@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Run the 60-prompt Self-Forcing K/V predictor ablation on four GPUs.
+"""Run the 60-prompt Self-Forcing K/V predictor ablation on selected GPUs.
 
 The runner varies K and V temporal predictors together and treats CrossKV as an
 independent V-side switch.  BF16 and the existing production TempoKV videos are
 supplied as reference directories and are never regenerated here.  Generation
-runs four variants in parallel, one visible GPU per process.  As soon as a
-generation batch finishes, quality workers start in another four-GPU batch and
-append one row per video to the CSV while the video frames are being decoded.
+runs one variant per selected GPU in each batch.  As soon as a generation batch
+finishes, quality workers start in another GPU batch and append one row per
+video to the CSV while the video frames are being decoded.
 
 Typical invocation::
 
@@ -17,7 +17,7 @@ Typical invocation::
         --bf16-videos results/self_forcing/bf16/videos \
         --tempokv-videos results/self_forcing/legacy-kh2-vh1-int4-layershared/videos \
         --output-root results/self_forcing/predictor_ablation_60p \
-        --gpus 0,1,2,3
+        --gpus 0,1
 """
 
 from __future__ import annotations
@@ -268,14 +268,11 @@ def _codec_payload(path: Path) -> dict[str, Any]:
 
 
 def _parse_gpus(raw: str | None) -> tuple[str, ...]:
-    selected = raw or os.environ.get("CUDA_VISIBLE_DEVICES") or "0,1,2,3"
+    selected = raw or os.environ.get("CUDA_VISIBLE_DEVICES") or "0"
     values = tuple(item.strip() for item in selected.split(",") if item.strip())
-    if len(values) != 4:
-        raise ValueError(
-            "predictor ablation requires exactly four GPU ids; "
-            f"got {values!r}"
-        )
-    if len(set(values)) != 4:
+    if not values:
+        raise ValueError("predictor ablation requires at least one GPU id")
+    if len(set(values)) != len(values):
         raise ValueError(f"GPU list contains duplicates: {values!r}")
     return values
 
@@ -552,7 +549,7 @@ def _run_jobs(
     root: Path,
     dry_run: bool,
 ) -> None:
-    """Run jobs in four-process batches, one CUDA device per process."""
+    """Run jobs in batches sized to the selected GPU count."""
     for batch_start in range(0, len(jobs), len(gpus)):
         batch = jobs[batch_start : batch_start + len(gpus)]
         if dry_run:
@@ -989,7 +986,7 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
                 variant.name: variant.use_cross_kv for variant in VARIANTS
             },
             "gpus": list(args.gpus),
-            "generation_parallelism": 4,
+            "generation_parallelism": len(args.gpus),
             "quality_streaming": bool(args.quality),
             "quality_frame_stride": args.quality_frame_stride,
             "rerun_bf16": False,
@@ -1006,11 +1003,18 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
             for variant in VARIANTS
         ],
         "jobs": {
-            "fit": [_job_record(job, i % 4) for i, job in enumerate(fit_jobs)],
-            "generation": [
-                _job_record(job, i % 4) for i, job in enumerate(generation_jobs)
+            "fit": [
+                _job_record(job, i % len(args.gpus))
+                for i, job in enumerate(fit_jobs)
             ],
-            "quality": [_job_record(job, i % 4) for i, job in enumerate(quality_jobs)],
+            "generation": [
+                _job_record(job, i % len(args.gpus))
+                for i, job in enumerate(generation_jobs)
+            ],
+            "quality": [
+                _job_record(job, i % len(args.gpus))
+                for i, job in enumerate(quality_jobs)
+            ],
         },
     }
     _write_json(manifest_path, manifest)
@@ -1021,14 +1025,17 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
             ("generation", generation_jobs),
             ("quality", quality_jobs),
         ):
-            print(f"\n--- {title} ({len(jobs)} jobs, four-GPU batches) ---")
+            print(
+                f"\n--- {title} ({len(jobs)} jobs, "
+                f"{len(args.gpus)}-GPU batches) ---"
+            )
             _run_jobs(jobs, args.gpus, root=root, dry_run=True)
         print(f"\n[dry-run] manifest: {manifest_path}")
         return None
 
     _run_jobs(fit_jobs, args.gpus, root=root, dry_run=False)
 
-    # Generation uses four predictor jobs in parallel.  Once all generation
+    # Generation uses one predictor job per selected GPU. Once all generation
     # batches finish, quality workers stream one video at a time and do not
     # accumulate decoded frames in memory.
     _run_jobs(generation_jobs, args.gpus, root=root, dry_run=False)
@@ -1067,7 +1074,10 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=PROJECT_ROOT / "results/self_forcing/predictor_ablation_60p",
     )
-    parser.add_argument("--gpus", help="exactly four GPU ids, e.g. 0,1,2,3")
+    parser.add_argument(
+        "--gpus",
+        help="comma-separated GPU ids; defaults to CUDA_VISIBLE_DEVICES or GPU 0",
+    )
     parser.add_argument("--frames", type=int, default=717)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--bits", type=int, choices=(2, 4, 8))
@@ -1083,7 +1093,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--quality",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="stream RGB quality metrics after each generation batch",
+        help="stream RGB quality metrics after the generation batches",
     )
     parser.add_argument("--fid-batch-size", type=int, default=32)
     parser.add_argument("--lpips-network", choices=("alex", "vgg", "squeeze"), default="alex")
