@@ -546,7 +546,7 @@ def _encode(
         else None
     )
     residual_sequence = sequence - stride
-    packed_width = width if bits == 8 else width // (8 // bits)
+    packed_width = (width * bits + 7) // 8
     scale_width = width // config.group_size
     residual_quant = (
         torch.empty(

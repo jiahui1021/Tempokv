@@ -24,7 +24,7 @@
 #   CONFIG       位宽等固定设置（默认取该模型的 INT4 配置）
 #   K_HISTORY    K 扫描点（默认 0,1,2,3,4,5；0=直接量化）
 #   V_HISTORY    V 扫描点（默认 0,1,2,4,5）
-#   BITS / K_BITS / V_BITS  位宽 override（2/4/8）
+#   BITS / K_BITS / V_BITS  位宽 override（1 到 8）
 #   V_PREDICTOR  cross_kv、temporal、identity、taylor、taylor2、cross_kv_identity、cross_kv_taylor、cross_kv_taylor2、innovation 或 direct
 #   BASELINE_K_HISTORY / BASELINE_V_HISTORY  扫另一侧时固定的取值
 #   MAX_SAMPLES  下采样空间位置数，先跑小规模时用

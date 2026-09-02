@@ -96,8 +96,8 @@ def build_parser() -> argparse.ArgumentParser:
             "or direct quantization"
         ),
     )
-    parser.add_argument("--k-bits", type=int, choices=(2, 4, 8))
-    parser.add_argument("--v-bits", type=int, choices=(2, 4, 8))
+    parser.add_argument("--k-bits", type=int, choices=range(1, 9))
+    parser.add_argument("--v-bits", type=int, choices=range(1, 9))
     parser.add_argument(
         "--model-config",
         type=Path,

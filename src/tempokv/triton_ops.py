@@ -70,6 +70,60 @@ def _strided_bhsd_offsets(
 
 
 @triton.jit
+def _load_packed_unsigned(
+    quant_ptr,
+    row_offset,
+    channel,
+    valid,
+    packed_width: tl.constexpr,
+    bits: tl.constexpr,
+):
+    """Read one MSB-first packed code, including codes crossing byte boundaries."""
+    if bits == 8:
+        unsigned = tl.load(
+            quant_ptr + row_offset + channel[None, :], mask=valid, other=0
+        ).to(tl.int32)
+    elif bits == 1 or bits == 2 or bits == 4:
+        lanes = 8 // bits
+        packed_channel = channel // lanes
+        lane = channel - packed_channel * lanes
+        shift = bits * (lanes - lane - 1)
+        byte = tl.load(
+            quant_ptr + row_offset + packed_channel[None, :],
+            mask=valid,
+            other=0,
+        ).to(tl.int32)
+        unsigned = (byte >> shift[None, :]) & ((1 << bits) - 1)
+    else:
+        bit_position = channel * bits
+        packed_channel = bit_position // 8
+        bit_offset = bit_position - packed_channel * 8
+        first = tl.load(
+            quant_ptr + row_offset + packed_channel[None, :],
+            mask=valid & (packed_channel[None, :] < packed_width),
+            other=0,
+        ).to(tl.int32)
+        second = tl.load(
+            quant_ptr + row_offset + packed_channel[None, :] + 1,
+            mask=valid & (packed_channel[None, :] + 1 < packed_width),
+            other=0,
+        ).to(tl.int32)
+        word = (first << 8) | second
+        shift = 16 - bit_offset - bits
+        unsigned = (word >> shift[None, :]) & ((1 << bits) - 1)
+    return unsigned
+
+
+@triton.jit
+def _dequantize_symmetric_code(unsigned, scale, bits: tl.constexpr):
+    if bits == 1:
+        value = (unsigned.to(tl.float32) * 2.0 - 1.0) * scale
+    else:
+        value = (unsigned - ((1 << (bits - 1)) - 1)).to(tl.float32) * scale
+    return value
+
+
+@triton.jit
 def _anchor_decode_kernel(
     quant_ptr,
     scale_ptr,
@@ -93,25 +147,13 @@ def _anchor_decode_kernel(
     token = tl.program_id(1) * block_s + tl.arange(0, block_s)
     channel = tl.program_id(2) * block_d + tl.arange(0, block_d)
     valid = (token[:, None] < unit_length) & (channel[None, :] < width)
-    if bits == 8:
-        quant_offset = (
-            batch_head * unit_length * width
-            + token[:, None] * width
-            + channel[None, :]
-        )
-        unsigned = tl.load(quant_ptr + quant_offset, mask=valid, other=0).to(tl.int32)
-    else:
-        lanes = 8 // bits
-        packed_channel = channel // lanes
-        lane = channel - packed_channel * lanes
-        shift = bits * (lanes - lane - 1)
-        quant_offset = (
-            batch_head * unit_length * packed_width
-            + token[:, None] * packed_width
-            + packed_channel[None, :]
-        )
-        byte = tl.load(quant_ptr + quant_offset, mask=valid, other=0).to(tl.int32)
-        unsigned = (byte >> shift[None, :]) & ((1 << bits) - 1)
+    quant_row = (
+        batch_head * unit_length * packed_width
+        + token[:, None] * packed_width
+    )
+    unsigned = _load_packed_unsigned(
+        quant_ptr, quant_row, channel, valid, packed_width, bits
+    )
     group = channel // group_size
     scale_offset = (
         batch_head * unit_length * scale_width
@@ -119,7 +161,7 @@ def _anchor_decode_kernel(
         + group[None, :]
     )
     scale = tl.load(scale_ptr + scale_offset, mask=valid, other=1.0).to(tl.float32)
-    value = (unsigned - ((1 << (bits - 1)) - 1)).to(tl.float32) * scale
+    value = _dequantize_symmetric_code(unsigned, scale, bits)
     output_offset = _strided_bhsd_offsets(
         batch_head,
         token,
@@ -172,27 +214,13 @@ def _direct_persistent_decode_kernel(
             & (residual_token[:, None] < residual_sequence)
             & (channel[None, :] < width)
         )
-        if bits == 8:
-            quant_offset = (
-                batch_head * residual_sequence * width
-                + residual_token[:, None] * width
-                + channel[None, :]
-            )
-            unsigned = tl.load(quant_ptr + quant_offset, mask=valid, other=0).to(
-                tl.int32
-            )
-        else:
-            lanes = 8 // bits
-            packed_channel = channel // lanes
-            lane = channel - packed_channel * lanes
-            shift = bits * (lanes - lane - 1)
-            quant_offset = (
-                batch_head * residual_sequence * packed_width
-                + residual_token[:, None] * packed_width
-                + packed_channel[None, :]
-            )
-            byte = tl.load(quant_ptr + quant_offset, mask=valid, other=0).to(tl.int32)
-            unsigned = (byte >> shift[None, :]) & ((1 << bits) - 1)
+        quant_row = (
+            batch_head * residual_sequence * packed_width
+            + residual_token[:, None] * packed_width
+        )
+        unsigned = _load_packed_unsigned(
+            quant_ptr, quant_row, channel, valid, packed_width, bits
+        )
         group = channel // group_size
         scale_offset = (
             batch_head * residual_sequence * scale_width
@@ -204,7 +232,7 @@ def _direct_persistent_decode_kernel(
             zero = tl.load(zero_ptr + scale_offset, mask=valid, other=0).to(tl.float32)
             value = (unsigned.to(tl.float32) - zero) * scale
         else:
-            value = (unsigned - ((1 << (bits - 1)) - 1)).to(tl.float32) * scale
+            value = _dequantize_symmetric_code(unsigned, scale, bits)
         output_offset = _strided_bhsd_offsets(
             batch_head,
             current_token,
@@ -266,25 +294,13 @@ def _temporal_persistent_decode_kernel(
             & (residual_token[:, None] < residual_sequence)
             & (channel[None, :] < width)
         )
-        if bits == 8:
-            quant_offset = (
-                batch_head * residual_sequence * width
-                + residual_token[:, None] * width
-                + channel[None, :]
-            )
-            unsigned = tl.load(quant_ptr + quant_offset, mask=valid, other=0).to(tl.int32)
-        else:
-            lanes = 8 // bits
-            packed_channel = channel // lanes
-            lane = channel - packed_channel * lanes
-            shift = bits * (lanes - lane - 1)
-            quant_offset = (
-                batch_head * residual_sequence * packed_width
-                + residual_token[:, None] * packed_width
-                + packed_channel[None, :]
-            )
-            byte = tl.load(quant_ptr + quant_offset, mask=valid, other=0).to(tl.int32)
-            unsigned = (byte >> shift[None, :]) & ((1 << bits) - 1)
+        quant_row = (
+            batch_head * residual_sequence * packed_width
+            + residual_token[:, None] * packed_width
+        )
+        unsigned = _load_packed_unsigned(
+            quant_ptr, quant_row, channel, valid, packed_width, bits
+        )
         group = channel // group_size
         scale_offset = (
             batch_head * residual_sequence * scale_width
@@ -296,7 +312,7 @@ def _temporal_persistent_decode_kernel(
             zero = tl.load(zero_ptr + scale_offset, mask=valid, other=0).to(tl.float32)
             residual = (unsigned.to(tl.float32) - zero) * scale
         else:
-            residual = (unsigned - ((1 << (bits - 1)) - 1)).to(tl.float32) * scale
+            residual = _dequantize_symmetric_code(unsigned, scale, bits)
 
         order = unit_index
         if order > history_length:
@@ -427,25 +443,13 @@ def _cross_kv_persistent_decode_kernel(
             & (residual_token[:, None] < residual_sequence)
             & (channel[None, :] < width)
         )
-        if bits == 8:
-            quant_offset = (
-                batch_head * residual_sequence * width
-                + residual_token[:, None] * width
-                + channel[None, :]
-            )
-            unsigned = tl.load(quant_ptr + quant_offset, mask=valid, other=0).to(tl.int32)
-        else:
-            lanes = 8 // bits
-            packed_channel = channel // lanes
-            lane = channel - packed_channel * lanes
-            shift = bits * (lanes - lane - 1)
-            quant_offset = (
-                batch_head * residual_sequence * packed_width
-                + residual_token[:, None] * packed_width
-                + packed_channel[None, :]
-            )
-            byte = tl.load(quant_ptr + quant_offset, mask=valid, other=0).to(tl.int32)
-            unsigned = (byte >> shift[None, :]) & ((1 << bits) - 1)
+        quant_row = (
+            batch_head * residual_sequence * packed_width
+            + residual_token[:, None] * packed_width
+        )
+        unsigned = _load_packed_unsigned(
+            quant_ptr, quant_row, channel, valid, packed_width, bits
+        )
         group = channel // group_size
         scale_offset = (
             batch_head * residual_sequence * scale_width
@@ -457,7 +461,7 @@ def _cross_kv_persistent_decode_kernel(
             zero = tl.load(zero_ptr + scale_offset, mask=valid, other=0).to(tl.float32)
             residual = (unsigned.to(tl.float32) - zero) * scale
         else:
-            residual = (unsigned - ((1 << (bits - 1)) - 1)).to(tl.float32) * scale
+            residual = _dequantize_symmetric_code(unsigned, scale, bits)
         source_offset = _strided_bhsd_offsets(
             batch_head,
             current_token,
@@ -603,29 +607,13 @@ def _cross_kv_history_persistent_decode_kernel(
             & (residual_token[:, None] < residual_sequence)
             & (channel[None, :] < width)
         )
-        if bits == 8:
-            quant_offset = (
-                batch_head * residual_sequence * width
-                + residual_token[:, None] * width
-                + channel[None, :]
-            )
-            unsigned = tl.load(quant_ptr + quant_offset, mask=valid, other=0).to(
-                tl.int32
-            )
-        else:
-            lanes = 8 // bits
-            packed_channel = channel // lanes
-            lane = channel - packed_channel * lanes
-            shift = bits * (lanes - lane - 1)
-            quant_offset = (
-                batch_head * residual_sequence * packed_width
-                + residual_token[:, None] * packed_width
-                + packed_channel[None, :]
-            )
-            byte = tl.load(quant_ptr + quant_offset, mask=valid, other=0).to(
-                tl.int32
-            )
-            unsigned = (byte >> shift[None, :]) & ((1 << bits) - 1)
+        quant_row = (
+            batch_head * residual_sequence * packed_width
+            + residual_token[:, None] * packed_width
+        )
+        unsigned = _load_packed_unsigned(
+            quant_ptr, quant_row, channel, valid, packed_width, bits
+        )
         group = channel // group_size
         scale_offset = (
             batch_head * residual_sequence * scale_width
@@ -641,9 +629,7 @@ def _cross_kv_history_persistent_decode_kernel(
             )
             residual = (unsigned.to(tl.float32) - zero) * scale
         else:
-            residual = (
-                unsigned - ((1 << (bits - 1)) - 1)
-            ).to(tl.float32) * scale
+            residual = _dequantize_symmetric_code(unsigned, scale, bits)
 
         source_offset = _strided_bhsd_offsets(
             batch_head,
@@ -730,7 +716,7 @@ def _uniform_layout(packed: "PackedTensor") -> bool:
 def _supported(packed: "PackedTensor", source: torch.Tensor | None) -> bool:
     if not packed.anchor_quant.is_cuda:
         return False
-    if packed.bits not in (2, 4, 8) or packed.anchor_bits not in (2, 4, 8):
+    if not 1 <= packed.bits <= 8 or not 1 <= packed.anchor_bits <= 8:
         return False
     if packed.predictor_kind in {"cross_kv", "innovation"}:
         return source is not None and source.is_cuda and packed.cross_kv is not None
@@ -825,7 +811,7 @@ def decode(
             output.stride()
         )
     anchor_length = packed.unit_lengths[0]
-    anchor_packed_width = width if packed.anchor_bits == 8 else width // (8 // packed.anchor_bits)
+    anchor_packed_width = (width * packed.anchor_bits + 7) // 8
     anchor_grid = (
         batch_heads,
         _ceil_div(anchor_length, block_s),
@@ -855,7 +841,7 @@ def decode(
         return _logical_bhsd_output(output, direct_output_layout)
     assert packed.residual_scale is not None
     residual_sequence = int(packed.residual_quant.shape[2])
-    residual_packed_width = width if packed.bits == 8 else width // (8 // packed.bits)
+    residual_packed_width = (width * packed.bits + 7) // 8
     quant = packed.residual_quant.contiguous().view(
         batch_heads, residual_sequence, residual_packed_width
     )

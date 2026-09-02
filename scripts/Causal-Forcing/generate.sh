@@ -37,7 +37,7 @@
 #   NUM_GPUS         torchrun 使用的 GPU 数（默认 1）
 #   LOCAL_ATTN_SIZE  局部注意力窗口（默认 -1，即全序列）
 #   USE_EMA          是否读取 checkpoint 的 generator_ema（默认 0，官方权重只有 generator）
-#   BITS / K_BITS / V_BITS  位宽 override（2/4/8；默认读取 CONFIG）
+#   BITS / K_BITS / V_BITS  位宽 override（1 到 8；默认读取 CONFIG）
 #   K_HISTORY_LENGTH / V_HISTORY_LENGTH  历史帧数（默认读取 CONFIG）
 #
 set -euo pipefail

@@ -14,5 +14,4 @@ paper_init
 paper_run_tempokv k4v4 4 4
 paper_run_tempokv k2v4 2 4
 paper_run_tempokv k4v2 4 2
-
-printf '\n[exp5] K3V3 skipped: current codec only supports 2/4/8-bit quantization.\n'
+paper_run_tempokv k3v3 3 3

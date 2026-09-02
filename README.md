@@ -76,7 +76,7 @@ layer-shared Cross 权重。常用覆盖项：
 | `CONFIG` | 选择 `configs/legacy.json` |
 | `TRACE_FILE` | 指定采集好的 `clean_trace.npz` |
 | `OUTPUT_DIR` | 指定参数输出目录 |
-| `BITS=2/4/8` | 同时设置 K/V 位宽 |
+| `BITS=1..8` | 同时设置 K/V 位宽；INT1/3/5/7 使用连续 bit packing |
 | `K_BITS`、`V_BITS` | 分别设置 K/V 位宽 |
 | `KH`、`VH` | 设置 K/V history length |
 | `k_predictor_mode` | 配置中的 `shared`、`identity`、`taylor`、`taylor2` 或 `direct` |
