@@ -194,6 +194,19 @@ VARIANTS: tuple[Variant, ...] = (
 )
 
 
+def _select_variants(raw: str | None) -> tuple[Variant, ...]:
+    """Return the requested subset of ``VARIANTS``, or the whole matrix."""
+    if not raw:
+        return VARIANTS
+    wanted = tuple(item.strip() for item in raw.split(",") if item.strip())
+    known = tuple(variant.name for variant in VARIANTS)
+    unknown = tuple(name for name in wanted if name not in known)
+    if unknown:
+        raise ValueError(f"unknown variant(s) {list(unknown)}; choose from {list(known)}")
+    selected = set(wanted)
+    return tuple(variant for variant in VARIANTS if variant.name in selected)
+
+
 @dataclass(frozen=True)
 class Job:
     name: str
@@ -914,6 +927,8 @@ def _validate_main(args: argparse.Namespace) -> tuple[CodecConfig, int, int]:
 
 
 def run(args: argparse.Namespace) -> dict[str, Any] | None:
+    global VARIANTS
+    VARIANTS = _select_variants(args.variants)
     base, k_bits, v_bits = _validate_main(args)
     root = args.output_root.expanduser().resolve()
     if root == Path(root.anchor):
@@ -1077,6 +1092,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--gpus",
         help="comma-separated GPU ids; defaults to CUDA_VISIBLE_DEVICES or GPU 0",
+    )
+    parser.add_argument(
+        "--variants",
+        help="comma-separated subset of the matrix to run (default: every variant)",
     )
     parser.add_argument("--frames", type=int, default=717)
     parser.add_argument("--seed", type=int, default=0)

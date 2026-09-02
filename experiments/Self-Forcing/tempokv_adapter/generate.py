@@ -1038,8 +1038,33 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             )
     else:
         for name in tuple(environment):
-            if name.startswith("TEMPOKV_"):
+            if name.startswith("TEMPOKV_") and name not in (
+                "TEMPOKV_TRACE_DIR",
+                "TEMPOKV_TRITON_CACHE",
+                "TEMPOKV_TRACE_EVENT_FRAMES",
+            ):
                 environment.pop(name)
+        if args.mode == "trace" and args.config is not None:
+            # Reuse the TempoKV bounded-cache runtime while trace_bridge captures
+            # the clean (pre-quant) K/V.  Without this the model falls back to a
+            # full unbounded bf16 KV cache, which OOMs on long sequences.
+            _cfg = json.loads(Path(args.config).read_text())
+            if isinstance(_cfg, dict) and "codec" in _cfg:
+                _cfg = _cfg["codec"]
+            paths["runtime_config"].write_text(
+                json.dumps(_cfg, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            environment.update(
+                {
+                    "TEMPOKV_CONFIG_PATH": str(paths["runtime_config"]),
+                    "TEMPOKV_K_PARAMS_PATH": str(args.k_params),
+                    "TEMPOKV_V_PARAMS_PATH": str(args.v_params),
+                    "TEMPOKV_NUM_FRAMES": str(latent_frames_for(args.frames)),
+                }
+            )
+            if args.allow_triton_fallback or args.torch_decoder:
+                environment["TEMPOKV_ALLOW_TRITON_FALLBACK"] = "1"
         if args.mode == "bf16":
             # The legacy runtime also rotates dense cached K in complex64.  Keep the
             # BF16 reference on the same arithmetic path as its quantized run.
