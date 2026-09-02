@@ -18,7 +18,7 @@
 #   CONFIG          codec 配置 JSON（默认 configs/legacy.json）
 #   TRACE_FILE      拟合输入（默认 data/self-forcing/trace/clean_trace.npz）
 #   OUTPUT_DIR      输出目录（默认 data/self-forcing/params/<参数方案>）
-#   BITS / K_BITS / V_BITS  位宽 override（2/4/8；默认读取 CONFIG）
+#   BITS / K_BITS / V_BITS  位宽 override（1 到 8；默认读取 CONFIG）
 #   K_HISTORY_LENGTH  K 历史长度（默认读取 CONFIG）
 #   V_HISTORY_LENGTH  V 历史长度（默认读取 CONFIG）
 #   ITERATIONS     拟合迭代次数（默认 2）

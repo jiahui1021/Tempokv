@@ -297,7 +297,7 @@ def _launch_inputs(packed: PackedTensor) -> _LaunchInputs:
     assert packed.residual_quant is not None and packed.residual_scale is not None
     residual_sequence = int(packed.residual_quant.shape[2])
     residual_packed_width = (
-        width if packed.bits == 8 else width // (8 // packed.bits)
+        (width * packed.bits + 7) // 8
     )
     quant = packed.residual_quant.contiguous().view(
         batch_heads, residual_sequence, residual_packed_width
@@ -334,9 +334,7 @@ def _launch_anchor(
     batch, heads, sequence, width = packed.shape
     anchor_length = packed.unit_lengths[0]
     anchor_packed_width = (
-        width
-        if packed.anchor_bits == 8
-        else width // (8 // packed.anchor_bits)
+        (width * packed.anchor_bits + 7) // 8
     )
     block_s, block_d = 16, min(128, width)
     strides = output.stride()
@@ -778,7 +776,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--sweep", choices=("production", "tile", "both"), default="production"
     )
-    parser.add_argument("--bits", type=int, choices=(2, 4, 8), default=4)
+    parser.add_argument("--bits", type=int, choices=range(1, 9), default=4)
     parser.add_argument("--k-history", type=int, default=3)
     parser.add_argument("--v-history", type=int, default=1)
     parser.add_argument("--heads", type=int, default=12)

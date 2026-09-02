@@ -18,7 +18,7 @@
 #   GENERATION_MODE  chunkwise（默认）或 framewise
 #   TRACE_FILE       拟合输入（默认使用 legacy trace 目录）
 #   OUTPUT_DIR       输出目录（默认 data/causal-forcing/params/<模式>/<参数方案>）
-#   BITS / K_BITS / V_BITS  位宽 override（2/4/8；默认读取 CONFIG）
+#   BITS / K_BITS / V_BITS  位宽 override（1 到 8；默认读取 CONFIG）
 #   K_HISTORY_LENGTH / V_HISTORY_LENGTH  历史长度（默认读取 CONFIG）
 #   ITERATIONS / TEMPORAL_RIDGE / CROSS_RIDGE / V_HISTORY_RIDGE / MAX_GAIN
 #   FIT_HISTORY_SOURCE  reconstructed（默认）或 clean；仅用于拟合消融

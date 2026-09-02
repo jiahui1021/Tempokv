@@ -101,7 +101,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=list(DEFAULT_METHODS),
         help=f"subset of {', '.join(item.name for item in METHODS)}",
     )
-    parser.add_argument("--bits", type=int, default=2, choices=(2, 4, 8))
+    parser.add_argument("--bits", type=int, default=2, choices=range(1, 9))
     parser.add_argument(
         "--max-records",
         type=int,

@@ -334,13 +334,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--k-bits",
         type=int,
-        choices=(2, 4, 8),
+        choices=range(1, 9),
         help="override K residual bit width while keeping the config family",
     )
     parser.add_argument(
         "--v-bits",
         type=int,
-        choices=(2, 4, 8),
+        choices=range(1, 9),
         help="override V residual bit width while keeping the config family",
     )
     parser.add_argument(

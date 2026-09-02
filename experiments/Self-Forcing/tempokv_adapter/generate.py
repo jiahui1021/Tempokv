@@ -108,8 +108,8 @@ def build_parser() -> argparse.ArgumentParser:
             "reconstructed K (production), v_to_k mirrors the roles"
         ),
     )
-    parser.add_argument("--k-bits", type=int, choices=(2, 4, 8))
-    parser.add_argument("--v-bits", type=int, choices=(2, 4, 8))
+    parser.add_argument("--k-bits", type=int, choices=range(1, 9))
+    parser.add_argument("--v-bits", type=int, choices=range(1, 9))
     parser.add_argument(
         "--torch-decoder",
         action="store_true",

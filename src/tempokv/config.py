@@ -204,8 +204,8 @@ class CodecConfig:
             object.__setattr__(self, name, int(value))
         for name in ("k_bits", "v_bits", "anchor_bits"):
             value = getattr(self, name)
-            if value not in (2, 4, 8):
-                raise ValueError(f"{name} must be 2, 4, or 8, got {value}")
+            if not 1 <= value <= 8:
+                raise ValueError(f"{name} must be an integer from 1 to 8, got {value}")
         if self.group_size <= 0:
             raise ValueError("group_size must be positive")
         if self.stride <= 0:
