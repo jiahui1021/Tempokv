@@ -16,8 +16,9 @@ Common overrides:
   CONFIG=...              Codec config (default: configs/legacy.json)
   TRACE_FILE=...          Clean trace archive
   OUTPUT_DIR=...          Parameter output directory
-  BITS=1..8               Set K/V bit width together
-  K_BITS=... V_BITS=...   Set K/V bit width separately
+  BITS=1..8               Set the K/V residual width together
+  K_BITS=... V_BITS=...   Set the K/V residual width separately
+  ANCHOR_BITS=1..16       Set the anchor width (default INT4)
   KH=... VH=...           K/V history length
   V_PREDICTOR=cross_kv|temporal|identity|taylor|taylor2|cross_kv_identity|cross_kv_taylor|cross_kv_taylor2|innovation|direct
   FIT_DEVICE=auto|cuda|cpu

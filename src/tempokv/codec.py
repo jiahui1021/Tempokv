@@ -15,6 +15,7 @@ from .config import (
 )
 from .parameters import CrossKVParameters, TemporalParameters
 from .quantization import (
+    code_dtype,
     dequantize_asymmetric,
     dequantize_symmetric,
     quantize_asymmetric,
@@ -579,7 +580,10 @@ def _encode(
             residual_sequence,
             scale_width,
             device=value.device,
-            dtype=torch.uint8,
+            # A zero point is a code, so it needs the same room a code does.
+            # Residual widths stop at 8 today, which keeps this uint8; asking
+            # the packer means a wider residual could never truncate here.
+            dtype=code_dtype(bits),
         )
         if residual_sequence and config.residual_mode == "asymmetric"
         else None

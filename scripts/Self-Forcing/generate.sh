@@ -37,7 +37,8 @@
 #   SINK_SIZE       注意力 sink 帧数（窗口前固定的历史帧，默认 0）
 #   K_HISTORY_LENGTH  K 使用的历史帧数（1 到 8；默认读取 CONFIG）
 #   V_HISTORY_LENGTH  V 使用的历史帧数（0 到 5；默认读取 CONFIG）
-#   BITS            K/V 位宽（1 到 8；默认读取 CONFIG）；K_BITS / V_BITS 可分别设
+#   BITS            K/V residual 位宽（1 到 8；默认读取 CONFIG）；K_BITS / V_BITS 可分别设
+#   ANCHOR_BITS     anchor 位宽（1 到 16；默认读取 CONFIG，即 INT4）
 #   TORCH_DECODER   用 PyTorch 参考解码器代替 Triton，0 或 1（默认 0）
 #   BENCHMARK       要求本次完整生成且不允许跳过已有视频，0 或 1（默认 0）
 #   PROFILE         记录每段 CUDA-event 耗时分解，0 或 1（默认 0）；结果写入
@@ -76,7 +77,7 @@ if [[ "$mode" == "tempokv" ]]; then
   # This only selects the matching fitted parameter directory; runtime always
   # consumes reconstructed cache state regardless of the fitting ablation.
   FIT_HISTORY_SOURCE="${FIT_HISTORY_SOURCE:-reconstructed}"
-  parameter_name="${PARAM_NAME:-$(codec_slug "$(resolve_path "$CONFIG")" "${K_HISTORY_LENGTH:-}" "${V_HISTORY_LENGTH:-}" "${K_BITS:-}" "${V_BITS:-}" "" "${V_PREDICTOR:-}" "$FIT_HISTORY_SOURCE")}"
+  parameter_name="${PARAM_NAME:-$(codec_slug "$(resolve_path "$CONFIG")" "${K_HISTORY_LENGTH:-}" "${V_HISTORY_LENGTH:-}" "${K_BITS:-}" "${V_BITS:-}" "" "${V_PREDICTOR:-}" "$FIT_HISTORY_SOURCE" "${ANCHOR_BITS:-}")}"
   param_dir="$(resolve_path "${PARAM_DIR:-data/self-forcing/params/$parameter_name}")"
   result_label="$parameter_name"
   v_predictor_mode="$("$python_bin" - "$(resolve_path "$CONFIG")" <<'PY'
@@ -226,6 +227,7 @@ if [[ "$mode" == "tempokv" ]]; then
   [[ -n "${V_HISTORY_LENGTH:-}" ]] && generate_command+=(--v-history-length "$V_HISTORY_LENGTH")
   [[ -n "${K_BITS:-}" ]] && generate_command+=(--k-bits "$K_BITS")
   [[ -n "${V_BITS:-}" ]] && generate_command+=(--v-bits "$V_BITS")
+  [[ -n "${ANCHOR_BITS:-}" ]] && generate_command+=(--anchor-bits "$ANCHOR_BITS")
   [[ -n "${V_PREDICTOR:-}" ]] && generate_command+=(--v-predictor-mode "$V_PREDICTOR")
   [[ -n "${DIRECTION:-}" ]] && generate_command+=(--predictor-direction "$predictor_direction")
   [[ "$TORCH_DECODER" == "1" ]] && generate_command+=(--torch-decoder)

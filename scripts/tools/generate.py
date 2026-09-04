@@ -54,7 +54,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--triton-cache", type=Path)
     parser.add_argument("--k-bits", type=int, choices=range(1, 9))
     parser.add_argument("--v-bits", type=int, choices=range(1, 9))
-    parser.add_argument("--anchor-bits", type=int, choices=range(1, 9))
+    parser.add_argument("--anchor-bits", type=int, choices=range(1, 17))
     parser.add_argument("--group-size", type=int)
     parser.add_argument("--stride", type=int)
     parser.add_argument("--k-history-length", type=int)

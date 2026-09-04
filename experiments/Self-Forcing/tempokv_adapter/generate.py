@@ -110,6 +110,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--k-bits", type=int, choices=range(1, 9))
     parser.add_argument("--v-bits", type=int, choices=range(1, 9))
+    parser.add_argument("--anchor-bits", type=int, choices=range(1, 17))
     parser.add_argument(
         "--torch-decoder",
         action="store_true",
@@ -352,6 +353,7 @@ def _validate_parameters(
         "k_predictor_mode": config.k_predictor_mode,
         "k_bits": config.k_bits,
         "v_bits": config.v_bits,
+        "anchor_bits": config.anchor_bits,
         "v_history_length": codec.v_parameters.history_length,
         "v_history_mode": (
             "temporal"
@@ -941,6 +943,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                 ("v_history_length", args.v_history_length),
                 ("k_bits", args.k_bits),
                 ("v_bits", args.v_bits),
+                ("anchor_bits", args.anchor_bits),
                 ("v_predictor_mode", args.v_predictor_mode),
                 ("predictor_direction", args.predictor_direction),
                 ("use_triton", False if args.torch_decoder else None),

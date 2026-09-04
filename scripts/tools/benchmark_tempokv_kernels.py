@@ -96,17 +96,22 @@ def _production_config(
     v_history: int,
     stride: int,
     cross_matmul_precision: str,
+    v_bits: int | None = None,
+    anchor_bits: int = 4,
 ) -> CodecConfig:
     """The legacy production codec settings the plan freezes for this round.
 
     ``stride`` is threaded through rather than hardcoded so a mismatch between
     the benchmark geometry and the codec is impossible; ``CodecConfig`` rejects
-    any value legacy fitting does not support.
+    any value legacy fitting does not support.  ``bits``/``v_bits`` and
+    ``anchor_bits`` are separate because the decode kernels read a different
+    packed width for each, and a mixed or wide-anchor run is exactly the case
+    where a per-width regression would otherwise go unmeasured.
     """
     return CodecConfig(
         k_bits=bits,
-        v_bits=bits,
-        anchor_bits=4,
+        v_bits=bits if v_bits is None else v_bits,
+        anchor_bits=anchor_bits,
         group_size=64,
         stride=stride,
         residual_mode="asymmetric",
@@ -777,6 +782,15 @@ def main(argv: list[str] | None = None) -> int:
         "--sweep", choices=("production", "tile", "both"), default="production"
     )
     parser.add_argument("--bits", type=int, choices=range(1, 9), default=4)
+    parser.add_argument(
+        "--v-bits",
+        type=int,
+        choices=range(1, 9),
+        help="V residual width; defaults to --bits",
+    )
+    parser.add_argument(
+        "--anchor-bits", type=int, choices=range(1, 17), default=4
+    )
     parser.add_argument("--k-history", type=int, default=3)
     parser.add_argument("--v-history", type=int, default=1)
     parser.add_argument("--heads", type=int, default=12)
@@ -828,6 +842,8 @@ def main(argv: list[str] | None = None) -> int:
         arguments.v_history,
         arguments.stride,
         arguments.cross_matmul_precision,
+        v_bits=arguments.v_bits,
+        anchor_bits=arguments.anchor_bits,
     )
     generator = torch.Generator(device=device).manual_seed(arguments.seed)
     codec = _load_codec(
@@ -889,7 +905,10 @@ def main(argv: list[str] | None = None) -> int:
             "stride": shape.stride,
             "units": shape.units,
         },
-        "bits": arguments.bits,
+        "bits": config.k_bits if config.k_bits == config.v_bits else None,
+        "k_bits": config.k_bits,
+        "v_bits": config.v_bits,
+        "anchor_bits": config.anchor_bits,
         "k_history": arguments.k_history,
         "v_history": arguments.v_history,
         "cross_matmul_precision": arguments.cross_matmul_precision,

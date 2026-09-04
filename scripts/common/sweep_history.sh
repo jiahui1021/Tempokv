@@ -87,8 +87,8 @@ K_HISTORY="${K_HISTORY:-0,1,2,3,4,5}"
 V_HISTORY="${V_HISTORY:-0,1,2,4,5}"
 K_BITS="$(resolve_bits K_BITS)"
 V_BITS="$(resolve_bits V_BITS)"
-if [[ -z "${OUTPUT:-}" && ( -n "${K_BITS:-}" || -n "${V_BITS:-}" ) ]]; then
-  sweep_identity="$(codec_slug "$config_path" "" "" "${K_BITS:-}" "${V_BITS:-}" "" "${V_PREDICTOR:-}" reconstructed)"
+if [[ -z "${OUTPUT:-}" && ( -n "${K_BITS:-}" || -n "${V_BITS:-}" || -n "${ANCHOR_BITS:-}" ) ]]; then
+  sweep_identity="$(codec_slug "$config_path" "" "" "${K_BITS:-}" "${V_BITS:-}" "" "${V_PREDICTOR:-}" reconstructed "${ANCHOR_BITS:-}")"
   output="$(resolve_path "${default_output%.json}-$sweep_identity.json")"
 else
   output="$(resolve_path "${OUTPUT:-$default_output}")"

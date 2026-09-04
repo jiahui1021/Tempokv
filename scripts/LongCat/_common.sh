@@ -80,9 +80,10 @@ codec_slug() {
   local k_bits_override="${4:-}" v_bits_override="${5:-}" stride_override="${6:-}"
   local v_predictor_override="${7:-}"
   local fit_history_source="${8:-reconstructed}"
+  local anchor_bits_override="${9:-}"
   "$python_bin" - "$config_path" "$k_override" "$v_override" \
     "$k_bits_override" "$v_bits_override" "$stride_override" \
-    "$v_predictor_override" "$fit_history_source" <<'SLUGPY'
+    "$v_predictor_override" "$fit_history_source" "$anchor_bits_override" <<'SLUGPY'
 import json
 import sys
 
@@ -92,6 +93,7 @@ import sys
 # CodecConfig, so they cannot drift silently.
 DEFAULT_K_BITS = 2
 DEFAULT_V_BITS = 2
+DEFAULT_ANCHOR_BITS = 4
 DEFAULT_STRIDE = 1560
 DEFAULT_V_HISTORY_LENGTH = 0
 DEFAULT_V_PREDICTOR_MODE = "cross_kv"
@@ -108,6 +110,7 @@ config = config.get("codec", config)
 k_bits = override(4) or int(config.get("k_bits", DEFAULT_K_BITS))
 v_bits = override(5) or int(config.get("v_bits", DEFAULT_V_BITS))
 stride = override(6) or int(config.get("stride", DEFAULT_STRIDE))
+anchor_bits = override(9) or int(config.get("anchor_bits", DEFAULT_ANCHOR_BITS))
 k_override = override(2)
 if k_override is None:
     k_history = config.get("k_history_length")
@@ -172,6 +175,10 @@ else:
     # Keep the historical intN name for equal precision while making mixed
     # K/V precision directories unambiguous.
     precision_label = f"k{k_bits}-v{v_bits}"
+# The anchor width is part of the codec signature too, so parameters fitted at
+# one anchor cannot be loaded at another.  INT4 stays unlabelled, which keeps
+# every directory fitted before the anchor became configurable byte-identical.
+anchor_label = "" if anchor_bits == DEFAULT_ANCHOR_BITS else f"-a{anchor_bits}"
 # stride is part of the codec signature, so a context-parallel run fits its own
 # parameters.  Without this segment every CP degree wrote to one directory and
 # silently overwrote the others.
@@ -184,7 +191,7 @@ if fit_history_source not in {"reconstructed", "clean"}:
     )
 fit_label = "" if fit_history_source == "reconstructed" else "-fitclean"
 print(
-    f"{mode_label}{k_label}-{v_label}-{precision_label}"
+    f"{mode_label}{k_label}-{v_label}-{precision_label}{anchor_label}"
     f"{stride_label}{cross_weight_label}{fit_label}"
 )
 SLUGPY

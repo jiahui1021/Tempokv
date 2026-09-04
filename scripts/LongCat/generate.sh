@@ -33,7 +33,7 @@ if [[ "$mode" == "tempokv" ]]; then
     codec_slug "$config_path" \
       "${K_HISTORY_LENGTH:-}" "${V_HISTORY_LENGTH:-}" \
       "${K_BITS:-}" "${V_BITS:-}" "${CACHE_STRIDE:-}" \
-      "${V_PREDICTOR:-}" "$FIT_HISTORY_SOURCE"
+      "${V_PREDICTOR:-}" "$FIT_HISTORY_SOURCE" "${ANCHOR_BITS:-}"
   )}"
   param_dir="$(resolve_path "${PARAM_DIR:-data/longcat/params/$parameter_name}")"
   v_predictor_mode="$("$python_bin" - "$config_path" <<'PY'
@@ -137,6 +137,7 @@ args=(
 [[ -n "${V_HISTORY_LENGTH:-}" ]] && args+=(--v-history-length "$V_HISTORY_LENGTH")
 [[ -n "${K_BITS:-}" ]] && args+=(--k-bits "$K_BITS")
 [[ -n "${V_BITS:-}" ]] && args+=(--v-bits "$V_BITS")
+[[ -n "${ANCHOR_BITS:-}" ]] && args+=(--anchor-bits "$ANCHOR_BITS")
 [[ -n "${V_PREDICTOR:-}" ]] && args+=(--v-predictor-mode "$V_PREDICTOR")
 [[ -n "${TRITON_CACHE:-}" ]] && args+=(--triton-cache "$(resolve_path "$TRITON_CACHE")")
 if [[ "$mode" == "tempokv" ]]; then
@@ -156,6 +157,7 @@ preflight_args=(
 [[ -n "${CACHE_STRIDE:-}" ]] && preflight_args+=(--stride "$CACHE_STRIDE")
 [[ -n "${K_BITS:-}" ]] && preflight_args+=(--k-bits "$K_BITS")
 [[ -n "${V_BITS:-}" ]] && preflight_args+=(--v-bits "$V_BITS")
+[[ -n "${ANCHOR_BITS:-}" ]] && preflight_args+=(--anchor-bits "$ANCHOR_BITS")
 [[ -n "${V_PREDICTOR:-}" ]] && preflight_args+=(--v-predictor-mode "$V_PREDICTOR")
 if [[ "$mode" == "tempokv" ]]; then
   preflight_args+=(

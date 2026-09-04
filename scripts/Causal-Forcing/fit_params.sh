@@ -18,7 +18,8 @@
 #   GENERATION_MODE  chunkwise（默认）或 framewise
 #   TRACE_FILE       拟合输入（默认使用 legacy trace 目录）
 #   OUTPUT_DIR       输出目录（默认 data/causal-forcing/params/<模式>/<参数方案>）
-#   BITS / K_BITS / V_BITS  位宽 override（1 到 8；默认读取 CONFIG）
+#   BITS / K_BITS / V_BITS  K/V residual 位宽 override（1 到 8；默认读取 CONFIG）
+#   ANCHOR_BITS     anchor 位宽 override（1 到 16；默认读取 CONFIG，即 INT4）
 #   K_HISTORY_LENGTH / V_HISTORY_LENGTH  历史长度（默认读取 CONFIG）
 #   ITERATIONS / TEMPORAL_RIDGE / CROSS_RIDGE / V_HISTORY_RIDGE / MAX_GAIN
 #   FIT_HISTORY_SOURCE  reconstructed（默认）或 clean；仅用于拟合消融
@@ -63,7 +64,7 @@ else
 fi
 trace_file="$(resolve_path "${TRACE_FILE:-$default_trace_file}")"
 FIT_HISTORY_SOURCE="${FIT_HISTORY_SOURCE:-reconstructed}"
-parameter_name="${PARAM_NAME:-$(codec_slug "$config_path" "${K_HISTORY_LENGTH:-}" "${V_HISTORY_LENGTH:-}" "${K_BITS:-}" "${V_BITS:-}" "" "$v_predictor_mode" "$FIT_HISTORY_SOURCE")}"
+parameter_name="${PARAM_NAME:-$(codec_slug "$config_path" "${K_HISTORY_LENGTH:-}" "${V_HISTORY_LENGTH:-}" "${K_BITS:-}" "${V_BITS:-}" "" "$v_predictor_mode" "$FIT_HISTORY_SOURCE" "${ANCHOR_BITS:-}")}"
 output_dir="$(resolve_path "${OUTPUT_DIR:-data/causal-forcing/params/$generation_mode/$parameter_name}")"
 case "$v_predictor_mode" in
   temporal|identity|taylor|taylor2|direct) v_artifact_name="v_temporal.npz" ;;
@@ -159,6 +160,7 @@ fi
 [[ -n "${V_HISTORY_LENGTH:-}" ]] && fit_command+=(--v-history-length "$V_HISTORY_LENGTH")
 [[ -n "${K_BITS:-}" ]] && fit_command+=(--k-bits "$K_BITS")
 [[ -n "${V_BITS:-}" ]] && fit_command+=(--v-bits "$V_BITS")
+[[ -n "${ANCHOR_BITS:-}" ]] && fit_command+=(--anchor-bits "$ANCHOR_BITS")
 
 if [[ "$DRY_RUN" == "1" ]]; then
   printf '[fit_params] 干跑模式：打印将要执行的命令，不执行\n'

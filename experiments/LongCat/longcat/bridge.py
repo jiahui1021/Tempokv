@@ -1147,6 +1147,9 @@ class LongCatTempoKVBridge:
             "mode": self.mode,
             "k_bits": codec_config["k_bits"] if codec_config is not None else None,
             "v_bits": codec_config["v_bits"] if codec_config is not None else None,
+            "anchor_bits": (
+                codec_config["anchor_bits"] if codec_config is not None else None
+            ),
             "codec_config": codec_config,
             "context_parallel_size": self.context_parallel_size,
             "context_parallel_rank": self.context_parallel_rank,

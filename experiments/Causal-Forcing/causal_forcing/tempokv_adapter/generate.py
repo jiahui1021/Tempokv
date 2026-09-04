@@ -98,6 +98,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--k-bits", type=int, choices=range(1, 9))
     parser.add_argument("--v-bits", type=int, choices=range(1, 9))
+    parser.add_argument("--anchor-bits", type=int, choices=range(1, 17))
     parser.add_argument(
         "--model-config",
         type=Path,
@@ -257,6 +258,7 @@ def _validate_parameters(k_path: Path, v_path: Path, config) -> dict[str, object
         "v_history_length": codec.v_parameters.history_length,
         "k_bits": config.k_bits,
         "v_bits": config.v_bits,
+        "anchor_bits": config.anchor_bits,
         "v_predictor_mode": config.v_predictor_mode,
         "v_history_diagonal": False if temporal_v else cross.history_diagonal,
         "predictor_parameter_bytes": predictor_parameter_bytes,
@@ -565,6 +567,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                 ("v_history_length", args.v_history_length),
                 ("k_bits", args.k_bits),
                 ("v_bits", args.v_bits),
+                ("anchor_bits", args.anchor_bits),
                 ("v_predictor_mode", args.v_predictor_mode),
             )
             if value is not None

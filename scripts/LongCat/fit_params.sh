@@ -17,7 +17,8 @@
 #   CONFIG          codec 配置 JSON（默认 configs/legacy.json）
 #   TRACE_FILE / TRACE  拟合输入（默认 data/longcat/trace/clean_trace.npz）
 #   OUTPUT_DIR          输出目录（默认 data/longcat/params/<参数方案>）
-#   BITS / K_BITS / V_BITS  位宽 override（1 到 8；默认读取 CONFIG）
+#   BITS / K_BITS / V_BITS  K/V residual 位宽 override（1 到 8；默认读取 CONFIG）
+#   ANCHOR_BITS     anchor 位宽 override（1 到 16；默认读取 CONFIG，即 INT4）
 #   K_HISTORY_LENGTH / V_HISTORY_LENGTH  历史长度（默认读取 CONFIG），可简写 KH / VH
 #   PARAM_NAME          直接指定参数方案目录名
 #   FIT_DEVICE          拟合设备（默认 auto：有 CUDA 就用 GPU，否则回退 CPU 并告警）
@@ -49,7 +50,7 @@ fi
 trace="$(resolve_path "${TRACE_FILE:-${TRACE:-data/longcat/trace/clean_trace.npz}}")"
 config="$(resolve_path "${CONFIG:-$default_codec_config}")"
 FIT_HISTORY_SOURCE="${FIT_HISTORY_SOURCE:-reconstructed}"
-parameter_name="${PARAM_NAME:-$(codec_slug "$config" "${K_HISTORY_LENGTH:-}" "${V_HISTORY_LENGTH:-}" "${K_BITS:-}" "${V_BITS:-}" "${CACHE_STRIDE:-}" "${V_PREDICTOR:-}" "$FIT_HISTORY_SOURCE")}"
+parameter_name="${PARAM_NAME:-$(codec_slug "$config" "${K_HISTORY_LENGTH:-}" "${V_HISTORY_LENGTH:-}" "${K_BITS:-}" "${V_BITS:-}" "${CACHE_STRIDE:-}" "${V_PREDICTOR:-}" "$FIT_HISTORY_SOURCE" "${ANCHOR_BITS:-}")}"
 output_dir="$(resolve_path "${OUTPUT_DIR:-data/longcat/params/$parameter_name}")"
 
 if [[ "$output_dir" == "/" ]]; then
@@ -102,6 +103,7 @@ fit_command=(
 [[ -n "${V_HISTORY_LENGTH:-}" ]] && fit_command+=(--v-history-length "$V_HISTORY_LENGTH")
 [[ -n "${K_BITS:-}" ]] && fit_command+=(--k-bits "$K_BITS")
 [[ -n "${V_BITS:-}" ]] && fit_command+=(--v-bits "$V_BITS")
+[[ -n "${ANCHOR_BITS:-}" ]] && fit_command+=(--anchor-bits "$ANCHOR_BITS")
 [[ -n "${CACHE_STRIDE:-}" ]] && fit_command+=(--stride "$CACHE_STRIDE")
 [[ -n "${V_PREDICTOR:-}" ]] && fit_command+=(--v-predictor-mode "$V_PREDICTOR")
 

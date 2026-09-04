@@ -37,7 +37,8 @@
 #   NUM_GPUS         torchrun 使用的 GPU 数（默认 1）
 #   LOCAL_ATTN_SIZE  局部注意力窗口（默认 -1，即全序列）
 #   USE_EMA          是否读取 checkpoint 的 generator_ema（默认 0，官方权重只有 generator）
-#   BITS / K_BITS / V_BITS  位宽 override（1 到 8；默认读取 CONFIG）
+#   BITS / K_BITS / V_BITS  K/V residual 位宽 override（1 到 8；默认读取 CONFIG）
+#   ANCHOR_BITS     anchor 位宽 override（1 到 16；默认读取 CONFIG，即 INT4）
 #   K_HISTORY_LENGTH / V_HISTORY_LENGTH  历史帧数（默认读取 CONFIG）
 #
 set -euo pipefail
@@ -80,7 +81,7 @@ if [[ "$mode" == "tempokv" ]]; then
   # This only selects the matching fitted parameter directory; runtime always
   # consumes reconstructed cache state regardless of the fitting ablation.
   FIT_HISTORY_SOURCE="${FIT_HISTORY_SOURCE:-reconstructed}"
-  parameter_name="${PARAM_NAME:-$(codec_slug "$config_path" "${K_HISTORY_LENGTH:-}" "${V_HISTORY_LENGTH:-}" "${K_BITS:-}" "${V_BITS:-}" "" "$v_predictor_mode" "$FIT_HISTORY_SOURCE")}"
+  parameter_name="${PARAM_NAME:-$(codec_slug "$config_path" "${K_HISTORY_LENGTH:-}" "${V_HISTORY_LENGTH:-}" "${K_BITS:-}" "${V_BITS:-}" "" "$v_predictor_mode" "$FIT_HISTORY_SOURCE" "${ANCHOR_BITS:-}")}"
   param_dir="$(resolve_path "${PARAM_DIR:-data/causal-forcing/params/$generation_mode/$parameter_name}")"
   result_label="$parameter_name"
   case "$v_predictor_mode" in
@@ -185,6 +186,7 @@ if [[ "$mode" == "tempokv" ]]; then
   [[ -n "${V_HISTORY_LENGTH:-}" ]] && generate_command+=(--v-history-length "$V_HISTORY_LENGTH")
   [[ -n "${K_BITS:-}" ]] && generate_command+=(--k-bits "$K_BITS")
   [[ -n "${V_BITS:-}" ]] && generate_command+=(--v-bits "$V_BITS")
+  [[ -n "${ANCHOR_BITS:-}" ]] && generate_command+=(--anchor-bits "$ANCHOR_BITS")
   generate_command+=(--v-predictor-mode "$v_predictor_mode")
   [[ -n "${SPAN_FRAMES:-}" ]] && generate_command+=(--span-frames "$SPAN_FRAMES")
 fi

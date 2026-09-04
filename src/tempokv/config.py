@@ -4,6 +4,8 @@ from dataclasses import dataclass
 import json
 from typing import Any, Mapping
 
+from .quantization import MAX_BITS
+
 
 # Settings that existed in an earlier format and no longer do.  A hand-written
 # config, or a ``runtime_config.json`` stored alongside an older run, would
@@ -157,9 +159,11 @@ class CodecConfig:
         # construction is the repository default.
         implicit_family = self.fit_mode is None
         if implicit_family:
+            # anchor_bits is deliberately absent: the anchor width is a codec
+            # setting, not a family marker, so raising it must not silently
+            # reinterpret a legacy config as the retired native family.
             legacy_shape = (
-                self.anchor_bits == 4
-                and self.group_size == 64
+                self.group_size == 64
                 and self.residual_mode == "asymmetric"
                 and self.scale_dtype == "bfloat16"
                 and self.reconstruction_dtype == "bfloat16"
@@ -202,10 +206,19 @@ class CodecConfig:
             if isinstance(value, bool) or int(value) != value:
                 raise ValueError(f"{name} must be a whole number, got {value!r}")
             object.__setattr__(self, name, int(value))
-        for name in ("k_bits", "v_bits", "anchor_bits"):
+        for name in ("k_bits", "v_bits"):
             value = getattr(self, name)
             if not 1 <= value <= 8:
                 raise ValueError(f"{name} must be an integer from 1 to 8, got {value}")
+        # The anchor is one span in every unit, and it is the only reconstruction
+        # the residuals are predicted from, so trading its width against the
+        # residual width is a real knob.  It is capped at 16 rather than 8: past
+        # bfloat16 the anchor stores more than the tensor it replaces.
+        if not 1 <= self.anchor_bits <= MAX_BITS:
+            raise ValueError(
+                f"anchor_bits must be an integer from 1 to {MAX_BITS}, "
+                f"got {self.anchor_bits}"
+            )
         if self.group_size <= 0:
             raise ValueError("group_size must be positive")
         if self.stride <= 0:
@@ -390,16 +403,17 @@ class CodecConfig:
             # K and V are packed and decoded independently.  Legacy keeps its
             # shared predictor and reference arithmetic, but does not require
             # the two cache tensors to use the same residual bit width.
-            # anchor_bits and group_size fix the quantizer's bit layout, so the
-            # reference implementation is only reproduced at these values.
-            # stride is not one of them: it only decides where the encoder cuts
+            # group_size fixes the quantizer's grouping, so the reference
+            # implementation is only reproduced at 64.  anchor_bits is not one
+            # of them: it selects a width within the same quantizer, the
+            # signature records it, and INT4 stays the default, so a wider or
+            # narrower anchor is a configuration rather than a second codec.
+            # stride is likewise free: it only decides where the encoder cuts
             # units. Self-Forcing and Causal-Forcing use the fixed legacy event
             # protocol at stride 1560; LongCat uses its regular model-shaped
             # trace and records the matching runtime stride in that archive.
-            if self.anchor_bits != 4 or self.group_size != 64:
-                raise ValueError(
-                    "legacy fitting requires anchor_bits=4 and group_size=64"
-                )
+            if self.group_size != 64:
+                raise ValueError("legacy fitting requires group_size=64")
             if self.residual_mode != "asymmetric":
                 raise ValueError("legacy fitting requires asymmetric residuals")
             if (

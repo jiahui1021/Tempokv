@@ -154,6 +154,7 @@ if tempokv_config_path and os.path.isfile(tempokv_config_path):
         "v_history_length",
         "k_bits",
         "v_bits",
+        "anchor_bits",
         "v_predictor_mode",
     ):
         if name in codec_payload:

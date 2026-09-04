@@ -144,6 +144,7 @@ def _read_codec_config(
         stride=int(config.stride),
         k_bits=int(config.k_bits),
         v_bits=int(config.v_bits),
+        anchor_bits=int(config.anchor_bits),
         codec_signature=config.format_signature(),
     )
 
@@ -433,6 +434,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             for name, value in (
                 ("k_bits", getattr(args, "k_bits", None)),
                 ("v_bits", getattr(args, "v_bits", None)),
+                ("anchor_bits", getattr(args, "anchor_bits", None)),
                 ("stride", args.stride),
                 ("v_predictor_mode", args.v_predictor_mode),
             )
@@ -514,6 +516,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                     "K/V parameters match the resolved codec configuration",
                     k_bits=int(codec.config.k_bits),
                     v_bits=int(codec.config.v_bits),
+                    anchor_bits=int(codec.config.anchor_bits),
                     codec_signature=codec.config.format_signature(),
                     parameter_set_id=codec.temporal.parameter_set_id,
                 )
@@ -569,6 +572,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--stride", type=int)
     parser.add_argument("--k-bits", type=int, choices=range(1, 9))
     parser.add_argument("--v-bits", type=int, choices=range(1, 9))
+    parser.add_argument("--anchor-bits", type=int, choices=range(1, 17))
     # The V predictor decides which kind of parameter file to expect, and it
     # is a command-line override, so preflight has to be told about it too.
     parser.add_argument(

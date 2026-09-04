@@ -81,6 +81,7 @@ def _parser() -> argparse.ArgumentParser:
     # because the bridge checks it against the real cache shape.
     parser.add_argument("--k-bits", type=int, choices=range(1, 9))
     parser.add_argument("--v-bits", type=int, choices=range(1, 9))
+    parser.add_argument("--anchor-bits", type=int, choices=range(1, 17))
     parser.add_argument("--k-history-length", type=int, choices=range(1, 9))
     parser.add_argument("--v-history-length", type=int, choices=range(0, 6))
     parser.add_argument(
@@ -112,6 +113,7 @@ def _codec_overrides(known) -> dict[str, object]:
         for name, value in (
             ("k_bits", known.k_bits),
             ("v_bits", known.v_bits),
+            ("anchor_bits", known.anchor_bits),
             ("k_history_length", known.k_history_length),
             ("v_history_length", known.v_history_length),
             ("v_predictor_mode", known.v_predictor_mode),

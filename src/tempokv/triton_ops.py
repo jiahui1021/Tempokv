@@ -6,6 +6,7 @@ import torch
 import triton
 import triton.language as tl
 
+from .quantization import MAX_BITS
 from .runtime import persistent_units_per_launch
 
 if TYPE_CHECKING:
@@ -108,8 +109,20 @@ def _load_packed_unsigned(
             mask=valid & (packed_channel[None, :] + 1 < packed_width),
             other=0,
         ).to(tl.int32)
-        word = (first << 8) | second
-        shift = 16 - bit_offset - bits
+        # ``_window_bytes`` in quantization.py: a code plus a 7-bit offset fits
+        # in two bytes up to INT8 and needs a third from INT9 upward.  The two
+        # sides must agree on the window, so keep this split in step with it.
+        if bits <= 8:
+            word = (first << 8) | second
+            shift = 16 - bit_offset - bits
+        else:
+            third = tl.load(
+                quant_ptr + row_offset + packed_channel[None, :] + 2,
+                mask=valid & (packed_channel[None, :] + 2 < packed_width),
+                other=0,
+            ).to(tl.int32)
+            word = (first << 16) | (second << 8) | third
+            shift = 24 - bit_offset - bits
         unsigned = (word >> shift[None, :]) & ((1 << bits) - 1)
     return unsigned
 
@@ -716,7 +729,9 @@ def _uniform_layout(packed: "PackedTensor") -> bool:
 def _supported(packed: "PackedTensor", source: torch.Tensor | None) -> bool:
     if not packed.anchor_quant.is_cuda:
         return False
-    if not 1 <= packed.bits <= 8 or not 1 <= packed.anchor_bits <= 8:
+    # Residual widths stop at 8 by configuration; the anchor is allowed the
+    # full packed range, and the loader above decodes all of it.
+    if not 1 <= packed.bits <= 8 or not 1 <= packed.anchor_bits <= MAX_BITS:
         return False
     if packed.predictor_kind in {"cross_kv", "innovation"}:
         return source is not None and source.is_cuda and packed.cross_kv is not None
