@@ -729,8 +729,9 @@ def _uniform_layout(packed: "PackedTensor") -> bool:
 def _supported(packed: "PackedTensor", source: torch.Tensor | None) -> bool:
     if not packed.anchor_quant.is_cuda:
         return False
-    # Residual widths stop at 8 by configuration; the anchor is allowed the
-    # full packed range, and the loader above decodes all of it.
+    # Residual widths stop at 8 by configuration.  The anchor covers INT1-INT15
+    # through the loader above, plus the unquantized width the caller copies
+    # instead of decoding.
     if not 1 <= packed.bits <= 8 or not 1 <= packed.anchor_bits <= MAX_BITS:
         return False
     if packed.predictor_kind in {"cross_kv", "innovation"}:
@@ -826,31 +827,45 @@ def decode(
             output.stride()
         )
     anchor_length = packed.unit_lengths[0]
-    anchor_packed_width = (width * packed.anchor_bits + 7) // 8
-    anchor_grid = (
-        batch_heads,
-        _ceil_div(anchor_length, block_s),
-        _ceil_div(width, block_d),
-    )
-    _anchor_decode_kernel[anchor_grid](
-        packed.anchor_quant.contiguous().view(batch_heads, anchor_length, anchor_packed_width),
-        packed.anchor_scale.contiguous().view(batch_heads, anchor_length, scale_width),
-        output,
-        output_stride_b,
-        output_stride_h,
-        output_stride_s,
-        output_stride_d,
-        sequence,
-        anchor_length,
-        heads,
-        width,
-        anchor_packed_width,
-        scale_width,
-        packed.anchor_bits,
-        packed.group_size,
-        block_s,
-        block_d,
-    )
+    if packed.raw_anchor:
+        # There is nothing to unpack: the stored anchor already holds values.
+        # The recurrent kernels below read their first history unit out of
+        # ``output``, not out of ``anchor_quant``, so writing it here with a
+        # plain copy leaves the rest of the pipeline untouched.  Going through
+        # the logical BHSD view keeps this correct for a BSHD destination.
+        _logical_bhsd_output(output, direct_output_layout)[
+            :, :, :anchor_length
+        ] = packed.anchor_quant.to(output.dtype)
+    else:
+        anchor_packed_width = (width * packed.anchor_bits + 7) // 8
+        anchor_grid = (
+            batch_heads,
+            _ceil_div(anchor_length, block_s),
+            _ceil_div(width, block_d),
+        )
+        _anchor_decode_kernel[anchor_grid](
+            packed.anchor_quant.contiguous().view(
+                batch_heads, anchor_length, anchor_packed_width
+            ),
+            packed.anchor_scale.contiguous().view(
+                batch_heads, anchor_length, scale_width
+            ),
+            output,
+            output_stride_b,
+            output_stride_h,
+            output_stride_s,
+            output_stride_d,
+            sequence,
+            anchor_length,
+            heads,
+            width,
+            anchor_packed_width,
+            scale_width,
+            packed.anchor_bits,
+            packed.group_size,
+            block_s,
+            block_d,
+        )
     if packed.residual_quant is None:
         _record(_route_name("anchor", direct_output_layout))
         return _logical_bhsd_output(output, direct_output_layout)

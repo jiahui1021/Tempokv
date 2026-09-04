@@ -19,7 +19,7 @@
 #   TRACE_FILE      拟合输入（默认 data/self-forcing/trace/clean_trace.npz）
 #   OUTPUT_DIR      输出目录（默认 data/self-forcing/params/<参数方案>）
 #   BITS / K_BITS / V_BITS  K/V residual 位宽 override（1 到 8；默认读取 CONFIG）
-#   ANCHOR_BITS     anchor 位宽 override（1 到 16；默认读取 CONFIG，即 INT4）
+#   ANCHOR_BITS     anchor 位宽（1 到 15 量化，16 表示不量化直接存 bf16；默认 INT4）
 #   K_HISTORY_LENGTH  K 历史长度（默认读取 CONFIG）
 #   V_HISTORY_LENGTH  V 历史长度（默认读取 CONFIG）
 #   ITERATIONS     拟合迭代次数（默认 2）

@@ -19,7 +19,7 @@
 #   TRACE_FILE       拟合输入（默认使用 legacy trace 目录）
 #   OUTPUT_DIR       输出目录（默认 data/causal-forcing/params/<模式>/<参数方案>）
 #   BITS / K_BITS / V_BITS  K/V residual 位宽 override（1 到 8；默认读取 CONFIG）
-#   ANCHOR_BITS     anchor 位宽 override（1 到 16；默认读取 CONFIG，即 INT4）
+#   ANCHOR_BITS     anchor 位宽（1 到 15 量化，16 表示不量化直接存 bf16；默认 INT4）
 #   K_HISTORY_LENGTH / V_HISTORY_LENGTH  历史长度（默认读取 CONFIG）
 #   ITERATIONS / TEMPORAL_RIDGE / CROSS_RIDGE / V_HISTORY_RIDGE / MAX_GAIN
 #   FIT_HISTORY_SOURCE  reconstructed（默认）或 clean；仅用于拟合消融

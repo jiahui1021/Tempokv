@@ -38,7 +38,7 @@
 #   LOCAL_ATTN_SIZE  局部注意力窗口（默认 -1，即全序列）
 #   USE_EMA          是否读取 checkpoint 的 generator_ema（默认 0，官方权重只有 generator）
 #   BITS / K_BITS / V_BITS  K/V residual 位宽 override（1 到 8；默认读取 CONFIG）
-#   ANCHOR_BITS     anchor 位宽 override（1 到 16；默认读取 CONFIG，即 INT4）
+#   ANCHOR_BITS     anchor 位宽（1 到 15 量化，16 表示不量化直接存 bf16；默认 INT4）
 #   K_HISTORY_LENGTH / V_HISTORY_LENGTH  历史帧数（默认读取 CONFIG）
 #
 set -euo pipefail

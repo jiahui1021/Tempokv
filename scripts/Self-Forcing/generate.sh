@@ -38,7 +38,7 @@
 #   K_HISTORY_LENGTH  K 使用的历史帧数（1 到 8；默认读取 CONFIG）
 #   V_HISTORY_LENGTH  V 使用的历史帧数（0 到 5；默认读取 CONFIG）
 #   BITS            K/V residual 位宽（1 到 8；默认读取 CONFIG）；K_BITS / V_BITS 可分别设
-#   ANCHOR_BITS     anchor 位宽（1 到 16；默认读取 CONFIG，即 INT4）
+#   ANCHOR_BITS     anchor 位宽（1 到 15 量化，16 表示不量化直接存 bf16；默认 INT4）
 #   TORCH_DECODER   用 PyTorch 参考解码器代替 Triton，0 或 1（默认 0）
 #   BENCHMARK       要求本次完整生成且不允许跳过已有视频，0 或 1（默认 0）
 #   PROFILE         记录每段 CUDA-event 耗时分解，0 或 1（默认 0）；结果写入

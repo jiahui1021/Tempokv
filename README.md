@@ -57,7 +57,8 @@ PROMPTS=assets/generation_prompts.txt bash scripts/Self-Forcing/run_bf16.sh
 |---|---|---|
 | `BITS` | 1–8 | 同时设置 K/V 残差位宽 |
 | `K_BITS`、`V_BITS` | 1–8 | 分别设置 K/V 残差位宽（混合位宽） |
-| `ANCHOR_BITS` | 1–16 | 设置 anchor 位宽 |
+| `ANCHOR_BITS` | 1–15 | 设置 anchor 量化位宽 |
+| `ANCHOR_BITS=16` | — | anchor 不量化，直接按 bf16 存 |
 
 默认是 anchor INT4 + K/V 残差 INT4（`configs/legacy.json`）。
 
@@ -65,12 +66,17 @@ PROMPTS=assets/generation_prompts.txt bash scripts/Self-Forcing/run_bf16.sh
 BITS=2 bash scripts/fit_params.sh self-forcing                    # K/V 都是 INT2
 K_BITS=3 V_BITS=5 bash scripts/fit_params.sh self-forcing         # K INT3、V INT5
 ANCHOR_BITS=8 BITS=2 bash scripts/fit_params.sh self-forcing      # 宽 anchor、窄残差
+ANCHOR_BITS=16 BITS=2 bash scripts/fit_params.sh self-forcing     # 无损 anchor 上界
 ```
 
 所有位宽都用连续 bit packing，INT1/3/5/7 这些非 2 的幂不浪费 padding。残差停在 8 位，
-因为超过 8 位的残差已经比它替换的 bfloat16 更大。anchor 可以到 16 位，但 scale 本身存成
-bfloat16，误差在 INT12 附近就被 scale 精度卡住：标准正态输入下 INT8→INT12 的 RMSE 降约
-11 倍，INT12→INT16 只再降约 1.4 倍。
+因为超过 8 位的残差已经比它替换的 bfloat16 更大。
+
+anchor 的每组还要存一个 bf16 scale，所以 N 位 anchor 的实际开销是 `N + 16/group_size` 位/元素。
+到 INT16 就是 16.25 位——**比原始 bf16 还大，而且仍然有损**。所以 `ANCHOR_BITS=16` 不是
+INT16，而是跳过量化器、直接以 bf16 存 anchor：正好 16.00 位/元素，逐位无损，不存 scale。
+中间档位仍然是有损压缩，但 scale 精度让收益在 INT12 附近就基本饱和：标准正态输入下
+INT8→INT12 的 RMSE 降约 11 倍，INT12 之后已经很平。
 
 K/V 位宽相等时目录名沿用 `intN`，不相等时写成 `kN-vM`；anchor 不是默认的 INT4 时追加
 `-aN`。例如 `K_BITS=3 V_BITS=5 ANCHOR_BITS=12` 得到

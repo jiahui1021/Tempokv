@@ -9,6 +9,7 @@ import warnings
 import torch
 
 from .config import (
+    RAW_ANCHOR_BITS,
     CodecConfig,
     is_cross_kv_v_predictor,
     is_temporal_v_predictor,
@@ -101,6 +102,11 @@ class PackedTensor:
             if self.residual_zero_point is None:
                 raise ValueError("asymmetric residuals require zero points")
         _dtype(self.reconstruction_dtype)
+
+    @property
+    def raw_anchor(self) -> bool:
+        """Whether ``anchor_quant`` holds values rather than packed codes."""
+        return self.anchor_bits == RAW_ANCHOR_BITS
 
     def storage_bytes(self) -> int:
         """On-device bytes actually stored for this packed tensor.
@@ -506,17 +512,29 @@ def _encode(
             )
 
     anchor = value[:, :, :stride]
-    anchor_quant, anchor_scale = quantize_symmetric(
-        anchor, config.anchor_bits, config.group_size, scale_dtype
-    )
-    anchor_rebuilt = dequantize_symmetric(
-        anchor_quant,
-        anchor_scale,
-        config.anchor_bits,
-        config.group_size,
-        width,
-        torch.float32,
-    ).to(reconstruction_dtype)
+    if config.raw_anchor:
+        # No quantizer: the anchor is the stored value.  ``clone`` matters
+        # because ``to`` returns the input itself when the dtype already
+        # matches, and an in-place reconstruction would then write through the
+        # tensor the packed state is supposed to own.
+        anchor_quant = anchor.to(reconstruction_dtype).clone()
+        # No codes means no group scale.  Keeping the field a real tensor
+        # rather than None spares every reader an optional, and an empty one
+        # contributes nothing to storage_bytes().
+        anchor_scale = anchor_quant.new_empty((0,), dtype=scale_dtype)
+        anchor_rebuilt = anchor_quant
+    else:
+        anchor_quant, anchor_scale = quantize_symmetric(
+            anchor, config.anchor_bits, config.group_size, scale_dtype
+        )
+        anchor_rebuilt = dequantize_symmetric(
+            anchor_quant,
+            anchor_scale,
+            config.anchor_bits,
+            config.group_size,
+            width,
+            torch.float32,
+        ).to(reconstruction_dtype)
     reconstruction = (
         value
         if reuse_input_for_reconstruction
@@ -920,13 +938,17 @@ def decode_tensor(
         output = output_tensor.permute(0, 2, 1, 3)
     else:
         output = output_tensor
-    anchor = dequantize_symmetric(
-        packed.anchor_quant,
-        packed.anchor_scale,
-        packed.anchor_bits,
-        packed.group_size,
-        width,
-        output_dtype,
+    anchor = (
+        packed.anchor_quant.to(output_dtype)
+        if packed.raw_anchor
+        else dequantize_symmetric(
+            packed.anchor_quant,
+            packed.anchor_scale,
+            packed.anchor_bits,
+            packed.group_size,
+            width,
+            output_dtype,
+        )
     )
     output[:, :, :anchor_length] = anchor
     if packed.residual_quant is None:

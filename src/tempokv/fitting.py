@@ -1885,6 +1885,20 @@ def _quantization_roundtrip(
     )
 
 
+def _anchor_roundtrip(value: torch.Tensor, config: CodecConfig) -> torch.Tensor:
+    """Replay what the encoder stores for one anchor unit.
+
+    The unquantized anchor keeps its value, so fitting sees the same anchor the
+    codec will; sending it through the quantizer at 16 bits would make the
+    fitted predictors disagree with the runtime reconstruction.
+    """
+    if config.raw_anchor:
+        return value.to(_SCALE_DTYPES[config.reconstruction_dtype])
+    return _quantization_roundtrip(
+        value, bits=config.anchor_bits, config=config, symmetric=True
+    )
+
+
 def _reconstruct_direct_trace(
     clean_values: torch.Tensor,
     config: CodecConfig,
@@ -1905,12 +1919,7 @@ def _reconstruct_direct_trace(
         dtype=torch.float32 if legacy_math else reconstruction_dtype,
     )
 
-    anchor = _quantization_roundtrip(
-        clean_values[..., 0, :, :],
-        bits=config.anchor_bits,
-        config=config,
-        symmetric=True,
-    )
+    anchor = _anchor_roundtrip(clean_values[..., 0, :, :], config)
     rebuilt[..., 0, :, :] = (
         anchor.to(torch.bfloat16).float()
         if legacy_math
@@ -1970,12 +1979,7 @@ def _reconstruct_temporal_trace(
         clean_keys,
         dtype=torch.float32 if legacy_math else reconstruction_dtype,
     )
-    anchor = _quantization_roundtrip(
-        clean_keys[..., 0, :, :],
-        bits=config.anchor_bits,
-        config=config,
-        symmetric=True,
-    )
+    anchor = _anchor_roundtrip(clean_keys[..., 0, :, :], config)
     rebuilt[..., 0, :, :] = (
         anchor.to(torch.bfloat16).float()
         if legacy_math
@@ -2142,12 +2146,7 @@ def _reconstruct_legacy_cross_kv_record(
 ) -> torch.Tensor:
     """Replay one contiguous legacy ``[B,F,...,H,D]`` fitting record."""
     reconstructed = [
-        _quantization_roundtrip(
-            clean_values[:, 0],
-            bits=config.anchor_bits,
-            config=config,
-            symmetric=True,
-        ).to(torch.bfloat16).float()
+        _anchor_roundtrip(clean_values[:, 0], config).to(torch.bfloat16).float()
     ]
     with _cuda_matmul_precision(
         clean_values.device, config.cross_matmul_precision
@@ -2245,12 +2244,7 @@ def _reconstruct_cross_kv_trace(
         clean_values,
         dtype=torch.float32 if legacy_math else reconstruction_dtype,
     )
-    anchor = _quantization_roundtrip(
-        clean_values[..., 0, :, :],
-        bits=config.anchor_bits,
-        config=config,
-        symmetric=True,
-    )
+    anchor = _anchor_roundtrip(clean_values[..., 0, :, :], config)
     rebuilt[..., 0, :, :] = (
         anchor.to(torch.bfloat16).float()
         if legacy_math

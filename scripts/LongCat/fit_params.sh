@@ -18,7 +18,7 @@
 #   TRACE_FILE / TRACE  拟合输入（默认 data/longcat/trace/clean_trace.npz）
 #   OUTPUT_DIR          输出目录（默认 data/longcat/params/<参数方案>）
 #   BITS / K_BITS / V_BITS  K/V residual 位宽 override（1 到 8；默认读取 CONFIG）
-#   ANCHOR_BITS     anchor 位宽 override（1 到 16；默认读取 CONFIG，即 INT4）
+#   ANCHOR_BITS     anchor 位宽（1 到 15 量化，16 表示不量化直接存 bf16；默认 INT4）
 #   K_HISTORY_LENGTH / V_HISTORY_LENGTH  历史长度（默认读取 CONFIG），可简写 KH / VH
 #   PARAM_NAME          直接指定参数方案目录名
 #   FIT_DEVICE          拟合设备（默认 auto：有 CUDA 就用 GPU，否则回退 CPU 并告警）

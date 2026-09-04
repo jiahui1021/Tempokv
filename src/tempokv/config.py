@@ -7,6 +7,17 @@ from typing import Any, Mapping
 from .quantization import MAX_BITS
 
 
+# Storing the anchor as INT16 codes costs 16 bits per element *plus* the group
+# scale — more than the bfloat16 value it replaces — and is still lossy, so it
+# is dominated by simply keeping the tensor.  ``anchor_bits=16`` therefore does
+# not mean INT16: it means the anchor skips the quantizer and is stored in
+# ``reconstruction_dtype``, which is exactly 16 bits per element and exact.
+RAW_ANCHOR_BITS = 16
+
+# The dtypes for which "16 bits" is the honest description of a stored value.
+RAW_ANCHOR_DTYPES = frozenset({"bfloat16", "float16"})
+
+
 # Settings that existed in an earlier format and no longer do.  A hand-written
 # config, or a ``runtime_config.json`` stored alongside an older run, would
 # otherwise fail with an unexpected-keyword ``TypeError`` that does not say what
@@ -212,12 +223,21 @@ class CodecConfig:
                 raise ValueError(f"{name} must be an integer from 1 to 8, got {value}")
         # The anchor is one span in every unit, and it is the only reconstruction
         # the residuals are predicted from, so trading its width against the
-        # residual width is a real knob.  It is capped at 16 rather than 8: past
-        # bfloat16 the anchor stores more than the tensor it replaces.
-        if not 1 <= self.anchor_bits <= MAX_BITS:
+        # residual width is a real knob.  1 through 15 are quantized codes; 16
+        # is the unquantized anchor described at RAW_ANCHOR_BITS.
+        if not 1 <= self.anchor_bits <= RAW_ANCHOR_BITS:
             raise ValueError(
-                f"anchor_bits must be an integer from 1 to {MAX_BITS}, "
+                f"anchor_bits must be an integer from 1 to {RAW_ANCHOR_BITS}, "
                 f"got {self.anchor_bits}"
+            )
+        if (
+            self.anchor_bits == RAW_ANCHOR_BITS
+            and self.reconstruction_dtype not in RAW_ANCHOR_DTYPES
+        ):
+            raise ValueError(
+                "anchor_bits=16 stores the anchor unquantized in "
+                "reconstruction_dtype, so it needs a 16-bit "
+                f"reconstruction_dtype, not {self.reconstruction_dtype}"
             )
         if self.group_size <= 0:
             raise ValueError("group_size must be positive")
@@ -423,6 +443,11 @@ class CodecConfig:
                 raise ValueError(
                     "legacy fitting requires bfloat16 scales and reconstruction"
                 )
+
+    @property
+    def raw_anchor(self) -> bool:
+        """Whether the anchor skips the quantizer and is stored as-is."""
+        return self.anchor_bits == RAW_ANCHOR_BITS
 
     @property
     def primary_tensor(self) -> str:
