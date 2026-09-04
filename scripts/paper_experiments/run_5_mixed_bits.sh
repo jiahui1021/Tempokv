@@ -15,3 +15,5 @@ paper_run_tempokv k4v4 4 4
 paper_run_tempokv k2v4 2 4
 paper_run_tempokv k4v2 4 2
 paper_run_tempokv k3v3 3 3
+paper_run_tempokv k3v5 3 5
+paper_run_tempokv k1v7 1 7

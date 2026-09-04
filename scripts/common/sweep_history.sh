@@ -82,12 +82,17 @@ source "$sweep_project_root/scripts/$model_dir/_common.sh"
 
 trace_file="$(resolve_path "${TRACE_FILE:-$default_trace}")"
 config_path="$(resolve_path "${CONFIG:-$default_config}")"
-output="$(resolve_path "${OUTPUT:-$default_output}")"
 
 K_HISTORY="${K_HISTORY:-0,1,2,3,4,5}"
 V_HISTORY="${V_HISTORY:-0,1,2,4,5}"
 K_BITS="$(resolve_bits K_BITS)"
 V_BITS="$(resolve_bits V_BITS)"
+if [[ -z "${OUTPUT:-}" && ( -n "${K_BITS:-}" || -n "${V_BITS:-}" ) ]]; then
+  sweep_identity="$(codec_slug "$config_path" "" "" "${K_BITS:-}" "${V_BITS:-}" "" "${V_PREDICTOR:-}" reconstructed)"
+  output="$(resolve_path "${default_output%.json}-$sweep_identity.json")"
+else
+  output="$(resolve_path "${OUTPUT:-$default_output}")"
+fi
 ITERATIONS="${ITERATIONS:-2}"
 TEMPORAL_RIDGE="${TEMPORAL_RIDGE:-1.0}"
 CROSS_RIDGE="${CROSS_RIDGE:-0.1}"

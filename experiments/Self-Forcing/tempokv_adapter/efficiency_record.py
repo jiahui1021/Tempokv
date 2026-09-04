@@ -203,6 +203,35 @@ def _measured(
     return measured_indices, (median(measured_seconds) if measured_seconds else None)
 
 
+def _resolved_bit_widths(
+    bits: int | None,
+    k_bits: int | None,
+    v_bits: int | None,
+) -> tuple[int | None, int | None, int | None]:
+    """Return the compatible scalar alias and resolved K/V bit widths.
+
+    Older callers only supplied ``bits``.  Treat that value as both widths so
+    their records gain the explicit fields without changing meaning.  New
+    mixed-width callers supply ``k_bits`` and ``v_bits``; their scalar alias is
+    deliberately null because no single bit width describes the run.
+    """
+    resolved_k = k_bits if k_bits is not None else bits
+    resolved_v = v_bits if v_bits is not None else bits
+    for name, value in (("k_bits", resolved_k), ("v_bits", resolved_v)):
+        if value is not None and not 1 <= int(value) <= 8:
+            raise ValueError(f"{name} must be in [1, 8], got {value}")
+    compatible_bits = (
+        int(resolved_k)
+        if resolved_k is not None and resolved_k == resolved_v
+        else None
+    )
+    return (
+        compatible_bits,
+        None if resolved_k is None else int(resolved_k),
+        None if resolved_v is None else int(resolved_v),
+    )
+
+
 def build_efficiency_payload(
     *,
     repo: str,
@@ -218,6 +247,8 @@ def build_efficiency_payload(
     prompt_indices: Sequence[int],
     segments_ms: dict,
     instrumentation: dict,
+    k_bits: int | None = None,
+    v_bits: int | None = None,
 ) -> dict:
     """Assemble one ``efficiency.v1`` record.
 
@@ -233,11 +264,16 @@ def build_efficiency_payload(
         name: (None if segments_ms.get(name) is None else float(segments_ms[name]))
         for name in ("e2e", "cache_encode", "cache_decode", "vae_decode")
     }
+    compatible_bits, resolved_k_bits, resolved_v_bits = _resolved_bit_widths(
+        bits, k_bits, v_bits
+    )
     return {
         "schema_version": SCHEMA_VERSION,
         "repo": repo,
         "method": method,
-        "bits": bits,
+        "bits": compatible_bits,
+        "k_bits": resolved_k_bits,
+        "v_bits": resolved_v_bits,
         "run": dict(run),
         "kv_cache": {
             "definition": RESIDENT_DEFINITION,
@@ -279,6 +315,8 @@ def build_horizon_payload(
     peak_allocated_bytes_at_max: int,
     kv_resident_bytes_at_max: int,
     bisect_probes: Iterable[dict],
+    k_bits: int | None = None,
+    v_bits: int | None = None,
 ) -> dict:
     """Assemble one ``horizon.v1`` record.
 
@@ -294,11 +332,16 @@ def build_horizon_payload(
             "max_feasible_frames must satisfy (frames + 3) % 12 == 0, got "
             f"{max_feasible_frames}"
         )
+    compatible_bits, resolved_k_bits, resolved_v_bits = _resolved_bit_widths(
+        bits, k_bits, v_bits
+    )
     return {
         "schema_version": HORIZON_SCHEMA_VERSION,
         "repo": repo,
         "method": method,
-        "bits": bits,
+        "bits": compatible_bits,
+        "k_bits": resolved_k_bits,
+        "v_bits": resolved_v_bits,
         "run": dict(run),
         "budget": dict(budget),
         "probe_mode": probe_mode,

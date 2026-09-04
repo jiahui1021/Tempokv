@@ -76,6 +76,30 @@ def _record_name(record: dict) -> str:
     return str(record.get("method", record.get("repo", "<unknown>")))
 
 
+def _bit_widths(record: dict) -> tuple[int | None, int | None]:
+    """Read explicit K/V widths, falling back to legacy scalar records."""
+    legacy = record.get("bits")
+    k_bits = record.get("k_bits", legacy)
+    v_bits = record.get("v_bits", legacy)
+    return (
+        None if k_bits is None else int(k_bits),
+        None if v_bits is None else int(v_bits),
+    )
+
+
+def _bit_fields(record: dict) -> dict[str, int | None]:
+    k_bits, v_bits = _bit_widths(record)
+    return {
+        "bits": k_bits if k_bits is not None and k_bits == v_bits else None,
+        "k_bits": k_bits,
+        "v_bits": v_bits,
+    }
+
+
+def _record_key(record: dict) -> tuple[str, int | None, int | None]:
+    return (_record_name(record), *_bit_widths(record))
+
+
 def check_consistency(records: list[dict]) -> list[str]:
     """Check the frozen experiment identity across every run."""
     if not records:
@@ -168,8 +192,12 @@ def check_decomposition(record: dict) -> str | None:
 def _sort_key(row: dict) -> tuple:
     method = str(row.get("method", ""))
     group, order = METHOD_ORDER.get(method, (9, 9))
-    bits = row.get("bits")
-    return (group, 0 if bits is None else int(bits), order, method)
+    k_bits, v_bits = _bit_widths(row)
+    width_order = (
+        -1 if k_bits is None else k_bits,
+        -1 if v_bits is None else v_bits,
+    )
+    return (group, width_order, order, method)
 
 
 def _final_bf16_equivalent_bytes(record: dict) -> int | None:
@@ -248,7 +276,7 @@ def efficiency_rows(records: list[dict]) -> list[dict]:
         rows.append(
             {
                 "method": _record_name(record),
-                "bits": record.get("bits"),
+                **_bit_fields(record),
                 "kv_cache_gb": cache / GIB,
                 # Cross-repository reduction uses the single TempoKV BF16
                 # row. It is unavailable for a standalone QVG/KVQuant run.
@@ -297,7 +325,7 @@ def latency_rows(records: list[dict]) -> list[dict]:
         rows.append(
             {
                 "method": _record_name(record),
-                "bits": record.get("bits"),
+                **_bit_fields(record),
                 "e2e_ms": float(segments["e2e"]),
                 "cache_encode_ms": float(segments["cache_encode"]),
                 "cache_decode_ms": float(segments["cache_decode"]),
@@ -359,8 +387,14 @@ def check_compression_scale(
 
 
 def _method_label(row: dict) -> str:
-    bits = row.get("bits")
-    return str(row["method"]) if bits is None else f"{row['method']} INT{bits}"
+    k_bits, v_bits = _bit_widths(row)
+    if k_bits is None and v_bits is None:
+        return str(row["method"])
+    if k_bits == v_bits:
+        return f"{row['method']} INT{k_bits}"
+    k_label = "?" if k_bits is None else str(k_bits)
+    v_label = "?" if v_bits is None else str(v_bits)
+    return f"{row['method']} K{k_label}/V{v_label}"
 
 
 def render_efficiency_tex(rows: list[dict]) -> str:
@@ -372,7 +406,7 @@ def render_efficiency_tex(rows: list[dict]) -> str:
     ]
     previous_group = None
     for row in sorted(rows, key=_sort_key):
-        group = 0 if row.get("bits") is None else int(row["bits"])
+        group = _bit_widths(row)
         if previous_group is not None and group != previous_group:
             lines.append(r"\midrule")
         reduction = (
@@ -456,7 +490,9 @@ def horizon_rows(
     horizon_records: list[dict], efficiency_records: list[dict]
 ) -> list[dict]:
     """Attach measured-vs-extrapolated horizon information to each method."""
-    by_method = {_record_name(record): record for record in efficiency_records}
+    by_method_and_width = {
+        _record_key(record): record for record in efficiency_records
+    }
     baseline = next(
         (record for record in horizon_records if _record_name(record) == "BF16"),
         None,
@@ -465,7 +501,7 @@ def horizon_rows(
     for record in horizon_records:
         name = _record_name(record)
         measured = int(record["max_feasible_frames"])
-        source = by_method.get(name)
+        source = by_method_and_width.get(_record_key(record))
         total = int(record.get("budget", {}).get("device_total_bytes", 0))
         predicted = predicted_horizon(source, total) if source and total else None
         warning = None
@@ -480,7 +516,7 @@ def horizon_rows(
         rows.append(
             {
                 "method": name,
-                "bits": record.get("bits"),
+                **_bit_fields(record),
                 "max_feasible_frames": measured,
                 "is_lower_bound": not bool(record.get("oom_reached", False)),
                 "probe_mode": record.get("probe_mode"),
@@ -521,18 +557,31 @@ def render_horizon_tex(rows: list[dict]) -> str:
 
 def headline_sentence(rows: list[dict], efficiency_rows_data: list[dict]) -> str:
     """Render the design-spec headline using 717-frame timing only."""
-    by_method = {row["method"]: row for row in rows}
-    by_cost = {row["method"]: row for row in efficiency_rows_data}
-    baseline = by_method.get("BF16")
+    baseline = next((row for row in rows if row["method"] == "BF16"), None)
     if baseline is None:
         return ""
-    others = ", ".join(
-        f"{row['method']} {row['max_feasible_frames']}"
-        for row in rows
-        if row["method"] not in {"BF16", "TempoKV"}
+    tempokv_rows = [row for row in rows if row["method"] == "TempoKV"]
+    tempokv = (
+        max(tempokv_rows, key=lambda row: int(row["max_feasible_frames"]))
+        if tempokv_rows
+        else None
     )
-    tempokv = by_method.get("TempoKV")
-    time_ratio = by_cost.get("TempoKV", {}).get("vs_bf16")
+    others = ", ".join(
+        f"{_method_label(row)} {row['max_feasible_frames']}"
+        for row in rows
+        if row is not baseline and row is not tempokv
+    )
+    matching_cost = next(
+        (
+            row
+            for row in efficiency_rows_data
+            if tempokv is not None
+            and (row["method"], *_bit_widths(row))
+            == (tempokv["method"], *_bit_widths(tempokv))
+        ),
+        {},
+    )
+    time_ratio = matching_cost.get("vs_bf16")
     if tempokv is None:
         return f"BF16 reaches {baseline['max_feasible_frames']} frames."
     tail = f"; {others} respectively" if others else ""
@@ -540,7 +589,7 @@ def headline_sentence(rows: list[dict], efficiency_rows_data: list[dict]) -> str
     time_text = "unknown" if time_ratio is None else f"{time_ratio:.0%}"
     return (
         f"On one A100 80GB under a global attention window, BF16 generates at most "
-        f"{baseline['max_feasible_frames']} frames; TempoKV reaches "
+        f"{baseline['max_feasible_frames']} frames; {_method_label(tempokv)} reaches "
         f"{tempokv['max_feasible_frames']} ({ratio}){tail}. At the shared 717-frame "
         f"horizon TempoKV's per-frame generation time is {time_text} of BF16's."
     )
@@ -551,7 +600,7 @@ def latency_sentence(rows: list[dict]) -> str:
     if not rows:
         return "Latency decomposition is unavailable because no row passed the profile gate."
     labels = ", ".join(
-        f"{row['method']}: encode {row['cache_encode_ms']:.1f} ms, "
+        f"{_method_label(row)}: encode {row['cache_encode_ms']:.1f} ms, "
         f"decode {row['cache_decode_ms']:.1f} ms, VAE {row['vae_decode_ms']:.1f} ms, "
         f"other {row['denoising_other_ms']:.1f} ms"
         for row in rows

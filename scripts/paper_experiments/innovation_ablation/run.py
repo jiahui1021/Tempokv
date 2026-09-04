@@ -287,7 +287,29 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "variants": [asdict(variant) for variant in VARIANTS],
         "commands": commands,
     }
-    _write_json(root / "manifest.json", manifest)
+    manifest_path = root / "manifest.json"
+    if args.resume and manifest_path.is_file():
+        existing = _read_json(manifest_path)
+        if existing is None or existing.get("schema") != manifest["schema"]:
+            raise ValueError(
+                f"cannot resume invalid innovation manifest: {manifest_path}"
+            )
+        existing_controls = existing.get("fairness_controls") or {}
+        existing_bits = (
+            existing_controls.get("same_k_bits"),
+            existing_controls.get("same_v_bits"),
+        )
+        if existing_bits != (args.k_bits, args.v_bits):
+            raise ValueError(
+                "cannot resume innovation ablation with different K/V bit widths: "
+                f"existing K{existing_bits[0]}/V{existing_bits[1]}, "
+                f"requested K{args.k_bits}/V{args.v_bits}"
+            )
+    elif args.resume and any(root.iterdir()):
+        raise ValueError(
+            f"cannot resume without the existing manifest: {manifest_path}"
+        )
+    _write_json(manifest_path, manifest)
 
     failure: str | None = None
     bf16_run = root / "runs/bf16"
@@ -432,7 +454,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "variants": rows,
     }
     manifest["status"] = summary["status"]
-    _write_json(root / "manifest.json", manifest)
+    _write_json(manifest_path, manifest)
     _write_json(root / "summary.json", summary)
     print(json.dumps(summary, indent=2, ensure_ascii=False))
     if failure:

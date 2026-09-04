@@ -255,6 +255,8 @@ def _validate_parameters(k_path: Path, v_path: Path, config) -> dict[str, object
         "head_dimension": head_dim,
         "k_history_length": codec.temporal.history_length,
         "v_history_length": codec.v_parameters.history_length,
+        "k_bits": config.k_bits,
+        "v_bits": config.v_bits,
         "v_predictor_mode": config.v_predictor_mode,
         "v_history_diagonal": False if temporal_v else cross.history_diagonal,
         "predictor_parameter_bytes": predictor_parameter_bytes,

@@ -946,6 +946,21 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
                 f"cannot resume manifest schema {existing_manifest.get('schema')!r}; "
                 f"expected {SCHEMA!r}"
             )
+        existing_protocol = existing_manifest.get("protocol") or {}
+        existing_bits = (
+            existing_protocol.get("k_bits"),
+            existing_protocol.get("v_bits"),
+        )
+        if existing_bits != (k_bits, v_bits):
+            raise ValueError(
+                "cannot resume predictor ablation with different K/V bit widths: "
+                f"existing K{existing_bits[0]}/V{existing_bits[1]}, "
+                f"requested K{k_bits}/V{v_bits}"
+            )
+    elif args.resume and any(root.iterdir()):
+        raise ValueError(
+            f"cannot resume without the existing manifest: {manifest_path}"
+        )
 
     base_payload = _codec_payload(args.config)
     configs: dict[str, CodecConfig] = {}

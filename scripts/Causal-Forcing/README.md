@@ -166,9 +166,9 @@ bash scripts/Causal-Forcing/fit_params.sh
 objective/optimizer 消融使用同一入口，例如 reconstruction-only V phase 与历史 sign-gradient：
 
 ```bash
-CONFIG=configs/legacy.json PARAM_NAME=legacy-winner-adam-r1-a0-kv ATTENTION_STEPS=100 \
+CONFIG=configs/legacy.json PARAM_NAME=legacy-winner-adam-r1-a0-k ATTENTION_STEPS=100 \
 ATTENTION_RECONSTRUCTION_WEIGHT=1 ATTENTION_OUTPUT_WEIGHT=0 \
-ATTENTION_REFINE_TENSORS=value \
+ATTENTION_REFINE_TENSORS=key \
 bash scripts/Causal-Forcing/fit_params.sh
 
 CONFIG=configs/legacy.json PARAM_NAME=legacy-winner-sign-r05-a05-kv ATTENTION_STEPS=1 \

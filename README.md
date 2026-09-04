@@ -89,9 +89,13 @@ layer-shared Cross 权重。常用覆盖项：
 
 ```bash
 BITS=2 FIT_DEVICE=cuda bash scripts/fit_params.sh self-forcing
+K_BITS=3 V_BITS=5 FIT_DEVICE=cuda bash scripts/fit_params.sh self-forcing
 KH=3 VH=1 FIT_DEVICE=cuda bash scripts/fit_params.sh causal-forcing
 CACHE_STRIDE=780 FIT_DEVICE=cuda bash scripts/fit_params.sh longcat
 ```
+
+`K_BITS=3 V_BITS=5` 会生成独立的 `k3-v5` 参数与结果目录。Legacy 协议的
+anchor 固定为 INT4；这里的位宽指 K/V residual。
 
 默认参数目录：
 

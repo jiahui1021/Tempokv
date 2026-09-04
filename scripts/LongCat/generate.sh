@@ -101,7 +101,10 @@ if (( NUM_COND_FRAMES > NUM_FRAMES || (NUM_COND_FRAMES - 1) % 4 != 0 )); then
 fi
 
 if [[ "$mode" == "tempokv" ]]; then
-  default_output="results/longcat/tempokv"
+  # Keep each resolved codec variant in its own result directory.  The same
+  # signature already selects the matching fitted parameters above, so mixed
+  # K/V bit widths cannot silently overwrite another generation run.
+  default_output="results/longcat/tempokv/$parameter_name"
 else
   default_output="results/longcat/bf16"
 fi
@@ -151,6 +154,8 @@ preflight_args=(
   --context-parallel-size "$CONTEXT_PARALLEL_SIZE"
 )
 [[ -n "${CACHE_STRIDE:-}" ]] && preflight_args+=(--stride "$CACHE_STRIDE")
+[[ -n "${K_BITS:-}" ]] && preflight_args+=(--k-bits "$K_BITS")
+[[ -n "${V_BITS:-}" ]] && preflight_args+=(--v-bits "$V_BITS")
 [[ -n "${V_PREDICTOR:-}" ]] && preflight_args+=(--v-predictor-mode "$V_PREDICTOR")
 if [[ "$mode" == "tempokv" ]]; then
   preflight_args+=(

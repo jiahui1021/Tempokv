@@ -23,6 +23,7 @@
 #   FIT_DEVICE          拟合设备（默认 auto：有 CUDA 就用 GPU，否则回退 CPU 并告警）
 #   FIT_HISTORY_SOURCE  reconstructed（默认）或 clean；仅用于拟合消融
 #   DRY_RUN             只打印命令不执行（0/1，默认 0）
+#   OVERWRITE           已存在参数时覆盖（0/1，默认 0）
 #   ITERATIONS / TEMPORAL_RIDGE / CROSS_RIDGE / MAX_GAIN  拟合控制
 #
 # 其余参数原样透传给 scripts/common/fit_params.py。
@@ -58,17 +59,26 @@ fi
 
 FIT_DEVICE="${FIT_DEVICE:-auto}"
 DRY_RUN="${DRY_RUN:-0}"
+OVERWRITE="${OVERWRITE:-0}"
 check_flag DRY_RUN
+check_flag OVERWRITE
 ITERATIONS="${ITERATIONS:-2}"
-fit_mode="$("$python_bin" - "$config" <<'PY'
+read -r fit_mode config_v_predictor <<<"$("$python_bin" - "$config" <<'PY'
 import json
 import sys
 
 config = json.load(open(sys.argv[1], encoding="utf-8"))
-print(config.get("codec", config).get("fit_mode", "legacy"))
+config = config.get("codec", config)
+print(config.get("fit_mode", "legacy"), config.get("v_predictor_mode", "cross_kv"))
 PY
 )"
 [[ "$fit_mode" == "legacy" ]] || die "仅支持 CONFIG 的 fit_mode=legacy"
+v_predictor_mode="${V_PREDICTOR:-$config_v_predictor}"
+case "$v_predictor_mode" in
+  temporal|identity|taylor|taylor2|direct) v_artifact_name="v_temporal.npz" ;;
+  innovation) v_artifact_name="v_innovation.npz" ;;
+  *) v_artifact_name="v_cross_kv.npz" ;;
+esac
 default_temporal_ridge=1.0
 TEMPORAL_RIDGE="${TEMPORAL_RIDGE:-$default_temporal_ridge}"
 CROSS_RIDGE="${CROSS_RIDGE:-0.1}"
@@ -105,4 +115,17 @@ fi
 
 [[ -f "$trace" ]] || die "TRACE_FILE 不存在：${trace}（先跑 collect_trace.sh）"
 
-exec "${fit_command[@]}" "$@"
+if [[ "$OVERWRITE" != "1" ]]; then
+  for artifact in "$output_dir/k_temporal.npz" "$output_dir/$v_artifact_name"; do
+    if [[ -e "$artifact" ]]; then
+      die "已存在参数：${artifact}。设置 OVERWRITE=1 覆盖，或换一个 OUTPUT_DIR。"
+    fi
+  done
+fi
+
+mkdir -p -- "$output_dir"
+"${fit_command[@]}" "$@"
+
+for artifact in "$output_dir/k_temporal.npz" "$output_dir/$v_artifact_name"; do
+  [[ -s "$artifact" ]] || die "拟合未生成参数：$artifact"
+done

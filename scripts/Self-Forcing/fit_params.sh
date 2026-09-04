@@ -30,7 +30,7 @@
 #                    Adam 学习率、早停 patience 与最小相对改善
 #   ATTENTION_OPTIMIZER  adam（默认）或 sign_gradient
 #   ATTENTION_RECONSTRUCTION_WEIGHT / ATTENTION_OUTPUT_WEIGHT  objective 权重
-#   ATTENTION_REFINE_TENSORS  key、value 或 key_value（默认）
+#   ATTENTION_REFINE_TENSORS  key、value 或 key_value（CrossKV 默认 key；temporal V 默认 key_value）
 #   ATTENTION_SIGN_STEP_SIZES  sign-gradient 候选步长，空格分隔
 #   ATTENTION_MAX_TOKENS  refinement 使用的 sampled token-track 上限
 #   ATTENTION_LAYER_CHUNK  attention refinement 每批层数（默认 4）
@@ -125,7 +125,13 @@ ATTENTION_MIN_RELATIVE_IMPROVEMENT="${ATTENTION_MIN_RELATIVE_IMPROVEMENT:-0.0001
 ATTENTION_OPTIMIZER="${ATTENTION_OPTIMIZER:-adam}"
 ATTENTION_RECONSTRUCTION_WEIGHT="${ATTENTION_RECONSTRUCTION_WEIGHT:-0.5}"
 ATTENTION_OUTPUT_WEIGHT="${ATTENTION_OUTPUT_WEIGHT:-0.5}"
-ATTENTION_REFINE_TENSORS="${ATTENTION_REFINE_TENSORS:-key_value}"
+if [[ -z "${ATTENTION_REFINE_TENSORS:-}" ]]; then
+  if [[ "$v_predictor_mode" == "cross_kv" ]]; then
+    ATTENTION_REFINE_TENSORS="key"
+  else
+    ATTENTION_REFINE_TENSORS="key_value"
+  fi
+fi
 read -r -a attention_sign_step_sizes <<<"${ATTENTION_SIGN_STEP_SIZES:-0.01}"
 OVERWRITE="${OVERWRITE:-0}"
 DRY_RUN="${DRY_RUN:-0}"

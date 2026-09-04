@@ -4,11 +4,12 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import asdict
 import importlib.util
 import json
 from pathlib import Path
 import sys
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
@@ -86,7 +87,10 @@ def _module_check(name: str) -> dict[str, object]:
     return _check(available, "available" if available else "module is not installed")
 
 
-def _read_codec_config(path: Path) -> tuple[dict[str, Any] | None, dict[str, object]]:
+def _read_codec_config(
+    path: Path,
+    overrides: Mapping[str, object] | None = None,
+) -> tuple[dict[str, Any] | None, dict[str, object]]:
     if not path.is_file():
         return None, _check(False, f"file does not exist: {path}", path=str(path))
     try:
@@ -105,6 +109,8 @@ def _read_codec_config(path: Path) -> tuple[dict[str, Any] | None, dict[str, obj
         payload = payload["codec"]
     if not isinstance(payload, dict):
         return None, _check(False, "config.codec must contain a JSON object", path=str(path))
+    if overrides:
+        payload = {**payload, **overrides}
     try:
         from tempokv.config import config_from_mapping
 
@@ -130,19 +136,15 @@ def _read_codec_config(path: Path) -> tuple[dict[str, Any] | None, dict[str, obj
     # Report the resolved settings rather than the literal file: a config only
     # states what gives it an identity, so anything it omits comes from a
     # CodecConfig default and that default is what the runtime uses.
-    resolved = {
-        **payload,
-        "fit_mode": config.fit_mode,
-        "k_predictor_mode": config.k_predictor_mode,
-        "cross_kv_weight_mode": config.cross_kv_weight_mode,
-        "stride": int(config.stride),
-        "v_predictor_mode": config.v_predictor_mode,
-    }
+    resolved = asdict(config)
     return resolved, _check(
         True,
         "valid codec configuration",
         path=str(path),
         stride=int(config.stride),
+        k_bits=int(config.k_bits),
+        v_bits=int(config.v_bits),
+        codec_signature=config.format_signature(),
     )
 
 
@@ -426,8 +428,20 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                          path=str(path) if path is not None else None)
             for name, path in required_paths.items()
         }
+        codec_overrides = {
+            name: value
+            for name, value in (
+                ("k_bits", getattr(args, "k_bits", None)),
+                ("v_bits", getattr(args, "v_bits", None)),
+                ("stride", args.stride),
+                ("v_predictor_mode", args.v_predictor_mode),
+            )
+            if value is not None
+        }
         if args.config is not None:
-            codec_config, config_check = _read_codec_config(args.config)
+            codec_config, config_check = _read_codec_config(
+                args.config, codec_overrides
+            )
             checks["codec_config"] = config_check
         # The parameter files must have been fitted for the stride this run will
         # use, which is the override when one was given.
@@ -464,6 +478,57 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             ),
         }
         checks["parameter_files"] = parameter_checks
+        identity_ready = (
+            codec_config is not None
+            and args.config is not None
+            and args.k_parameters is not None
+            and args.v_parameters is not None
+            and all(item["ok"] for item in parameter_checks.values())
+        )
+        if identity_ready:
+            try:
+                from tempokv.integration import load_codec
+
+                codec = load_codec(
+                    args.config,
+                    args.k_parameters,
+                    args.v_parameters,
+                    overrides={
+                        **codec_overrides,
+                        "use_triton": False,
+                        "strict_triton": False,
+                    },
+                )
+                if (
+                    not codec.temporal.codec_signature
+                    or not codec.v_parameters.codec_signature
+                    or not codec.temporal.parameter_set_id
+                    or not codec.v_parameters.parameter_set_id
+                ):
+                    raise ValueError(
+                        "LongCat requires fitted parameters with codec_signature "
+                        "and parameter_set_id metadata"
+                    )
+                checks["parameter_identity"] = _check(
+                    True,
+                    "K/V parameters match the resolved codec configuration",
+                    k_bits=int(codec.config.k_bits),
+                    v_bits=int(codec.config.v_bits),
+                    codec_signature=codec.config.format_signature(),
+                    parameter_set_id=codec.temporal.parameter_set_id,
+                )
+            except (
+                EOFError,
+                ImportError,
+                KeyError,
+                OSError,
+                TypeError,
+                ValueError,
+            ) as error:
+                checks["parameter_identity"] = _check(
+                    False,
+                    f"parameters do not match the resolved codec: {error}",
+                )
     elif args.stride is not None:
         checks["stride"] = _check(args.stride > 0, "stride is positive", stride=args.stride)
 
@@ -502,6 +567,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--v-parameters", type=Path)
     parser.add_argument("--context-parallel-size", type=int, default=1)
     parser.add_argument("--stride", type=int)
+    parser.add_argument("--k-bits", type=int, choices=range(1, 9))
+    parser.add_argument("--v-bits", type=int, choices=range(1, 9))
     # The V predictor decides which kind of parameter file to expect, and it
     # is a command-line override, so preflight has to be told about it too.
     parser.add_argument(

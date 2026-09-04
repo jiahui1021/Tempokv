@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from collections.abc import MutableMapping
 from contextvars import ContextVar
-from dataclasses import dataclass, field, replace
+from dataclasses import asdict, dataclass, field, replace
 import importlib
 from pathlib import Path
 import time
@@ -1059,7 +1059,11 @@ class LongCatTempoKVBridge:
     def report(self) -> dict[str, object]:
         """Return a serializable summary of bridge activity for one rank."""
         predictor_parameter_bytes = 0
+        codec_config = None
         if self.codec is not None:
+            # This is the post-override runtime config, rather than the source
+            # JSON.  Recording it makes mixed-precision results self-describing.
+            codec_config = asdict(self.codec.config)
             v_parameters = self.codec.v_parameters
             if self.codec.predicts_v_from_key:
                 parameters = (
@@ -1141,6 +1145,9 @@ class LongCatTempoKVBridge:
         )
         return {
             "mode": self.mode,
+            "k_bits": codec_config["k_bits"] if codec_config is not None else None,
+            "v_bits": codec_config["v_bits"] if codec_config is not None else None,
+            "codec_config": codec_config,
             "context_parallel_size": self.context_parallel_size,
             "context_parallel_rank": self.context_parallel_rank,
             "attention_sink_frames": self.attention_sink_frames,

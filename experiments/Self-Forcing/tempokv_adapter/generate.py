@@ -350,6 +350,8 @@ def _validate_parameters(
         "history_length": codec.temporal.history_length,
         "k_history_length": codec.temporal.history_length,
         "k_predictor_mode": config.k_predictor_mode,
+        "k_bits": config.k_bits,
+        "v_bits": config.v_bits,
         "v_history_length": codec.v_parameters.history_length,
         "v_history_mode": (
             "temporal"
@@ -632,6 +634,19 @@ def _sampler_from_summary(
     return sampler
 
 
+def _record_bit_widths(
+    args: argparse.Namespace, config: object | None
+) -> tuple[int | None, int | None, int | None]:
+    """Widths stored in efficiency records after all config overrides."""
+    if args.mode != "tempokv":
+        return None, None, None
+    if config is None:
+        raise ValueError("TempoKV efficiency records require a resolved config")
+    k_bits = int(getattr(config, "k_bits"))
+    v_bits = int(getattr(config, "v_bits"))
+    return (k_bits if k_bits == v_bits else None), k_bits, v_bits
+
+
 def _write_efficiency_record(
     args: argparse.Namespace,
     *,
@@ -640,16 +655,20 @@ def _write_efficiency_record(
     performance: dict[str, object],
     batch_entries: list[dict[str, object]],
     parameters: dict[str, object] | None,
+    config: object | None,
 ) -> None:
     """Emit this run's ``efficiency.v1`` record beside the pipeline report."""
     profiles = report.get("runtime_profile") or []
     segments, instrumentation = _efficiency_segments(list(profiles))
+    bits, k_bits, v_bits = _record_bit_widths(args, config)
     efficiency.write_record(
         output_dir / "efficiency.json",
         efficiency.build_efficiency_payload(
             repo="Tempokv",
             method="TempoKV" if args.mode == "tempokv" else "BF16",
-            bits=(args.k_bits if args.mode == "tempokv" else None),
+            bits=bits,
+            k_bits=k_bits,
+            v_bits=v_bits,
             run=_frozen_run_block(args, performance, batch_entries),
             sampler=_sampler_from_summary(batch_entries),
             cache_shape={
@@ -689,6 +708,7 @@ def _write_horizon_record(
     *,
     output_dir: Path,
     result: dict[str, object],
+    config: object | None,
 ) -> dict:
     """Turn the worker's OOM bookkeeping into the shared horizon schema."""
     import torch
@@ -711,10 +731,13 @@ def _write_horizon_record(
         "cuda_version": torch.version.cuda or "",
         "local_attn_size": local_attn_size,
     }
+    bits, k_bits, v_bits = _record_bit_widths(args, config)
     payload = efficiency.build_horizon_payload(
         repo="Tempokv",
         method="TempoKV" if args.mode == "tempokv" else "BF16",
-        bits=args.k_bits if args.mode == "tempokv" else None,
+        bits=bits,
+        k_bits=k_bits,
+        v_bits=v_bits,
         run=run,
         budget={
             "device_total_bytes": int(torch.cuda.get_device_properties(0).total_memory),
@@ -1102,6 +1125,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             args,
             output_dir=paths["run"],
             result=probe,
+            config=config,
         )
         report.update({"status": "horizon_complete", "horizon": payload})
         (paths["run"] / "pipeline_report.json").write_text(
@@ -1233,6 +1257,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         performance=performance,
         batch_entries=batch_entries,
         parameters=parameters if args.mode == "tempokv" else None,
+        config=config,
     )
     (paths["run"] / "pipeline_report.json").write_text(
         json.dumps(report, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
