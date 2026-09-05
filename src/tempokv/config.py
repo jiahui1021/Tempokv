@@ -4,9 +4,6 @@ from dataclasses import dataclass
 import json
 from typing import Any, Mapping
 
-from .quantization import MAX_BITS
-
-
 # Storing the anchor as INT16 codes costs 16 bits per element *plus* the group
 # scale — more than the bfloat16 value it replaces — and is still lossy, so it
 # is dominated by simply keeping the tensor.  ``anchor_bits=16`` therefore does
@@ -230,15 +227,6 @@ class CodecConfig:
                 f"anchor_bits must be an integer from 1 to {RAW_ANCHOR_BITS}, "
                 f"got {self.anchor_bits}"
             )
-        if (
-            self.anchor_bits == RAW_ANCHOR_BITS
-            and self.reconstruction_dtype not in RAW_ANCHOR_DTYPES
-        ):
-            raise ValueError(
-                "anchor_bits=16 stores the anchor unquantized in "
-                "reconstruction_dtype, so it needs a 16-bit "
-                f"reconstruction_dtype, not {self.reconstruction_dtype}"
-            )
         if self.group_size <= 0:
             raise ValueError("group_size must be positive")
         if self.stride <= 0:
@@ -264,6 +252,18 @@ class CodecConfig:
         if self.reconstruction_dtype not in supported_dtypes:
             raise ValueError(
                 "reconstruction_dtype must be float32, float16, or bfloat16"
+            )
+        # Checked after the dtype itself is validated, so an unsupported dtype
+        # is reported as the dtype problem it is rather than as an anchor
+        # problem.
+        if (
+            self.anchor_bits == RAW_ANCHOR_BITS
+            and self.reconstruction_dtype not in RAW_ANCHOR_DTYPES
+        ):
+            raise ValueError(
+                "anchor_bits=16 stores the anchor unquantized in "
+                "reconstruction_dtype, so it needs a 16-bit "
+                f"reconstruction_dtype, not {self.reconstruction_dtype}"
             )
         if self.cross_matmul_precision not in {"ieee", "tf32"}:
             raise ValueError("cross_matmul_precision must be ieee or tf32")
@@ -496,6 +496,13 @@ class CodecConfig:
         # be loaded into a forward-direction runtime.
         if self.predictor_direction != "k_to_v":
             payload["predictor_direction"] = self.predictor_direction
+        # anchor_bits=16 once meant INT16 codes and now means no quantizer at
+        # all, so the width alone no longer identifies the anchor codec.  This
+        # marker appears only for the raw anchor, which keeps every quantized
+        # parameter set's signature byte-identical while making a set fitted
+        # under the old INT16 reading fail to load instead of loading silently.
+        if self.raw_anchor:
+            payload["anchor_mode"] = "raw"
         return "tempokv-codec-v5:" + json.dumps(
             payload, sort_keys=True, separators=(",", ":")
         )

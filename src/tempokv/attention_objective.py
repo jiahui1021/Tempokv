@@ -18,7 +18,7 @@ import torch
 import torch.nn.functional as F
 
 from .config import CodecConfig
-from .codec import _cuda_matmul_precision
+from .codec import _cuda_matmul_precision, anchor_roundtrip
 from .quantization import roundtrip
 
 
@@ -108,12 +108,9 @@ def temporal_rollout(
         # the same anchor/residual quantization protocol as the production
         # codec, but every later unit is quantized without a prediction.
         reconstructed = [
-            _round_trip(
-                target[..., 0, :, :],
-                bits=config.anchor_bits,
-                config=config,
-                symmetric=True,
-            ).to(_reconstruction_dtype(config)).float()
+            anchor_roundtrip(target[..., 0, :, :], config)
+            .to(_reconstruction_dtype(config))
+            .float()
         ]
         for frame in range(1, frames):
             reconstructed.append(
@@ -127,12 +124,9 @@ def temporal_rollout(
         return torch.stack(reconstructed, dim=-3)
 
     reconstructed = [
-        _round_trip(
-            target[..., 0, :, :],
-            bits=config.anchor_bits,
-            config=config,
-            symmetric=True,
-        ).to(_reconstruction_dtype(config)).float()
+        anchor_roundtrip(target[..., 0, :, :], config)
+        .to(_reconstruction_dtype(config))
+        .float()
     ]
     for frame in range(1, frames):
         order = min(frame, history_length)
@@ -236,12 +230,9 @@ def cross_kv_rollout(
         raise ValueError("history length must be smaller than the frame count")
 
     reconstructed = [
-        _round_trip(
-            target[..., 0, :, :],
-            bits=config.anchor_bits,
-            config=config,
-            symmetric=True,
-        ).to(_reconstruction_dtype(config)).float()
+        anchor_roundtrip(target[..., 0, :, :], config)
+        .to(_reconstruction_dtype(config))
+        .float()
     ]
     for frame in range(1, frames):
         current_source = source[..., frame, :, :].float()

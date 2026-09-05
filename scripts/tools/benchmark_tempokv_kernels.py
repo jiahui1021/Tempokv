@@ -789,7 +789,12 @@ def main(argv: list[str] | None = None) -> int:
         help="V residual width; defaults to --bits",
     )
     parser.add_argument(
-        "--anchor-bits", type=int, choices=range(1, 17), default=4
+        "--anchor-bits",
+        type=int,
+        # 16 is the unquantized anchor, which is a tensor copy rather than a
+        # kernel; there is no anchor decode kernel to benchmark at that width.
+        choices=range(1, 16),
+        default=4,
     )
     parser.add_argument("--k-history", type=int, default=3)
     parser.add_argument("--v-history", type=int, default=1)

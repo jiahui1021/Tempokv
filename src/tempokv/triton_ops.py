@@ -833,9 +833,11 @@ def decode(
         # ``output``, not out of ``anchor_quant``, so writing it here with a
         # plain copy leaves the rest of the pipeline untouched.  Going through
         # the logical BHSD view keeps this correct for a BSHD destination.
+        # No ``.to(output.dtype)``: the slice assignment casts as it copies,
+        # so converting first would allocate and copy a whole anchor span twice.
         _logical_bhsd_output(output, direct_output_layout)[
             :, :, :anchor_length
-        ] = packed.anchor_quant.to(output.dtype)
+        ] = packed.anchor_quant
     else:
         anchor_packed_width = (width * packed.anchor_bits + 7) // 8
         anchor_grid = (
@@ -867,7 +869,14 @@ def decode(
             block_d,
         )
     if packed.residual_quant is None:
-        _record(_route_name("anchor", direct_output_layout))
+        # Name the copy for what it is.  Reporting it as the anchor kernel would
+        # put time in the profile against a launch that never happened.
+        _record(
+            _route_name(
+                "anchor_raw" if packed.raw_anchor else "anchor",
+                direct_output_layout,
+            )
+        )
         return _logical_bhsd_output(output, direct_output_layout)
     assert packed.residual_scale is not None
     residual_sequence = int(packed.residual_quant.shape[2])

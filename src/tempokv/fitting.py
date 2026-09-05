@@ -22,7 +22,7 @@ from .attention_objective import (
     phase_score,
     temporal_rollout,
 )
-from .codec import _cuda_matmul_precision
+from .codec import _cuda_matmul_precision, anchor_roundtrip as _anchor_roundtrip
 from .config import (
     FIXED_CROSS_KV_V_PREDICTOR_MODES,
     FIXED_TEMPORAL_PREDICTOR_MODES,
@@ -1882,20 +1882,6 @@ def _quantization_roundtrip(
         group_size=config.group_size,
         scale_dtype=_SCALE_DTYPES[config.scale_dtype],
         symmetric=symmetric,
-    )
-
-
-def _anchor_roundtrip(value: torch.Tensor, config: CodecConfig) -> torch.Tensor:
-    """Replay what the encoder stores for one anchor unit.
-
-    The unquantized anchor keeps its value, so fitting sees the same anchor the
-    codec will; sending it through the quantizer at 16 bits would make the
-    fitted predictors disagree with the runtime reconstruction.
-    """
-    if config.raw_anchor:
-        return value.to(_SCALE_DTYPES[config.reconstruction_dtype])
-    return _quantization_roundtrip(
-        value, bits=config.anchor_bits, config=config, symmetric=True
     )
 
 

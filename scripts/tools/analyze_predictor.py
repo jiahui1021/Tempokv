@@ -36,6 +36,7 @@ from tempokv.config import (  # noqa: E402
     config_from_mapping,
     is_temporal_v_predictor,
 )
+from tempokv.codec import anchor_roundtrip  # noqa: E402
 from tempokv.fitting import _quantization_roundtrip  # noqa: E402
 from tempokv.parameters import CrossKVParameters, TemporalParameters  # noqa: E402
 
@@ -80,12 +81,7 @@ def reconstruct_temporal(
         target,
         dtype=torch.float32 if legacy_math else reconstruction_dtype,
     )
-    anchor = _quantization_roundtrip(
-        target[..., 0, :, :],
-        bits=config.anchor_bits,
-        config=config,
-        symmetric=True,
-    )
+    anchor = anchor_roundtrip(target[..., 0, :, :], config)
     rebuilt[..., 0, :, :] = (
         anchor.to(torch.bfloat16).float()
         if legacy_math
@@ -212,9 +208,7 @@ def reconstruct_v(
     cross_term = torch.zeros_like(values)
     history_term = torch.zeros_like(values)
     rebuilt = torch.empty_like(values)
-    rebuilt[:, :, 0] = _quantization_roundtrip(
-        values[:, :, 0], bits=config.anchor_bits, config=config, symmetric=True
-    )
+    rebuilt[:, :, 0] = anchor_roundtrip(values[:, :, 0], config)
     weight = cross.weight
     hist_weights = cross.history_weights
     bias = cross.bias.view(L, 1, H, D)

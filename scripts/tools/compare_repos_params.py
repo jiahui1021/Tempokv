@@ -22,6 +22,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT / "src") not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
+from tempokv.codec import anchor_roundtrip  # noqa: E402
 from tempokv.config import CodecConfig  # noqa: E402
 from tempokv.quantization import (  # noqa: E402
     dequantize_asymmetric,
@@ -52,8 +53,7 @@ def reconstruct_k(keys, weights, bias, config, device):
     # -> [B, L, E, H, F, P, D]; concatenate F -> [B,L,E,H, seq, D]
     kf = k.permute(0, 1, 2, 3, 4, 5, 6).reshape(B, L, E, H, seq, D).float()
     rebuilt = torch.empty_like(kf)
-    anchor = _roundtrip(kf[..., :stride, :], config.anchor_bits, config.group_size,
-                        getattr(torch, config.scale_dtype), True)
+    anchor = anchor_roundtrip(kf[..., :stride, :], config)
     rebuilt[..., :stride, :] = anchor.to(torch.bfloat16).float()
     hist = [anchor]
     for offset in range(stride, seq, stride):

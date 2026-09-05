@@ -30,6 +30,7 @@ SOURCE_ROOT = PROJECT_ROOT / "src"
 if str(SOURCE_ROOT) not in sys.path:
     sys.path.insert(0, str(SOURCE_ROOT))
 
+from tempokv.codec import anchor_roundtrip  # noqa: E402
 from tempokv.config import CodecConfig, config_from_mapping  # noqa: E402
 from tempokv.fitting import (  # noqa: E402
     _quantization_roundtrip,
@@ -371,12 +372,7 @@ def rollout_value(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     rebuilt = torch.empty_like(clean_value, dtype=torch.float32)
     predictions = torch.zeros_like(clean_value, dtype=torch.float32)
-    anchor = _quantization_roundtrip(
-        clean_value[..., 0, :, :],
-        bits=config.anchor_bits,
-        config=config,
-        symmetric=True,
-    )
+    anchor = anchor_roundtrip(clean_value[..., 0, :, :], config)
     rebuilt[..., 0, :, :] = anchor.to(torch.bfloat16).float()
     for frame in range(1, clean_value.shape[-3]):
         available = {

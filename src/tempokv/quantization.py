@@ -3,9 +3,12 @@ from __future__ import annotations
 import torch
 
 
-# The packing layer is width-agnostic up to 16 bits.  Residual widths stay at
-# or below 8 because a wider residual costs more than the bfloat16 value it
-# replaces; the anchor has no such ceiling, so it is allowed the full range.
+# The packer's own ceiling.  Residual widths stop at 8 by configuration
+# because a wider residual costs more than the bfloat16 value it replaces, and
+# quantized anchors stop at 15 because at 16 the codes plus their group scale
+# also cost more than bfloat16 -- see RAW_ANCHOR_BITS in config.py.  Nothing
+# currently asks for 16, and the packer is written for the width rather than
+# for its callers, so the bound stays where the layout stops working.
 MAX_BITS = 16
 
 

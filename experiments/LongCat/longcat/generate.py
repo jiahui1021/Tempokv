@@ -286,7 +286,9 @@ def _require_direct_persistent_routes(
             "LongCat TempoKV direct persistent Triton decode was not used: "
             + ", ".join(missing)
         )
-    allowed = {*required, "anchor_direct_bhsd"}
+    # The unquantized anchor is copied rather than decoded, and reports itself
+    # under its own route name; both are legitimate ways to fill the anchor.
+    allowed = {*required, "anchor_direct_bhsd", "anchor_raw_direct_bhsd"}
     unexpected = {
         str(name): int(count)
         for name, count in routes.items()

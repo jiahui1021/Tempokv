@@ -481,6 +481,12 @@ def _load_codec(path: Path | None) -> CodecSettings:
     if "codec" in payload:
         payload = payload["codec"]
     config = config_from_mapping(payload)
+    if config.raw_anchor:
+        raise SystemExit(
+            "this study quantizes the anchor with its own standalone "
+            "quantizer, so it cannot model anchor_bits=16, which stores the "
+            "anchor unquantized; use a quantized anchor width"
+        )
     return CodecSettings(
         anchor_bits=config.anchor_bits,
         k_bits=config.k_bits,

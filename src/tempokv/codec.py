@@ -21,6 +21,7 @@ from .quantization import (
     dequantize_symmetric,
     quantize_asymmetric,
     quantize_symmetric,
+    roundtrip,
 )
 
 
@@ -95,6 +96,24 @@ class PackedTensor:
             raise ValueError("cross_matmul_precision must be ieee or tf32")
         if self.compatibility_mode not in {"native", "legacy"}:
             raise ValueError("compatibility_mode must be native or legacy")
+        if self.anchor_bits == RAW_ANCHOR_BITS:
+            # The width alone cannot tell codes from values, and a packed state
+            # built under the older INT16 reading has the same anchor_bits.
+            # Both decoders read this tensor as values, so a mismatch here
+            # would reinterpret code bytes as floats and decode the anchor span
+            # to garbage without raising.
+            if self.anchor_quant.dtype != _dtype(self.reconstruction_dtype):
+                raise ValueError(
+                    "an unquantized anchor must be stored in "
+                    f"{self.reconstruction_dtype}, got {self.anchor_quant.dtype}"
+                )
+            if int(self.anchor_quant.shape[-1]) != width:
+                raise ValueError(
+                    "an unquantized anchor stores one value per channel, "
+                    f"expected width {width}, got {self.anchor_quant.shape[-1]}"
+                )
+            if self.anchor_scale.numel():
+                raise ValueError("an unquantized anchor has no group scale")
         has_residual = len(self.unit_lengths) > 1
         if has_residual != (self.residual_quant is not None):
             raise ValueError("residual tensors do not match unit layout")
@@ -386,6 +405,31 @@ def _cuda_matmul_precision(device: torch.device, precision: str):
         backend.allow_tf32 = previous
 
 
+def anchor_roundtrip(value: torch.Tensor, config: CodecConfig) -> torch.Tensor:
+    """Replay what the encoder stores for one anchor unit.
+
+    Fitting, attention refinement and the analysis tools all rebuild the anchor
+    outside the codec, and each of them has to round exactly where
+    :func:`_encode` rounds.  The unquantized anchor keeps its value, so handing
+    ``config.anchor_bits`` to a quantizer there would optimize and report
+    against an anchor the codec never produces.
+
+    Every out-of-codec anchor replay goes through this function instead of
+    calling a quantizer with ``config.anchor_bits``; the quantized branch
+    returns float32 exactly as ``roundtrip`` does, so existing callers keep
+    their own reconstruction-dtype rounding.
+    """
+    if config.raw_anchor:
+        return value.to(_dtype(config.reconstruction_dtype))
+    return roundtrip(
+        value,
+        bits=config.anchor_bits,
+        group_size=config.group_size,
+        scale_dtype=_dtype(config.scale_dtype),
+        symmetric=True,
+    )
+
+
 def _quantize(
     value: torch.Tensor,
     *,
@@ -513,11 +557,12 @@ def _encode(
 
     anchor = value[:, :, :stride]
     if config.raw_anchor:
-        # No quantizer: the anchor is the stored value.  ``clone`` matters
+        # No quantizer: the anchor is the stored value.  ``copy=True`` matters
         # because ``to`` returns the input itself when the dtype already
         # matches, and an in-place reconstruction would then write through the
-        # tensor the packed state is supposed to own.
-        anchor_quant = anchor.to(reconstruction_dtype).clone()
+        # tensor the packed state is supposed to own.  It also keeps this to a
+        # single copy when the dtype does differ.
+        anchor_quant = anchor.to(reconstruction_dtype, copy=True)
         # No codes means no group scale.  Keeping the field a real tensor
         # rather than None spares every reader an optional, and an empty one
         # contributes nothing to storage_bytes().
