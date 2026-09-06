@@ -39,6 +39,7 @@ parser.add_argument("--local_attn_size", type=int, default=-1)
 parser.add_argument("--sink_size", type=int, default=0)
 parser.add_argument("--skip_existing", action="store_true")
 parser.add_argument("--skip_video_save", action="store_true", help=argparse.SUPPRESS)
+parser.add_argument("--save_latents", action="store_true")
 args = parser.parse_args()
 
 # Initialize distributed inference
@@ -245,6 +246,24 @@ def _write_horizon_probe(path: str, result: dict) -> None:
     os.replace(temporary, path)
 
 
+def _write_latents_checked(path: str, latents: torch.Tensor, metadata: dict) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    temporary = f"{path}.tmp-{os.getpid()}"
+    payload = {
+        "latents": latents.detach().to(device="cpu", dtype=torch.bfloat16),
+        **metadata,
+    }
+    try:
+        torch.save(payload, temporary)
+        loaded = torch.load(temporary, map_location="cpu", weights_only=True)
+        if tuple(loaded["latents"].shape) != tuple(latents.shape):
+            raise RuntimeError(f"latent shape mismatch after save: {path}")
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
 for i, batch_data in enumerate(dataloader):
     idx = batch_data['idx'].item()
     video_total_start = time.perf_counter()
@@ -387,6 +406,20 @@ for i, batch_data in enumerate(dataloader):
         for seed_idx in range(args.num_samples):
             # All processes save their videos
             output_path = _output_path(prompt, idx, seed_idx)
+            latent_path = None
+            if args.save_latents:
+                latent_path = os.path.join(
+                    args.output_folder, "latents", f"{idx}_{seed_idx}.pt"
+                )
+                _write_latents_checked(
+                    latent_path,
+                    latents[seed_idx],
+                    {
+                        "prompt_index": int(idx),
+                        "sample_index": seed_idx,
+                        "noise_seed": prompt_seed,
+                    },
+                )
             save_start = time.perf_counter()
             save_seconds = None
             _write_video_checked(output_path, video[seed_idx], fps=16)
@@ -397,6 +430,7 @@ for i, batch_data in enumerate(dataloader):
                     "sample_index": seed_idx,
                     "noise_seed": prompt_seed,
                     "path": output_path,
+                    "latent_path": latent_path,
                     "skipped": False,
                     "generation_seconds": generation_seconds,
                     "save_seconds": save_seconds,
