@@ -35,13 +35,25 @@ def test_default_and_shipped_configs_are_legacy_layer_shared() -> None:
     root = Path(__file__).resolve().parents[2]
     for path in sorted((root / "configs").glob("*.json")):
         config = config_from_mapping(json.loads(path.read_text(encoding="utf-8")))
-        assert config.fit_mode == "legacy", path.name
-        assert config.cross_kv_weight_mode == "layer_shared", path.name
+        expected = (
+            "layer_shared" if config.fit_mode == "legacy" else "layer_head"
+        )
+        assert config.cross_kv_weight_mode == expected, path.name
 
 
-def test_native_json_config_is_rejected() -> None:
-    with pytest.raises(ValueError, match="native fitting family is no longer supported"):
-        config_from_mapping({"fit_mode": "native"})
+def test_native_json_config_selects_the_native_defaults() -> None:
+    """Naming the family is enough; the rest of it follows.
+
+    Both families are selectable again, so a config only has to say which one
+    it wants.  Spelling out the predictor and CrossKV layouts too would let a
+    config name one family and carry the other's structure.
+    """
+    config = config_from_mapping({"fit_mode": "native"})
+
+    assert config.fit_mode == "native"
+    assert config.k_predictor_mode == "layer_head"
+    assert config.cross_kv_weight_mode == "layer_head"
+    assert config.cross_matmul_precision == "tf32"
 
 
 def test_legacy_mapping_without_mode_defaults_to_layer_shared() -> None:

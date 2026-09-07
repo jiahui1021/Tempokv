@@ -221,7 +221,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=(0.01,),
         help="candidate step sizes for the historical sign-gradient scan",
     )
-    parser.add_argument("--fit-mode", choices=("legacy",))
+    parser.add_argument("--fit-mode", choices=("legacy", "native"))
     parser.add_argument(
         "--use-triton", action=argparse.BooleanOptionalAction, default=None
     )
@@ -273,8 +273,6 @@ def _codec_config(args: argparse.Namespace) -> CodecConfig:
         config = config_from_mapping(values)
     except (TypeError, ValueError) as error:
         raise ValueError(f"invalid codec config: {error}") from error
-    if config.fit_mode != "legacy":
-        raise ValueError("only fit_mode=legacy is supported")
     return config
 
 

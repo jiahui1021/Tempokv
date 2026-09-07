@@ -123,13 +123,16 @@ if v_history is None:
     if v_history is None:
         v_history = 0
 
-# All shipped TempoKV parameter sets use the legacy fixed-point protocol.
-if config.get("fit_mode", "legacy") != "legacy":
-    raise SystemExit("only fit_mode=legacy is supported")
-mode_label = "legacy-"
+# Both fitting families are selectable, and their parameters are not
+# interchangeable, so the family leads the directory name.
+fit_mode = config.get("fit_mode", "legacy")
+if fit_mode not in {"legacy", "native"}:
+    raise SystemExit(f"fit_mode must be legacy or native, got {fit_mode!r}")
+mode_label = f"{fit_mode}-"
 # The K/V segments record the predictor structures: parameters fitted for one
 # predictor family are not interchangeable with another.
-k_predictor = config.get("k_predictor_mode", "shared")
+default_k_predictor = "shared" if fit_mode == "legacy" else "layer_head"
+k_predictor = config.get("k_predictor_mode", default_k_predictor)
 k_prefix = {
     "identity": "ki",
     "taylor": "kty",
@@ -162,12 +165,16 @@ if v_prefix is None:
         f"{v_predictor!r}"
     )
 v_label = f"{v_prefix}{int(v_history)}"
-cross_weight_mode = config.get("cross_kv_weight_mode", "layer_shared")
-if cross_weight_mode != "layer_shared":
+# One CrossKV layout per family; the sharing-ablation modes are not production
+# parameter sets and must not land in a production directory name.
+expected_cross = "layer_shared" if fit_mode == "legacy" else "layer_head"
+cross_weight_mode = config.get("cross_kv_weight_mode", expected_cross)
+if cross_weight_mode != expected_cross:
     raise SystemExit(
-        "production CrossKV parameters must use cross_kv_weight_mode=layer_shared"
+        f"{fit_mode} CrossKV parameters must use "
+        f"cross_kv_weight_mode={expected_cross}, got {cross_weight_mode}"
     )
-cross_weight_label = "-layershared"
+cross_weight_label = "-" + expected_cross.replace("_", "")
 if k_bits == v_bits:
     precision_label = f"int{k_bits}"
 else:

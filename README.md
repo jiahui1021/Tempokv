@@ -48,6 +48,23 @@ PROMPTS=assets/generation_prompts.txt bash scripts/Self-Forcing/run_bf16.sh
 相应改成 `causal-forcing` 或 `longcat`。Causal Forcing 首次使用可先运行
 `bash scripts/Causal-Forcing/download_models.sh`。
 
+## 拟合协议
+
+两个协议都可用，用 `CONFIG` 选：
+
+| 协议 | 配置 | K predictor | CrossKV 权重 | Cross 矩阵乘 |
+|---|---|---|---|---|
+| legacy（默认） | `configs/legacy.json` | 跨层共享 | layer-shared | ieee |
+| native | `configs/native.json` | 每层每头 | layer-head | tf32 |
+
+配置里写 `fit_mode` 就够了，其余结构默认值跟着协议走。两个协议的位宽选项完全一样
+（下一节），但参数**不能互换**：协议写进 codec signature，加载时不匹配直接报错，
+参数目录也分别以 `legacy-` / `native-` 开头。
+
+```bash
+CONFIG=configs/native.json FIT_DEVICE=cuda bash scripts/fit_params.sh self-forcing
+```
+
 ## 位宽
 
 一个 span 的第一个 unit 是 **anchor**，直接量化；后面每个 unit 只存**预测残差**。
@@ -60,7 +77,7 @@ PROMPTS=assets/generation_prompts.txt bash scripts/Self-Forcing/run_bf16.sh
 | `ANCHOR_BITS` | 1–15 | 设置 anchor 量化位宽 |
 | `ANCHOR_BITS=16` | — | anchor 不量化，直接按 bf16 存 |
 
-默认是 anchor INT4 + K/V 残差 INT4（`configs/legacy.json`）。
+默认是 anchor INT4 + K/V 残差 INT4，legacy 和 native 都一样。
 
 ```bash
 BITS=2 bash scripts/fit_params.sh self-forcing                    # K/V 都是 INT2
@@ -86,7 +103,7 @@ K/V 位宽相等时目录名沿用 `intN`，不相等时写成 `kN-vM`；anchor 
 
 | 变量 | 作用 |
 |---|---|
-| `CONFIG` | codec 配置 JSON（默认 `configs/legacy.json`） |
+| `CONFIG` | codec 配置 JSON，同时决定拟合协议（默认 `configs/legacy.json`） |
 | `TRACE_FILE` | 指定采集好的 `clean_trace.npz` |
 | `OUTPUT_DIR` | 指定参数输出目录 |
 | `KH`、`VH` | 设置 K/V history length |
@@ -101,8 +118,7 @@ K/V 位宽相等时目录名沿用 `intN`，不相等时写成 `kN-vM`；anchor 
 
 参数写到 `data/<模型>/params/<参数方案>/`（Causal Forcing 多一层模式目录），每个目录包含
 `k_temporal.npz`、一个 V 参数文件和 `fit_report.json`。上表每一项都写进 codec signature，
-所以参数不能跨模型、位宽、stride 或配置复用——加载时签名不匹配会直接报错。旧的 native 或
-非 layer-shared 参数需要按当前 legacy 配置重新拟合。
+所以参数不能跨模型、协议、位宽、stride 或配置复用——加载时签名不匹配会直接报错。
 
 ## 查看结果
 

@@ -115,12 +115,16 @@ def _read_codec_config(
         from tempokv.config import config_from_mapping
 
         config = config_from_mapping(payload)
-        if config.fit_mode != "legacy":
-            raise ValueError("only fit_mode=legacy is supported")
-        if config.cross_kv_weight_mode != "layer_shared":
+        # One CrossKV layout per family; the other modes belong to the sharing
+        # ablation rather than to a production run.
+        expected_cross = (
+            "layer_shared" if config.fit_mode == "legacy" else "layer_head"
+        )
+        if config.cross_kv_weight_mode != expected_cross:
             raise ValueError(
-                "production CrossKV parameters must use "
-                "cross_kv_weight_mode=layer_shared"
+                f"{config.fit_mode} CrossKV parameters must use "
+                f"cross_kv_weight_mode={expected_cross}, got "
+                f"{config.cross_kv_weight_mode}"
             )
     except (ImportError, TypeError, ValueError) as error:
         return None, _check(False, f"invalid TempoKV codec configuration: {error}", path=str(path))

@@ -84,10 +84,6 @@ def fixed_temporal_predictor_mode(mode: str) -> str | None:
 
 def config_from_mapping(payload: Mapping[str, Any]) -> "CodecConfig":
     """Build a codec config from parsed JSON, naming withdrawn settings."""
-    if payload.get("fit_mode") == "native":
-        raise ValueError(
-            "native fitting family is no longer supported; use fit_mode=legacy"
-        )
     withdrawn = sorted(set(payload) & set(WITHDRAWN_SETTINGS))
     if withdrawn:
         raise ValueError(
@@ -98,12 +94,18 @@ def config_from_mapping(payload: Mapping[str, Any]) -> "CodecConfig":
             + " — remove them and refit if the parameters were shared"
         )
     resolved = dict(payload)
-    # There is one repository-wide codec family now.  Keep omitted fields
-    # deterministic so hand-written configs cannot silently fall back to the
-    # retired native/layer-head identity.
+    # Both families are selectable.  A config that does not name one is legacy,
+    # because that is what every shipped config and every fitted parameter set
+    # uses; the remaining defaults then follow the family rather than being
+    # guessed from unrelated settings, so writing ``fit_mode`` is enough to
+    # pick a family and nothing else has to be restated.
     resolved.setdefault("fit_mode", "legacy")
-    resolved.setdefault("k_predictor_mode", "shared")
-    resolved.setdefault("cross_kv_weight_mode", "layer_shared")
+    if resolved["fit_mode"] == "legacy":
+        resolved.setdefault("k_predictor_mode", "shared")
+        resolved.setdefault("cross_kv_weight_mode", "layer_shared")
+    else:
+        resolved.setdefault("k_predictor_mode", "layer_head")
+        resolved.setdefault("cross_kv_weight_mode", "layer_head")
     return CodecConfig(**resolved)
 
 

@@ -73,14 +73,23 @@ config = config.get("codec", config)
 print(config.get("fit_mode", "legacy"), config.get("v_predictor_mode", "cross_kv"))
 PY
 )"
-[[ "$fit_mode" == "legacy" ]] || die "仅支持 CONFIG 的 fit_mode=legacy"
+case "$fit_mode" in
+  legacy|native) ;;
+  *) die "CONFIG 的 fit_mode 必须是 legacy 或 native（当前值：${fit_mode}）" ;;
+esac
 v_predictor_mode="${V_PREDICTOR:-$config_v_predictor}"
 case "$v_predictor_mode" in
   temporal|identity|taylor|taylor2|direct) v_artifact_name="v_temporal.npz" ;;
   innovation) v_artifact_name="v_innovation.npz" ;;
   *) v_artifact_name="v_cross_kv.npz" ;;
 esac
-default_temporal_ridge=1.0
+# Legacy fitting reproduces the reference implementation and pins its controls;
+# fit_params.py rejects any other value, so the default has to follow fit_mode.
+if [[ "$fit_mode" == "legacy" ]]; then
+  default_temporal_ridge=1.0
+else
+  default_temporal_ridge=0.1
+fi
 TEMPORAL_RIDGE="${TEMPORAL_RIDGE:-$default_temporal_ridge}"
 CROSS_RIDGE="${CROSS_RIDGE:-0.1}"
 MAX_GAIN="${MAX_GAIN:-1.0}"

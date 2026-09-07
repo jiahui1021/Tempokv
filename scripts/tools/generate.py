@@ -89,12 +89,14 @@ def _load_config(path: Path, args: argparse.Namespace) -> CodecConfig:
     if unknown:
         raise ValueError(f"unknown codec config fields: {unknown}")
     config = config_from_mapping(payload)
-    if config.fit_mode != "legacy":
-        raise ValueError("only fit_mode=legacy is supported")
-    if config.cross_kv_weight_mode != "layer_shared":
+    # One CrossKV layout per family; the other modes belong to the sharing
+    # ablation rather than to a production run.
+    expected_cross = "layer_shared" if config.fit_mode == "legacy" else "layer_head"
+    if config.cross_kv_weight_mode != expected_cross:
         raise ValueError(
-            "production CrossKV parameters must use "
-            "cross_kv_weight_mode=layer_shared"
+            f"{config.fit_mode} CrossKV parameters must use "
+            f"cross_kv_weight_mode={expected_cross}, got "
+            f"{config.cross_kv_weight_mode}"
         )
     overrides = {
         field: getattr(args, field)

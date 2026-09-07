@@ -104,12 +104,16 @@ def load_codec(
     if overrides:
         payload = {**payload, **overrides}
     config = config_from_mapping(payload)
-    if config.fit_mode != "legacy":
-        raise ValueError("only fit_mode=legacy is supported")
-    if config.cross_kv_weight_mode != "layer_shared":
+    # Each family has one CrossKV layout: legacy pools the layers, native keeps
+    # per-layer weights.  Checking against the family rather than against one
+    # constant lets both load while still rejecting the sharing-ablation modes,
+    # which exist only for that experiment and not for a production run.
+    expected_cross = "layer_shared" if config.fit_mode == "legacy" else "layer_head"
+    if config.cross_kv_weight_mode != expected_cross:
         raise ValueError(
-            "production CrossKV parameters must use "
-            "cross_kv_weight_mode=layer_shared"
+            f"{config.fit_mode} CrossKV parameters must use "
+            f"cross_kv_weight_mode={expected_cross}, got "
+            f"{config.cross_kv_weight_mode}"
         )
     if config.use_triton:
         configure_triton_cache(triton_cache)

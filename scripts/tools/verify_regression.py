@@ -170,12 +170,14 @@ def _triton_parity(args, directory: Path) -> dict:
     config = config_from_mapping(
         {**payload, "stride": stride, "use_triton": False}
     )
-    if config.fit_mode != "legacy":
-        raise ValueError("only fit_mode=legacy is supported")
-    if config.cross_kv_weight_mode != "layer_shared":
+    # One CrossKV layout per family; the other modes belong to the sharing
+    # ablation rather than to a production run.
+    expected_cross = "layer_shared" if config.fit_mode == "legacy" else "layer_head"
+    if config.cross_kv_weight_mode != expected_cross:
         raise ValueError(
-            "production CrossKV parameters must use "
-            "cross_kv_weight_mode=layer_shared"
+            f"{config.fit_mode} CrossKV parameters must use "
+            f"cross_kv_weight_mode={expected_cross}, got "
+            f"{config.cross_kv_weight_mode}"
         )
     codec = TempoKVCodec(temporal, cross, config)
 

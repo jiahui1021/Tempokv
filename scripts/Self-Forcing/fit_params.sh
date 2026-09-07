@@ -112,8 +112,17 @@ config = json.load(open(sys.argv[1], encoding="utf-8"))
 print(config.get("codec", config).get("fit_mode", "legacy"))
 PY
 )"
-[[ "$fit_mode" == "legacy" ]] || die "仅支持 CONFIG 的 fit_mode=legacy"
-default_temporal_ridge=1.0
+case "$fit_mode" in
+  legacy|native) ;;
+  *) die "CONFIG 的 fit_mode 必须是 legacy 或 native（当前值：${fit_mode}）" ;;
+esac
+# Legacy fitting reproduces the reference implementation and pins its controls;
+# fit_params.py rejects any other value, so the default has to follow fit_mode.
+if [[ "$fit_mode" == "legacy" ]]; then
+  default_temporal_ridge=1.0
+else
+  default_temporal_ridge=0.1
+fi
 TEMPORAL_RIDGE="${TEMPORAL_RIDGE:-$default_temporal_ridge}"
 CROSS_RIDGE="${CROSS_RIDGE:-0.1}"
 V_HISTORY_RIDGE="${V_HISTORY_RIDGE:-0.0}"

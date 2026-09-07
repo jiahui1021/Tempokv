@@ -1,0 +1,10 @@
+{
+  "k_bits": 4,
+  "v_bits": 4,
+  "k_history_length": 2,
+  "v_history_length": 1,
+  "k_predictor_mode": "layer_head",
+  "cross_kv_weight_mode": "layer_head",
+  "cross_matmul_precision": "tf32",
+  "fit_mode": "native"
+}

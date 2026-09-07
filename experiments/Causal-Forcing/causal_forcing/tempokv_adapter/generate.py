@@ -168,10 +168,7 @@ def _load_config(path: Path):
         if len(payload) != 1 or not isinstance(payload["codec"], dict):
             raise ValueError("'codec' must be the only top-level config object")
         payload = payload["codec"]
-    config = config_from_mapping(payload)
-    if config.fit_mode != "legacy":
-        raise ValueError("only fit_mode=legacy is supported")
-    return config
+    return config_from_mapping(payload)
 
 
 def _validate_parameters(k_path: Path, v_path: Path, config) -> dict[str, object]:
