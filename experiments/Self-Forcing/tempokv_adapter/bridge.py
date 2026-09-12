@@ -97,6 +97,11 @@ def install(runtime_root: str | Path) -> type:
                 num_heads=getattr(self, "num_heads", 12),
                 head_dim=getattr(self, "head_dim", 128),
             )
+            # TempoKV intentionally keeps the pre-RoPE, frame-addressable
+            # cache so finalized spans can be predicted and re-rotated at
+            # absolute positions during reads.  The BF16 baseline gets the
+            # dense window-sized cache instead.
+            self._uses_pre_rope_cache = True
             self.tempokv_codec = load_codec_from_env()
             config = self.tempokv_codec.config
             self._tempokv_rope_precision = "complex64"
@@ -154,8 +159,17 @@ def install(runtime_root: str | Path) -> type:
             direction = getattr(
                 self.tempokv_codec.config, "predictor_direction", "k_to_v"
             )
+            # Same defensive read: a config predating the correction installs
+            # with it off, which is also the shipped default.
+            config = self.tempokv_codec.config
+            jensen = bool(getattr(config, "jensen_correction", False))
+            group_size = int(getattr(config, "group_size", 64))
             for layer in self.kv_cache1:
                 layer["k"].rope_precision = self._tempokv_rope_precision
+                # The correction reads the K cache's step sizes, so only the K
+                # slot needs to carry it.
+                layer["k"].tempokv_jensen_correction = jensen
+                layer["k"].tempokv_group_size = group_size
                 for role in ("k", "v"):
                     layer[role].tempokv_predictor_direction = direction
 

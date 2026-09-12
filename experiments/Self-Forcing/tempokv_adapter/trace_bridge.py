@@ -159,6 +159,10 @@ def install(runtime_root: str | Path) -> type:
     class TraceCausalInferencePipeline(base):
         def __init__(self, *args: Any, **kwargs: Any) -> None:
             super().__init__(*args, **kwargs)
+            # Trace collection reads clean pre-RoPE K/V out of the cache, so it
+            # needs the frame-addressable cache for the same reason TempoKV
+            # does, not the dense post-RoPE BF16 one.
+            self._uses_pre_rope_cache = True
             self._trace_rope_precision = rope_precision
             self._apply_trace_rope_precision()
             frame_seq_length = int(getattr(self, "frame_seq_length", 0))

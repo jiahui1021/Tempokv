@@ -448,6 +448,70 @@ class ChunkedKVCache:
             chunk_index = span["end_chunk"]
         return result
 
+    def read_step_sizes(
+        self,
+        start_index: int,
+        end_index: int,
+        *,
+        group_size: int,
+        output_layout: str | None = None,
+    ) -> torch.Tensor:
+        """Quantizer step sizes for a read range, aligned with :meth:`read`.
+
+        The result is ``[B, S, H, D/g]`` for a BSHD read and ``[B, H, S, D/g]``
+        for BHSD, so it indexes token-for-token with the keys the same range
+        returns.  This is what the Jensen-bias correction needs; the values are
+        the scales the packed spans already store, so nothing is recomputed and
+        nothing extra is kept.
+
+        Chunks still held as BF16 -- the current chunk during denoising, and
+        every chunk of a BF16 baseline run -- report a zero step size, because
+        an unquantized key carries no quantization noise and must receive no
+        correction.
+        """
+        layout = output_layout or self.layout
+        if layout not in {"BSHD", "BHSD"}:
+            raise ValueError(f"unsupported step-size layout: {layout}")
+        if group_size <= 0 or self.head_dim % group_size:
+            raise ValueError("group_size must divide the head dimension")
+        start_chunk = self._token_to_chunk(start_index)
+        end_chunk = self._token_to_chunk(end_index)
+        if start_chunk >= end_chunk:
+            raise ValueError("cache read range must be non-empty")
+        groups = self.head_dim // group_size
+        total_tokens = end_index - start_index
+        shape = (
+            (self.batch_size, total_tokens, self.num_heads, groups)
+            if layout == "BSHD"
+            else (self.batch_size, self.num_heads, total_tokens, groups)
+        )
+        result = torch.zeros(shape, device=self.device, dtype=torch.float32)
+        chunk_index = start_chunk
+        while chunk_index < end_chunk:
+            output_start = (chunk_index - start_chunk) * self.frame_seq_length
+            if self.chunk_state[chunk_index] != ChunkState.QUANTIZED:
+                chunk_index += 1
+                continue
+            span = self._span_by_chunk[chunk_index]
+            if span is None:
+                raise RuntimeError("packed cache span index is inconsistent")
+            if span["start_chunk"] < start_chunk or span["end_chunk"] > end_chunk:
+                raise ValueError("packed TempoKV spans must be read in full")
+            packed = span["quant_data"]
+            steps = packed.step_sizes()            # [B, H, S, G]
+            if steps.shape[-1] != groups:
+                raise ValueError(
+                    f"span stores {steps.shape[-1]} groups, the caller asked for "
+                    f"{groups}; group_size must match the codec config"
+                )
+            output_end = output_start + steps.shape[2]
+            if layout == "BSHD":
+                result[:, output_start:output_end] = steps.permute(0, 2, 1, 3)
+            else:
+                result[:, :, output_start:output_end] = steps
+            chunk_index = span["end_chunk"]
+        return result
+
     def store_quantized(
         self, start_index: int, end_index: int, quant_data: Any
     ) -> None:

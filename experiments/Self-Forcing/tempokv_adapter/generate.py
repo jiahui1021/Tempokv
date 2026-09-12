@@ -108,6 +108,23 @@ def build_parser() -> argparse.ArgumentParser:
             "reconstructed K (production), v_to_k mirrors the roles"
         ),
     )
+    parser.add_argument(
+        "--jensen-correction",
+        dest="jensen_correction",
+        action="store_true",
+        default=None,
+        help=(
+            "subtract the Jensen bias from quantized cached attention scores; "
+            "changes no stored value, so a run with and without it decodes the "
+            "same cache and reuses the same fitted parameters"
+        ),
+    )
+    parser.add_argument(
+        "--no-jensen-correction",
+        dest="jensen_correction",
+        action="store_false",
+        help="force the correction off even if the config enables it",
+    )
     parser.add_argument("--k-bits", type=int, choices=range(1, 9))
     parser.add_argument("--v-bits", type=int, choices=range(1, 9))
     parser.add_argument("--anchor-bits", type=int, choices=range(1, 17))
@@ -944,6 +961,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                 ("v_predictor_mode", args.v_predictor_mode),
                 ("predictor_direction", args.predictor_direction),
                 ("use_triton", False if args.torch_decoder else None),
+                ("jensen_correction", args.jensen_correction),
             )
             if value is not None
         }

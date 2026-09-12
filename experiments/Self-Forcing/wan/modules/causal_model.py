@@ -1,4 +1,8 @@
-from wan.modules.attention import attention
+from wan.modules.attention import (
+    FLASH_ATTN_2_AVAILABLE,
+    FLASH_ATTN_3_AVAILABLE,
+    attention,
+)
 from wan.modules.model import (
     WanRMSNorm,
     rope_apply,
@@ -79,10 +83,118 @@ def causal_rope_apply(x, grid_sizes, freqs, start_frame=0):
 # Read-time RoPE for the pre-RoPE cache is shared with Causal Forcing; see
 # tempokv.runtime.rope for the span-aware form used once eviction can leave a
 # gap between the sink and the recent window.
+from tempokv.runtime.jensen import augment as augment_for_jensen  # noqa: E402
 from tempokv.runtime.rope import (  # noqa: E402
     apply_rope_by_span,
     causal_rope_apply_long_input,
 )
+
+
+def _attention_window_ranges(
+    *, local_end_index, frame_seqlen, local_attn_size, sink_size
+):
+    """Token ranges of the attention window inside a full resident cache read.
+
+    The cache is always read in full so a packed TempoKV span is never cut, and
+    the window is sliced afterwards.  Returning the ranges instead of the
+    sliced tensors lets the keys, the values and the Jensen step sizes be cut
+    identically without three copies of this arithmetic.
+    """
+    if local_attn_size == -1:
+        return [(0, local_end_index)]
+    sink_tokens = sink_size * frame_seqlen
+    recent_frames = max(1, local_attn_size - sink_size)
+    recent_start = max(0, local_end_index - recent_frames * frame_seqlen)
+    if sink_size > 0 and recent_start > sink_tokens:
+        return [(0, sink_tokens), (recent_start, local_end_index)]
+    if sink_size > 0:
+        # The sink overlaps the recent window, so their union covers the whole
+        # resident range.
+        return [(0, local_end_index)]
+    return [(recent_start, local_end_index)]
+
+
+def _take_window(tensor, ranges):
+    """Slice ``[B, S, ...]`` down to the attention window, avoiding a copy."""
+    if len(ranges) == 1:
+        start, end = ranges[0]
+        if start == 0 and end == tensor.shape[1]:
+            return tensor
+        return tensor[:, start:end]
+    return torch.cat([tensor[:, start:end] for start, end in ranges], dim=1)
+
+
+def _attention_window_step_sizes(
+    key_cache, *, local_end_index, frame_seqlen, local_attn_size, sink_size
+):
+    """Quantizer step sizes for the attention window, shaped ``[B, S, H, G]``."""
+    steps = key_cache.read_step_sizes(
+        0, local_end_index, group_size=getattr(key_cache, "tempokv_group_size", 64)
+    )
+    return _take_window(
+        steps,
+        _attention_window_ranges(
+            local_end_index=local_end_index,
+            frame_seqlen=frame_seqlen,
+            local_attn_size=local_attn_size,
+            sink_size=sink_size,
+        ),
+    )
+
+
+def _jensen_corrected_attention(query, key, value, *, step_sizes, group_size):
+    """Attention with the Jensen bias removed from quantized cached scores.
+
+    The correction is a rank-G bilinear form, so it folds into G extra Q/K
+    channels and the ordinary attention kernel evaluates it -- no score_mod and
+    no fused-kernel change.  The head dimension is padded to a multiple of
+    eight because that is what the FlashAttention path accepts, and the value
+    is padded to match because FlashAttention-2 requires one head dimension for
+    all three inputs.  The padding channels are zero, so the extra output
+    columns are dropped rather than read.
+
+    The softmax scale stays 1/sqrt(D) of the *original* head dimension: the
+    extra channels carry a correction that is already in score units and must
+    not be renormalized by the widened head.
+
+    The call pins FlashAttention-2.  FA2 takes any head dimension that is a
+    multiple of eight, while FA3 -- which ``attention()`` selects on its own
+    whenever it runs on Hopper -- supports only a fixed set of widths that the
+    padded head is not in.  Leaving the choice to ``attention()`` would make
+    this path work on A100 and fail inside the kernel on H100.
+    """
+    dim = query.shape[-1]
+    groups = step_sizes.shape[-1]
+    padded = -(-(dim + groups) // 8) * 8
+    if not FLASH_ATTN_2_AVAILABLE and FLASH_ATTN_3_AVAILABLE:
+        raise RuntimeError(
+            f"the Jensen correction pads the head dimension to {padded}, which "
+            "FlashAttention-3 does not support, and FlashAttention-2 is not "
+            "installed. Install flash-attn (v2) alongside it, or run without "
+            "JENSEN=1."
+        )
+    corrected_query, corrected_key, softmax_scale = augment_for_jensen(
+        query.transpose(1, 2),
+        key.transpose(1, 2),
+        step_sizes.transpose(1, 2),
+        group_size=group_size,
+        pad_to=padded,
+    )
+    padded_value = torch.cat(
+        [
+            value,
+            value.new_zeros((*value.shape[:-1], padded - dim)),
+        ],
+        dim=-1,
+    )
+    out = attention(
+        corrected_query.transpose(1, 2),
+        corrected_key.transpose(1, 2),
+        padded_value,
+        softmax_scale=softmax_scale,
+        fa_version=2,
+    )
+    return out[..., :dim]
 
 
 class CausalWanSelfAttention(nn.Module):
@@ -351,6 +463,89 @@ class CausalWanSelfAttention(nn.Module):
             cached_local_end = _cache_index(kv_cache, "local_end_index")
             local_end_index = cached_local_end + current_end - global_end_index
             local_start_index = local_end_index - num_new_tokens
+            cache_backend = kv_cache.get("cache_backend")
+            if cache_backend is None:
+                # Preserve the direct attention-module API used by older
+                # callers: a ChunkedKVCache object unambiguously selects the
+                # pre-RoPE/read-time-RoPE path, while a tensor is native BF16.
+                cache_backend = (
+                    "bf16" if isinstance(kv_cache.get("k"), torch.Tensor)
+                    else "tempokv"
+                )
+            if cache_backend != "tempokv":
+                # Native BF16 baseline: post-RoPE K in a contiguous tensor
+                # cache sized to the attention window, rolled in place, with no
+                # ChunkedKVCache and no read-time RoPE over the whole rollout.
+                #
+                # The rotation goes through the span helper rather than
+                # causal_rope_apply because that one hardcodes float64, while
+                # this repository deliberately runs the BF16 reference on the
+                # same arithmetic as the quantized run it is the reference for
+                # (SELF_FORCING_CACHE_ROPE_PRECISION, complex64 for both under
+                # the generation scripts).  On one contiguous block the two
+                # helpers agree bit for bit at equal precision.
+                roped_key = causal_rope_apply_long_input(
+                    k, grid_sizes, freqs,
+                    start_frame=current_start_frame,
+                    precision=kv_cache.get("rope_precision", "native"),
+                ).type_as(v)
+                cache_k = kv_cache["k"]
+                cache_v = kv_cache["v"]
+                cache_size = int(cache_k.shape[1])
+                if num_new_tokens > cache_size:
+                    raise ValueError(
+                        "Self-Forcing KV cache capacity is smaller than one block"
+                    )
+                sink_tokens = self.sink_size * frame_seqlen
+                if (
+                    self.local_attn_size != -1
+                    and current_end > global_end_index
+                    and cached_local_end + num_new_tokens > cache_size
+                ):
+                    num_evicted_tokens = (
+                        cached_local_end + num_new_tokens - cache_size
+                    )
+                    num_rolled_tokens = (
+                        cached_local_end - num_evicted_tokens - sink_tokens
+                    )
+                    if num_rolled_tokens > 0:
+                        cache_k[:, sink_tokens:sink_tokens + num_rolled_tokens] = (
+                            cache_k[
+                                :,
+                                sink_tokens + num_evicted_tokens:
+                                sink_tokens + num_evicted_tokens + num_rolled_tokens,
+                            ].clone()
+                        )
+                        cache_v[:, sink_tokens:sink_tokens + num_rolled_tokens] = (
+                            cache_v[
+                                :,
+                                sink_tokens + num_evicted_tokens:
+                                sink_tokens + num_evicted_tokens + num_rolled_tokens,
+                            ].clone()
+                        )
+                    local_end_index = cached_local_end + current_end - global_end_index
+                    local_end_index -= num_evicted_tokens
+                    local_start_index = local_end_index - num_new_tokens
+                elif local_end_index > cache_size:
+                    raise ValueError("Self-Forcing KV cache capacity is too small")
+                cache_k[:, local_start_index:local_end_index] = roped_key
+                cache_v[:, local_start_index:local_end_index] = v
+                attention_start = 0
+                if self.local_attn_size != -1:
+                    attention_start = max(
+                        0, local_end_index - self.local_attn_size * frame_seqlen
+                    )
+                x = attention(
+                    roped_query,
+                    cache_k[:, attention_start:local_end_index],
+                    cache_v[:, attention_start:local_end_index],
+                )
+                _set_cache_index(kv_cache, "global_end_index", current_end)
+                _set_cache_index(kv_cache, "local_end_index", local_end_index)
+                x = x.flatten(2)
+                x = self.o(x)
+                return x
+
             if local_start_index < 0 or local_end_index > kv_cache["k"].kv_cache_size:
                 raise ValueError("Self-Forcing KV cache capacity is too small")
 
@@ -394,39 +589,38 @@ class CausalWanSelfAttention(nn.Module):
                 start_frame=0,
                 precision=getattr(kv_cache["k"], "rope_precision", "native"),
             ).type_as(v)
-            if self.local_attn_size == -1:
-                attn_k, attn_v = absolute_k, v_all
-            else:
-                sink_tokens = self.sink_size * frame_seqlen
-                recent_frames = max(1, self.local_attn_size - self.sink_size)
-                recent_start = max(
-                    0, local_end_index - recent_frames * frame_seqlen
-                )
-                if self.sink_size > 0 and recent_start > sink_tokens:
-                    attn_k = torch.cat(
-                        [absolute_k[:, :sink_tokens], absolute_k[:, recent_start:]],
-                        dim=1,
-                    )
-                    attn_v = torch.cat(
-                        [v_all[:, :sink_tokens], v_all[:, recent_start:]],
-                        dim=1,
-                    )
-                elif self.sink_size > 0:
-                    # The sink overlaps the recent window, so their union covers
-                    # the whole resident range.
-                    attn_k, attn_v = absolute_k, v_all
-                else:
-                    attn_k, attn_v = (
-                        absolute_k[:, recent_start:],
-                        v_all[:, recent_start:],
-                    )
+            window = _attention_window_ranges(
+                local_end_index=local_end_index,
+                frame_seqlen=frame_seqlen,
+                local_attn_size=self.local_attn_size,
+                sink_size=self.sink_size,
+            )
+            attn_k = _take_window(absolute_k, window)
+            attn_v = _take_window(v_all, window)
             recorder = getattr(self, "tempokv_trace_recorder", None)
             if recorder is not None:
                 # The attention objective needs the rotated Q and K the model
                 # actually used.  The newly written tokens are always the tail of
                 # the attention window, so no RoPE is recomputed for the trace.
                 recorder(roped_query, attn_k[:, -num_new_tokens:])
-            x = attention(roped_query, attn_k, attn_v)
+            if getattr(kv_cache["k"], "tempokv_jensen_correction", False):
+                x = _jensen_corrected_attention(
+                    roped_query,
+                    attn_k,
+                    attn_v,
+                    step_sizes=_attention_window_step_sizes(
+                        kv_cache["k"],
+                        local_end_index=local_end_index,
+                        frame_seqlen=frame_seqlen,
+                        local_attn_size=self.local_attn_size,
+                        sink_size=self.sink_size,
+                    ),
+                    group_size=int(
+                        getattr(kv_cache["k"], "tempokv_group_size", 64)
+                    ),
+                )
+            else:
+                x = attention(roped_query, attn_k, attn_v)
             _set_cache_index(kv_cache, "global_end_index", current_end)
             _set_cache_index(kv_cache, "local_end_index", local_end_index)
 

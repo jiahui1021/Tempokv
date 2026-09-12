@@ -122,6 +122,40 @@ class PackedTensor:
                 raise ValueError("asymmetric residuals require zero points")
         _dtype(self.reconstruction_dtype)
 
+    def step_sizes(self) -> torch.Tensor:
+        """Per-token per-group quantizer step size, shaped ``[B, H, S, D/g]``.
+
+        This is the ``Delta`` a Jensen-bias correction needs (arXiv 2605.26266):
+        the reconstruction error of a cached key is bounded by ``Delta/2``,
+        because the residual loop is closed and every unit after the anchor
+        stores only the quantization error of its own residual.
+
+        The step size is the stored scale itself at every width but one, so
+        reading it costs nothing and adds nothing to the cache.  The exception
+        is 1-bit symmetric quantization, which has no zero code and places its
+        two levels at -scale and +scale: the distance between adjacent levels
+        is then 2*scale, not scale.  Reporting the scale there would understate
+        the step by 2x and the bias, which is quadratic in it, by 4x.
+
+        An unquantized anchor reports zero, which is correct rather than merely
+        convenient: a key stored at bf16 carries no quantization noise and must
+        receive no correction.
+        """
+        batch, heads, sequence, width = self.shape
+        groups = width // self.group_size
+        if self.raw_anchor:
+            anchor = self.anchor_quant.new_zeros(
+                (batch, heads, self.stride, groups), dtype=torch.float32
+            )
+        else:
+            # The anchor is always quantized symmetrically.
+            anchor = self.anchor_scale.float() * (2.0 if self.anchor_bits == 1 else 1.0)
+        if self.residual_scale is None:
+            return anchor
+        residual_binary = self.residual_mode == "symmetric" and self.bits == 1
+        residual = self.residual_scale.float() * (2.0 if residual_binary else 1.0)
+        return torch.cat([anchor, residual], dim=2)
+
     @property
     def raw_anchor(self) -> bool:
         """Whether ``anchor_quant`` holds values rather than packed codes."""

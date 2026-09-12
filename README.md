@@ -99,6 +99,34 @@ K/V 位宽相等时目录名沿用 `intN`，不相等时写成 `kN-vM`；anchor 
 `-aN`。例如 `K_BITS=3 V_BITS=5 ANCHOR_BITS=12` 得到
 `legacy-kh2-vh1-k3-v5-a12-layershared`。
 
+## Jensen 修正（attention score，默认关闭）
+
+量化给 cached key 加的噪声在 score 上是零均值的，但 softmax 里的 `exp` 是凸的，所以
+`E[e^δ] ≥ 1`：每个被量化的 cached score 对配分和的贡献都被系统性放大，cached block 会
+从**未量化的当前 chunk** 那里抢走 attention mass。`JENSEN=1` 在 softmax 之前减掉这个偏置
+
+```
+b_i = (1 / 24d) · Σ_j Δ²_{i,j} · ‖q_j‖²
+```
+
+`Δ` 就是 codec 已经存着的 scale，所以**不增加任何存储**，也**不改变任何存储值**——
+`K̂`、`V̂`、重建 NMSE 开不开都逐位相同，变的只有 attention 输出。同理它不进 codec
+signature，所以开关两边共用同一份拟合参数，不用重新拟合。
+
+代价在计算：修正是一个秩 `G = d/group_size` 的双线性型，折进 Q/K 的额外通道里就能让
+普通 attention kernel 顺带算出来，不需要 FlexAttention 或自定义 kernel；head_dim 从 128
+补到 136（flash-attn 要 8 的倍数，且 FA2 要求 Q/K/V 同宽），QK^T 和 PV 各 **+6.25%**。
+
+```bash
+JENSEN=1 PROMPTS=assets/generation_prompts.txt bash scripts/Self-Forcing/run_tempokv.sh
+```
+
+输出目录自动加 `-jensen` 后缀，所以开关两边的视频不会互相覆盖，可以直接对比。
+
+目前只有 Self-Forcing 接入。默认关闭：在本仓库的 trace 上，生产的 INT4 残差位宽下这个
+偏置比论文测量的 INT2 直接量化设定小约两个数量级，端到端收益尚未验证。有希望的是
+`K_BITS=2`，以及 anchor 帧——anchor 走直接量化，`Δ` 明显更大，实测偏置是残差帧的 12 倍。
+
 ## 其他拟合选项
 
 | 变量 | 作用 |

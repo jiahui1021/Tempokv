@@ -5,7 +5,8 @@
 Self-Forcing and Causal Forcing share: both run Wan2.1-1.3B as a causal
 autoregressive video diffusion model, so both need the same frame-aligned
 pre-RoPE cache, the same read-time absolute-position RoPE, the same streaming
-span encoder, and the same memory/latency accounting.
+span encoder, and the same memory/latency accounting.  ``jensen`` holds the
+quantized-key attention-score correction those integrations can opt into.
 """
 
 from .cache import (
@@ -15,6 +16,8 @@ from .cache import (
     set_quantized_decoder,
     uncompress_single_kv_cache,
 )
+from .jensen import augment as augment_for_jensen
+from .jensen import bias as jensen_bias
 from .launch import (
     PERSISTENT_UNITS_ENV,
     configure_triton_cache,
@@ -33,9 +36,11 @@ __all__ = [
     "StreamingTempoKVEncoder",
     "TempoKVRuntimeReport",
     "apply_rope_by_span",
+    "augment_for_jensen",
     "bf16_bytes",
     "causal_rope_apply_long_input",
     "configure_triton_cache",
+    "jensen_bias",
     "persistent_units_per_launch",
     "set_quantized_decoder",
     "uncompress_single_kv_cache",

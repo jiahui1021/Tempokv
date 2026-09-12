@@ -39,6 +39,9 @@
 #   V_HISTORY_LENGTH  V 使用的历史帧数（0 到 5；默认读取 CONFIG）
 #   BITS            K/V residual 位宽（1 到 8；默认读取 CONFIG）；K_BITS / V_BITS 可分别设
 #   ANCHOR_BITS     anchor 位宽（1 到 15 量化，16 表示不量化直接存 bf16；默认 INT4）
+#   JENSEN          从量化 cached attention score 里减掉 Jensen bias，0 或 1
+#                   （默认 0）。只改 attention，不改任何存储值，所以和不开时
+#                   共用同一份拟合参数；输出目录会带 -jensen 后缀以便对比
 #   TORCH_DECODER   用 PyTorch 参考解码器代替 Triton，0 或 1（默认 0）
 #   BENCHMARK       要求本次完整生成且不允许跳过已有视频，0 或 1（默认 0）
 #   PROFILE         记录每段 CUDA-event 耗时分解，0 或 1（默认 0）；结果写入
@@ -146,6 +149,13 @@ fi
 
 model_type="${MODEL_TYPE:-self_forcing}"
 model_type="${model_type%/}"
+# The correction changes the video without changing the cache, so a corrected
+# run must not land on the uncorrected run's videos: SKIP_EXISTING would then
+# treat one as the other's output.  Only the result label moves; the parameter
+# directory is deliberately shared, because the two runs load the same fit.
+if [[ "$mode" == "tempokv" && "${JENSEN:-0}" == "1" ]]; then
+  result_label="$result_label-jensen"
+fi
 output_dir="$(resolve_path "${OUTPUT_DIR:-$project_root/results/$model_type/$result_label}")"
 if [[ "$output_dir" == "/" ]]; then
   die "OUTPUT_DIR 不能是文件系统根目录"
@@ -165,6 +175,7 @@ SKIP_EXISTING="${SKIP_EXISTING:-1}"
 BENCHMARK="${BENCHMARK:-0}"
 PROFILE="${PROFILE:-0}"
 TORCH_DECODER="${TORCH_DECODER:-0}"
+JENSEN="${JENSEN:-0}"
 
 check_flag DRY_RUN
 check_flag ALLOW_TRITON_FALLBACK
@@ -172,6 +183,7 @@ check_flag SKIP_EXISTING
 check_flag BENCHMARK
 check_flag PROFILE
 check_flag TORCH_DECODER
+check_flag JENSEN
 check_int FRAMES 1
 check_int NUM_SAMPLES 1
 check_int SEED 0
@@ -231,6 +243,7 @@ if [[ "$mode" == "tempokv" ]]; then
   [[ -n "${V_PREDICTOR:-}" ]] && generate_command+=(--v-predictor-mode "$V_PREDICTOR")
   [[ -n "${DIRECTION:-}" ]] && generate_command+=(--predictor-direction "$predictor_direction")
   [[ "$TORCH_DECODER" == "1" ]] && generate_command+=(--torch-decoder)
+  [[ "$JENSEN" == "1" ]] && generate_command+=(--jensen-correction)
 fi
 
 [[ -n "${MODEL_CONFIG:-}" ]] && generate_command+=(--model-config "$(resolve_path "$MODEL_CONFIG")")

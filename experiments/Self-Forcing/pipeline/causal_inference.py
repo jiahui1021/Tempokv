@@ -64,6 +64,11 @@ class CausalInferencePipeline(torch.nn.Module):
         self.frame_seq_length = int(getattr(args, "frame_seq_length", 1560))
 
         self.kv_cache1 = None
+        # The native BF16 path uses dense post-RoPE tensors sized to the
+        # attention window.  TempoKV and trace collection set this flag before
+        # the first inference so they keep their frame-addressable pre-RoPE
+        # ChunkedKVCache, whose whole-rollout storage is part of the method.
+        self._uses_pre_rope_cache = False
         self.args = args
         self.quant_config = getattr(
             args,
@@ -185,7 +190,13 @@ class CausalInferencePipeline(torch.nn.Module):
             # reset kv cache
             for block_index in range(len(self.kv_cache1)):
                 layer = self.kv_cache1[block_index]
-                if layer["k"].max_num_chunks < num_output_frames:
+                # A dense BF16 cache is sized to the attention window, so it is
+                # legitimately smaller than the rollout; only the whole-rollout
+                # ChunkedKVCache has to cover every frame.
+                if (
+                    self._uses_pre_rope_cache
+                    and layer["k"].max_num_chunks < num_output_frames
+                ):
                     raise ValueError(
                         "existing Self-Forcing cache is smaller than this request"
                     )
@@ -423,11 +434,22 @@ class CausalInferencePipeline(torch.nn.Module):
         resident = 0
         for layer in self.kv_cache1:
             for role in ("k", "v"):
-                resident += efficiency.tensor_bytes(layer[role].chunks)
+                cache = layer[role]
+                # The native BF16 backend is a dense tensor preallocated to the
+                # attention window; the chunked backend allocates lazily and
+                # reports only the chunks it has actually written.
+                resident += efficiency.tensor_bytes(
+                    cache if isinstance(cache, torch.Tensor) else cache.chunks
+                )
         # ``local_end_index`` is identical across layers; one read is enough.
         tokens = int(self.kv_cache1[0]["local_end_index"])
+        first_key = self.kv_cache1[0]["k"]
         equivalent = efficiency.bf16_equivalent_bytes(
-            batch=self.kv_cache1[0]["k"].batch_size,
+            batch=(
+                first_key.shape[0]
+                if isinstance(first_key, torch.Tensor)
+                else first_key.batch_size
+            ),
             tokens=tokens,
             heads=self.num_heads,
             head_dim=self.head_dim,
@@ -453,10 +475,10 @@ class CausalInferencePipeline(torch.nn.Module):
         Initialize a Per-GPU KV cache for the Wan model.
         """
         kv_cache1 = []
-        # Keep absolute frame positions even with local attention. The read
-        # window is local, while storage remains frame-addressable so RoPE and
-        # TempoKV spans never change coordinates.
-        max_num_chunks = int(target_frames or 21)
+        # Read before the backend split: the BF16 baseline has to rotate on the
+        # same arithmetic path as the quantized run it is the reference for, so
+        # the setting applies to both caches, and an invalid value must be
+        # rejected in either mode rather than only in the TempoKV one.
         rope_precision = os.environ.get(
             "SELF_FORCING_CACHE_ROPE_PRECISION", "native"
         )
@@ -464,6 +486,82 @@ class CausalInferencePipeline(torch.nn.Module):
             raise ValueError(
                 "SELF_FORCING_CACHE_ROPE_PRECISION must be native or complex64"
             )
+        if not self._uses_pre_rope_cache:
+            if self.local_attn_size != -1:
+                max_num_chunks = int(self.local_attn_size)
+            else:
+                max_num_chunks = int(target_frames or 21)
+            if max_num_chunks < 1:
+                raise ValueError("Self-Forcing KV cache capacity must be positive")
+            max_tokens = max_num_chunks * self.frame_seq_length
+
+            def attach_compat_methods(tensor: torch.Tensor) -> torch.Tensor:
+                """Keep the old test/runtime write API over a dense tensor.
+
+                The model only uses tensor slicing.  A few lightweight pipeline
+                harnesses write/read the cache directly, so expose the same
+                narrow methods without turning the BF16 cache into a chunked
+                object or changing its storage layout.
+                """
+                tensor.max_num_chunks = max_num_chunks
+                tensor.kv_cache_size = max_tokens
+
+                def write(
+                    start_index: int,
+                    end_index: int,
+                    data: torch.Tensor,
+                    *,
+                    global_start_frame: int | None = None,
+                ) -> None:
+                    del global_start_frame
+                    if end_index - start_index != data.shape[1]:
+                        raise ValueError("dense cache write shape does not match range")
+                    tensor[:, start_index:end_index].copy_(data)
+
+                def read(
+                    start_index: int,
+                    end_index: int,
+                    source_tensor: torch.Tensor | None = None,
+                ) -> torch.Tensor:
+                    del source_tensor
+                    return tensor[:, start_index:end_index]
+
+                def clear() -> None:
+                    tensor.zero_()
+
+                tensor.write = write
+                tensor.read = read
+                tensor.clear = clear
+                return tensor
+
+            for _ in range(self.num_transformer_blocks):
+                key = attach_compat_methods(torch.zeros(
+                    (batch_size, max_tokens, self.num_heads, self.head_dim),
+                    dtype=dtype,
+                    device=device,
+                ))
+                value = attach_compat_methods(torch.zeros_like(key))
+                kv_cache1.append({
+                    "k": key,
+                    "v": value,
+                    "cache_backend": "bf16",
+                    # The dense cache is a plain tensor, so the attention layer
+                    # cannot read this off the cache object the way the chunked
+                    # backend does.
+                    "rope_precision": rope_precision,
+                    # Keep these as Python integers: converting a CUDA scalar
+                    # with `.item()` in every attention call would synchronize
+                    # the GPU and distort the native BF16 benchmark.
+                    "global_end_index": 0,
+                    "local_end_index": 0,
+                })
+            self.kv_cache1 = kv_cache1
+            return
+
+        # Keep absolute frame positions even with local attention. The read
+        # window is local, while storage remains frame-addressable so RoPE and
+        # TempoKV spans never change coordinates.
+        max_num_chunks = int(target_frames or 21)
 
         for _ in range(self.num_transformer_blocks):
             key_cache = ChunkedKVCache(

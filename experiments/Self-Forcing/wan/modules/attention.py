@@ -178,8 +178,14 @@ def attention(
         k = k.transpose(1, 2).to(dtype)
         v = v.transpose(1, 2).to(dtype)
 
+        # Forward softmax_scale rather than letting SDPA infer 1/sqrt(head_dim).
+        # ``None`` is SDPA's own default and reproduces exactly that, so every
+        # existing caller is unaffected; a caller that passes a scale (the
+        # Jensen-corrected path, whose head dimension is padded past the one
+        # the scores are normalized by) would otherwise be silently rescaled.
         out = torch.nn.functional.scaled_dot_product_attention(
-            q, k, v, attn_mask=attn_mask, is_causal=causal, dropout_p=dropout_p)
+            q, k, v, attn_mask=attn_mask, is_causal=causal, dropout_p=dropout_p,
+            scale=softmax_scale)
 
         out = out.transpose(1, 2).contiguous()
         return out

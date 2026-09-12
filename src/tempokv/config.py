@@ -162,6 +162,17 @@ class CodecConfig:
     # the direction rather than to assume it.  The codec math is identical
     # under the swap, so the mirror is a role exchange and not a second codec.
     predictor_direction: str = "k_to_v"
+    # Subtract the Jensen bias (arXiv 2605.26266) from quantized cached
+    # attention scores.  It reads the step sizes the codec already stores and
+    # changes no stored value, so K_hat, V_hat and every reconstruction metric
+    # are identical either way and fitted parameters stay loadable -- which is
+    # why it is deliberately absent from format_signature().  What it changes
+    # is the attention output, and only for integrations that route their
+    # attention through runtime.jensen.  Off by default: on this repository's
+    # traces the bias at the production INT4 residual width is roughly two
+    # orders of magnitude below the INT2 direct-quantization setting the paper
+    # measures, and the end-to-end effect has not been demonstrated here.
+    jensen_correction: bool = False
 
     def __post_init__(self) -> None:
         # Resolve the remaining legacy defaults after the dataclass has kept
@@ -216,6 +227,8 @@ class CodecConfig:
             if isinstance(value, bool) or int(value) != value:
                 raise ValueError(f"{name} must be a whole number, got {value!r}")
             object.__setattr__(self, name, int(value))
+        if not isinstance(self.jensen_correction, bool):
+            raise ValueError("jensen_correction must be a boolean")
         for name in ("k_bits", "v_bits"):
             value = getattr(self, name)
             if not 1 <= value <= 8:
