@@ -42,6 +42,11 @@
 #   JENSEN          从量化 cached attention score 里减掉 Jensen bias，0 或 1
 #                   （默认 0）。只改 attention，不改任何存储值，所以和不开时
 #                   共用同一份拟合参数；输出目录会带 -jensen 后缀以便对比
+#   TEMPOKV_JENSEN_CACHE_MEAN  消融开关（0/1，默认 0），需与 JENSEN=1 同用。
+#                   把每个 cached key 自己的 Δ² 换成 cache 上的均值，于是偏置
+#                   在整个 cached block 上是常数。它精确等价于两段式 LSE 设计
+#                   能达到的效果（softmax 对全局常数不变），用来分离"质量迁移"
+#                   与"cache 内重排"两部分收益。输出目录再加 -cachemean
 #   TORCH_DECODER   用 PyTorch 参考解码器代替 Triton，0 或 1（默认 0）
 #   BENCHMARK       要求本次完整生成且不允许跳过已有视频，0 或 1（默认 0）
 #   PROFILE         记录每段 CUDA-event 耗时分解，0 或 1（默认 0）；结果写入
@@ -155,6 +160,13 @@ model_type="${model_type%/}"
 # directory is deliberately shared, because the two runs load the same fit.
 if [[ "$mode" == "tempokv" && "${JENSEN:-0}" == "1" ]]; then
   result_label="$result_label-jensen"
+  # The cache-mean ablation produces different videos from the exact
+  # correction, so it must not land on the exact run's output: SKIP_EXISTING
+  # would otherwise skip generation and leave the two arms comparing the same
+  # files.
+  if [[ "${TEMPOKV_JENSEN_CACHE_MEAN:-0}" == "1" ]]; then
+    result_label="$result_label-cachemean"
+  fi
 fi
 output_dir="$(resolve_path "${OUTPUT_DIR:-$project_root/results/$model_type/$result_label}")"
 if [[ "$output_dir" == "/" ]]; then
