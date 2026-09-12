@@ -24,7 +24,7 @@ import time
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-EVAL_DIR = Path("/mnt/cpfs/epic-user/hujiahui-20260612/kv-quant-result/evaluation-tools")
+EVAL_DIR = Path("/mnt/cpfs/epic-user/hujiahui-20260612/kv-quant-result/evaluation/scripts")
 sys.path.insert(0, str(EVAL_DIR))
 
 from eval_quality import LpipsMetric, eval_video  # noqa: E402
@@ -64,6 +64,24 @@ def main() -> int:
     fieldnames = [
         "video", "psnr", "ssim", "lpips", "frames", "mse", "identical_frames",
     ]
+
+    # Legacy CSVs may lack the lpips column; appending 7-field rows to a
+    # 6-field header shifts every value.  Migrate such files in place by
+    # re-writing them under the current schema (missing fields become "").
+    if out_path.exists() and out_path.stat().st_size > 0:
+        with out_path.open() as f:
+            header = f.readline().strip().split(",")
+        if header != fieldnames:
+            with out_path.open() as f:
+                legacy_rows = list(csv.DictReader(f))
+            tmp = out_path.with_suffix(out_path.suffix + ".migrating")
+            with tmp.open("w", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                writer.writeheader()
+                for r in legacy_rows:
+                    writer.writerow({k: r.get(k, "") for k in fieldnames})
+            tmp.replace(out_path)
+            print(f"migrated {out_path} from header {header} to {fieldnames}", flush=True)
 
     # Load previously evaluated indices (resume across restarts).
     if out_path.exists():

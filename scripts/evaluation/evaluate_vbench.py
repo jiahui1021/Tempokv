@@ -183,7 +183,7 @@ def _staging_mapping(
     mapping = []
     for index, video in enumerate(videos):
         staged_name = (
-            f"{index}-0{video.suffix.lower()}"
+            f"{index}_0{video.suffix.lower()}"
             if mode == "long_custom_input"
             else video.name
         )
@@ -393,6 +393,13 @@ def _numeric_values(value: Any) -> list[float]:
     return []
 
 
+def _usable_result(path: Path, dimension: str) -> float | None:
+    try:
+        return _validate_result(path, dimension)
+    except Exception:
+        return None
+
+
 def _validate_result(path: Path, dimension: str) -> float:
     if not path.is_file():
         raise RuntimeError(f"VBench-Long did not produce {path.name}")
@@ -480,7 +487,7 @@ def _runtime_full_info(module: Any, config: dict[str, Any]) -> Path:
     return full_info
 
 
-def run(config: dict[str, Any], prompts: dict[str, str]) -> list[str]:
+def run(config: dict[str, Any], prompts: dict[str, str], reuse: bool = False) -> list[str]:
     cache_dir_text = os.environ.get("VBENCH_CACHE_DIR")
     if not cache_dir_text:
         raise RuntimeError("VBENCH_CACHE_DIR must point to the VBench model cache")
@@ -541,14 +548,20 @@ def run(config: dict[str, Any], prompts: dict[str, str]) -> list[str]:
         for dimension in config["dimensions"]
         if dimension not in TEXT_ALIGNMENT_DIMENSIONS
     ):
-        run_name = f"{config['name']}_{dimension}"
-        result_path = output_dir / f"{run_name}_eval_results.json"
+        run_name = config["name"]
+        result_path = output_dir / f"{run_name}_{dimension}_eval_results.json"
+        if reuse:
+            reused_score = _usable_result(result_path, dimension)
+            if reused_score is not None:
+                scores[dimension] = reused_score
+                completed.append(dimension)
+                continue
         result_path.unlink(missing_ok=True)
         evaluator.evaluate(
             videos_path=str(staging_dir),
             name=run_name,
             prompt_list=prompt_list,
-            dimension_list=[dimension],
+            dimension=dimension,
             local=config["local_checkpoints"],
             read_frame=config["read_frame"],
             mode=config["mode"],
@@ -575,69 +588,83 @@ def run(config: dict[str, Any], prompts: dict[str, str]) -> list[str]:
         scores[dimension] = _validate_result(result_path, dimension)
         completed.append(dimension)
     if requested_text:
-        _restage_for_competition(staging_dir, config)
-        vbench_root = Path(module.__file__).resolve().parent.parent
-        competition_module_dir = vbench_root / "competitions"
-        if str(competition_module_dir) not in sys.path:
-            sys.path.insert(0, str(competition_module_dir))
-        try:
-            competition_module = importlib.import_module("competitions")
-            competition_type = getattr(competition_module, "VBenchCompetition")
-        except (ImportError, AttributeError) as error:
-            raise RuntimeError(
-                "the official VBench competitions package is required for text_alignment"
-            ) from error
-        competition_config_dir = Path(competition_module.__file__).resolve().parent / "configs"
-        competition = competition_type(device, None, str(output_dir))
-        text_name = f"{config['name']}_text_alignment"
-        text_result = output_dir / f"{text_name}_eval_results.json"
-        text_result.unlink(missing_ok=True)
-        competition.evaluate_long(
-            videos_path=str(staging_dir),
-            name=text_name,
-            prompt_list=prompt_list,
-            dimension_list=["text_alignment"],
-            local=config["local_checkpoints"],
-            read_frame=config["read_frame"],
-            mode=config["mode"],
-            clip_length_config=preprocessing["clip_length_config"],
-            use_semantic_splitting=preprocessing["use_semantic_splitting"],
-            slow_fast_eval_config=str(
-                competition_config_dir / preprocessing["slow_fast_eval_config"]
-            ),
-            dev_flag=preprocessing["dev_flag"],
-            sb_mapping_file_path=str(
-                competition_config_dir / preprocessing["sb_mapping_file"]
-            ),
-            bg_mapping_file_path=str(
-                competition_config_dir / preprocessing["bg_mapping_file"]
-            ),
-            sb_clip2clip_feat_extractor=preprocessing["sb_clip2clip_feat_extractor"],
-            bg_clip2clip_feat_extractor=preprocessing["bg_clip2clip_feat_extractor"],
-            imaging_quality_preprocessing_mode=preprocessing[
-                "imaging_quality_preprocessing_mode"
-            ],
-            w_inclip=preprocessing["w_inclip"],
-            w_clip2clip=preprocessing["w_clip2clip"],
-            num_of_samples_per_prompt=preprocessing["num_of_samples_per_prompt"],
-            split_rank=preprocessing["split_rank"],
-            split_world_size=preprocessing["split_world_size"],
-        )
-        payload = json.loads(text_result.read_text(encoding="utf-8"))
-        try:
-            subdimensions = payload["text_alignment"][1]
-        except (KeyError, IndexError, TypeError) as error:
-            raise RuntimeError(
-                f"official competition result is malformed: {text_result}"
-            ) from error
-        for dimension in TEXT_ALIGNMENT_DIMENSIONS:
-            dimension_result = output_dir / f"{config['name']}_{dimension}_eval_results.json"
-            dimension_result.write_text(
-                json.dumps({dimension: subdimensions[dimension]}, indent=2) + "\n",
-                encoding="utf-8",
+        reused_text: dict[str, float] = {}
+        if reuse:
+            for dimension in requested_text:
+                path = output_dir / f"{config['name']}_{dimension}_eval_results.json"
+                value = _usable_result(path, dimension)
+                if value is None:
+                    reused_text = {}
+                    break
+                reused_text[dimension] = value
+        if reused_text:
+            for dimension, value in reused_text.items():
+                scores[dimension] = value
+                completed.append(dimension)
+        else:
+            _restage_for_competition(staging_dir, config)
+            vbench_root = Path(module.__file__).resolve().parent.parent
+            competition_module_dir = vbench_root / "competitions"
+            if str(competition_module_dir) not in sys.path:
+                sys.path.insert(0, str(competition_module_dir))
+            try:
+                competition_module = importlib.import_module("competitions")
+                competition_type = getattr(competition_module, "VBenchCompetition")
+            except (ImportError, AttributeError) as error:
+                raise RuntimeError(
+                    "the official VBench competitions package is required for text_alignment"
+                ) from error
+            competition_config_dir = Path(competition_module.__file__).resolve().parent / "configs"
+            competition = competition_type(device, None, str(output_dir))
+            text_name = f"{config['name']}_text_alignment"
+            text_result = output_dir / f"{text_name}_eval_results.json"
+            text_result.unlink(missing_ok=True)
+            competition.evaluate_long(
+                videos_path=str(staging_dir),
+                name=text_name,
+                prompt_list=prompt_list,
+                dimension_list=["text_alignment"],
+                local=config["local_checkpoints"],
+                read_frame=config["read_frame"],
+                mode=config["mode"],
+                clip_length_config=preprocessing["clip_length_config"],
+                use_semantic_splitting=preprocessing["use_semantic_splitting"],
+                slow_fast_eval_config=str(
+                    competition_config_dir / preprocessing["slow_fast_eval_config"]
+                ),
+                dev_flag=preprocessing["dev_flag"],
+                sb_mapping_file_path=str(
+                    competition_config_dir / preprocessing["sb_mapping_file"]
+                ),
+                bg_mapping_file_path=str(
+                    competition_config_dir / preprocessing["bg_mapping_file"]
+                ),
+                sb_clip2clip_feat_extractor=preprocessing["sb_clip2clip_feat_extractor"],
+                bg_clip2clip_feat_extractor=preprocessing["bg_clip2clip_feat_extractor"],
+                imaging_quality_preprocessing_mode=preprocessing[
+                    "imaging_quality_preprocessing_mode"
+                ],
+                w_inclip=preprocessing["w_inclip"],
+                w_clip2clip=preprocessing["w_clip2clip"],
+                num_of_samples_per_prompt=preprocessing["num_of_samples_per_prompt"],
+                split_rank=preprocessing["split_rank"],
+                split_world_size=preprocessing["split_world_size"],
             )
-            scores[dimension] = _validate_result(dimension_result, dimension)
-            completed.append(dimension)
+            payload = json.loads(text_result.read_text(encoding="utf-8"))
+            try:
+                subdimensions = payload["text_alignment"][1]
+            except (KeyError, IndexError, TypeError) as error:
+                raise RuntimeError(
+                    f"official competition result is malformed: {text_result}"
+                ) from error
+            for dimension in TEXT_ALIGNMENT_DIMENSIONS:
+                dimension_result = output_dir / f"{config['name']}_{dimension}_eval_results.json"
+                dimension_result.write_text(
+                    json.dumps({dimension: subdimensions[dimension]}, indent=2) + "\n",
+                    encoding="utf-8",
+                )
+                scores[dimension] = _validate_result(dimension_result, dimension)
+                completed.append(dimension)
     if all(dimension in scores for dimension in CUSTOM_INPUT_DIMENSIONS):
         _write_summary(output_dir, config["name"], scores)
     return completed
@@ -679,7 +706,7 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
         config["status"] = "running"
         _write_config(destination, config)
         try:
-            config["completed_dimensions"] = run(config, prompts)
+            config["completed_dimensions"] = run(config, prompts, reuse=args.reuse_complete)
         except Exception as error:
             config["status"] = "failed"
             config["error"] = {"type": type(error).__name__, "message": str(error)}
