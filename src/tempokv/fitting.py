@@ -11,7 +11,7 @@ from contextlib import contextmanager
 import hashlib
 import math
 from dataclasses import dataclass, replace
-from typing import Iterator, Sequence
+from typing import Callable, Iterator, Sequence
 
 import torch
 
@@ -1890,6 +1890,7 @@ def _reconstruct_direct_trace(
     config: CodecConfig,
     *,
     bits: int | None = None,
+    residual_roundtrip: Callable[[torch.Tensor], torch.Tensor] | None = None,
 ) -> torch.Tensor:
     """Quantize every non-anchor trace unit without a temporal predictor."""
     residual_bits = config.k_bits if bits is None else bits
@@ -1912,12 +1913,19 @@ def _reconstruct_direct_trace(
         else anchor.to(reconstruction_dtype)
     )
     for frame in range(1, frame_count):
-        reconstructed_frame = _quantization_roundtrip(
-            clean_values[..., frame, :, :],
-            bits=residual_bits,
-            config=config,
-            symmetric=config.residual_mode == "symmetric",
+        current = clean_values[..., frame, :, :]
+        reconstructed_frame = (
+            residual_roundtrip(current.float())
+            if residual_roundtrip is not None
+            else _quantization_roundtrip(
+                current,
+                bits=residual_bits,
+                config=config,
+                symmetric=config.residual_mode == "symmetric",
+            )
         )
+        if reconstructed_frame.shape != current.shape:
+            raise ValueError("residual_roundtrip must preserve the residual shape")
         rebuilt[..., frame, :, :] = (
             reconstructed_frame.to(torch.bfloat16).float()
             if legacy_math
@@ -1932,6 +1940,7 @@ def _reconstruct_temporal_trace(
     config: CodecConfig,
     *,
     bits: int | None = None,
+    residual_roundtrip: Callable[[torch.Tensor], torch.Tensor] | None = None,
 ) -> torch.Tensor:
     """Apply the codec's closed-loop anchor/residual rules to a trace.
 
@@ -1944,7 +1953,12 @@ def _reconstruct_temporal_trace(
     head_count = int(clean_keys.shape[-2])
     dim = int(clean_keys.shape[-1])
     if parameters.history_length == 0:
-        return _reconstruct_direct_trace(clean_keys, config, bits=bits)
+        return _reconstruct_direct_trace(
+            clean_keys,
+            config,
+            bits=bits,
+            residual_roundtrip=residual_roundtrip,
+        )
     if parameters.per_head:
         if tuple(parameters.history_weights.shape[-2:]) != (head_count, dim):
             raise ValueError(
@@ -2029,12 +2043,18 @@ def _reconstruct_temporal_trace(
             else prediction.add_(bias)
         )
         residual = clean_keys[..., frame, :, :].float() - prediction
-        residual_rebuilt = _quantization_roundtrip(
-            residual,
-            bits=residual_bits,
-            config=config,
-            symmetric=config.residual_mode == "symmetric",
+        residual_rebuilt = (
+            residual_roundtrip(residual)
+            if residual_roundtrip is not None
+            else _quantization_roundtrip(
+                residual,
+                bits=residual_bits,
+                config=config,
+                symmetric=config.residual_mode == "symmetric",
+            )
         )
+        if residual_rebuilt.shape != residual.shape:
+            raise ValueError("residual_roundtrip must preserve the residual shape")
         reconstructed_frame = prediction + residual_rebuilt
         rebuilt[..., frame, :, :] = (
             reconstructed_frame.to(torch.bfloat16).float()
@@ -2166,6 +2186,8 @@ def _reconstruct_cross_kv_trace(
     clean_values: torch.Tensor,
     parameters: CrossKVParameters,
     config: CodecConfig,
+    *,
+    residual_roundtrip: Callable[[torch.Tensor], torch.Tensor] | None = None,
 ) -> torch.Tensor:
     """Roll out V with the same anchor, history, and residual rules as the codec."""
     _check_pair(
@@ -2193,6 +2215,10 @@ def _reconstruct_cross_kv_trace(
     weight = parameters.weight.to(clean_values.device)
     history_weights = parameters.history_weights.to(clean_values.device)
     if config.fit_mode == "legacy" and clean_values.ndim == 7:
+        if residual_roundtrip is not None:
+            raise ValueError(
+                "custom residual roundtrips are not supported for legacy 7D records"
+            )
         rebuilt = torch.empty_like(clean_values, dtype=torch.float32)
         parameter_bias = parameters.bias.to(clean_values.device)
         for layer in range(layer_count):
@@ -2272,12 +2298,18 @@ def _reconstruct_cross_kv_trace(
                         )
                     )
             residual = clean_values[..., frame, :, :].float() - prediction
-            residual_rebuilt = _quantization_roundtrip(
-                residual,
-                bits=config.v_bits,
-                config=config,
-                symmetric=config.residual_mode == "symmetric",
+            residual_rebuilt = (
+                residual_roundtrip(residual)
+                if residual_roundtrip is not None
+                else _quantization_roundtrip(
+                    residual,
+                    bits=config.v_bits,
+                    config=config,
+                    symmetric=config.residual_mode == "symmetric",
+                )
             )
+            if residual_rebuilt.shape != residual.shape:
+                raise ValueError("residual_roundtrip must preserve the residual shape")
             reconstructed_frame = prediction + residual_rebuilt
             rebuilt[..., frame, :, :] = (
                 reconstructed_frame.to(torch.bfloat16).float()
