@@ -112,18 +112,20 @@ def _read_codec_config(
     if overrides:
         payload = {**payload, **overrides}
     try:
-        from tempokv.config import config_from_mapping
+        from tempokv.config import config_from_mapping, is_temporal_v_predictor
 
         config = config_from_mapping(payload)
-        # One CrossKV layout per family; the other modes belong to the sharing
-        # ablation rather than to a production run.
-        expected_cross = (
-            "layer_shared" if config.fit_mode == "legacy" else "layer_head"
-        )
-        if config.cross_kv_weight_mode != expected_cross:
+        # LongCat CrossKV weights must be layer_head: per-layer V statistics
+        # differ too much for a shared matrix (layer0 V is unfit-able under
+        # layer_shared; see 9.6 hybrid-bits).  Temporal-only V never reads the
+        # CrossKV weights, so its layout is not constrained here.
+        if (
+            not is_temporal_v_predictor(config.v_predictor_mode)
+            and config.cross_kv_weight_mode != "layer_head"
+        ):
             raise ValueError(
-                f"{config.fit_mode} CrossKV parameters must use "
-                f"cross_kv_weight_mode={expected_cross}, got "
+                "LongCat CrossKV parameters must use "
+                f"cross_kv_weight_mode=layer_head, got "
                 f"{config.cross_kv_weight_mode}"
             )
     except (ImportError, TypeError, ValueError) as error:

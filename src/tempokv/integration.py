@@ -105,14 +105,18 @@ def load_codec(
         payload = {**payload, **overrides}
     config = config_from_mapping(payload)
     # Each family has one CrossKV layout: legacy pools the layers, native keeps
-    # per-layer weights.  Checking against the family rather than against one
-    # constant lets both load while still rejecting the sharing-ablation modes,
-    # which exist only for that experiment and not for a production run.
-    expected_cross = "layer_shared" if config.fit_mode == "legacy" else "layer_head"
-    if config.cross_kv_weight_mode != expected_cross:
+    # per-layer weights.  LongCat is the exception inside legacy: layer0 V is
+    # unfit-able under layer_shared (9.6 hybrid-bits), so legacy additionally
+    # accepts layer_head there.  Other sharing-ablation modes stay rejected.
+    allowed_cross = (
+        {"layer_shared", "layer_head"}
+        if config.fit_mode == "legacy"
+        else {"layer_head"}
+    )
+    if config.cross_kv_weight_mode not in allowed_cross:
         raise ValueError(
             f"{config.fit_mode} CrossKV parameters must use "
-            f"cross_kv_weight_mode={expected_cross}, got "
+            f"cross_kv_weight_mode in {sorted(allowed_cross)}, got "
             f"{config.cross_kv_weight_mode}"
         )
     if config.use_triton:
