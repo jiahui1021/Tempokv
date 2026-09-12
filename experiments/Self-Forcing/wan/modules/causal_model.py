@@ -84,6 +84,10 @@ def causal_rope_apply(x, grid_sizes, freqs, start_frame=0):
 # tempokv.runtime.rope for the span-aware form used once eviction can leave a
 # gap between the sink and the recent window.
 from tempokv.runtime.jensen import query_channels as jensen_query_channels  # noqa: E402
+from tempokv.runtime.jensen_flex import (  # noqa: E402
+    corrected_attention as jensen_flex_attention,
+    jensen_backend,
+)
 from tempokv.runtime.rope import (  # noqa: E402
     apply_rope_by_span,
     causal_rope_apply_long_input,
@@ -586,9 +590,10 @@ class CausalWanSelfAttention(nn.Module):
                 if getattr(kv_cache["k"], "tempokv_jensen_correction", False)
                 else 0
             )
+            fused_jensen = bool(jensen_groups) and jensen_backend() == "flex"
             extra_channels = (
                 _jensen_padded_width(head_dim, jensen_groups) - head_dim
-                if jensen_groups
+                if jensen_groups and not fused_jensen
                 else 0
             )
             primary_all = kv_cache[primary_role].read(
@@ -615,7 +620,13 @@ class CausalWanSelfAttention(nn.Module):
                 out=narrow_k,
             )
             if jensen_groups:
-                step_channels = k_all[..., head_dim:head_dim + jensen_groups]
+                # The fused route keeps K/V narrow; only G small channels are
+                # allocated separately. Preserve legacy cast-then-square order.
+                step_channels = (
+                    k_all.new_empty((*k_all.shape[:-1], jensen_groups))
+                    if fused_jensen
+                    else k_all[..., head_dim:head_dim + jensen_groups]
+                )
                 kv_cache["k"].read_step_sizes(
                     0,
                     local_end_index,
@@ -640,7 +651,17 @@ class CausalWanSelfAttention(nn.Module):
                 # actually used.  The newly written tokens are always the tail of
                 # the attention window, so no RoPE is recomputed for the trace.
                 recorder(roped_query, attn_k[:, -num_new_tokens:])
-            if jensen_groups:
+            if fused_jensen:
+                x = jensen_flex_attention(
+                    roped_query,
+                    attn_k,
+                    attn_v,
+                    _take_window(step_channels, window),
+                    group_size=int(
+                        getattr(kv_cache["k"], "tempokv_group_size", 64)
+                    ),
+                )
+            elif jensen_groups:
                 x = _jensen_corrected_attention(
                     roped_query,
                     attn_k,

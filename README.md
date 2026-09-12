@@ -115,13 +115,31 @@ signature，所以开关两边共用同一份拟合参数，不用重新拟合�
 
 代价在计算：修正是一个秩 `G = d/group_size` 的双线性型，折进 Q/K 的额外通道里就能让
 普通 attention kernel 顺带算出来，不需要 FlexAttention 或自定义 kernel；head_dim 从 128
-补到 136（flash-attn 要 8 的倍数，且 FA2 要求 Q/K/V 同宽），QK^T 和 PV 各 **+6.25%**。
+补到 136（flash-attn 要 8 的倍数，且 FA2 要求 Q/K/V 同宽）。增加 6.25% 的通道并不
+代表只增加 6.25% 的耗时：跨过 128 维边界会切换到更大的 kernel 规格，具体取决于
+FlashAttention 版本。
 
 ```bash
 JENSEN=1 PROMPTS=assets/generation_prompts.txt bash scripts/Self-Forcing/run_tempokv.sh
 ```
 
 输出目录自动加 `-jensen` 后缀，所以开关两边的视频不会互相覆盖，可以直接对比。
+
+新增实验路径 `TEMPOKV_JENSEN_BACKEND=flex`：Q/K/V 保持 128 维，在编译后的
+FlexAttention 内计算同一 Jensen 修正。采用连续的分组修正数据和自动调优，保留原路径
+的 BF16 中间舍入顺序，不生成完整 Q×K bias，输出不保证逐位一致。默认仍为 `augmented`；新路径尚未在
+A100 验证编译、正确性和速度，不保证更快。需要支持 FlexAttention 的 Torch（建议
+沿用运行 Wan 的 Torch >=2.5）及匹配的 Triton。缓存增长可能触发额外编译，首轮耗时与
+稳定运行耗时需分别比较。两个 backend 不会自动区分输出目录，比较时指定不同目录：
+
+```bash
+JENSEN=1 TEMPOKV_JENSEN_BACKEND=flex OUTPUT_DIR=results/self_forcing/jensen-flex \
+  PROMPTS=assets/generation_prompts.txt bash scripts/Self-Forcing/run_tempokv.sh
+```
+
+`scripts/tools/benchmark_jensen_fused.py` 比较原始 FA2、136 维修正和新融合路径，先做
+小尺寸数值检查，再分别报告首调用和稳定耗时。默认尺寸来自已有长窗口微测，应使用
+实际运行的 query/key 长度替换；不包含缓存解码和 RoPE，不能替代完整生成对照。
 
 目前只有 Self-Forcing 接入。默认关闭：在本仓库的 trace 上，生产的 INT4 残差位宽下这个
 偏置比论文测量的 INT2 直接量化设定小约两个数量级，端到端收益尚未验证。有希望的是

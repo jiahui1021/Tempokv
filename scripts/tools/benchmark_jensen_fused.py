@@ -1,0 +1,140 @@
+#!/usr/bin/env python3
+"""A100 comparison of actual augmented and opt-in fused Jensen attention.
+
+Run from checkout: PYTHONPATH=src python scripts/tools/benchmark_jensen_fused.py
+Default dimensions match the existing long-window microbenchmark, NOT a claim
+about the caller's run. Set dimensions to the actual slow workload. Cache decode,
+RoPE and scale extraction are excluded from all measurements. Both corrected
+calls include query-term preparation; fused also includes small-plane layout
+conversion. Large augmented K/V are prepared outside timing as in cache decode.
+"""
+
+import argparse
+import importlib.util
+import json
+from pathlib import Path
+import statistics
+import sys
+import time
+
+import torch
+
+ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT / "src"))
+
+from tempokv.runtime.jensen import query_channels  # noqa: E402
+from tempokv.runtime.jensen_flex import corrected_attention, score_terms  # noqa: E402
+
+
+def augmented(q, wide_k, wide_v, group_size):
+    dim = q.shape[-1]
+    groups = dim // group_size
+    wide_q = q.new_zeros((*q.shape[:-1], wide_k.shape[-1]))
+    wide_q[..., :dim] = q
+    wide_q[..., dim:dim + groups] = query_channels(q, group_size).to(q.dtype)
+    return attention(wide_q, wide_k, wide_v, softmax_scale=dim ** -0.5,
+                     fa_version=2)[..., :dim]
+
+
+def widened(k, v, squared_steps):
+    dim, groups = k.shape[-1], squared_steps.shape[-1]
+    width = -(-(dim + groups) // 8) * 8
+    wk = k.new_zeros((*k.shape[:-1], width))
+    wv = v.new_zeros((*v.shape[:-1], width))
+    wk[..., :dim], wv[..., :dim] = k, v
+    wk[..., dim:dim + groups] = squared_steps
+    return wk, wv
+
+
+def check(group_size):
+    q = torch.randn(1, 17, 2, 128, dtype=torch.bfloat16, device="cuda")
+    k = torch.randn(1, 257, 2, 128, dtype=q.dtype, device=q.device)
+    v = torch.randn_like(k)
+    steps = (torch.rand(1, 257, 2, 128 // group_size, device=q.device) * 2).to(q.dtype).pow(2)
+    steps[:, -17:] = 0
+    qt, kt = score_terms(q, steps, group_size)
+    scores = q.float().permute(0, 2, 1, 3) @ k.float().permute(0, 2, 3, 1)
+    scores = (scores + torch.einsum("gbhq,gbhk->bhqk", qt, kt)) * 128 ** -0.5
+    ref = (scores.softmax(-1) @ v.float().permute(0, 2, 1, 3)).permute(0, 2, 1, 3)
+    wk, wv = widened(k, v, steps)
+    legacy = augmented(q, wk, wv, group_size).float()
+    fused = corrected_attention(q, k, v, steps, group_size=group_size).float()
+    for output in (legacy, fused):
+        torch.testing.assert_close(output, ref, rtol=0.02, atol=0.02)
+    return {"legacy_max_abs_error": (legacy - ref).abs().max().item(),
+            "fused_max_abs_error": (fused - ref).abs().max().item()}
+
+
+def measure(fn, repeats, warmup):
+    torch.cuda.synchronize()
+    start = time.perf_counter()
+    fn()
+    torch.cuda.synchronize()
+    first = time.perf_counter() - start
+    for _ in range(warmup):
+        fn()
+    torch.cuda.synchronize()
+    samples = []
+    for _ in range(repeats):
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+        start_event.record()
+        fn()
+        end_event.record()
+        end_event.synchronize()
+        samples.append(start_event.elapsed_time(end_event))
+    return {"shape_first_call_s": first, "median_ms": statistics.median(samples),
+            "min_ms": min(samples), "samples_ms": samples}
+
+
+@torch.no_grad()
+def main():
+    global attention
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--query-tokens", type=int, default=4680)
+    parser.add_argument("--key-tokens", type=int, default=280800)
+    parser.add_argument("--heads", type=int, default=12)
+    parser.add_argument("--batch", type=int, default=1)
+    parser.add_argument("--group-size", type=int, default=64)
+    parser.add_argument("--repeats", type=int, default=10)
+    parser.add_argument("--warmup", type=int, default=3)
+    args = parser.parse_args()
+    if not torch.cuda.is_available():
+        parser.error("requires CUDA, Inductor/Triton and FlashAttention-2")
+    # Import the real wrapper directly, not wan.__init__, which loads unrelated
+    # model/config dependencies before a standalone kernel benchmark can run.
+    spec = importlib.util.spec_from_file_location(
+        "jensen_benchmark_attention", ROOT / "experiments" / "Self-Forcing" / "wan" / "modules" / "attention.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    if not module.FLASH_ATTN_2_AVAILABLE:
+        parser.error("requires FlashAttention-2")
+    attention = module.attention
+    if args.group_size <= 0 or 128 % args.group_size:
+        parser.error("group-size must divide 128")
+    if min(args.query_tokens, args.key_tokens, args.heads, args.batch, args.repeats) <= 0 or args.warmup < 0:
+        parser.error("dimensions/repeats must be positive and warmup nonnegative")
+    import flash_attn
+    torch.manual_seed(51)
+    correctness = check(args.group_size)
+    q = torch.randn(args.batch, args.query_tokens, args.heads, 128, dtype=torch.bfloat16, device="cuda")
+    k = torch.randn(args.batch, args.key_tokens, args.heads, 128, dtype=q.dtype, device=q.device)
+    v = torch.randn_like(k)
+    steps = torch.rand(args.batch, args.key_tokens, args.heads, 128 // args.group_size, device=q.device).to(q.dtype).pow(2)
+    steps[:, -min(args.query_tokens, args.key_tokens):] = 0
+    wk, wv = widened(k, v, steps)
+    calls = {
+        "fa2_plain_128": lambda: attention(q, k, v, softmax_scale=128 ** -0.5, fa_version=2),
+        "fa2_augmented": lambda: augmented(q, wk, wv, args.group_size),
+        "flex_fused_128": lambda: corrected_attention(q, k, v, steps, group_size=args.group_size),
+    }
+    results = {name: measure(fn, args.repeats, args.warmup) for name, fn in calls.items()}
+    print(json.dumps({"gpu": torch.cuda.get_device_name(), "torch": torch.__version__,
+                      "cuda": torch.version.cuda, "flash_attn": flash_attn.__version__,
+                      "settings": vars(args), "correctness": correctness, "results": results,
+                      "note": "First-call time includes any compilation; preflight warms a different shape. No end-to-end speedup claim."}, indent=2))
+
+
+if __name__ == "__main__":
+    main()
