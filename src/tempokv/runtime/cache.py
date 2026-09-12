@@ -288,12 +288,24 @@ class ChunkedKVCache:
         start_index: int,
         end_index: int,
         source_tensor: torch.Tensor | None = None,
+        *,
+        extra_channels: int = 0,
     ) -> torch.Tensor:
+        """Decode a token range.
+
+        ``extra_channels`` widens the head dimension of the returned buffer and
+        zero-fills the tail, decoding into the leading ``head_dim`` channels.
+        A caller that needs the decoded tensor inside a wider one -- the Jensen
+        correction folds its per-key term into extra channels, and
+        FlashAttention-2 wants one head dimension for Q, K and V -- gets that
+        for the cost of the padding instead of a second cache-sized copy.
+        """
         return self._read_layout(
             start_index,
             end_index,
             output_layout=self.layout,
             source_tensor=source_tensor,
+            extra_channels=extra_channels,
         )
 
     def read_bhsd(
@@ -301,12 +313,15 @@ class ChunkedKVCache:
         start_index: int,
         end_index: int,
         source_tensor: torch.Tensor | None = None,
+        *,
+        extra_channels: int = 0,
     ) -> torch.Tensor:
         return self._read_layout(
             start_index,
             end_index,
             output_layout="BHSD",
             source_tensor=source_tensor,
+            extra_channels=extra_channels,
         )
 
     def _source_for_span(
@@ -342,7 +357,10 @@ class ChunkedKVCache:
         *,
         output_layout: str,
         source_tensor: torch.Tensor | None,
+        extra_channels: int = 0,
     ) -> torch.Tensor:
+        if extra_channels < 0:
+            raise ValueError("extra_channels must not be negative")
         start_chunk = self._token_to_chunk(start_index)
         end_chunk = self._token_to_chunk(end_index)
         if start_chunk >= end_chunk:
@@ -351,34 +369,27 @@ class ChunkedKVCache:
             end_chunk - start_chunk == 1
             and self.chunk_state[start_chunk] == ChunkState.BF16
             and self.layout == output_layout
+            and not extra_channels
         ):
             chunk = self.chunks[start_chunk]
             if chunk is None:
                 raise RuntimeError("BF16 cache chunk has no tensor")
             return chunk
         total_tokens = end_index - start_index
-        if output_layout == "BSHD":
-            result = torch.empty(
-                (
-                    self.batch_size,
-                    total_tokens,
-                    self.num_heads,
-                    self.head_dim,
-                ),
-                device=self.device,
-                dtype=self.dtype,
-            )
+        width = self.head_dim + extra_channels
+        shape = (
+            (self.batch_size, total_tokens, self.num_heads, width)
+            if output_layout == "BSHD"
+            else (self.batch_size, self.num_heads, total_tokens, width)
+        )
+        # Only the padding has to be cleared; every leading channel is written
+        # by the decode below.
+        if extra_channels:
+            wide = torch.empty(shape, device=self.device, dtype=self.dtype)
+            wide[..., self.head_dim:].zero_()
+            result = wide[..., : self.head_dim]
         else:
-            result = torch.empty(
-                (
-                    self.batch_size,
-                    self.num_heads,
-                    total_tokens,
-                    self.head_dim,
-                ),
-                device=self.device,
-                dtype=self.dtype,
-            )
+            wide = result = torch.empty(shape, device=self.device, dtype=self.dtype)
         chunk_index = start_chunk
         while chunk_index < end_chunk:
             output_start = (
@@ -446,7 +457,7 @@ class ChunkedKVCache:
                 else:
                     direct_output.copy_(decoded)
             chunk_index = span["end_chunk"]
-        return result
+        return wide
 
     def read_step_sizes(
         self,
@@ -455,6 +466,8 @@ class ChunkedKVCache:
         *,
         group_size: int,
         output_layout: str | None = None,
+        out: torch.Tensor | None = None,
+        squared: bool = False,
     ) -> torch.Tensor:
         """Quantizer step sizes for a read range, aligned with :meth:`read`.
 
@@ -468,6 +481,11 @@ class ChunkedKVCache:
         every chunk of a BF16 baseline run -- report a zero step size, because
         an unquantized key carries no quantization noise and must receive no
         correction.
+
+        ``out`` writes into a caller-owned buffer instead of allocating, and
+        ``squared`` returns the squared step size, which is the form the Jensen
+        correction consumes.  Together they let the attention path fill the
+        padding channels of a widened cache read directly.
         """
         layout = output_layout or self.layout
         if layout not in {"BSHD", "BHSD"}:
@@ -485,7 +503,18 @@ class ChunkedKVCache:
             if layout == "BSHD"
             else (self.batch_size, self.num_heads, total_tokens, groups)
         )
-        result = torch.zeros(shape, device=self.device, dtype=torch.float32)
+        if out is None:
+            result = torch.zeros(shape, device=self.device, dtype=torch.float32)
+        else:
+            # Writing into the caller's buffer -- typically the padding
+            # channels of a widened cache read -- avoids a second tensor the
+            # size of the window on every forward.
+            if tuple(out.shape) != shape:
+                raise ValueError(
+                    f"step-size buffer {tuple(out.shape)} does not match {shape}"
+                )
+            out.zero_()
+            result = out
         chunk_index = start_chunk
         while chunk_index < end_chunk:
             output_start = (chunk_index - start_chunk) * self.frame_seq_length
@@ -509,6 +538,13 @@ class ChunkedKVCache:
                 result[:, output_start:output_end] = steps.permute(0, 2, 1, 3)
             else:
                 result[:, :, output_start:output_end] = steps
+            if squared:
+                target = (
+                    result[:, output_start:output_end]
+                    if layout == "BSHD"
+                    else result[:, :, output_start:output_end]
+                )
+                target.pow_(2)
             chunk_index = span["end_chunk"]
         return result
 

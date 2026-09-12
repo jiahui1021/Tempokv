@@ -85,11 +85,17 @@ def apply_rope_by_span(
     spans: Sequence[CacheSpan] | Iterable[CacheSpan],
     *,
     precision: str = "native",
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Rotate a pre-RoPE cache read, one absolute-position span at a time.
 
     ``x`` is ``[B, S, H, D]`` holding the spans back to back in the order
     given, which is the order :meth:`ChunkedKVCache.spans` returns.
+
+    ``out`` receives the rotated keys instead of a fresh allocation, and may
+    alias ``x``: each block is read in full before its result is written back,
+    so rotating a cache read in place is safe and saves a tensor the size of
+    the whole resident range on every forward.
     """
     if x.ndim != 4:
         raise ValueError("RoPE input must have shape [B,S,H,D]")
@@ -109,7 +115,12 @@ def apply_rope_by_span(
     temporal, height_freqs, width_freqs = freqs.split(
         [channels - 2 * (channels // 3), channels // 3, channels // 3], dim=1
     )
-    result = torch.empty_like(x)
+    if out is None:
+        result = torch.empty_like(x)
+    else:
+        if out.shape != x.shape or out.dtype != x.dtype:
+            raise ValueError("RoPE output buffer must match the input")
+        result = out
     for batch_index, (model_block_frames, height, width) in enumerate(
         grid_sizes.tolist()
     ):
@@ -152,6 +163,7 @@ def causal_rope_apply_long_input(
     start_frame: int = 0,
     *,
     precision: str = "native",
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Rotate one contiguous pre-RoPE cache read starting at ``start_frame``."""
     tokens_per_frame = int(grid_sizes[0][1]) * int(grid_sizes[0][2])
@@ -166,6 +178,7 @@ def causal_rope_apply_long_input(
         freqs,
         [CacheSpan(0, int(start_frame), frames)],
         precision=precision,
+        out=out,
     )
 
 

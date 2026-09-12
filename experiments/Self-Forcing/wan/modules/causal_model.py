@@ -83,7 +83,7 @@ def causal_rope_apply(x, grid_sizes, freqs, start_frame=0):
 # Read-time RoPE for the pre-RoPE cache is shared with Causal Forcing; see
 # tempokv.runtime.rope for the span-aware form used once eviction can leave a
 # gap between the sink and the recent window.
-from tempokv.runtime.jensen import augment as augment_for_jensen  # noqa: E402
+from tempokv.runtime.jensen import query_channels as jensen_query_channels  # noqa: E402
 from tempokv.runtime.rope import (  # noqa: E402
     apply_rope_by_span,
     causal_rope_apply_long_input,
@@ -124,48 +124,35 @@ def _take_window(tensor, ranges):
     return torch.cat([tensor[:, start:end] for start, end in ranges], dim=1)
 
 
-def _attention_window_step_sizes(
-    key_cache, *, local_end_index, frame_seqlen, local_attn_size, sink_size
-):
-    """Quantizer step sizes for the attention window, shaped ``[B, S, H, G]``."""
-    steps = key_cache.read_step_sizes(
-        0, local_end_index, group_size=getattr(key_cache, "tempokv_group_size", 64)
-    )
-    return _take_window(
-        steps,
-        _attention_window_ranges(
-            local_end_index=local_end_index,
-            frame_seqlen=frame_seqlen,
-            local_attn_size=local_attn_size,
-            sink_size=sink_size,
-        ),
-    )
+def _jensen_padded_width(head_dim, groups):
+    """Head dimension once the correction's G channels are appended.
+
+    Rounded up to a multiple of eight because that is what FlashAttention-2
+    accepts, and FA2 wants one head dimension for Q, K and V alike.
+    """
+    return -(-(head_dim + groups) // 8) * 8
 
 
-def _jensen_corrected_attention(query, key, value, *, step_sizes, group_size):
+def _jensen_corrected_attention(query, key, value, *, head_dim, groups, group_size):
     """Attention with the Jensen bias removed from quantized cached scores.
 
     The correction is a rank-G bilinear form, so it folds into G extra Q/K
     channels and the ordinary attention kernel evaluates it -- no score_mod and
-    no fused-kernel change.  The head dimension is padded to a multiple of
-    eight because that is what the FlashAttention path accepts, and the value
-    is padded to match because FlashAttention-2 requires one head dimension for
-    all three inputs.  The padding channels are zero, so the extra output
-    columns are dropped rather than read.
+    no fused-kernel change.  ``key`` and ``value`` already arrive at the padded
+    width, carrying the per-key squared step sizes the cache read wrote into
+    their padding, so nothing cache-sized is copied here; only the query, which
+    is one chunk, is widened.
 
-    The softmax scale stays 1/sqrt(D) of the *original* head dimension: the
-    extra channels carry a correction that is already in score units and must
-    not be renormalized by the widened head.
+    The softmax scale stays 1/sqrt(head_dim) of the *original* head dimension:
+    the extra channels carry a correction already in score units and must not
+    be renormalized by the widened head.
 
     The call pins FlashAttention-2.  FA2 takes any head dimension that is a
     multiple of eight, while FA3 -- which ``attention()`` selects on its own
     whenever it runs on Hopper -- supports only a fixed set of widths that the
-    padded head is not in.  Leaving the choice to ``attention()`` would make
-    this path work on A100 and fail inside the kernel on H100.
+    padded head is not in.
     """
-    dim = query.shape[-1]
-    groups = step_sizes.shape[-1]
-    padded = -(-(dim + groups) // 8) * 8
+    padded = key.shape[-1]
     if not FLASH_ATTN_2_AVAILABLE and FLASH_ATTN_3_AVAILABLE:
         raise RuntimeError(
             f"the Jensen correction pads the head dimension to {padded}, which "
@@ -173,28 +160,18 @@ def _jensen_corrected_attention(query, key, value, *, step_sizes, group_size):
             "installed. Install flash-attn (v2) alongside it, or run without "
             "JENSEN=1."
         )
-    corrected_query, corrected_key, softmax_scale = augment_for_jensen(
-        query.transpose(1, 2),
-        key.transpose(1, 2),
-        step_sizes.transpose(1, 2),
-        group_size=group_size,
-        pad_to=padded,
-    )
-    padded_value = torch.cat(
-        [
-            value,
-            value.new_zeros((*value.shape[:-1], padded - dim)),
-        ],
-        dim=-1,
-    )
+    extra = jensen_query_channels(query, group_size).to(query.dtype)
+    widened_query = query.new_zeros((*query.shape[:-1], padded))
+    widened_query[..., :head_dim] = query
+    widened_query[..., head_dim:head_dim + groups] = extra
     out = attention(
-        corrected_query.transpose(1, 2),
-        corrected_key.transpose(1, 2),
-        padded_value,
-        softmax_scale=softmax_scale,
+        widened_query,
+        key,
+        value,
+        softmax_scale=head_dim ** -0.5,
         fa_version=2,
     )
-    return out[..., :dim]
+    return out[..., :head_dim]
 
 
 class CausalWanSelfAttention(nn.Module):
@@ -571,24 +548,54 @@ class CausalWanSelfAttention(nn.Module):
             primary_role, secondary_role = (
                 ("v", "k") if direction == "v_to_k" else ("k", "v")
             )
-            primary_all = kv_cache[primary_role].read(0, local_end_index)
+            # The Jensen correction rides in extra head channels.  Decoding
+            # straight into the widened buffer, and rotating in place, keeps
+            # the cost at the padding itself: building the augmented K and the
+            # matching V with torch.cat instead copied the whole resident
+            # window twice per layer per forward.
+            head_dim = kv_cache["k"].head_dim
+            jensen_groups = (
+                head_dim // int(getattr(kv_cache["k"], "tempokv_group_size", 64))
+                if getattr(kv_cache["k"], "tempokv_jensen_correction", False)
+                else 0
+            )
+            extra_channels = (
+                _jensen_padded_width(head_dim, jensen_groups) - head_dim
+                if jensen_groups
+                else 0
+            )
+            primary_all = kv_cache[primary_role].read(
+                0, local_end_index, extra_channels=extra_channels
+            )
             secondary_all = kv_cache[secondary_role].read(
                 0,
                 local_end_index,
-                source_tensor=primary_all,
+                source_tensor=primary_all[..., :head_dim],
+                extra_channels=extra_channels,
             )
             k_all, v_all = (
                 (secondary_all, primary_all)
                 if direction == "v_to_k"
                 else (primary_all, secondary_all)
             )
-            absolute_k = causal_rope_apply_long_input(
-                k_all,
+            narrow_k = k_all[..., :head_dim]
+            causal_rope_apply_long_input(
+                narrow_k,
                 grid_sizes,
                 freqs,
                 start_frame=0,
                 precision=getattr(kv_cache["k"], "rope_precision", "native"),
-            ).type_as(v)
+                out=narrow_k,
+            )
+            if jensen_groups:
+                kv_cache["k"].read_step_sizes(
+                    0,
+                    local_end_index,
+                    group_size=int(getattr(kv_cache["k"], "tempokv_group_size", 64)),
+                    out=k_all[..., head_dim:head_dim + jensen_groups],
+                    squared=True,
+                )
+            absolute_k = k_all
             window = _attention_window_ranges(
                 local_end_index=local_end_index,
                 frame_seqlen=frame_seqlen,
@@ -603,18 +610,13 @@ class CausalWanSelfAttention(nn.Module):
                 # actually used.  The newly written tokens are always the tail of
                 # the attention window, so no RoPE is recomputed for the trace.
                 recorder(roped_query, attn_k[:, -num_new_tokens:])
-            if getattr(kv_cache["k"], "tempokv_jensen_correction", False):
+            if jensen_groups:
                 x = _jensen_corrected_attention(
                     roped_query,
                     attn_k,
                     attn_v,
-                    step_sizes=_attention_window_step_sizes(
-                        kv_cache["k"],
-                        local_end_index=local_end_index,
-                        frame_seqlen=frame_seqlen,
-                        local_attn_size=self.local_attn_size,
-                        sink_size=self.sink_size,
-                    ),
+                    head_dim=head_dim,
+                    groups=jensen_groups,
                     group_size=int(
                         getattr(kv_cache["k"], "tempokv_group_size", 64)
                     ),
