@@ -141,6 +141,26 @@ JENSEN=1 TEMPOKV_JENSEN_BACKEND=flex OUTPUT_DIR=results/self_forcing/jensen-flex
 小尺寸数值检查，再分别报告首调用和稳定耗时。默认尺寸来自已有长窗口微测，应使用
 实际运行的 query/key 长度替换；不包含缓存解码和 RoPE，不能替代完整生成对照。
 
+自定义 kernel 路径 `TEMPOKV_JENSEN_BACKEND=triton` 将 query 分组范数、Jensen 修正和
+attention 合并到一次 GPU 调用，直接读取已有的 squared steps；不扩宽 Q/K/V，也无需
+Flex 路径的修正数据整理。仅支持 NVIDIA Ampere 及更新 GPU 的推理，输入为 BF16/FP16，
+head_dim 为 64/128，group_size 为 32/64/128 且整除 head_dim。不支持反向传播。
+采用固定 tile，避免逐个缓存长度调优；尚未在 A100 编译或测速，默认路径仍为 `augmented`。
+
+```bash
+JENSEN=1 TEMPOKV_JENSEN_BACKEND=triton OUTPUT_DIR=results/self_forcing/jensen-triton \
+  PROMPTS=assets/generation_prompts.txt bash scripts/Self-Forcing/run_tempokv.sh
+
+# 在 A100 环境运行；下列尺寸为现有长窗口微测默认值，请按真实运行替换。
+PYTHONPATH=src python scripts/tools/benchmark_jensen_fused.py --backends triton \
+  --query-tokens 4680 --key-tokens 280800 --heads 12 --group-size 64
+
+python -m pytest -q scripts/tests/test_jensen_triton.py
+```
+
+测速输出含版本、正确性误差、首调用时间、稳定耗时及相对 augmented 的速度比；
+`--backends flex triton` 可同时比较两种融合实现。首调用可能包含编译，不能作为稳定延迟。
+
 目前只有 Self-Forcing 接入。默认关闭：在本仓库的 trace 上，生产的 INT4 残差位宽下这个
 偏置比论文测量的 INT2 直接量化设定小约两个数量级，端到端收益尚未验证。有希望的是
 `K_BITS=2`，以及 anchor 帧——anchor 走直接量化，`Δ` 明显更大，实测偏置是残差帧的 12 倍。

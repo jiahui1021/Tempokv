@@ -48,6 +48,8 @@ def test_backend_default_and_invalid(monkeypatch):
     assert jensen_backend() == "augmented"
     monkeypatch.setenv("TEMPOKV_JENSEN_BACKEND", "flex")
     assert jensen_backend() == "flex"
+    monkeypatch.setenv("TEMPOKV_JENSEN_BACKEND", "triton")
+    assert jensen_backend() == "triton"
     monkeypatch.setenv("TEMPOKV_JENSEN_BACKEND", "invalid")
     with pytest.raises(ValueError, match="BACKEND"):
         jensen_backend()
@@ -80,7 +82,7 @@ def test_input_guards_do_not_silently_use_dense_cpu_attention():
 
 
 @pytest.mark.parametrize("direction", ["k_to_v", "v_to_k"])
-@pytest.mark.parametrize("backend", ["augmented", "flex"])
+@pytest.mark.parametrize("backend", ["augmented", "flex", "triton"])
 def test_production_reads_and_sink_window_alignment(monkeypatch, direction, backend):
     """Execute actual cache-read/attention source without importing model weights."""
     monkeypatch.setenv("TEMPOKV_JENSEN_BACKEND", backend)
@@ -123,11 +125,19 @@ def test_production_reads_and_sink_window_alignment(monkeypatch, direction, back
     cache = {"k": Cache("k"), "v": Cache("v")}
 
     def fused(q, k, v, steps, *, group_size):
-        assert backend == "flex"
+        assert backend in {"flex", "triton"}
         assert k.shape == v.shape == (1, 3, 2, 128)
         torch.testing.assert_close(steps, raw_steps[:, [0, 4, 5]].pow(2))
         torch.testing.assert_close(k, cache["k"].tensor[:, [0, 4, 5]])
         return q
+
+    def flex(*args, **kwargs):
+        assert backend == "flex"
+        return fused(*args, **kwargs)
+
+    def triton(*args, **kwargs):
+        assert backend == "triton"
+        return fused(*args, **kwargs)
 
     def augmented(q, k, v, **kwargs):
         assert backend == "augmented"
@@ -141,13 +151,14 @@ def test_production_reads_and_sink_window_alignment(monkeypatch, direction, back
         grid_sizes=None, freqs=None,
         roped_query=torch.randn(1, 2, 2, 128, dtype=torch.bfloat16),
         causal_rope_apply_long_input=lambda *args, **kwargs: None,
-        jensen_flex_attention=fused, _jensen_corrected_attention=augmented,
+        jensen_flex_attention=flex, jensen_triton_attention=triton,
+        _jensen_corrected_attention=augmented,
     )
     start = source.index('            direction = getattr(\n')
     end = source.index('            _set_cache_index(kv_cache, "global_end_index", current_end)', start)
     exec(compile(textwrap.dedent(source[start:end]), str(path), "exec"), namespace)
-    assert calls == [("k" if direction == "k_to_v" else "v", 0 if backend == "flex" else 8),
-                     ("v" if direction == "k_to_v" else "k", 0 if backend == "flex" else 8)]
+    assert calls == [("k" if direction == "k_to_v" else "v", 8 if backend == "augmented" else 0),
+                     ("v" if direction == "k_to_v" else "k", 8 if backend == "augmented" else 0)]
     assert namespace["x"].shape[-1] == 128
 
 

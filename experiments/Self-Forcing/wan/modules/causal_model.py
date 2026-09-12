@@ -88,6 +88,9 @@ from tempokv.runtime.jensen_flex import (  # noqa: E402
     corrected_attention as jensen_flex_attention,
     jensen_backend,
 )
+from tempokv.runtime.jensen_triton import (  # noqa: E402
+    corrected_attention as jensen_triton_attention,
+)
 from tempokv.runtime.rope import (  # noqa: E402
     apply_rope_by_span,
     causal_rope_apply_long_input,
@@ -590,7 +593,8 @@ class CausalWanSelfAttention(nn.Module):
                 if getattr(kv_cache["k"], "tempokv_jensen_correction", False)
                 else 0
             )
-            fused_jensen = bool(jensen_groups) and jensen_backend() == "flex"
+            selected_jensen_backend = jensen_backend() if jensen_groups else "augmented"
+            fused_jensen = selected_jensen_backend in {"flex", "triton"}
             extra_channels = (
                 _jensen_padded_width(head_dim, jensen_groups) - head_dim
                 if jensen_groups and not fused_jensen
@@ -652,7 +656,12 @@ class CausalWanSelfAttention(nn.Module):
                 # the attention window, so no RoPE is recomputed for the trace.
                 recorder(roped_query, attn_k[:, -num_new_tokens:])
             if fused_jensen:
-                x = jensen_flex_attention(
+                fused_attention = (
+                    jensen_triton_attention
+                    if selected_jensen_backend == "triton"
+                    else jensen_flex_attention
+                )
+                x = fused_attention(
                     roped_query,
                     attn_k,
                     attn_v,

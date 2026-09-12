@@ -4,9 +4,10 @@
 Run from checkout: PYTHONPATH=src python scripts/tools/benchmark_jensen_fused.py
 Default dimensions match the existing long-window microbenchmark, NOT a claim
 about the caller's run. Set dimensions to the actual slow workload. Cache decode,
-RoPE and scale extraction are excluded from all measurements. Both corrected
-calls include query-term preparation; fused also includes small-plane layout
-conversion. Large augmented K/V are prepared outside timing as in cache decode.
+RoPE and scale extraction are excluded from all measurements. Augmented/Flex
+calls include query-term preparation; Flex also includes small-plane layout
+conversion. Triton computes norms inside attention and reads steps directly.
+Large augmented K/V are prepared outside timing as in cache decode.
 """
 
 import argparse
@@ -23,7 +24,10 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "src"))
 
 from tempokv.runtime.jensen import query_channels  # noqa: E402
-from tempokv.runtime.jensen_flex import corrected_attention, score_terms  # noqa: E402
+from tempokv.runtime.jensen_flex import corrected_attention as flex_attention, score_terms  # noqa: E402
+from tempokv.runtime.jensen_triton import corrected_attention as triton_attention  # noqa: E402
+
+BACKENDS = {"flex": flex_attention, "triton": triton_attention}
 
 
 def augmented(q, wide_k, wide_v, group_size):
@@ -46,7 +50,7 @@ def widened(k, v, squared_steps):
     return wk, wv
 
 
-def check(group_size):
+def check(group_size, backends):
     q = torch.randn(1, 17, 2, 128, dtype=torch.bfloat16, device="cuda")
     k = torch.randn(1, 257, 2, 128, dtype=q.dtype, device=q.device)
     v = torch.randn_like(k)
@@ -58,11 +62,13 @@ def check(group_size):
     ref = (scores.softmax(-1) @ v.float().permute(0, 2, 1, 3)).permute(0, 2, 1, 3)
     wk, wv = widened(k, v, steps)
     legacy = augmented(q, wk, wv, group_size).float()
-    fused = corrected_attention(q, k, v, steps, group_size=group_size).float()
-    for output in (legacy, fused):
-        torch.testing.assert_close(output, ref, rtol=0.02, atol=0.02)
-    return {"legacy_max_abs_error": (legacy - ref).abs().max().item(),
-            "fused_max_abs_error": (fused - ref).abs().max().item()}
+    torch.testing.assert_close(legacy, ref, rtol=0.02, atol=0.02)
+    errors = {"legacy_max_abs_error": (legacy - ref).abs().max().item()}
+    for backend in backends:
+        fused = BACKENDS[backend](q, k, v, steps, group_size=group_size).float()
+        torch.testing.assert_close(fused, ref, rtol=0.02, atol=0.02)
+        errors[f"{backend}_max_abs_error"] = (fused - ref).abs().max().item()
+    return errors
 
 
 def measure(fn, repeats, warmup):
@@ -98,6 +104,7 @@ def main():
     parser.add_argument("--group-size", type=int, default=64)
     parser.add_argument("--repeats", type=int, default=10)
     parser.add_argument("--warmup", type=int, default=3)
+    parser.add_argument("--backends", nargs="+", choices=tuple(BACKENDS), default=["flex", "triton"])
     args = parser.parse_args()
     if not torch.cuda.is_available():
         parser.error("requires CUDA, Inductor/Triton and FlashAttention-2")
@@ -117,7 +124,9 @@ def main():
         parser.error("dimensions/repeats must be positive and warmup nonnegative")
     import flash_attn
     torch.manual_seed(51)
-    correctness = check(args.group_size)
+    if "triton" in args.backends and args.group_size not in (32, 64, 128):
+        parser.error("Triton group-size must be 32, 64 or 128")
+    correctness = check(args.group_size, args.backends)
     q = torch.randn(args.batch, args.query_tokens, args.heads, 128, dtype=torch.bfloat16, device="cuda")
     k = torch.randn(args.batch, args.key_tokens, args.heads, 128, dtype=q.dtype, device=q.device)
     v = torch.randn_like(k)
@@ -127,11 +136,18 @@ def main():
     calls = {
         "fa2_plain_128": lambda: attention(q, k, v, softmax_scale=128 ** -0.5, fa_version=2),
         "fa2_augmented": lambda: augmented(q, wk, wv, args.group_size),
-        "flex_fused_128": lambda: corrected_attention(q, k, v, steps, group_size=args.group_size),
     }
+    for backend in dict.fromkeys(args.backends):
+        calls[f"{backend}_fused_128"] = lambda backend=backend: BACKENDS[backend](
+            q, k, v, steps, group_size=args.group_size)
     results = {name: measure(fn, args.repeats, args.warmup) for name, fn in calls.items()}
+    legacy_ms = results["fa2_augmented"]["median_ms"]
+    for result in results.values():
+        result["speedup_vs_augmented"] = legacy_ms / result["median_ms"]
+    import triton
     print(json.dumps({"gpu": torch.cuda.get_device_name(), "torch": torch.__version__,
                       "cuda": torch.version.cuda, "flash_attn": flash_attn.__version__,
+                      "triton": triton.__version__,
                       "settings": vars(args), "correctness": correctness, "results": results,
                       "note": "First-call time includes any compilation; preflight warms a different shape. No end-to-end speedup claim."}, indent=2))
 

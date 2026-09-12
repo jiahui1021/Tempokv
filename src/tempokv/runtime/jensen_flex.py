@@ -18,8 +18,8 @@ from .jensen import query_channels
 
 def jensen_backend() -> str:
     backend = os.environ.get("TEMPOKV_JENSEN_BACKEND", "augmented").strip().lower()
-    if backend not in {"augmented", "flex"}:
-        raise ValueError("TEMPOKV_JENSEN_BACKEND must be 'augmented' or 'flex'")
+    if backend not in {"augmented", "flex", "triton"}:
+        raise ValueError("TEMPOKV_JENSEN_BACKEND must be 'augmented', 'flex' or 'triton'")
     return backend
 
 
