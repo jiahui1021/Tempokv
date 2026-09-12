@@ -170,6 +170,12 @@ def install(runtime_root: str | Path) -> type:
                 # slot needs to carry it.
                 layer["k"].tempokv_jensen_correction = jensen
                 layer["k"].tempokv_group_size = group_size
+                # Ablation switch, read from the environment rather than the
+                # codec config: it changes no stored value and exists to tell
+                # the exact correction apart from the cheap approximation.
+                layer["k"].tempokv_jensen_cache_mean = (
+                    os.environ.get("TEMPOKV_JENSEN_CACHE_MEAN") == "1"
+                )
                 for role in ("k", "v"):
                     layer[role].tempokv_predictor_direction = direction
 

@@ -124,6 +124,33 @@ def _take_window(tensor, ranges):
     return torch.cat([tensor[:, start:end] for start, end in ranges], dim=1)
 
 
+def _replace_with_cached_mean(step_channels):
+    """Flatten the per-key squared step sizes to their mean over the cache.
+
+    This is the ablation that decides which fast design to build.  The exact
+    correction subtracts a per-key bias, which needs per-score work in the
+    attention kernel; replacing the key term by its cache mean leaves a bias
+    that is constant across the cached block, and a bias like that can be
+    applied as a per-query offset when merging two plain attention calls by
+    their log-sum-exp -- no widened head and no score_mod.
+
+    That cheaper form keeps the cached-versus-current attention-mass shift the
+    paper describes and drops the within-cache reordering that TempoKV's
+    content-dependent step sizes add.  Running the quality comparison with this
+    switch on says how much of the measured gain came from which.
+
+    Tokens still held as BF16 report a zero step and must keep it: they carry
+    no quantization noise, so averaging them into the cache mean -- or giving
+    them a share of it -- would invent a correction for unquantized keys.
+    """
+    quantized = (step_channels != 0).any(dim=-1, keepdim=True)
+    count = quantized.sum(dim=1, keepdim=True).clamp_min(1)
+    mean = step_channels.sum(dim=1, keepdim=True) / count
+    step_channels.copy_(
+        torch.where(quantized, mean.expand_as(step_channels), step_channels)
+    )
+
+
 def _jensen_padded_width(head_dim, groups):
     """Head dimension once the correction's G channels are appended.
 
@@ -588,13 +615,16 @@ class CausalWanSelfAttention(nn.Module):
                 out=narrow_k,
             )
             if jensen_groups:
+                step_channels = k_all[..., head_dim:head_dim + jensen_groups]
                 kv_cache["k"].read_step_sizes(
                     0,
                     local_end_index,
                     group_size=int(getattr(kv_cache["k"], "tempokv_group_size", 64)),
-                    out=k_all[..., head_dim:head_dim + jensen_groups],
+                    out=step_channels,
                     squared=True,
                 )
+                if getattr(kv_cache["k"], "tempokv_jensen_cache_mean", False):
+                    _replace_with_cached_mean(step_channels)
             absolute_k = k_all
             window = _attention_window_ranges(
                 local_end_index=local_end_index,
