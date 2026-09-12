@@ -527,6 +527,16 @@ class ChunkedKVCache:
             if span["start_chunk"] < start_chunk or span["end_chunk"] > end_chunk:
                 raise ValueError("packed TempoKV spans must be read in full")
             packed = span["quant_data"]
+            # Self-Forcing's bridge wraps the PackedTensor in a dict; unwrap to
+            # the object that owns step_sizes(), the same way the decode path does.
+            if not hasattr(packed, "step_sizes"):
+                packed = (
+                    next((v for v in packed.values() if hasattr(v, "step_sizes")), None)
+                    if isinstance(packed, dict)
+                    else None
+                )
+                if packed is None:
+                    raise RuntimeError("packed cache span has no quantizer step sizes")
             steps = packed.step_sizes()            # [B, H, S, G]
             if steps.shape[-1] != groups:
                 raise ValueError(
