@@ -114,7 +114,7 @@ def widened(k, v, squared_steps):
     return wk, wv
 
 
-def check(group_size, backends, tune_triton=False, compare_correction=False):
+def check(group_size, backends, tune_triton=False, compare_correction=False, tune_configs=None):
     q = torch.randn(1, 17, 2, 128, dtype=torch.bfloat16, device="cuda")
     k = torch.randn(1, 257, 2, 128, dtype=q.dtype, device=q.device)
     v = torch.randn_like(k)
@@ -139,7 +139,7 @@ def check(group_size, backends, tune_triton=False, compare_correction=False):
         torch.testing.assert_close(plain, plain_ref, rtol=0.02, atol=0.02)
         errors[f"{backend}_plain_max_abs_error"] = (plain - plain_ref).abs().max().item()
     if tune_triton:
-        for config in triton_config_names():
+        for config in (tune_configs or triton_config_names()):
             for correction in (False, True):
                 out = raw_triton(q, k, v, steps, group_size, config=config, correction=correction).float()
                 expected = ref if correction else plain_ref
@@ -194,6 +194,8 @@ def main():
     parser.add_argument("--backends", nargs="+", choices=tuple(BACKENDS), default=["flex", "triton"])
     parser.add_argument("--tune-triton", action="store_true",
                         help="compare legacy and every current fixed tile, with correction compiled out/in")
+    parser.add_argument("--tune-configs", nargs="+",
+                        help="restrict --tune-triton to these fixed configs; compare by corrected time")
     parser.add_argument("--compare-correction", action="store_true",
                         help="same fixed tile: plain vs scalar correction vs Tensor Core correction")
     parser.add_argument("--triton-config", help="fixed tile; compare-correction defaults to user-measured 128x64w8s4")
@@ -202,6 +204,14 @@ def main():
         parser.error("requires CUDA, Inductor/Triton and FlashAttention-2")
     if args.tune_triton and "triton" not in args.backends:
         parser.error("--tune-triton requires --backends triton")
+    if args.tune_configs and not args.tune_triton:
+        parser.error("--tune-configs requires --tune-triton")
+    tune_configs = ()
+    if args.tune_triton:
+        available = triton_config_names()
+        tune_configs = tuple(dict.fromkeys(args.tune_configs or available))
+        if any(config not in available for config in tune_configs):
+            parser.error("unknown --tune-configs value")
     if args.compare_correction and "triton" not in args.backends:
         parser.error("--compare-correction requires --backends triton")
     if args.compare_correction and args.triton_config is None:
@@ -231,7 +241,7 @@ def main():
     if "triton" in args.backends and args.group_size not in (32, 64, 128):
         parser.error("Triton group-size must be 32, 64 or 128")
     print("Checking numerical correctness (first call can compile/tune)...", file=sys.stderr, flush=True)
-    correctness = check(args.group_size, args.backends, args.tune_triton, args.compare_correction)
+    correctness = check(args.group_size, args.backends, args.tune_triton, args.compare_correction, tune_configs)
     q = torch.randn(args.batch, args.query_tokens, args.heads, 128, dtype=torch.bfloat16, device="cuda")
     k = torch.randn(args.batch, args.key_tokens, args.heads, 128, dtype=q.dtype, device=q.device)
     v = torch.randn_like(k)
@@ -256,7 +266,7 @@ def main():
             calls[f"triton_{mode}_fused_128"] = lambda mode=mode: raw_triton(
                 q, k, v, steps, args.group_size, correction_mode=mode)
     if args.tune_triton:
-        for config in triton_config_names():
+        for config in tune_configs:
             for correction in (False, True):
                 name = f"triton_{config}_{'fused' if correction else 'plain'}"
                 calls[name] = lambda config=config, correction=correction: raw_triton(
@@ -288,11 +298,15 @@ def main():
                 correction_mode="scalar" if mode == "none" else mode, return_metadata=True)
     recommended = None
     if args.tune_triton:
-        for config in triton_config_names():
+        for config in tune_configs:
             comparisons[f"triton_{config}"] = comparison(
                 results[f"triton_{config}_plain"]["median_ms"],
                 results[f"triton_{config}_fused"]["median_ms"], fa2_ms)
-        best = min(triton_config_names(), key=lambda c: results[f"triton_{c}_fused"]["median_ms"])
+            for correction in (False, True):
+                _, resources[f"triton_{config}_{'fused' if correction else 'plain'}"] = raw_triton(
+                    q, k, v, steps, args.group_size, config=config,
+                    correction=correction, return_metadata=True)
+        best = min(tune_configs, key=lambda c: results[f"triton_{c}_fused"]["median_ms"])
         recommended = {"TEMPOKV_JENSEN_TRITON_CONFIG": best,
                        "scope": "Only this measured shape, dtype, GPU and stride layout; no automatic production change."}
     import triton
