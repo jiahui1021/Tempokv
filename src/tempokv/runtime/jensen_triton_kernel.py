@@ -138,7 +138,7 @@ _tuned_forward = triton.autotune(
 
 def attention_forward(query, key, value, step_squared, group_size, *,
                       config=None, apply_correction=True, correction_mode=None,
-                      return_metadata=False):
+                      return_metadata=False, implementation=None):
     """Production always corrects; plain controls are private benchmark-only.
 
     ``auto`` tunes candidates per power-of-two sequence bucket. A fixed tile
@@ -149,6 +149,9 @@ def attention_forward(query, key, value, step_squared, group_size, *,
     """
     config = config or os.environ.get("TEMPOKV_JENSEN_TRITON_CONFIG", "auto")
     correction_mode = correction_mode or os.environ.get("TEMPOKV_JENSEN_TRITON_CORRECTION", "scalar")
+    implementation = implementation or os.environ.get("TEMPOKV_JENSEN_TRITON_IMPL", "baseline")
+    if implementation not in {"baseline", "pipeline"}:
+        raise ValueError("TEMPOKV_JENSEN_TRITON_IMPL must be baseline or pipeline")
     if correction_mode not in {"scalar", "mma"}:
         raise ValueError("TEMPOKV_JENSEN_TRITON_CORRECTION must be scalar or mma")
     if config not in {"auto", "legacy", *_TILES}:
@@ -156,6 +159,14 @@ def attention_forward(query, key, value, step_squared, group_size, *,
             "TEMPOKV_JENSEN_TRITON_CONFIG must be auto, legacy or one of: "
             + ", ".join(_TILES)
         )
+    if implementation == "pipeline":
+        if apply_correction and correction_mode != "mma":
+            raise ValueError("pipeline implementation requires TEMPOKV_JENSEN_TRITON_CORRECTION=mma")
+        from .jensen_triton_pipeline import attention_forward as pipeline_forward
+
+        return pipeline_forward(
+            query, key, value, step_squared, group_size, config=config,
+            apply_correction=apply_correction, return_metadata=return_metadata)
     batch, nq, heads, dim = query.shape
     output = torch.empty(query.shape, dtype=query.dtype, device=query.device)
     launch = _tuned_forward if config == "auto" else _attention_forward
@@ -173,16 +184,23 @@ def attention_forward(query, key, value, step_squared, group_size, *,
         enable_fp_fusion=config != "legacy", **options,
     )
     if return_metadata:
-        meta = getattr(compiled, "metadata", None)
-        ptx = getattr(compiled, "asm", {}).get("ptx", "")
-        return output, {
-            "config": str(getattr(launch, "best_config", config)),
-            "correction_mode": correction_mode if apply_correction else "none",
-            "n_regs": getattr(compiled, "n_regs", None),
-            "n_spills": getattr(compiled, "n_spills", None),
-            "shared_mem_bytes": getattr(meta, "shared", None),
-            "ptx_mma_instructions": ptx.count("mma.sync") if ptx else None,
-            "ptx_local_load_instructions": ptx.count("ld.local") if ptx else None,
-            "ptx_local_store_instructions": ptx.count("st.local") if ptx else None,
-        }
+        return output, _kernel_metadata(
+            compiled, str(getattr(launch, "best_config", config)),
+            correction_mode if apply_correction else "none", "baseline")
     return output
+
+
+def _kernel_metadata(compiled, config, correction_mode, implementation):
+    meta = getattr(compiled, "metadata", None)
+    ptx = getattr(compiled, "asm", {}).get("ptx", "")
+    return {
+        "config": config,
+        "implementation": implementation,
+        "correction_mode": correction_mode,
+        "n_regs": getattr(compiled, "n_regs", None),
+        "n_spills": getattr(compiled, "n_spills", None),
+        "shared_mem_bytes": getattr(meta, "shared", None),
+        "ptx_mma_instructions": ptx.count("mma.sync") if ptx else None,
+        "ptx_local_load_instructions": ptx.count("ld.local") if ptx else None,
+        "ptx_local_store_instructions": ptx.count("st.local") if ptx else None,
+    }

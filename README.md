@@ -145,15 +145,19 @@ JENSEN=1 TEMPOKV_JENSEN_BACKEND=flex OUTPUT_DIR=results/self_forcing/jensen-flex
 attention 合并到一次 GPU 调用，直接读取已有的 squared steps；不扩宽 Q/K/V，也无需
 Flex 路径的修正数据整理。仅支持 NVIDIA Ampere 及更新 GPU 的推理，输入为 BF16/FP16，
 head_dim 为 64/128，group_size 为 32/64/128 且整除 head_dim。不支持反向传播。
-Triton 默认在三个 tile 配置中自动测速选择，按序列长度的 2 的幂次范围复用选择，
+Triton 默认在候选 tile 配置中自动测速选择，按序列长度的 2 的幂次范围复用选择，
 首次进入新范围会增加编译和调优时间。可设 `TEMPOKV_JENSEN_TRITON_CONFIG` 为
 `64x64`、`128x64` 或 `128x32` 固定配置；`legacy` 保留上一版 64×64 和关闭 FP fusion
 的设置以便对照。新配置允许编译器合并浮点运算，仍保留 half coefficient 的舍入边界；
-需要 GPU 数值测试确认误差。尚未在 A100 测速，默认 backend 仍为 `augmented`。
+默认 backend 仍为 `augmented`。`triton` 的默认修正方式是 `scalar`，用于保留原有对照；
+选择 MMA 时同时设置修正方式和固定配置，避免重新自动调优。
 **单独设置 `JENSEN=1` 不会启用 Triton**；生成日志会打印所选 backend。
 
 ```bash
-JENSEN=1 TEMPOKV_JENSEN_BACKEND=triton OUTPUT_DIR=results/self_forcing/jensen-triton \
+JENSEN=1 TEMPOKV_JENSEN_BACKEND=triton \
+  TEMPOKV_JENSEN_TRITON_CORRECTION=mma \
+  TEMPOKV_JENSEN_TRITON_CONFIG=128x64w8s4 \
+  OUTPUT_DIR=results/self_forcing/jensen-triton-mma \
   PROMPTS=assets/generation_prompts.txt bash scripts/Self-Forcing/run_tempokv.sh
 
 # 在 A100 环境运行；下列尺寸为现有长窗口微测默认值，请按真实运行替换。
@@ -165,25 +169,24 @@ python -m pytest -q scripts/tests/test_jensen_triton.py
 
 测速输出含版本、正确性误差、首调用时间、稳定耗时及相对 augmented 的速度比；
 `--backends flex triton` 可同时比较两种融合实现。首调用可能包含编译，不能作为稳定延迟。
-新增不带修正的同 backend 对照；`--tune-triton` 比较旧配置和三个新配置，分别报告
+新增不带修正的同 backend 对照；`--tune-triton` 比较旧配置和当前候选配置，分别报告
 backend 替换代价、Jensen 修正代价以及相对原始 FA2 的总开销，并给出该尺寸最快的固定
 Triton 配置。该推荐仅适用于测量的尺寸，不代表比 FA2 或 augmented 更快。
 `PROFILE=1` 现已覆盖 Flex/Triton 实际调用及 `jensen_steps` 数据准备；原报告漏计了这两项。
 
-用户提供的 A100 长窗口测量（Q=4680、K=280800、H=12、D=128、g=64）中，
-FA2 plain 为 49.1 ms，augmented 为 82.3 ms，原 Triton fused 最优仍为 106.5 ms。
-因此原 Triton fused 尚不构成加速方案。现新增实验性
-`TEMPOKV_JENSEN_TRITON_CORRECTION=mma`：将 rank-G 修正作为独立的 rank-16 half dot
+`TEMPOKV_JENSEN_TRITON_CORRECTION=mma` 将 rank-G 修正作为独立的 rank-16 half dot
 直接累加到 QK，交给 Tensor Cores 计算，主 Q/K/V 仍为 D=128。只把小修正维补零至 16，
 不扩宽缓存，不修改 Jensen 公式或 half 中间舍入。累积顺序改变，必须重新验证数值。
-默认 `scalar` 保留用户已测的实现；新 `mma` 尚无 A100 速度或正确性结果。
+MMA 作为显式选项使用，上面的固定配置不改变默认 backend。速度与误差应以实际设备和
+输入形状的对照为准；运行报告和测速结果保存在本地忽略目录 `reports/`。
 
 ```bash
 # 使用已测较好的固定配置，比较结构而非重扫所有 tile。
+mkdir -p reports
 PYTHONPATH=src python scripts/tools/benchmark_jensen_fused.py \
   --backends triton --compare-correction --triton-config 128x64w8s4 \
   --query-tokens 4680 --key-tokens 280800 --heads 12 --group-size 64 \
-  > jensen-mma-benchmark.json
+  > reports/jensen-mma-benchmark.json
 
 PYTHONPATH=src python -m pytest -q scripts/tests/test_jensen_mma.py
 ```
@@ -193,6 +196,25 @@ PYTHONPATH=src python -m pytest -q scripts/tests/test_jensen_mma.py
 静态指令数，未知字段为 null。极慢配置是否 spill 应依据这些信息核对，不能仅凭耗时判定。
 新路径在生产中需同时设置 `TEMPOKV_JENSEN_BACKEND=triton` 和
 `TEMPOKV_JENSEN_TRITON_CORRECTION=mma`，建议固定与测试相同的 `TEMPOKV_JENSEN_TRITON_CONFIG`。
+
+主 attention 的实验候选为 `TEMPOKV_JENSEN_TRITON_IMPL=pipeline`，默认仍为 `baseline`。
+新候选先处理末尾 KV tile，其余完整 tile 省去 token 边界判断，并通过
+`tl.range(num_stages=2)` 调整 K/V 预读、循环流水和 softmax 缩放。要求固定配置与 MMA
+修正；公式和输入格式相同，但累积顺序不同，需要独立数值检查。该候选尚无 GPU 测量结果。
+
+```bash
+mkdir -p reports
+PYTHONPATH=src python scripts/tools/benchmark_jensen_fused.py \
+  --backends triton --compare-implementations --triton-config 128x64w8s4 \
+  --query-tokens 4680 --key-tokens 280800 --heads 12 --group-size 64 \
+  > reports/jensen-pipeline-benchmark.json
+
+PYTHONPATH=src python -m pytest -q scripts/tests/test_jensen_pipeline.py
+```
+
+对照同时报告 baseline/pipeline 各自的 plain/MMA 时间和资源使用情况。`pipeline` 的
+显式循环预读为两级，避免把 K/V 都预读四级而过度占用 shared memory；配置中的通用
+编译选项仍按固定配置传入，资源报告会额外给出 `loop_pipeline_stages`。
 
 目前只有 Self-Forcing 接入。默认关闭：在本仓库的 trace 上，生产的 INT4 残差位宽下这个
 偏置比论文测量的 INT2 直接量化设定小约两个数量级，端到端收益尚未验证。有希望的是

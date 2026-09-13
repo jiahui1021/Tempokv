@@ -50,12 +50,13 @@ def plain_flex(q, k, v):
 
 
 def raw_triton(q, k, v, steps, group_size, *, config=None, correction=True,
-               correction_mode=None, return_metadata=False):
+               correction_mode=None, return_metadata=False, implementation=None):
     from tempokv.runtime.jensen_triton_kernel import attention_forward
 
     return attention_forward(q, k, v, steps, group_size,
                              config=config, apply_correction=correction,
-                             correction_mode=correction_mode, return_metadata=return_metadata)
+                             correction_mode=correction_mode, return_metadata=return_metadata,
+                             implementation=implementation)
 
 
 def comparison(plain_ms, corrected_ms, fa2_ms):
@@ -69,7 +70,7 @@ def comparison(plain_ms, corrected_ms, fa2_ms):
     }
 
 
-def check_correction_signal(group_size, mode):
+def check_correction_signal(group_size, mode, implementation=None):
     """Known answers sensitive to omitted, wrongly signed or misgrouped bias."""
     groups = 128 // group_size
     q = torch.zeros(1, groups, 1, 128, dtype=torch.bfloat16, device="cuda")
@@ -89,7 +90,8 @@ def check_correction_signal(group_size, mode):
     weights /= weights.sum(-1, keepdim=True)
     expected = torch.zeros(q.shape, dtype=torch.float32, device=q.device)
     expected[0, :, 0, :groups + 1] = weights
-    actual = raw_triton(q, k, v, steps, group_size, correction_mode=mode).float()
+    actual = raw_triton(q, k, v, steps, group_size, correction_mode=mode,
+                       implementation=implementation).float()
     torch.testing.assert_close(actual, expected, atol=0.003, rtol=0.005)
     return (actual - expected).abs().max().item()
 
@@ -114,7 +116,8 @@ def widened(k, v, squared_steps):
     return wk, wv
 
 
-def check(group_size, backends, tune_triton=False, compare_correction=False, tune_configs=None):
+def check(group_size, backends, tune_triton=False, compare_correction=False,
+          tune_configs=None, compare_implementations=False):
     q = torch.randn(1, 17, 2, 128, dtype=torch.bfloat16, device="cuda")
     k = torch.randn(1, 257, 2, 128, dtype=q.dtype, device=q.device)
     v = torch.randn_like(k)
@@ -131,6 +134,8 @@ def check(group_size, backends, tune_triton=False, compare_correction=False, tun
     torch.testing.assert_close(legacy, ref, rtol=0.02, atol=0.02)
     errors = {"legacy_max_abs_error": (legacy - ref).abs().max().item()}
     for backend in backends:
+        if backend == "triton" and compare_implementations:
+            continue
         fused = BACKENDS[backend](q, k, v, steps, group_size=group_size).float()
         torch.testing.assert_close(fused, ref, rtol=0.02, atol=0.02)
         errors[f"{backend}_max_abs_error"] = (fused - ref).abs().max().item()
@@ -151,6 +156,15 @@ def check(group_size, backends, tune_triton=False, compare_correction=False, tun
             torch.testing.assert_close(out, ref, rtol=0.02, atol=0.02)
             errors[f"triton_{mode}_max_abs_error"] = (out - ref).abs().max().item()
             errors[f"triton_{mode}_analytic_max_abs_error"] = check_correction_signal(group_size, mode)
+    if compare_implementations:
+        for impl in ("baseline", "pipeline"):
+            for correction in (False, True):
+                out = raw_triton(q, k, v, steps, group_size, correction_mode="mma",
+                                 correction=correction, implementation=impl).float()
+                expected = ref if correction else plain_ref
+                torch.testing.assert_close(out, expected, rtol=0.02, atol=0.02)
+                errors[f"{impl}_{correction}_max_abs_error"] = (out - expected).abs().max().item()
+            errors[f"{impl}_analytic_max_abs_error"] = check_correction_signal(group_size, "mma", impl)
     return errors
 
 
@@ -198,12 +212,19 @@ def main():
                         help="restrict --tune-triton to these fixed configs; compare by corrected time")
     parser.add_argument("--compare-correction", action="store_true",
                         help="same fixed tile: plain vs scalar correction vs Tensor Core correction")
+    parser.add_argument("--compare-implementations", action="store_true",
+                        help="fixed tile: measured baseline vs pipelined backbone, each with plain/MMA")
     parser.add_argument("--triton-config", help="fixed tile; compare-correction defaults to user-measured 128x64w8s4")
     args = parser.parse_args()
     if not torch.cuda.is_available():
         parser.error("requires CUDA, Inductor/Triton and FlashAttention-2")
     if args.tune_triton and "triton" not in args.backends:
         parser.error("--tune-triton requires --backends triton")
+    if args.compare_implementations:
+        if "triton" not in args.backends:
+            parser.error("--compare-implementations requires --backends triton")
+        if args.compare_correction or args.tune_triton:
+            parser.error("--compare-implementations is separate from correction/tile sweeps")
     if args.tune_configs and not args.tune_triton:
         parser.error("--tune-configs requires --tune-triton")
     tune_configs = ()
@@ -214,13 +235,13 @@ def main():
             parser.error("unknown --tune-configs value")
     if args.compare_correction and "triton" not in args.backends:
         parser.error("--compare-correction requires --backends triton")
-    if args.compare_correction and args.triton_config is None:
+    if (args.compare_correction or args.compare_implementations) and args.triton_config is None:
         args.triton_config = "128x64w8s4"
     if args.triton_config is not None:
         if args.triton_config not in (*triton_config_names(), "auto"):
             parser.error("unknown --triton-config")
-        if args.compare_correction and args.triton_config == "auto":
-            parser.error("--compare-correction needs a fixed tile for a paired comparison")
+        if (args.compare_correction or args.compare_implementations) and args.triton_config == "auto":
+            parser.error("paired comparisons need a fixed tile")
         os.environ["TEMPOKV_JENSEN_TRITON_CONFIG"] = args.triton_config
     # Import the real wrapper directly, not wan.__init__, which loads unrelated
     # model/config dependencies before a standalone kernel benchmark can run.
@@ -241,7 +262,8 @@ def main():
     if "triton" in args.backends and args.group_size not in (32, 64, 128):
         parser.error("Triton group-size must be 32, 64 or 128")
     print("Checking numerical correctness (first call can compile/tune)...", file=sys.stderr, flush=True)
-    correctness = check(args.group_size, args.backends, args.tune_triton, args.compare_correction, tune_configs)
+    correctness = check(args.group_size, args.backends, args.tune_triton, args.compare_correction,
+                        tune_configs, args.compare_implementations)
     q = torch.randn(args.batch, args.query_tokens, args.heads, 128, dtype=torch.bfloat16, device="cuda")
     k = torch.randn(args.batch, args.key_tokens, args.heads, 128, dtype=q.dtype, device=q.device)
     v = torch.randn_like(k)
@@ -253,6 +275,8 @@ def main():
         "fa2_augmented": lambda: augmented(q, wk, wv, args.group_size),
     }
     for backend in dict.fromkeys(args.backends):
+        if backend == "triton" and args.compare_implementations:
+            continue
         calls[f"{backend}_plain_128"] = (
             (lambda: plain_flex(q, k, v)) if backend == "flex" else
             (lambda: raw_triton(q, k, v, steps, args.group_size, correction=False))
@@ -265,6 +289,13 @@ def main():
         for mode in ("scalar", "mma"):
             calls[f"triton_{mode}_fused_128"] = lambda mode=mode: raw_triton(
                 q, k, v, steps, args.group_size, correction_mode=mode)
+    if args.compare_implementations:
+        for impl in ("baseline", "pipeline"):
+            for correction in (False, True):
+                name = f"triton_{impl}_{'mma' if correction else 'plain'}_128"
+                calls[name] = lambda impl=impl, correction=correction: raw_triton(
+                    q, k, v, steps, args.group_size, correction_mode="mma",
+                    correction=correction, implementation=impl)
     if args.tune_triton:
         for config in tune_configs:
             for correction in (False, True):
@@ -284,9 +315,19 @@ def main():
         backend: comparison(results[f"{backend}_plain_128"]["median_ms"],
                             results[f"{backend}_fused_128"]["median_ms"], fa2_ms)
         for backend in dict.fromkeys(args.backends)
-        if not (backend == "triton" and args.compare_correction)
+        if not (backend == "triton" and (args.compare_correction or args.compare_implementations))
     }
     resources = {}
+    if args.compare_implementations:
+        for impl in ("baseline", "pipeline"):
+            comparisons[f"triton_{impl}"] = comparison(
+                results[f"triton_{impl}_plain_128"]["median_ms"],
+                results[f"triton_{impl}_mma_128"]["median_ms"], fa2_ms)
+            for correction in (False, True):
+                name = f"triton_{impl}_{'mma' if correction else 'plain'}_128"
+                _, resources[name] = raw_triton(
+                    q, k, v, steps, args.group_size, correction=correction,
+                    correction_mode="mma", implementation=impl, return_metadata=True)
     if args.compare_correction:
         for mode in ("scalar", "mma"):
             comparisons[f"triton_{mode}"] = comparison(
@@ -315,6 +356,7 @@ def main():
                       "triton": triton.__version__,
                       "settings": vars(args), "correctness": correctness, "results": results,
                       "triton_correction_env": os.environ.get("TEMPOKV_JENSEN_TRITON_CORRECTION", "scalar"),
+                      "triton_implementation_env": os.environ.get("TEMPOKV_JENSEN_TRITON_IMPL", "baseline"),
                       "compiled_resources": resources,
                       "comparisons": comparisons, "best_measured_fixed_config": recommended,
                       "note": "First-call time includes any compilation; preflight warms a different shape. No end-to-end speedup claim."}, indent=2))

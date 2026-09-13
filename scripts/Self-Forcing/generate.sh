@@ -288,9 +288,9 @@ mkdir -p -- "$output_dir"
 printf '[generate] 输出目录：%s\n' "$output_dir"
 {
   if [[ "$mode" == "tempokv" && "$JENSEN" == "1" ]]; then
-    printf '[generate] Jensen backend=%s; Triton config=%s; correction=%s\n' \
+    printf '[generate] Jensen backend=%s; Triton config=%s; correction=%s; implementation=%s\n' \
       "${TEMPOKV_JENSEN_BACKEND:-augmented}" "${TEMPOKV_JENSEN_TRITON_CONFIG:-auto}" \
-      "${TEMPOKV_JENSEN_TRITON_CORRECTION:-scalar}"
+      "${TEMPOKV_JENSEN_TRITON_CORRECTION:-scalar}" "${TEMPOKV_JENSEN_TRITON_IMPL:-baseline}"
   fi
   "${generate_command[@]}"
 } 2>&1 | tee "$output_dir/generate.log"
