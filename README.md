@@ -155,6 +155,7 @@ Triton 默认在候选 tile 配置中自动测速选择，按序列长度的 2 �
 
 ```bash
 JENSEN=1 TEMPOKV_JENSEN_BACKEND=triton \
+  TEMPOKV_JENSEN_TRITON_IMPL=baseline \
   TEMPOKV_JENSEN_TRITON_CORRECTION=mma \
   TEMPOKV_JENSEN_TRITON_CONFIG=128x64w8s4 \
   OUTPUT_DIR=results/self_forcing/jensen-triton-mma \
@@ -197,10 +198,10 @@ PYTHONPATH=src python -m pytest -q scripts/tests/test_jensen_mma.py
 新路径在生产中需同时设置 `TEMPOKV_JENSEN_BACKEND=triton` 和
 `TEMPOKV_JENSEN_TRITON_CORRECTION=mma`，建议固定与测试相同的 `TEMPOKV_JENSEN_TRITON_CONFIG`。
 
-主 attention 的实验候选为 `TEMPOKV_JENSEN_TRITON_IMPL=pipeline`，默认仍为 `baseline`。
-新候选先处理末尾 KV tile，其余完整 tile 省去 token 边界判断，并通过
+`TEMPOKV_JENSEN_TRITON_IMPL=pipeline` 保留用于性能对照，不推荐用于 Jensen 生成；
+生成时显式选择上面的 `baseline + mma + 128x64w8s4`。`pipeline` 先处理末尾 KV tile，其余完整 tile 省去 token 边界判断，并通过
 `tl.range(num_stages=2)` 调整 K/V 预读、循环流水和 softmax 缩放。要求固定配置与 MMA
-修正；公式和输入格式相同，但累积顺序不同，需要独立数值检查。该候选尚无 GPU 测量结果。
+修正；公式和输入格式相同，但累积顺序不同。单独 plain 的改善不能视为加入 MMA 后也会改善。
 
 ```bash
 mkdir -p reports

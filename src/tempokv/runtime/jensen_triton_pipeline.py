@@ -1,8 +1,10 @@
-"""Opt-in attention schedule with a masked tail and pipelined full KV tiles.
+"""Experimental comparison schedule; not recommended for Jensen generation.
 
 The measured baseline lives in jensen_triton_kernel.py. This candidate keeps
 the same Q/K/V and rounded MMA correction, but changes traversal and scheduling.
 Only the tail needs key bounds checks; full tiles are visited in reverse order.
+Keep the measured baseline+MMA route for generation; this candidate is retained
+to reproduce the interaction between scheduling and correction operands.
 """
 
 import torch
