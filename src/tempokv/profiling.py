@@ -51,6 +51,7 @@ DECODE_K = "decode_k"
 DECODE_V = "decode_v"
 ROPE = "rope"
 ATTENTION_KERNEL = "attention_kernel"
+JENSEN_STEPS = "jensen_steps"
 QUANTIZE_EVENT = "quantize_event"
 ENCODE_K = "encode_k"
 ENCODE_V = "encode_v"
@@ -385,6 +386,25 @@ def install(profile: RuntimeProfile) -> dict[str, str]:
             SELF_ATTENTION,
         )
 
+    def patch_fused_attention(name: str) -> None:
+        causal_model = sys.modules["wan.modules.causal_model"]
+        original = getattr(causal_model, name)
+
+        @functools.wraps(original)
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
+            # A common parent preserves existing efficiency aggregation; the
+            # child records the actual executed backend, not an env guess.
+            with profile.section(ATTENTION_KERNEL):
+                with profile.section(name):
+                    return original(*args, **kwargs)
+
+        setattr(causal_model, name, wrapper)
+
+    def patch_steps() -> None:
+        from .runtime.cache import ChunkedKVCache
+
+        _wrap_method(ChunkedKVCache, "read_step_sizes", profile, JENSEN_STEPS)
+
     def patch_pipeline() -> None:
         pipeline_module = sys.modules["pipeline.causal_inference"]
         pipeline_class = pipeline_module.CausalInferencePipeline
@@ -402,6 +422,9 @@ def install(profile: RuntimeProfile) -> dict[str, str]:
     attempt("decode", patch_decode)
     attempt("encode", patch_encode)
     attempt("attention", patch_attention)
+    for name in ("jensen_flex_attention", "jensen_triton_attention"):
+        attempt(name, lambda name=name: patch_fused_attention(name))
+    attempt(JENSEN_STEPS, patch_steps)
     attempt("pipeline", patch_pipeline)
     attempt("vae", patch_vae)
     return status
@@ -464,6 +487,7 @@ __all__ = [
     "ENCODE_K",
     "ENCODE_V",
     "GENERATION",
+    "JENSEN_STEPS",
     "QUANTIZE_EVENT",
     "ROPE",
     "SELF_ATTENTION",

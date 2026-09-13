@@ -286,4 +286,10 @@ fi
 
 mkdir -p -- "$output_dir"
 printf '[generate] 输出目录：%s\n' "$output_dir"
-"${generate_command[@]}" 2>&1 | tee "$output_dir/generate.log"
+{
+  if [[ "$mode" == "tempokv" && "$JENSEN" == "1" ]]; then
+    printf '[generate] Jensen backend=%s; Triton config=%s\n' \
+      "${TEMPOKV_JENSEN_BACKEND:-augmented}" "${TEMPOKV_JENSEN_TRITON_CONFIG:-auto}"
+  fi
+  "${generate_command[@]}"
+} 2>&1 | tee "$output_dir/generate.log"

@@ -7,6 +7,12 @@ from tempokv.runtime.jensen import query_channels
 from tempokv.runtime.jensen_triton import corrected_attention
 
 
+@pytest.fixture(autouse=True)
+def fixed_tile_for_correctness_tests(monkeypatch):
+    # Test numerical behavior without retuning every small edge-case shape.
+    monkeypatch.setenv("TEMPOKV_JENSEN_TRITON_CONFIG", "64x64")
+
+
 def test_guards_and_lazy_cuda_import():
     q = torch.zeros(1, 3, 2, 128, dtype=torch.bfloat16)
     k = torch.zeros(1, 5, 2, 128, dtype=q.dtype)
@@ -75,3 +81,25 @@ def test_zero_steps_large_logits_and_fresh_steps():
         actual = corrected_attention(q, k, v, steps, group_size=64)
         assert actual.isfinite().all()
         torch.testing.assert_close(actual.float(), reference(q, k, v, steps, 64), atol=0.03, rtol=0.03)
+
+
+@cuda_only
+@pytest.mark.parametrize("config", ["legacy", "64x64", "128x64", "128x32", "auto"])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@torch.no_grad()
+def test_tuning_candidates_and_compiled_out_control(config, dtype):
+    from tempokv.runtime.jensen_triton_kernel import attention_forward
+
+    torch.manual_seed(781)
+    q = torch.randn(1, 129, 2, 128, dtype=dtype, device="cuda")
+    k = torch.randn(1, 257, 2, 128, dtype=dtype, device="cuda")
+    v = torch.randn_like(k)
+    steps = torch.rand(1, 257, 2, 2, dtype=dtype, device="cuda") * 3
+    steps[:, -17:] = 0
+    out = attention_forward(q, k, v, steps, 64, config=config)
+    torch.testing.assert_close(out.float(), reference(q, k, v, steps, 64), atol=0.02, rtol=0.02)
+    # NaN steps must be entirely unused by the plain compile-time control.
+    steps.fill_(float("nan"))
+    plain = attention_forward(q, k, v, steps, 64, config=config, apply_correction=False)
+    torch.testing.assert_close(plain.float(), reference(q, k, v, torch.zeros_like(steps), 64),
+                               atol=0.02, rtol=0.02)

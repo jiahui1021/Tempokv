@@ -24,10 +24,45 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "src"))
 
 from tempokv.runtime.jensen import query_channels  # noqa: E402
-from tempokv.runtime.jensen_flex import corrected_attention as flex_attention, score_terms  # noqa: E402
+from tempokv.runtime.jensen_flex import (  # noqa: E402
+    corrected_attention as flex_attention, score_terms, _compiled_attention,
+)
 from tempokv.runtime.jensen_triton import corrected_attention as triton_attention  # noqa: E402
 
 BACKENDS = {"flex": flex_attention, "triton": triton_attention}
+
+
+def triton_config_names():
+    # The benchmark must check every candidate production auto tuning can pick.
+    # Import lazily to keep --help and CPU-side comparison tests CUDA-free.
+    from tempokv.runtime.jensen_triton_kernel import _TILES
+
+    return ("legacy", *_TILES)
+
+
+def plain_flex(q, k, v):
+    return _compiled_attention()(
+        q.permute(0, 2, 1, 3), k.permute(0, 2, 1, 3), v.permute(0, 2, 1, 3),
+        scale=q.shape[-1] ** -0.5,
+    ).permute(0, 2, 1, 3).contiguous()
+
+
+def raw_triton(q, k, v, steps, group_size, *, config=None, correction=True):
+    from tempokv.runtime.jensen_triton_kernel import attention_forward
+
+    return attention_forward(q, k, v, steps, group_size,
+                             config=config, apply_correction=correction)
+
+
+def comparison(plain_ms, corrected_ms, fa2_ms):
+    """Separate backend replacement from correction; retain negative/noisy deltas."""
+    return {
+        "backend_extra_ms": plain_ms - fa2_ms,
+        "correction_extra_ms": corrected_ms - plain_ms,
+        "backend_vs_fa2_pct": 100 * (plain_ms / fa2_ms - 1),
+        "correction_vs_same_backend_pct": 100 * (corrected_ms / plain_ms - 1),
+        "total_vs_fa2_pct": 100 * (corrected_ms / fa2_ms - 1),
+    }
 
 
 def augmented(q, wide_k, wide_v, group_size):
@@ -50,7 +85,7 @@ def widened(k, v, squared_steps):
     return wk, wv
 
 
-def check(group_size, backends):
+def check(group_size, backends, tune_triton=False):
     q = torch.randn(1, 17, 2, 128, dtype=torch.bfloat16, device="cuda")
     k = torch.randn(1, 257, 2, 128, dtype=q.dtype, device=q.device)
     v = torch.randn_like(k)
@@ -60,6 +95,8 @@ def check(group_size, backends):
     scores = q.float().permute(0, 2, 1, 3) @ k.float().permute(0, 2, 3, 1)
     scores = (scores + torch.einsum("gbhq,gbhk->bhqk", qt, kt)) * 128 ** -0.5
     ref = (scores.softmax(-1) @ v.float().permute(0, 2, 1, 3)).permute(0, 2, 1, 3)
+    plain_scores = q.float().permute(0, 2, 1, 3) @ k.float().permute(0, 2, 3, 1) * 128 ** -0.5
+    plain_ref = (plain_scores.softmax(-1) @ v.float().permute(0, 2, 1, 3)).permute(0, 2, 1, 3)
     wk, wv = widened(k, v, steps)
     legacy = augmented(q, wk, wv, group_size).float()
     torch.testing.assert_close(legacy, ref, rtol=0.02, atol=0.02)
@@ -68,6 +105,17 @@ def check(group_size, backends):
         fused = BACKENDS[backend](q, k, v, steps, group_size=group_size).float()
         torch.testing.assert_close(fused, ref, rtol=0.02, atol=0.02)
         errors[f"{backend}_max_abs_error"] = (fused - ref).abs().max().item()
+        plain = (plain_flex(q, k, v) if backend == "flex" else raw_triton(
+            q, k, v, steps, group_size, correction=False)).float()
+        torch.testing.assert_close(plain, plain_ref, rtol=0.02, atol=0.02)
+        errors[f"{backend}_plain_max_abs_error"] = (plain - plain_ref).abs().max().item()
+    if tune_triton:
+        for config in triton_config_names():
+            for correction in (False, True):
+                out = raw_triton(q, k, v, steps, group_size, config=config, correction=correction).float()
+                expected = ref if correction else plain_ref
+                torch.testing.assert_close(out, expected, rtol=0.02, atol=0.02)
+                errors[f"triton_{config}_{correction}_max_abs_error"] = (out - expected).abs().max().item()
     return errors
 
 
@@ -81,15 +129,19 @@ def measure(fn, repeats, warmup):
         fn()
     torch.cuda.synchronize()
     samples = []
+    wall_samples = []
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event = torch.cuda.Event(enable_timing=True)
     for _ in range(repeats):
-        start_event = torch.cuda.Event(enable_timing=True)
-        end_event = torch.cuda.Event(enable_timing=True)
+        wall_start = time.perf_counter()
         start_event.record()
         fn()
         end_event.record()
         end_event.synchronize()
         samples.append(start_event.elapsed_time(end_event))
+        wall_samples.append((time.perf_counter() - wall_start) * 1000)
     return {"shape_first_call_s": first, "median_ms": statistics.median(samples),
+            "synchronized_wall_median_ms": statistics.median(wall_samples),
             "min_ms": min(samples), "samples_ms": samples}
 
 
@@ -105,9 +157,13 @@ def main():
     parser.add_argument("--repeats", type=int, default=10)
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--backends", nargs="+", choices=tuple(BACKENDS), default=["flex", "triton"])
+    parser.add_argument("--tune-triton", action="store_true",
+                        help="compare legacy and every current fixed tile, with correction compiled out/in")
     args = parser.parse_args()
     if not torch.cuda.is_available():
         parser.error("requires CUDA, Inductor/Triton and FlashAttention-2")
+    if args.tune_triton and "triton" not in args.backends:
+        parser.error("--tune-triton requires --backends triton")
     # Import the real wrapper directly, not wan.__init__, which loads unrelated
     # model/config dependencies before a standalone kernel benchmark can run.
     spec = importlib.util.spec_from_file_location(
@@ -126,7 +182,8 @@ def main():
     torch.manual_seed(51)
     if "triton" in args.backends and args.group_size not in (32, 64, 128):
         parser.error("Triton group-size must be 32, 64 or 128")
-    correctness = check(args.group_size, args.backends)
+    print("Checking numerical correctness (first call can compile/tune)...", file=sys.stderr, flush=True)
+    correctness = check(args.group_size, args.backends, args.tune_triton)
     q = torch.randn(args.batch, args.query_tokens, args.heads, 128, dtype=torch.bfloat16, device="cuda")
     k = torch.randn(args.batch, args.key_tokens, args.heads, 128, dtype=q.dtype, device=q.device)
     v = torch.randn_like(k)
@@ -138,17 +195,47 @@ def main():
         "fa2_augmented": lambda: augmented(q, wk, wv, args.group_size),
     }
     for backend in dict.fromkeys(args.backends):
+        calls[f"{backend}_plain_128"] = (
+            (lambda: plain_flex(q, k, v)) if backend == "flex" else
+            (lambda: raw_triton(q, k, v, steps, args.group_size, correction=False))
+        )
         calls[f"{backend}_fused_128"] = lambda backend=backend: BACKENDS[backend](
             q, k, v, steps, group_size=args.group_size)
-    results = {name: measure(fn, args.repeats, args.warmup) for name, fn in calls.items()}
+    if args.tune_triton:
+        for config in triton_config_names():
+            for correction in (False, True):
+                name = f"triton_{config}_{'fused' if correction else 'plain'}"
+                calls[name] = lambda config=config, correction=correction: raw_triton(
+                    q, k, v, steps, args.group_size, config=config, correction=correction)
+    results = {}
+    for name, fn in calls.items():
+        print(f"Measuring {name}...", file=sys.stderr, flush=True)
+        results[name] = measure(fn, args.repeats, args.warmup)
     legacy_ms = results["fa2_augmented"]["median_ms"]
+    fa2_ms = results["fa2_plain_128"]["median_ms"]
     for result in results.values():
         result["speedup_vs_augmented"] = legacy_ms / result["median_ms"]
+        result["overhead_vs_fa2_plain_pct"] = 100 * (result["median_ms"] / fa2_ms - 1)
+    comparisons = {
+        backend: comparison(results[f"{backend}_plain_128"]["median_ms"],
+                            results[f"{backend}_fused_128"]["median_ms"], fa2_ms)
+        for backend in dict.fromkeys(args.backends)
+    }
+    recommended = None
+    if args.tune_triton:
+        for config in triton_config_names():
+            comparisons[f"triton_{config}"] = comparison(
+                results[f"triton_{config}_plain"]["median_ms"],
+                results[f"triton_{config}_fused"]["median_ms"], fa2_ms)
+        best = min(triton_config_names(), key=lambda c: results[f"triton_{c}_fused"]["median_ms"])
+        recommended = {"TEMPOKV_JENSEN_TRITON_CONFIG": best,
+                       "scope": "Only this measured shape, dtype, GPU and stride layout; no automatic production change."}
     import triton
     print(json.dumps({"gpu": torch.cuda.get_device_name(), "torch": torch.__version__,
                       "cuda": torch.version.cuda, "flash_attn": flash_attn.__version__,
                       "triton": triton.__version__,
                       "settings": vars(args), "correctness": correctness, "results": results,
+                      "comparisons": comparisons, "best_measured_fixed_config": recommended,
                       "note": "First-call time includes any compilation; preflight warms a different shape. No end-to-end speedup claim."}, indent=2))
 
 

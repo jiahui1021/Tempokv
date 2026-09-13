@@ -1,5 +1,7 @@
 # Jensen 自定义 Triton kernel
 
+以下首先记录初版实现；文末记录用户报告 60%+ 开销后的修改。
+
 ## 实现范围
 
 新增 `src/tempokv/runtime/jensen_triton_kernel.py`，通过
@@ -67,3 +69,56 @@ Flex 和 Triton 的 correctness error、首调用时间、CUDA event 中位数�
 参考：本地论文 `arXiv-2605.26266v1/main.tex` 的 Implementation Note 与 Taylor-corrected
 attention 伪代码；[Triton 官方 fused attention 文档](https://triton-lang.org/main/getting-started/tutorials/06-fused-attention.html)
 用于核对 online-softmax recurrence。
+
+## 60%+ 开销反馈后的修改
+
+用户确认无法提供远程 GPU 连接，由用户在 A100 执行修改后的程序。
+60%+ 是用户报告值，本地没有该次运行的命令、日志、输入形状和计时范围；不能判定
+具体占比。初版只有固定 tile，且将整个 attention 替换为未经性能验证的 Triton 实现，
+没有同 kernel 的无修正对照，无法把 backend 代价与修正代价分开。
+
+### 性能候选
+
+- Triton 默认 `auto`，在 64×64/4 warps/2 stages、128×64/4/2、128×32/4/3 三组配置中
+  测量选择；Q/K 按 2 的幂次 bucket 复用选择，不刻意按每个增长长度重新调优。
+- 新候选启用编译器 FP fusion；Jensen coefficient 仍先 round 到输入 half dtype。
+- `TEMPOKV_JENSEN_TRITON_CONFIG=legacy` 保留上一版固定 tile 和禁用 FP fusion 的配置。
+- 调优写入临时 output，不修改 Q/K/V/steps；首次新 bucket 耗时包括编译和调优。
+- 不承诺自动选择优于 FA2；三个候选全部来自同一自定义 kernel，仍可能整体落后。
+
+### 测量修复
+
+- `src/tempokv/profiling.py` 原先只包裹普通 `causal_model.attention`；现在还包裹
+  `jensen_flex_attention` 与 `jensen_triton_attention`，统一计入 `attention_kernel`，
+  用子节点记录实际执行的 backend，避免重复计入同名汇总。
+- `read_step_sizes` 单列为 `jensen_steps`；原来这部分只出现在 self_attention self time。
+- `generate.log` 打印 Jensen backend 和 Triton config；仅设置 JENSEN=1 仍使用默认 augmented。
+- benchmark 增加 plain Flex、plain Triton。Triton plain 使用编译期关闭 correction，
+  连范数和 steps 读取都去掉，区别于输入全零 steps 后仍执行 correction。
+- `--tune-triton` 对每个固定配置分别测 plain/fused，保留 legacy 对照。除 GPU events 外
+  还报告同步 wall time；数值检查失败会退出，不能把错误候选推荐给用户。
+
+`comparisons` 中：
+
+```text
+backend_extra_ms = plain_backend_ms - plain_fa2_ms
+correction_extra_ms = corrected_backend_ms - plain_backend_ms
+total_vs_fa2_pct = 100 * (corrected_backend_ms / plain_fa2_ms - 1)
+```
+
+两个毫秒差值可相加；两个百分比的分母不同，不能直接相加。
+自动配置的 plain/fused 可能各自选中不同 tile；严格固定 tile 对照看 `triton_64x64`
+等配置条目。微测不包含 cache decode、step extraction 和 RoPE，完整生成通过 PROFILE 比较。
+
+```bash
+PYTHONPATH=src python scripts/tools/benchmark_jensen_fused.py \
+  --backends triton --tune-triton --query-tokens 4680 --key-tokens 280800 \
+  --heads 12 --group-size 64 > jensen-benchmark.json
+```
+
+上述形状是历史微测默认值，不推定为用户真实慢例；实际使用时与运行窗口对应。
+输出包含 `best_measured_fixed_config`，只推荐本次形状中最快的固定 Triton 配置。
+
+本轮本地检查：57 passed、33 CUDA skipped；Python 语法和 benchmark help 通过。
+新增测试覆盖 profiler 实际别名、缺失别名报告、无重复计时、backend/correction 占比计算，
+以及待 GPU 运行的每个 tile、自动调优和编译期关闭 correction 对照。尚无新 latency 结果。

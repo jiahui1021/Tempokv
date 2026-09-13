@@ -145,14 +145,19 @@ JENSEN=1 TEMPOKV_JENSEN_BACKEND=flex OUTPUT_DIR=results/self_forcing/jensen-flex
 attention 合并到一次 GPU 调用，直接读取已有的 squared steps；不扩宽 Q/K/V，也无需
 Flex 路径的修正数据整理。仅支持 NVIDIA Ampere 及更新 GPU 的推理，输入为 BF16/FP16，
 head_dim 为 64/128，group_size 为 32/64/128 且整除 head_dim。不支持反向传播。
-采用固定 tile，避免逐个缓存长度调优；尚未在 A100 编译或测速，默认路径仍为 `augmented`。
+Triton 默认在三个 tile 配置中自动测速选择，按序列长度的 2 的幂次范围复用选择，
+首次进入新范围会增加编译和调优时间。可设 `TEMPOKV_JENSEN_TRITON_CONFIG` 为
+`64x64`、`128x64` 或 `128x32` 固定配置；`legacy` 保留上一版 64×64 和关闭 FP fusion
+的设置以便对照。新配置允许编译器合并浮点运算，仍保留 half coefficient 的舍入边界；
+需要 GPU 数值测试确认误差。尚未在 A100 测速，默认 backend 仍为 `augmented`。
+**单独设置 `JENSEN=1` 不会启用 Triton**；生成日志会打印所选 backend。
 
 ```bash
 JENSEN=1 TEMPOKV_JENSEN_BACKEND=triton OUTPUT_DIR=results/self_forcing/jensen-triton \
   PROMPTS=assets/generation_prompts.txt bash scripts/Self-Forcing/run_tempokv.sh
 
 # 在 A100 环境运行；下列尺寸为现有长窗口微测默认值，请按真实运行替换。
-PYTHONPATH=src python scripts/tools/benchmark_jensen_fused.py --backends triton \
+PYTHONPATH=src python scripts/tools/benchmark_jensen_fused.py --backends triton --tune-triton \
   --query-tokens 4680 --key-tokens 280800 --heads 12 --group-size 64
 
 python -m pytest -q scripts/tests/test_jensen_triton.py
@@ -160,6 +165,10 @@ python -m pytest -q scripts/tests/test_jensen_triton.py
 
 测速输出含版本、正确性误差、首调用时间、稳定耗时及相对 augmented 的速度比；
 `--backends flex triton` 可同时比较两种融合实现。首调用可能包含编译，不能作为稳定延迟。
+新增不带修正的同 backend 对照；`--tune-triton` 比较旧配置和三个新配置，分别报告
+backend 替换代价、Jensen 修正代价以及相对原始 FA2 的总开销，并给出该尺寸最快的固定
+Triton 配置。该推荐仅适用于测量的尺寸，不代表比 FA2 或 augmented 更快。
+`PROFILE=1` 现已覆盖 Flex/Triton 实际调用及 `jensen_steps` 数据准备；原报告漏计了这两项。
 
 目前只有 Self-Forcing 接入。默认关闭：在本仓库的 trace 上，生产的 INT4 残差位宽下这个
 偏置比论文测量的 INT2 直接量化设定小约两个数量级，端到端收益尚未验证。有希望的是

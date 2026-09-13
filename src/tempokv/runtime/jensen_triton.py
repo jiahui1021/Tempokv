@@ -11,11 +11,13 @@ import torch
 
 
 def corrected_attention(query, key, value, step_squared, *, group_size):
-    """Apply the existing rounded Jensen correction in a single GPU launch.
+    """Apply the existing rounded Jensen correction in a single warmed GPU launch.
 
     Supported head dimensions: 64/128; group sizes: 32/64/128 dividing D.
     Arbitrary positive input strides are accepted, including sliced windows.
     This is forward-only; callers requesting gradients receive an error.
+    The default auto configuration benchmarks three tiles on a new length
+    bucket; use TEMPOKV_JENSEN_TRITON_CONFIG for a measured fixed configuration.
     """
     if query.ndim != 4 or key.ndim != 4 or value.shape != key.shape:
         raise ValueError("Q/K/V must be rank-4 BSHD tensors, with matching K/V")
