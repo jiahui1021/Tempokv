@@ -8,7 +8,7 @@ ROOT = Path(__file__).resolve().parents[3]
 
 
 def _load_module():
-    script = ROOT / "scripts/cf_compare_quality.py"
+    script = ROOT / "scripts/oneoff/cf_compare_quality.py"
     spec = importlib.util.spec_from_file_location("cf_compare_quality", script)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)

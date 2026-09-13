@@ -39,7 +39,7 @@ gen_s=$((t1 - t0))
 
 # --- 3. stream eval (single video) ---
 t0=$(date +%s)
-env PYTHON_BIN=$QVG $QVG scripts/streaming_eval_loop.py \
+env PYTHON_BIN=$QVG $QVG scripts/oneoff/streaming_eval_loop.py \
   --ref-dir /mnt/cpfs/epic-user/hujiahui-20260612/kv-quant-result/Self-Forcing/bf16 \
   --target-dir "results/self_forcing/$LABEL/videos" \
   --output "results/self_forcing/$LABEL/streaming_psnr_ssim.csv" \

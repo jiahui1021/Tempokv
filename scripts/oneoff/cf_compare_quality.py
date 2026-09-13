@@ -7,7 +7,7 @@ SSIM/LPIPS. Both directories must contain videos named {idx}_0.mp4; pairs are
 formed by numeric prompt index.
 
 Usage:
-  python scripts/cf_compare_quality.py \
+  python scripts/oneoff/cf_compare_quality.py \
       --ref-dir results/causal_forcing/chunkwise/bf16-bench5/videos \
       --tgt-dir results/causal_forcing/chunkwise/kh2-vh1-int2-bench5/videos \
       --out-csv results/causal_forcing/chunkwise/kh2-vh1-int2-bench5/quality_per_video.csv \

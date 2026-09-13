@@ -2,15 +2,25 @@
 
 ```text
 scripts/
-├── fit_params.sh   one parameter-fitting entry point for all three models
-├── Self-Forcing/   Self-Forcing trace, fit, BF16, and TempoKV commands
-├── Causal-Forcing/ Causal Forcing download, trace, fit, BF16, and TempoKV commands
-├── LongCat/        LongCat trace, fit, and generation commands
-├── common/         shared parameter fitting command
-├── evaluation/     paired quality/FID, VBench, and one-click evaluation
-└── tools/          generic analysis and pipeline utilities
-                 (analyze_predictor.py, sweep_history_length.py)
+├── fit_params.sh      one parameter-fitting entry point for all three models
+├── Self-Forcing/      Self-Forcing trace, fit, BF16, and TempoKV commands
+├── Causal-Forcing/    Causal Forcing download, trace, fit, BF16, and TempoKV commands
+├── LongCat/           LongCat trace, fit, and generation commands
+├── common/            shared parameter fitting command
+├── evaluation/        paired quality/FID, VBench, and one-click evaluation
+├── tools/             generic analysis and pipeline utilities
+│                      (analyze_predictor.py, sweep_history_length.py)
+├── paper_experiments/ one study per subdirectory, each with its own README
+│                      (calibration, cross_kv_sharing, direction,
+│                      predictor_ablation, reconstruction, ...)
+├── tests/             tests for the scripts in this tree
+└── oneoff/            personal analysis runs, not entry points; every file
+                       hardcodes one machine's absolute paths (see its README)
 ```
+
+The first seven entries are the supported surface. `paper_experiments/` holds
+per-paper studies rather than commands you would run day to day, and `oneoff/`
+is kept only so the entry points above stay easy to find.
 
 Model code is kept under `experiments/`; reusable trace and fitted parameters
 are kept under `data/`.
