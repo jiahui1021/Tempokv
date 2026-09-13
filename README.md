@@ -170,6 +170,30 @@ backend 替换代价、Jensen 修正代价以及相对原始 FA2 的总开销，
 Triton 配置。该推荐仅适用于测量的尺寸，不代表比 FA2 或 augmented 更快。
 `PROFILE=1` 现已覆盖 Flex/Triton 实际调用及 `jensen_steps` 数据准备；原报告漏计了这两项。
 
+用户提供的 A100 长窗口测量（Q=4680、K=280800、H=12、D=128、g=64）中，
+FA2 plain 为 49.1 ms，augmented 为 82.3 ms，原 Triton fused 最优仍为 106.5 ms。
+因此原 Triton fused 尚不构成加速方案。现新增实验性
+`TEMPOKV_JENSEN_TRITON_CORRECTION=mma`：将 rank-G 修正作为独立的 rank-16 half dot
+直接累加到 QK，交给 Tensor Cores 计算，主 Q/K/V 仍为 D=128。只把小修正维补零至 16，
+不扩宽缓存，不修改 Jensen 公式或 half 中间舍入。累积顺序改变，必须重新验证数值。
+默认 `scalar` 保留用户已测的实现；新 `mma` 尚无 A100 速度或正确性结果。
+
+```bash
+# 使用已测较好的固定配置，比较结构而非重扫所有 tile。
+PYTHONPATH=src python scripts/tools/benchmark_jensen_fused.py \
+  --backends triton --compare-correction --triton-config 128x64w8s4 \
+  --query-tokens 4680 --key-tokens 280800 --heads 12 --group-size 64 \
+  > jensen-mma-benchmark.json
+
+PYTHONPATH=src python -m pytest -q scripts/tests/test_jensen_mma.py
+```
+
+新对照包括 plain、scalar、mma；在测速前检查随机 reference 和可独立计算的修正敏感
+答案。输出 `compiled_resources` 含可用的 `n_regs`、`n_spills`、shared memory 及 PTX
+静态指令数，未知字段为 null。极慢配置是否 spill 应依据这些信息核对，不能仅凭耗时判定。
+新路径在生产中需同时设置 `TEMPOKV_JENSEN_BACKEND=triton` 和
+`TEMPOKV_JENSEN_TRITON_CORRECTION=mma`，建议固定与测试相同的 `TEMPOKV_JENSEN_TRITON_CONFIG`。
+
 目前只有 Self-Forcing 接入。默认关闭：在本仓库的 trace 上，生产的 INT4 残差位宽下这个
 偏置比论文测量的 INT2 直接量化设定小约两个数量级，端到端收益尚未验证。有希望的是
 `K_BITS=2`，以及 anchor 帧——anchor 走直接量化，`Δ` 明显更大，实测偏置是残差帧的 12 倍。

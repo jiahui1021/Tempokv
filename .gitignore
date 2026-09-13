@@ -9,6 +9,7 @@ htmlcov/
 .venv/
 
 # Local verification files
+/reports/
 /tests/
 # Figure-generation artifacts are intentionally kept under tests/ and excluded from commits.
 /tests/figures/

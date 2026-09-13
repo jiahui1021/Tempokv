@@ -16,8 +16,10 @@ def corrected_attention(query, key, value, step_squared, *, group_size):
     Supported head dimensions: 64/128; group sizes: 32/64/128 dividing D.
     Arbitrary positive input strides are accepted, including sliced windows.
     This is forward-only; callers requesting gradients receive an error.
-    The default auto configuration benchmarks three tiles on a new length
+    The default auto configuration benchmarks candidate tiles on a new length
     bucket; use TEMPOKV_JENSEN_TRITON_CONFIG for a measured fixed configuration.
+    TEMPOKV_JENSEN_TRITON_CORRECTION=mma opts into the small Tensor Core
+    correction; scalar remains the user-measured default.
     """
     if query.ndim != 4 or key.ndim != 4 or value.shape != key.shape:
         raise ValueError("Q/K/V must be rank-4 BSHD tensors, with matching K/V")
