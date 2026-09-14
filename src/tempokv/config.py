@@ -132,8 +132,9 @@ class CodecConfig:
     # positional compatibility with older programmatic callers; reference
     # construction resolves it to legacy below.
     cross_matmul_precision: str | None = None
-    # ``shared`` pools all layers and heads into [P,P,D].  The fixed temporal
-    # modes use the same shared layout but write analytic coefficients.
+    # ``shared`` pools all layers and heads into [P,P,D]; ``layer_head`` fits
+    # [L,P,P,H,D] (native, and legacy as a K sharing ablation).  The fixed
+    # temporal modes use the shared layout but write analytic coefficients.
     # ``direct`` is the zero-history baseline: non-anchor K units are quantized
     # directly and the parameter file contains an empty temporal map.
     k_predictor_mode: str | None = None
@@ -415,14 +416,18 @@ class CodecConfig:
                 "k_predictor_mode=shared requires fit_mode=legacy"
             )
         if self.fit_mode == "legacy":
+            # ``layer_head`` keeps the legacy fitting math (FP64 statistics,
+            # ridge toward persistence, IEEE arithmetic) but solves one K
+            # predictor per layer and head instead of pooling them.
             if self.k_predictor_mode not in {
                 "shared",
+                "layer_head",
                 "direct",
                 *FIXED_TEMPORAL_PREDICTOR_MODES,
             }:
                 raise ValueError(
-                    "legacy fitting requires k_predictor_mode=shared, identity, "
-                    "taylor, taylor2, or direct"
+                    "legacy fitting requires k_predictor_mode=shared, layer_head, "
+                    "identity, taylor, taylor2, or direct"
                 )
             if self.k_history_length is None:
                 raise ValueError(

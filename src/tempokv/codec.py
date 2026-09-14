@@ -248,7 +248,14 @@ def predict_temporal(
     prediction = torch.zeros_like(history[0], dtype=torch.float32)
     if legacy:
         if parameters.per_head:
-            raise ValueError("legacy temporal parameters must share heads")
+            # Legacy layer_head K: the same out-of-place FP32 accumulation as
+            # the shared predictor, with one coefficient row per head.
+            if weights.shape[1] != history[0].shape[1]:
+                raise ValueError("per-head temporal parameters do not match the cache")
+            head_shape = (1, weights.shape[1], 1, weights.shape[-1])
+            for index in range(order):
+                prediction += history[index].float() * weights[index].view(head_shape)
+            return prediction + bias.view(head_shape)
         for index in range(order):
             coefficient = weights[index].view(
                 *([1] * (history[index].ndim - 1)), history[index].shape[-1]

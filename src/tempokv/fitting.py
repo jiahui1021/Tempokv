@@ -1365,6 +1365,153 @@ def fit_legacy_shared_temporal(
 
 
 @torch.no_grad()
+def fit_legacy_layer_head_temporal(
+    reconstructed: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    history_length: int,
+    ridge: float = 1.0,
+    max_gain: float = 1.0,
+    stride: int | None = None,
+    layer_ids: tuple[int, ...] | None = None,
+) -> TemporalParameters:
+    """Fit the legacy K predictor independently for every layer and head.
+
+    The statistics, FP64 accumulation, warm-up rows, ridge toward persistence
+    and per-channel gain cap are those of :func:`fit_legacy_shared_temporal`;
+    only the normal equations are kept per ``(layer, head)`` instead of pooled.
+    Returns ``[L,P,P,H,D]`` weights and ``[L,P,H,D]`` bias.
+    """
+    _check_pair(
+        reconstructed,
+        target,
+        minimum_dimensions=4,
+        layout="[L, ..., T, H, D]",
+    )
+    if isinstance(history_length, bool) or int(history_length) != history_length:
+        raise ValueError(
+            f"history_length must be a positive integer, got {history_length!r}"
+        )
+    history_length = int(history_length)
+    layer_count = int(target.shape[0])
+    frame_count = int(target.shape[-3])
+    heads = int(target.shape[-2])
+    dim = int(target.shape[-1])
+    if history_length <= 0 or history_length >= frame_count:
+        raise ValueError("history_length must be positive and smaller than T")
+    ridge = _check_scalar("ridge", ridge)
+    max_gain = _check_scalar("max_gain", max_gain, positive=True)
+    stride = _check_stride(stride)
+    work_device = (
+        torch.device("cpu")
+        if reconstructed.device.type == "mps"
+        else reconstructed.device
+    )
+
+    weights = torch.zeros(
+        layer_count,
+        history_length,
+        history_length,
+        heads,
+        dim,
+        dtype=torch.float32,
+        device=work_device,
+    )
+    bias = torch.zeros(
+        layer_count, history_length, heads, dim, dtype=torch.float32, device=work_device
+    )
+    for layer in range(layer_count):
+        stats: list[dict[str, torch.Tensor | int]] = [
+            {
+                "count": 0,
+                "sum_x": torch.zeros(
+                    heads, order, dim, dtype=torch.float64, device=work_device
+                ),
+                "sum_y": torch.zeros(
+                    heads, dim, dtype=torch.float64, device=work_device
+                ),
+                "sum_xx": torch.zeros(
+                    heads, order, order, dim, dtype=torch.float64, device=work_device
+                ),
+                "sum_xy": torch.zeros(
+                    heads, order, dim, dtype=torch.float64, device=work_device
+                ),
+            }
+            for order in range(1, history_length + 1)
+        ]
+        for rebuilt_record, target_record in zip(
+            _legacy_layer_records(reconstructed, layer),
+            _legacy_layer_records(target, layer),
+            strict=True,
+        ):
+            rebuilt_layer = rebuilt_record.detach().to(work_device)
+            target_layer = target_record.detach().to(work_device)
+            for order in range(1, history_length + 1):
+                stop = order + 1 if order < history_length else frame_count
+                history = torch.stack(
+                    [
+                        rebuilt_layer[:, order - lag : stop - lag]
+                        for lag in range(1, order + 1)
+                    ],
+                    dim=-2,
+                )
+                x = history.reshape(-1, heads, order, dim).double()
+                y = target_layer[:, order:stop].reshape(-1, heads, dim).double()
+                current = stats[order - 1]
+                current["count"] = int(current["count"]) + int(x.shape[0])
+                torch.as_tensor(current["sum_x"]).add_(x.sum(dim=0))
+                torch.as_tensor(current["sum_y"]).add_(y.sum(dim=0))
+                torch.as_tensor(current["sum_xx"]).add_(
+                    torch.einsum("nhid,nhjd->hijd", x, x)
+                )
+                torch.as_tensor(current["sum_xy"]).add_(
+                    torch.einsum("nhid,nhd->hid", x, y)
+                )
+
+        for order, current in enumerate(stats, start=1):
+            count = int(current["count"])
+            if count <= 0:
+                raise ValueError(
+                    f"no K fitting samples for layer {layer}, history order {order}"
+                )
+            sum_x = torch.as_tensor(current["sum_x"])
+            sum_y = torch.as_tensor(current["sum_y"])
+            mean_x = sum_x / count
+            mean_y = sum_y / count
+            covariance = torch.as_tensor(current["sum_xx"]) - torch.einsum(
+                "hid,hjd->hijd", sum_x, sum_x
+            ) / count
+            cross = torch.as_tensor(current["sum_xy"]) - sum_x * mean_y[:, None]
+            gram = covariance.permute(0, 3, 1, 2)
+            rhs = cross.permute(0, 2, 1)
+            scale = (
+                torch.diagonal(gram, dim1=-2, dim2=-1).sum(dim=-1) / order
+            ).clamp_min(1e-20)
+            penalty = ridge * scale
+            system = gram + penalty[..., None, None] * torch.eye(
+                order, dtype=torch.float64, device=work_device
+            )
+            persistence = torch.zeros(order, dtype=torch.float64, device=work_device)
+            persistence[0] = 1.0
+            coefficient = torch.linalg.solve(
+                system, (rhs + penalty[..., None] * persistence).unsqueeze(-1)
+            ).squeeze(-1)
+            gain = coefficient.abs().sum(dim=-1).clamp_min(1e-20)
+            coefficient.mul_(torch.clamp(max_gain / gain, max=1.0)[..., None])
+            weights[layer, order - 1, :order] = coefficient.permute(2, 0, 1).float()
+            bias[layer, order - 1] = (
+                mean_y - (mean_x.permute(0, 2, 1) * coefficient).sum(dim=-1)
+            ).float()
+
+    return TemporalParameters(
+        weights.to(target.device).contiguous(),
+        bias.to(target.device).contiguous(),
+        stride=stride,
+        layer_ids=tuple(range(layer_count)) if layer_ids is None else layer_ids,
+    )
+
+
+@torch.no_grad()
 def fit_cross_kv(
     keys: torch.Tensor,
     values: torch.Tensor,
@@ -2641,6 +2788,33 @@ def _fit_legacy_predictors(
             device=keys.device,
             signature=signature,
         )
+    elif config.k_predictor_mode == "layer_head":
+        layer_count = int(keys.shape[0])
+        head_count = int(keys.shape[-2])
+        initial_weights = torch.zeros(
+            layer_count,
+            history_length,
+            history_length,
+            head_count,
+            dim,
+            dtype=torch.float32,
+            device=keys.device,
+        )
+        initial_weights[:, :, 0] = 1.0
+        temporal = TemporalParameters(
+            history_weights=initial_weights,
+            history_bias=torch.zeros(
+                layer_count,
+                history_length,
+                head_count,
+                dim,
+                dtype=torch.float32,
+                device=keys.device,
+            ),
+            stride=config.stride,
+            layer_ids=layer_ids,
+            codec_signature=signature,
+        )
     else:
         initial_weights = torch.zeros(
             history_length,
@@ -2681,18 +2855,30 @@ def _fit_legacy_predictors(
                 if fit_history_source == "reconstructed"
                 else keys
             )
-            fitted = fit_legacy_shared_temporal(
-                reconstructed_keys,
-                keys,
-                history_length=history_length,
-                ridge=temporal_ridge,
-                max_gain=max_gain,
-                stride=config.stride,
-            )
+            if config.k_predictor_mode == "layer_head":
+                fitted = fit_legacy_layer_head_temporal(
+                    reconstructed_keys,
+                    keys,
+                    history_length=history_length,
+                    ridge=temporal_ridge,
+                    max_gain=max_gain,
+                    stride=config.stride,
+                    layer_ids=layer_ids,
+                )
+            else:
+                fitted = fit_legacy_shared_temporal(
+                    reconstructed_keys,
+                    keys,
+                    history_length=history_length,
+                    ridge=temporal_ridge,
+                    max_gain=max_gain,
+                    stride=config.stride,
+                )
             temporal = TemporalParameters(
                 fitted.history_weights,
                 fitted.history_bias,
                 fitted.stride,
+                layer_ids=fitted.layer_ids,
                 codec_signature=signature,
             )
 

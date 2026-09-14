@@ -19,6 +19,8 @@ against a different one, so a config change means refitting.
 | config | fit | K/V | anchor | notes |
 |---|---|---|---|---|
 | `legacy-cross-lh.json` | legacy | 4/4 | INT4 | layer-head CrossKV under the legacy family — the CrossKV sharing study |
+| `legacy-k-lh.json` | legacy | 4/4 | INT4 | per-layer/head K predictor under the legacy family — the K sharing study |
+| `legacy-k-lh-cross-lh.json` | legacy | 4/4 | INT4 | both layer-head; differs from `native.json` only in fitting math and IEEE matmul |
 | `legacy-cross-lh-a5.json` | legacy | 5/3 | INT5 | same, wider anchor |
 | `legacy-cross-lh-a6.json` | legacy | 6/4 | INT6 | same, wider still |
 | `legacy-k5v3-anchor-max.json` | legacy | 5/3 | INT5 | anchor widened to match K, layer-shared CrossKV |

@@ -61,6 +61,10 @@ PROMPTS=assets/generation_prompts.txt bash scripts/Self-Forcing/run_bf16.sh
 （下一节），但参数**不能互换**：协议写进 codec signature，加载时不匹配直接报错，
 参数目录也分别以 `legacy-` / `native-` 开头。
 
+legacy 协议也可以把 `k_predictor_mode` 设成 `layer_head`（`configs/legacy-k-lh.json`、
+`configs/legacy-k-lh-cross-lh.json`）：拟合数学不变，只是 K 的正规方程按层、按头分开累积，
+用于在同一套拟合数学下对比 K 的共享方式。
+
 ```bash
 CONFIG=configs/native.json FIT_DEVICE=cuda bash scripts/fit_params.sh self-forcing
 ```
@@ -229,7 +233,7 @@ PYTHONPATH=src python -m pytest -q scripts/tests/test_jensen_pipeline.py
 | `TRACE_FILE` | 指定采集好的 `clean_trace.npz` |
 | `OUTPUT_DIR` | 指定参数输出目录 |
 | `KH`、`VH` | 设置 K/V history length |
-| `k_predictor_mode` | 配置中的 `shared`、`identity`、`taylor`、`taylor2` 或 `direct` |
+| `k_predictor_mode` | 配置中的 `shared`、`layer_head`、`identity`、`taylor`、`taylor2` 或 `direct` |
 | `V_PREDICTOR` | `cross_kv`、`temporal`、`identity`、`taylor`、`taylor2`、`cross_kv_identity`、`cross_kv_taylor`、`cross_kv_taylor2`、`innovation` 或 `direct` |
 | `CACHE_STRIDE` | LongCat Context Parallel 的 local stride |
 | `FIT_DEVICE` | `cuda`、`cpu` 或 `auto` |

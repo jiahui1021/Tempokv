@@ -125,7 +125,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cross-matmul-precision", choices=("ieee", "tf32"))
     parser.add_argument(
         "--k-predictor-mode",
-        choices=("shared", "identity", "taylor", "taylor2", "direct"),
+        choices=("shared", "layer_head", "identity", "taylor", "taylor2", "direct"),
     )
     parser.add_argument(
         "--v-predictor-mode",
