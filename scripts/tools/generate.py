@@ -26,6 +26,7 @@ from tempokv import (
     configure_triton_cache,
 )
 from tempokv.config import config_from_mapping, is_temporal_v_predictor
+from tempokv.integration import check_deployable_cross_kv_layout
 
 
 CONFIG_FIELDS = tuple(CodecConfig.__dataclass_fields__)
@@ -89,15 +90,7 @@ def _load_config(path: Path, args: argparse.Namespace) -> CodecConfig:
     if unknown:
         raise ValueError(f"unknown codec config fields: {unknown}")
     config = config_from_mapping(payload)
-    # One CrossKV layout per family; the other modes belong to the sharing
-    # ablation rather than to a production run.
-    expected_cross = "layer_shared" if config.fit_mode == "legacy" else "layer_head"
-    if config.cross_kv_weight_mode != expected_cross:
-        raise ValueError(
-            f"{config.fit_mode} CrossKV parameters must use "
-            f"cross_kv_weight_mode={expected_cross}, got "
-            f"{config.cross_kv_weight_mode}"
-        )
+    check_deployable_cross_kv_layout(config)
     overrides = {
         field: getattr(args, field)
         for field in CONFIG_FIELDS

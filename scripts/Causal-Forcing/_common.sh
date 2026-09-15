@@ -166,6 +166,14 @@ if k_prefix is None:
     k_label = f"kh{int(k_history)}"
 else:
     k_label = f"{k_prefix}{int(k_history)}"
+# A learned K predictor at its family's own granularity stays unlabelled, which
+# keeps every existing directory name.  Legacy can also fit K per layer and head
+# (the K sharing study); those parameters must not overwrite the pooled ones.
+k_layout_label = (
+    "-k" + k_predictor.replace("_", "")
+    if k_prefix is None and k_predictor not in {default_k_predictor, "direct"}
+    else ""
+)
 v_predictor = sys.argv[7] or config.get(
     "v_predictor_mode", DEFAULT_V_PREDICTOR_MODE
 )
@@ -189,16 +197,25 @@ if v_prefix is None:
         f"{v_predictor!r}"
     )
 v_label = f"{v_prefix}{int(v_history)}"
-# One CrossKV layout per family; the sharing-ablation modes are not production
-# parameter sets and must not land in a production directory name.
-expected_cross = "layer_shared" if fit_mode == "legacy" else "layer_head"
-cross_weight_mode = config.get("cross_kv_weight_mode", expected_cross)
-if cross_weight_mode != expected_cross:
+# The CrossKV layouts each family deploys, as in
+# tempokv.integration.DEPLOYABLE_CROSS_KV_WEIGHT_MODES.  Legacy deploys both, so
+# the segment names the layout actually fitted; the sharing-ablation modes are
+# not production parameter sets and must not land in a production directory.
+deployable_cross = (
+    ("layer_shared", "layer_head") if fit_mode == "legacy" else ("layer_head",)
+)
+cross_weight_mode = config.get("cross_kv_weight_mode", deployable_cross[0])
+# Only CrossKV V reads a per-layer matrix: fit_params.py and the model adapters
+# run every other legacy V predictor with the layer-shared layout whatever the
+# config says, so the name follows that.
+if fit_mode == "legacy" and v_predictor not in {"cross_kv", "direct"}:
+    cross_weight_mode = "layer_shared"
+if cross_weight_mode not in deployable_cross:
     raise SystemExit(
-        f"{fit_mode} CrossKV parameters must use "
-        f"cross_kv_weight_mode={expected_cross}, got {cross_weight_mode}"
+        f"{fit_mode} CrossKV parameters must use cross_kv_weight_mode in "
+        f"{list(deployable_cross)}, got {cross_weight_mode}"
     )
-cross_weight_label = "-" + expected_cross.replace("_", "")
+cross_weight_label = "-" + cross_weight_mode.replace("_", "")
 if k_bits == v_bits:
     precision_label = f"int{k_bits}"
 else:
@@ -222,7 +239,7 @@ if fit_history_source not in {"reconstructed", "clean"}:
 fit_label = "" if fit_history_source == "reconstructed" else "-fitclean"
 print(
     f"{mode_label}{k_label}-{v_label}-{precision_label}{anchor_label}"
-    f"{stride_label}{cross_weight_label}{fit_label}"
+    f"{stride_label}{k_layout_label}{cross_weight_label}{fit_label}"
 )
 SLUGPY
 }

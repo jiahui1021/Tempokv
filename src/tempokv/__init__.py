@@ -20,6 +20,7 @@ from .fitting import (
     fit_temporal_layers,
 )
 from .integration import (
+    check_deployable_cross_kv_layout,
     check_parameters_match_config,
     load_codec,
     load_codec_from_env,
@@ -44,6 +45,7 @@ __all__ = [
     "fit_predictors",
     "fit_temporal",
     "fit_temporal_layers",
+    "check_deployable_cross_kv_layout",
     "check_parameters_match_config",
     "configure_triton_cache",
     "load_codec",

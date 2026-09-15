@@ -26,7 +26,9 @@ def _legacy_config(**overrides: object) -> CodecConfig:
     return CodecConfig(**values)
 
 
-def test_default_and_shipped_configs_are_legacy_layer_shared() -> None:
+def test_default_is_legacy_layer_shared_and_shipped_configs_are_deployable() -> None:
+    from tempokv.integration import DEPLOYABLE_CROSS_KV_WEIGHT_MODES
+
     default = CodecConfig()
     assert default.fit_mode == "legacy"
     assert default.k_predictor_mode == "shared"
@@ -35,10 +37,8 @@ def test_default_and_shipped_configs_are_legacy_layer_shared() -> None:
     root = Path(__file__).resolve().parents[2]
     for path in sorted((root / "configs").glob("*.json")):
         config = config_from_mapping(json.loads(path.read_text(encoding="utf-8")))
-        expected = (
-            "layer_shared" if config.fit_mode == "legacy" else "layer_head"
-        )
-        assert config.cross_kv_weight_mode == expected, path.name
+        deployable = DEPLOYABLE_CROSS_KV_WEIGHT_MODES[config.fit_mode]
+        assert config.cross_kv_weight_mode in deployable, path.name
 
 
 def test_native_json_config_selects_the_native_defaults() -> None:

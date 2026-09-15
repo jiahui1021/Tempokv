@@ -70,6 +70,30 @@ def check_parameters_match_config(
             )
 
 
+# CrossKV layouts a fitted parameter set is deployed with, per fitting family.
+# Legacy fits both: layer_shared is the Self-Forcing / Causal-Forcing default,
+# and layer_head is LongCat's production layout (layer0 V is unfit-able under
+# layer_shared, 9.6 hybrid-bits) as well as the CrossKV sharing experiments'.
+# Native only fits layer_head.  head_shared and shared exist for the sharing
+# ablation alone.  codec_slug in scripts/*/_common.sh repeats this table without
+# importing tempokv, so the two must change together.
+DEPLOYABLE_CROSS_KV_WEIGHT_MODES: dict[str, tuple[str, ...]] = {
+    "legacy": ("layer_shared", "layer_head"),
+    "native": ("layer_head",),
+}
+
+
+def check_deployable_cross_kv_layout(config: CodecConfig) -> None:
+    """Refuse a CrossKV layout that no production parameter set uses."""
+    allowed = DEPLOYABLE_CROSS_KV_WEIGHT_MODES[config.fit_mode]
+    if config.cross_kv_weight_mode not in allowed:
+        raise ValueError(
+            f"{config.fit_mode} CrossKV parameters must use "
+            f"cross_kv_weight_mode in {list(allowed)}, got "
+            f"{config.cross_kv_weight_mode}"
+        )
+
+
 def load_codec(
     config_path: str | Path,
     k_parameters_path: str | Path,
@@ -104,21 +128,7 @@ def load_codec(
     if overrides:
         payload = {**payload, **overrides}
     config = config_from_mapping(payload)
-    # Each family has one CrossKV layout: legacy pools the layers, native keeps
-    # per-layer weights.  LongCat is the exception inside legacy: layer0 V is
-    # unfit-able under layer_shared (9.6 hybrid-bits), so legacy additionally
-    # accepts layer_head there.  Other sharing-ablation modes stay rejected.
-    allowed_cross = (
-        {"layer_shared", "layer_head"}
-        if config.fit_mode == "legacy"
-        else {"layer_head"}
-    )
-    if config.cross_kv_weight_mode not in allowed_cross:
-        raise ValueError(
-            f"{config.fit_mode} CrossKV parameters must use "
-            f"cross_kv_weight_mode in {sorted(allowed_cross)}, got "
-            f"{config.cross_kv_weight_mode}"
-        )
+    check_deployable_cross_kv_layout(config)
     if config.use_triton:
         configure_triton_cache(triton_cache)
     temporal = TemporalParameters.load(k_parameters_path)

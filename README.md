@@ -101,7 +101,9 @@ INT8→INT12 的 RMSE 降约 11 倍，INT12 之后已经很平。
 
 K/V 位宽相等时目录名沿用 `intN`，不相等时写成 `kN-vM`；anchor 不是默认的 INT4 时追加
 `-aN`。例如 `K_BITS=3 V_BITS=5 ANCHOR_BITS=12` 得到
-`legacy-kh2-vh1-k3-v5-a12-layershared`。
+`legacy-kh2-vh1-k3-v5-a12-layershared`。最后一段是实际拟合的 CrossKV 布局
+（`layershared` / `layerhead`，legacy 两种都能部署）；legacy 的 K 用 `layer_head` 时再加
+`-klayerhead`，例如 `legacy-kh2-vh1-int4-klayerhead-layerhead`，不会覆盖共享 K 的目录。
 
 ## Jensen 修正（attention score，默认关闭）
 
