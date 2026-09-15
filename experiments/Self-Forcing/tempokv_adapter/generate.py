@@ -1001,11 +1001,17 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                 )
             fit_report = json.loads(fit_report_path.read_text(encoding="utf-8"))
             fitted_span = (fit_report.get("fit") or {}).get("span_frames")
-            if fitted_span != args.span_frames:
+            # A runtime span may be *wider* than the calibration window (the
+            # span-48 arm reuses the production k2v2 params, whose fit_report
+            # records no span_frames -> treated as unconstrained). Only a
+            # narrower runtime span than the fitted window is rejected, since
+            # that would run outside the calibrated regime in the unsafe
+            # direction.
+            if fitted_span is not None and args.span_frames < fitted_span:
                 raise ValueError(
-                    "TempoKV parameters were not calibrated for "
-                    f"span_frames={args.span_frames}: fit report has "
-                    f"{fitted_span!r}"
+                    "TempoKV parameters were calibrated for a wider span than "
+                    f"requested: fit report span_frames={fitted_span!r}, "
+                    f"runtime span_frames={args.span_frames}"
                 )
 
     generation_command = _generation_command(args, paths)

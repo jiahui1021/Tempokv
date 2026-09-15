@@ -15,8 +15,8 @@ from typing import Any
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
-DEFAULT_SPANS = (2, 4, 8, 12, 18)
-DEFAULT_BITS = (2, 4)
+DEFAULT_SPANS = (4, 12, 48)
+DEFAULT_BITS = (2,)
 FIXED_PIXEL_FRAMES = 717
 LONG_PIXEL_FRAMES = 1401  # nearest exact Self-Forcing workload to requested 1400
 
@@ -126,7 +126,7 @@ def _generation_command(
         "--start-index",
         str(args.prompt_index),
         "--end-index",
-        str(args.prompt_index + 1),
+        str(args.end_index),
         "--num-gpus",
         "1",
         "--benchmark",
@@ -473,6 +473,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--bits", type=int, nargs="+", default=DEFAULT_BITS)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--prompt-index", type=int, default=0)
+    parser.add_argument("--end-index", type=int, default=None, help="exclusive end prompt index for generation (defaults to prompt_index+1)")
     parser.add_argument("--fit-device", default="auto")
     parser.add_argument("--nmse-device", default="cpu")
     parser.add_argument("--attention-steps", type=int)
@@ -482,6 +483,8 @@ def _parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     args = _parser().parse_args()
+    if args.end_index is None:
+        args.end_index = args.prompt_index + 1
     if sorted(set(args.spans)) != sorted(DEFAULT_SPANS):
         raise ValueError(f"formal scan requires spans {DEFAULT_SPANS}")
     if sorted(set(args.bits)) != sorted(DEFAULT_BITS):
