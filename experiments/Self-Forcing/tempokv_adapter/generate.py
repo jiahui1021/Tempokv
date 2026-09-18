@@ -992,27 +992,10 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         parameters = _validate_parameters(
             paths["k_params"], paths["v_params"], config
         )
-        if args.span_frames is not None:
-            fit_report_path = paths["k_params"].parent / "fit_report.json"
-            if not fit_report_path.is_file():
-                raise ValueError(
-                    "span experiments require fit_report.json beside the "
-                    "parameter files"
-                )
-            fit_report = json.loads(fit_report_path.read_text(encoding="utf-8"))
-            fitted_span = (fit_report.get("fit") or {}).get("span_frames")
-            # A runtime span may be *wider* than the calibration window (the
-            # span-48 arm reuses the production k2v2 params, whose fit_report
-            # records no span_frames -> treated as unconstrained). Only a
-            # narrower runtime span than the fitted window is rejected, since
-            # that would run outside the calibrated regime in the unsafe
-            # direction.
-            if fitted_span is not None and args.span_frames < fitted_span:
-                raise ValueError(
-                    "TempoKV parameters were calibrated for a wider span than "
-                    f"requested: fit report span_frames={fitted_span!r}, "
-                    f"runtime span_frames={args.span_frames}"
-                )
+        # Predictor parameters are reusable across span lengths.  A fitting
+        # span only partitions calibration samples and is deliberately absent
+        # from the parameter format signature, so generation must not couple
+        # its runtime boundary to fit_report.json.
 
     generation_command = _generation_command(args, paths)
     report: dict[str, object] = {

@@ -202,6 +202,10 @@ BENCHMARK        要求本次完整生成，不能跳过已有视频，0 或 1�
 DRY_RUN          只检查并打印命令，0 或 1
 ```
 
+`SPAN_FRAMES` 在生成命令中只决定 span 边界，不是参数格式的一部分。使用某个
+span 长度拟合的 K/V 参数可以在生成时改用其他 `SPAN_FRAMES`，无需重新拟合或修改
+`fit_report.json`。拟合命令中的 `SPAN_FRAMES` 仅用于将 calibration trace 分成独立窗口。
+
 做 latency benchmark 时设置 `BENCHMARK=1 SKIP_EXISTING=0`。报告中的
 `generation_seconds` 是 prompt batch 的耗时；`NUM_SAMPLES>1` 时另记录每样本
 耗时和吞吐量，不会把多个视频的累计保存时间当作单个样本延迟。
