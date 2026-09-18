@@ -992,21 +992,10 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         parameters = _validate_parameters(
             paths["k_params"], paths["v_params"], config
         )
-        if args.span_frames is not None:
-            fit_report_path = paths["k_params"].parent / "fit_report.json"
-            if not fit_report_path.is_file():
-                raise ValueError(
-                    "span experiments require fit_report.json beside the "
-                    "parameter files"
-                )
-            fit_report = json.loads(fit_report_path.read_text(encoding="utf-8"))
-            fitted_span = (fit_report.get("fit") or {}).get("span_frames")
-            if fitted_span != args.span_frames:
-                raise ValueError(
-                    "TempoKV parameters were not calibrated for "
-                    f"span_frames={args.span_frames}: fit report has "
-                    f"{fitted_span!r}"
-                )
+        # Predictor parameters are reusable across span lengths.  A fitting
+        # span only partitions calibration samples and is deliberately absent
+        # from the parameter format signature, so generation must not couple
+        # its runtime boundary to fit_report.json.
 
     generation_command = _generation_command(args, paths)
     report: dict[str, object] = {
