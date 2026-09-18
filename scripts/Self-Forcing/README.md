@@ -205,6 +205,9 @@ DRY_RUN          只检查并打印命令，0 或 1
 `SPAN_FRAMES` 在生成命令中只决定 span 边界，不是参数格式的一部分。使用某个
 span 长度拟合的 K/V 参数可以在生成时改用其他 `SPAN_FRAMES`，无需重新拟合或修改
 `fit_report.json`。拟合命令中的 `SPAN_FRAMES` 仅用于将 calibration trace 分成独立窗口。
+生成时每个 clean-refresh block 完成后会立即追加量化新帧；无需先在 BF16 中攒满整个
+span。未闭合的 span 只保留预测器所需的最近重建历史，`SPAN_FRAMES` 决定何时重新建立
+anchor。实验性 mean-split K 和 innovation V 仍保留整 span 批处理，以避免改变它们的数学定义。
 
 做 latency benchmark 时设置 `BENCHMARK=1 SKIP_EXISTING=0`。报告中的
 `generation_seconds` 是 prompt batch 的耗时；`NUM_SAMPLES>1` 时另记录每样本

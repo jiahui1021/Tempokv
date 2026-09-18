@@ -371,10 +371,16 @@ def install(profile: RuntimeProfile) -> dict[str, str]:
         bridge.decode_cache_state = wrapper
 
     def patch_encode() -> None:
-        from .codec import TempoKVCodec
+        from .codec import IncrementalTensorEncoder, TempoKVCodec
 
         _wrap_method(TempoKVCodec, "encode_key", profile, ENCODE_K)
         _wrap_method(TempoKVCodec, "encode_value", profile, ENCODE_V)
+        _wrap_method(
+            IncrementalTensorEncoder,
+            "append",
+            profile,
+            lambda encoder: ENCODE_V if encoder.cache_role == "v" else ENCODE_K,
+        )
 
     def patch_attention() -> None:
         causal_model = sys.modules["wan.modules.causal_model"]

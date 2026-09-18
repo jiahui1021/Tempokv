@@ -74,6 +74,9 @@ CONFIG=configs/native.json FIT_DEVICE=cuda bash scripts/fit_params.sh self-forci
 一个 span 的第一个 unit 是 **anchor**，直接量化；后面每个 unit 只存**预测残差**。
 两者的位宽独立设置，拟合和生成必须传入相同的值：
 
+Self-Forcing 在每个 clean block 完成后立即把新 unit 追加到当前 packed span；
+span 长度只控制 anchor 重置周期，不再是 BF16 缓冲区的累积门槛。
+
 | 变量 | 范围 | 作用 |
 |---|---|---|
 | `BITS` | 1–8 | 同时设置 K/V 残差位宽 |

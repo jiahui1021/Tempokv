@@ -153,7 +153,10 @@ class PackedTensor:
         if self.residual_scale is None:
             return anchor
         residual_binary = self.residual_mode == "symmetric" and self.bits == 1
-        residual = self.residual_scale.float() * (2.0 if residual_binary else 1.0)
+        residual_length = self.shape[2] - self.unit_lengths[0]
+        residual = self.residual_scale[:, :, :residual_length].float() * (
+            2.0 if residual_binary else 1.0
+        )
         return torch.cat([anchor, residual], dim=2)
 
     @property
@@ -797,6 +800,286 @@ def _encode(
     return packed, reconstruction
 
 
+class IncrementalTensorEncoder:
+    """Append finalized units to one predictor-continuous packed span.
+
+    The public batch codec remains the reference implementation.  This helper
+    starts from a batch-encoded prefix, preallocates the compressed residual
+    capacity for the configured span, and then applies the same closed-loop
+    predictor/quantizer arithmetic only to newly finalized units.  The packed
+    tensor keeps its capacity buffers while ``shape`` and ``unit_lengths``
+    describe the logical prefix visible to the decoder.
+
+    Only reconstructed predictor history is retained in BF16.  It is bounded
+    by the configured history order and released as soon as the span closes.
+    """
+
+    def __init__(
+        self,
+        packed: PackedTensor,
+        reconstruction: torch.Tensor,
+        config: CodecConfig,
+        *,
+        capacity_units: int,
+    ) -> None:
+        if capacity_units < len(packed.unit_lengths):
+            raise ValueError(
+                "incremental capacity is smaller than the encoded prefix"
+            )
+        if capacity_units < 1:
+            raise ValueError("incremental capacity must be positive")
+        if packed.channel_mean is not None:
+            raise ValueError("incremental encoding does not support span-mean K")
+        if packed.predictor_kind == "innovation":
+            raise ValueError("incremental encoding does not support K innovation")
+        if any(length != packed.stride for length in packed.unit_lengths):
+            raise ValueError("incremental prefixes must contain complete units")
+        if tuple(reconstruction.shape) != packed.shape:
+            raise ValueError(
+                "incremental reconstruction does not match packed prefix"
+            )
+
+        self.packed = packed
+        self.config = config
+        self.cache_role: str | None = None
+        self.capacity_units = int(capacity_units)
+        self._capacity_sequence = self.capacity_units * packed.stride
+        if self._capacity_sequence < packed.shape[2]:
+            raise ValueError("incremental capacity does not cover the prefix")
+
+        batch, heads, _, width = packed.shape
+        residual_capacity = self._capacity_sequence - packed.stride
+        packed_width = (width * packed.bits + 7) // 8
+        scale_width = width // packed.group_size
+        device = packed.anchor_quant.device
+        scale_dtype = _dtype(packed.reconstruction_dtype)
+        if packed.residual_scale is not None:
+            scale_dtype = packed.residual_scale.dtype
+        else:
+            scale_dtype = _dtype(config.scale_dtype)
+
+        quant_storage = torch.empty(
+            batch,
+            heads,
+            residual_capacity,
+            packed_width,
+            device=device,
+            dtype=torch.uint8,
+        )
+        scale_storage = torch.empty(
+            batch,
+            heads,
+            residual_capacity,
+            scale_width,
+            device=device,
+            dtype=scale_dtype,
+        )
+        zero_storage = (
+            torch.empty(
+                batch,
+                heads,
+                residual_capacity,
+                scale_width,
+                device=device,
+                dtype=code_dtype(packed.bits),
+            )
+            if packed.residual_mode == "asymmetric"
+            else None
+        )
+        used = packed.shape[2] - packed.stride
+        if used:
+            assert packed.residual_quant is not None
+            assert packed.residual_scale is not None
+            quant_storage[:, :, :used].copy_(packed.residual_quant)
+            scale_storage[:, :, :used].copy_(packed.residual_scale)
+            if zero_storage is not None:
+                assert packed.residual_zero_point is not None
+                zero_storage[:, :, :used].copy_(packed.residual_zero_point)
+        # Keep the full-capacity tensors attached to the packed object.  Triton
+        # can then consume them without a growing non-contiguous slice being
+        # materialized on every attention read.
+        packed.residual_quant = quant_storage
+        packed.residual_scale = scale_storage
+        packed.residual_zero_point = zero_storage
+
+        history_length = self._history_length
+        units: list[torch.Tensor] = []
+        offset = 0
+        for length in packed.unit_lengths:
+            units.append(reconstruction[:, :, offset : offset + length])
+            offset += length
+        self._history = (
+            [
+                unit.clone(memory_format=torch.contiguous_format)
+                for unit in reversed(units[-history_length:])
+            ]
+            if history_length
+            else []
+        )
+
+    @property
+    def _history_length(self) -> int:
+        if self.packed.predictor_kind == "temporal":
+            assert self.packed.temporal is not None
+            return int(self.packed.temporal.history_length)
+        assert self.packed.cross_kv is not None
+        return int(self.packed.cross_kv.history_length)
+
+    @property
+    def units(self) -> int:
+        return len(self.packed.unit_lengths)
+
+    @property
+    def full(self) -> bool:
+        return self.units == self.capacity_units
+
+    def history_bytes(self) -> int:
+        seen: set[tuple[int, int]] = set()
+        total = 0
+        for tensor in self._history:
+            storage = tensor.untyped_storage()
+            identity = (int(storage.data_ptr()), int(storage.nbytes()))
+            if identity in seen:
+                continue
+            seen.add(identity)
+            total += identity[1]
+        return total
+
+    def append(
+        self,
+        value: torch.Tensor,
+        *,
+        source: torch.Tensor | None = None,
+        reuse_input_for_reconstruction: bool = False,
+    ) -> torch.Tensor:
+        """Append one or more complete units and return their reconstruction."""
+        _validate_input(value, self.config)
+        if value.shape[2] <= 0 or value.shape[2] % self.packed.stride:
+            raise ValueError("incremental append must contain complete units")
+        appended_units = value.shape[2] // self.packed.stride
+        if self.units + appended_units > self.capacity_units:
+            raise ValueError("incremental append exceeds the span capacity")
+        if (
+            value.shape[:2] != self.packed.shape[:2]
+            or value.shape[3] != self.packed.shape[3]
+        ):
+            raise ValueError("incremental append shape changed within a span")
+        reconstruction_dtype = _dtype(self.packed.reconstruction_dtype)
+        if reuse_input_for_reconstruction and value.dtype != reconstruction_dtype:
+            raise ValueError(
+                "in-place incremental reconstruction requires "
+                f"{reconstruction_dtype}, got {value.dtype}"
+            )
+        reconstruction = (
+            value
+            if reuse_input_for_reconstruction
+            else torch.empty_like(value, dtype=reconstruction_dtype)
+        )
+
+        if self.packed.predictor_kind == "temporal":
+            if source is not None:
+                raise ValueError("temporal incremental encoding does not use a source")
+            projection = None
+        else:
+            if source is None or tuple(source.shape) != tuple(value.shape):
+                raise ValueError("CrossKV incremental source must match the append")
+            if source.dtype != reconstruction_dtype or source.device != value.device:
+                raise ValueError("CrossKV incremental source dtype/device mismatch")
+            assert self.packed.cross_kv is not None
+            projection = cross_projection(
+                source,
+                self.packed.cross_kv,
+                matmul_precision=self.packed.cross_matmul_precision,
+            )
+
+        assert self.packed.residual_quant is not None
+        assert self.packed.residual_scale is not None
+        residual_offset = self.packed.shape[2] - self.packed.stride
+        output_offset = 0
+        new_lengths = list(self.packed.unit_lengths)
+        for _ in range(appended_units):
+            unit_length = self.packed.stride
+            current = value[:, :, output_offset : output_offset + unit_length]
+            if self.packed.predictor_kind == "temporal":
+                assert self.packed.temporal is not None
+                if self.packed.temporal.history_length == 0:
+                    prediction = torch.zeros_like(current, dtype=torch.float32)
+                else:
+                    prediction = predict_temporal(
+                        self._history,
+                        self.packed.temporal,
+                        legacy=self.packed.compatibility_mode == "legacy",
+                    )
+            else:
+                assert source is not None
+                assert projection is not None
+                assert self.packed.cross_kv is not None
+                source_unit = source[
+                    :, :, output_offset : output_offset + unit_length
+                ]
+                projection_unit = projection[
+                    :, :, output_offset : output_offset + unit_length
+                ]
+                prediction = predict_cross_kv(
+                    source_unit,
+                    self.packed.cross_kv,
+                    self._history,
+                    matmul_precision=self.packed.cross_matmul_precision,
+                    legacy=self.packed.compatibility_mode == "legacy",
+                    projection=projection_unit,
+                )
+            if self.packed.compatibility_mode == "legacy":
+                residual_input = current.float() - prediction
+            else:
+                residual_input = torch.empty_like(current, dtype=torch.float32)
+                torch.sub(current, prediction, out=residual_input)
+            quant, scale, zero_point, residual_rebuilt = _quantize(
+                residual_input,
+                bits=self.packed.bits,
+                group_size=self.packed.group_size,
+                mode=self.packed.residual_mode,
+                scale_dtype=self.packed.residual_scale.dtype,
+            )
+            rebuilt = (
+                (prediction + residual_rebuilt).to(reconstruction_dtype)
+                if self.packed.compatibility_mode == "legacy"
+                else prediction.add_(residual_rebuilt).to(reconstruction_dtype)
+            )
+            reconstruction[
+                :, :, output_offset : output_offset + unit_length
+            ] = rebuilt
+            residual_end = residual_offset + unit_length
+            self.packed.residual_quant[
+                :, :, residual_offset:residual_end
+            ].copy_(quant)
+            self.packed.residual_scale[
+                :, :, residual_offset:residual_end
+            ].copy_(scale)
+            if zero_point is not None:
+                assert self.packed.residual_zero_point is not None
+                self.packed.residual_zero_point[
+                    :, :, residual_offset:residual_end
+                ].copy_(zero_point)
+            if self._history_length:
+                self._history = [
+                    rebuilt,
+                    *self._history[: self._history_length - 1],
+                ]
+            residual_offset = residual_end
+            output_offset += unit_length
+            new_lengths.append(unit_length)
+
+        batch, heads, sequence, width = self.packed.shape
+        self.packed.shape = (
+            batch,
+            heads,
+            sequence + int(value.shape[2]),
+            width,
+        )
+        self.packed.unit_lengths = tuple(new_lengths)
+        return reconstruction
+
+
 def encode_temporal(
     key: torch.Tensor,
     parameters: TemporalParameters,
@@ -1278,6 +1561,27 @@ class TempoKVCodec:
         """
         return self.encode_key(tensor, layer=layer, reuse_input=reuse_input)
 
+    def begin_incremental_primary(
+        self,
+        tensor: torch.Tensor,
+        *,
+        capacity_units: int,
+        layer: int = 0,
+        reuse_input: bool = False,
+    ) -> tuple[IncrementalTensorEncoder, torch.Tensor]:
+        """Encode a primary prefix and keep bounded state for later appends."""
+        packed, reconstruction = self.encode_primary(
+            tensor, layer=layer, reuse_input=reuse_input
+        )
+        encoder = IncrementalTensorEncoder(
+            packed,
+            reconstruction,
+            self.config,
+            capacity_units=capacity_units,
+        )
+        encoder.cache_role = self.primary_role
+        return encoder, reconstruction
+
     def encode_secondary(
         self,
         tensor: torch.Tensor,
@@ -1290,6 +1594,39 @@ class TempoKVCodec:
         return self.encode_value(
             tensor, reconstructed_primary, layer=layer, reuse_input=reuse_input
         )
+
+    def begin_incremental_secondary(
+        self,
+        tensor: torch.Tensor,
+        reconstructed_primary: torch.Tensor | None,
+        *,
+        capacity_units: int,
+        layer: int = 0,
+        reuse_input: bool = False,
+    ) -> IncrementalTensorEncoder:
+        """Encode a secondary prefix and keep bounded state for later appends."""
+        packed = self.encode_secondary(
+            tensor,
+            reconstructed_primary,
+            layer=layer,
+            reuse_input=reuse_input,
+        )
+        # The secondary batch API intentionally discards its reconstruction.
+        # The streaming integration uses the in-place path, leaving the exact
+        # decoder-visible values in ``tensor`` without another allocation.
+        if not reuse_input:
+            raise ValueError(
+                "incremental secondary initialization requires in-place "
+                "reconstruction"
+            )
+        encoder = IncrementalTensorEncoder(
+            packed,
+            tensor,
+            self.config,
+            capacity_units=capacity_units,
+        )
+        encoder.cache_role = self.secondary_role
+        return encoder
 
     @property
     def cross_kv(self) -> CrossKVParameters:
