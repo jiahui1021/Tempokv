@@ -206,6 +206,7 @@ class CausalInferencePipeline(torch.nn.Module):
                 layer["local_end_index"] = 0
         self.summary["quantization_events"] = []
         self.summary["last_kv_cache_memory"] = None
+        self.reset_quantization_state()
 
         # Step 2: Cache context feature
         current_start_frame = 0
@@ -224,6 +225,12 @@ class CausalInferencePipeline(torch.nn.Module):
                     crossattn_cache=self.crossattn_cache,
                     current_start=current_start_frame * self.frame_seq_length,
                 )
+                if getattr(self, "_incremental_tempokv", False):
+                    self.quantize_kv_cache(
+                        current_start_frame * self.frame_seq_length,
+                        (current_start_frame + 1) * self.frame_seq_length,
+                        int(self.kv_cache1[0]["local_end_index"]),
+                    )
                 current_start_frame += 1
             else:
                 # Assume num_input_frames is self.num_frame_per_block * num_input_blocks
@@ -242,6 +249,14 @@ class CausalInferencePipeline(torch.nn.Module):
                     crossattn_cache=self.crossattn_cache,
                     current_start=current_start_frame * self.frame_seq_length,
                 )
+                if getattr(self, "_incremental_tempokv", False):
+                    self.quantize_kv_cache(
+                        current_start_frame * self.frame_seq_length,
+                        (
+                            current_start_frame + self.num_frame_per_block
+                        ) * self.frame_seq_length,
+                        int(self.kv_cache1[0]["local_end_index"]),
+                    )
                 current_start_frame += self.num_frame_per_block
 
         if profile:
@@ -281,15 +296,17 @@ class CausalInferencePipeline(torch.nn.Module):
                     block_start.record()
 
                 finalized_frames = sum(all_num_frames[:chunk_index])
-                for quantized_frames_start, quantized_frames_end in ready_quantization_spans(
-                    next_span_start_frame, finalized_frames, span_frames
-                ):
-                    self.quantize_kv_cache(
-                        quantized_frames_start * self.frame_seq_length,
-                        quantized_frames_end * self.frame_seq_length,
-                        int(self.kv_cache1[0]["local_end_index"]),
+                if not getattr(self, "_incremental_tempokv", False):
+                    ready_spans = ready_quantization_spans(
+                        next_span_start_frame, finalized_frames, span_frames
                     )
-                    next_span_start_frame = quantized_frames_end
+                    for quantized_frames_start, quantized_frames_end in ready_spans:
+                        self.quantize_kv_cache(
+                            quantized_frames_start * self.frame_seq_length,
+                            quantized_frames_end * self.frame_seq_length,
+                            int(self.kv_cache1[0]["local_end_index"]),
+                        )
+                        next_span_start_frame = quantized_frames_end
 
                 noisy_input = noise[
                     :, current_start_frame - num_input_frames:current_start_frame + current_num_frames - num_input_frames]
@@ -342,6 +359,14 @@ class CausalInferencePipeline(torch.nn.Module):
                     crossattn_cache=self.crossattn_cache,
                     current_start=current_start_frame * self.frame_seq_length,
                 )
+                if getattr(self, "_incremental_tempokv", False):
+                    self.quantize_kv_cache(
+                        current_start_frame * self.frame_seq_length,
+                        (
+                            current_start_frame + current_num_frames
+                        ) * self.frame_seq_length,
+                        int(self.kv_cache1[0]["local_end_index"]),
+                    )
 
                 if profile:
                     block_end.record()
@@ -422,6 +447,9 @@ class CausalInferencePipeline(torch.nn.Module):
     ) -> None:
         """BF16/trace hook. TempoKV replaces this method in ``bridge.py``."""
         del tokens_to_quantize_start, tokens_to_quantize_end, max_tokens_to_quantize
+
+    def reset_quantization_state(self) -> None:
+        """Hook for a cache backend that retains state across clean blocks."""
 
     def _resident_kv_bytes(self) -> tuple[int, int]:
         """Resident KV bytes and their BF16 equivalent, per ``resident_analytic.v1``.

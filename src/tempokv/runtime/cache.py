@@ -584,6 +584,36 @@ class ChunkedKVCache:
             self.chunk_state[chunk_index] = ChunkState.QUANTIZED
             self._span_by_chunk[chunk_index] = span
 
+    def extend_quantized(self, start_index: int, end_index: int) -> None:
+        """Extend an existing packed span over newly finalized BF16 chunks.
+
+        The span's quantized state is mutable and has already received the new
+        residual codes.  This method only advances the cache ownership range
+        and releases the dense chunks; it never creates another anchor.
+        """
+        start_chunk = self._token_to_chunk(start_index)
+        end_chunk = self._token_to_chunk(end_index)
+        if start_chunk >= end_chunk:
+            raise ValueError("extended packed cache span must be non-empty")
+        span = self._span_by_chunk[start_chunk]
+        if span is None or span["start_chunk"] != start_chunk:
+            raise ValueError("extended packed cache span start is not installed")
+        old_end = int(span["end_chunk"])
+        if end_chunk <= old_end:
+            raise ValueError("extended packed cache span must grow")
+        for chunk_index in range(old_end, end_chunk):
+            if self.chunk_state[chunk_index] != ChunkState.BF16:
+                raise ValueError(
+                    f"cache chunk {chunk_index} is not finalized BF16 data"
+                )
+            if self._span_by_chunk[chunk_index] is not None:
+                raise ValueError("extended packed cache span overlaps another span")
+        span["end_chunk"] = end_chunk
+        for chunk_index in range(old_end, end_chunk):
+            self.chunks[chunk_index] = None
+            self.chunk_state[chunk_index] = ChunkState.QUANTIZED
+            self._span_by_chunk[chunk_index] = span
+
     def bf16_resident_bytes(self) -> int:
         """Bytes held by dense chunks that are not covered by a packed span.
 
