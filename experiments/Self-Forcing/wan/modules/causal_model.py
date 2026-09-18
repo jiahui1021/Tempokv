@@ -600,11 +600,30 @@ class CausalWanSelfAttention(nn.Module):
                 if jensen_groups and not fused_jensen
                 else 0
             )
+            decode_start_index = 0
+            if self.local_attn_size != -1 and self.sink_size == 0:
+                requested_start = max(
+                    0,
+                    local_end_index - self.local_attn_size * frame_seqlen,
+                )
+                primary_start = kv_cache[primary_role].complete_span_read_start(
+                    requested_start
+                )
+                secondary_start = kv_cache[secondary_role].complete_span_read_start(
+                    requested_start
+                )
+                # K/V are packed on identical boundaries.  Fall back to the
+                # full range rather than risk cutting either span if a future
+                # integration violates that invariant.
+                if primary_start == secondary_start:
+                    decode_start_index = primary_start
             primary_all = kv_cache[primary_role].read(
-                0, local_end_index, extra_channels=extra_channels
+                decode_start_index,
+                local_end_index,
+                extra_channels=extra_channels,
             )
             secondary_all = kv_cache[secondary_role].read(
-                0,
+                decode_start_index,
                 local_end_index,
                 source_tensor=primary_all[..., :head_dim],
                 extra_channels=extra_channels,
@@ -619,7 +638,7 @@ class CausalWanSelfAttention(nn.Module):
                 narrow_k,
                 grid_sizes,
                 freqs,
-                start_frame=0,
+                start_frame=decode_start_index // frame_seqlen,
                 precision=getattr(kv_cache["k"], "rope_precision", "native"),
                 out=narrow_k,
             )
@@ -632,7 +651,7 @@ class CausalWanSelfAttention(nn.Module):
                     else k_all[..., head_dim:head_dim + jensen_groups]
                 )
                 kv_cache["k"].read_step_sizes(
-                    0,
+                    decode_start_index,
                     local_end_index,
                     group_size=int(getattr(kv_cache["k"], "tempokv_group_size", 64)),
                     out=step_channels,
@@ -642,7 +661,7 @@ class CausalWanSelfAttention(nn.Module):
                     _replace_with_cached_mean(step_channels)
             absolute_k = k_all
             window = _attention_window_ranges(
-                local_end_index=local_end_index,
+                local_end_index=local_end_index - decode_start_index,
                 frame_seqlen=frame_seqlen,
                 local_attn_size=self.local_attn_size,
                 sink_size=self.sink_size,

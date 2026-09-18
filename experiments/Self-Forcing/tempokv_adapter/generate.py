@@ -1050,6 +1050,12 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                 "TEMPOKV_K_PARAMS_PATH": str(paths["k_params"]),
                 "TEMPOKV_V_PARAMS_PATH": str(paths["v_params"]),
                 "TEMPOKV_NUM_FRAMES": str(latent_frames_for(args.frames)),
+                # The rollout length, which is what the incremental encoder
+                # sizes its spans against.  It is exported separately because
+                # TEMPOKV_NUM_FRAMES doubles as the attention window and the
+                # ablation below narrows that window without shortening the
+                # rollout.
+                "TEMPOKV_HORIZON_FRAMES": str(latent_frames_for(args.frames)),
             }
         )
         if args.span_frames is not None:
