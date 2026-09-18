@@ -184,6 +184,28 @@ class PackedTensor:
                 total += component.numel() * component.element_size()
         return total
 
+    def logical_storage_bytes(self) -> int:
+        """Bytes initialized for the logical prefix of an open packed span.
+
+        ``storage_bytes`` is the allocator-facing figure and includes unused
+        geometric-growth capacity.  This method exists only for codec-format
+        analysis; resident-memory reports must continue to use allocated bytes.
+        """
+        total = self.anchor_quant.numel() * self.anchor_quant.element_size()
+        total += self.anchor_scale.numel() * self.anchor_scale.element_size()
+        if self.channel_mean is not None:
+            total += self.channel_mean.numel() * self.channel_mean.element_size()
+        residual_length = self.shape[2] - self.unit_lengths[0]
+        for component in (
+            self.residual_quant,
+            self.residual_scale,
+            self.residual_zero_point,
+        ):
+            if component is not None:
+                logical = component[:, :, :residual_length]
+                total += logical.numel() * logical.element_size()
+        return total
+
 
 @dataclass(slots=True)
 class PackedKV:
@@ -843,64 +865,14 @@ class IncrementalTensorEncoder:
         self.config = config
         self.cache_role: str | None = None
         self.capacity_units = int(capacity_units)
-        self._capacity_sequence = self.capacity_units * packed.stride
-        if self._capacity_sequence < packed.shape[2]:
+        if self.capacity_units * packed.stride < packed.shape[2]:
             raise ValueError("incremental capacity does not cover the prefix")
-
-        batch, heads, _, width = packed.shape
-        residual_capacity = self._capacity_sequence - packed.stride
-        packed_width = (width * packed.bits + 7) // 8
-        scale_width = width // packed.group_size
-        device = packed.anchor_quant.device
-        scale_dtype = _dtype(packed.reconstruction_dtype)
-        if packed.residual_scale is not None:
-            scale_dtype = packed.residual_scale.dtype
-        else:
-            scale_dtype = _dtype(config.scale_dtype)
-
-        quant_storage = torch.empty(
-            batch,
-            heads,
-            residual_capacity,
-            packed_width,
-            device=device,
-            dtype=torch.uint8,
+        self._allocated_units = len(packed.unit_lengths)
+        self._scale_dtype = (
+            packed.residual_scale.dtype
+            if packed.residual_scale is not None
+            else _dtype(config.scale_dtype)
         )
-        scale_storage = torch.empty(
-            batch,
-            heads,
-            residual_capacity,
-            scale_width,
-            device=device,
-            dtype=scale_dtype,
-        )
-        zero_storage = (
-            torch.empty(
-                batch,
-                heads,
-                residual_capacity,
-                scale_width,
-                device=device,
-                dtype=code_dtype(packed.bits),
-            )
-            if packed.residual_mode == "asymmetric"
-            else None
-        )
-        used = packed.shape[2] - packed.stride
-        if used:
-            assert packed.residual_quant is not None
-            assert packed.residual_scale is not None
-            quant_storage[:, :, :used].copy_(packed.residual_quant)
-            scale_storage[:, :, :used].copy_(packed.residual_scale)
-            if zero_storage is not None:
-                assert packed.residual_zero_point is not None
-                zero_storage[:, :, :used].copy_(packed.residual_zero_point)
-        # Keep the full-capacity tensors attached to the packed object.  Triton
-        # can then consume them without a growing non-contiguous slice being
-        # materialized on every attention read.
-        packed.residual_quant = quant_storage
-        packed.residual_scale = scale_storage
-        packed.residual_zero_point = zero_storage
 
         history_length = self._history_length
         units: list[torch.Tensor] = []
@@ -933,6 +905,69 @@ class IncrementalTensorEncoder:
     def full(self) -> bool:
         return self.units == self.capacity_units
 
+    @property
+    def allocated_units(self) -> int:
+        """Compressed capacity currently allocated for this open span."""
+        return self._allocated_units
+
+    def _ensure_capacity(self, required_units: int) -> None:
+        if required_units <= self._allocated_units:
+            return
+        grown_units = max(required_units, max(2, self._allocated_units * 2))
+        grown_units = min(self.capacity_units, grown_units)
+        batch, heads, _, width = self.packed.shape
+        residual_capacity = (grown_units - 1) * self.packed.stride
+        packed_width = (width * self.packed.bits + 7) // 8
+        scale_width = width // self.packed.group_size
+        device = self.packed.anchor_quant.device
+        quant_storage = torch.empty(
+            batch,
+            heads,
+            residual_capacity,
+            packed_width,
+            device=device,
+            dtype=torch.uint8,
+        )
+        scale_storage = torch.empty(
+            batch,
+            heads,
+            residual_capacity,
+            scale_width,
+            device=device,
+            dtype=self._scale_dtype,
+        )
+        zero_storage = (
+            torch.empty(
+                batch,
+                heads,
+                residual_capacity,
+                scale_width,
+                device=device,
+                dtype=code_dtype(self.packed.bits),
+            )
+            if self.packed.residual_mode == "asymmetric"
+            else None
+        )
+        used = self.packed.shape[2] - self.packed.stride
+        if used:
+            assert self.packed.residual_quant is not None
+            assert self.packed.residual_scale is not None
+            quant_storage[:, :, :used].copy_(
+                self.packed.residual_quant[:, :, :used]
+            )
+            scale_storage[:, :, :used].copy_(
+                self.packed.residual_scale[:, :, :used]
+            )
+            if zero_storage is not None:
+                assert self.packed.residual_zero_point is not None
+                zero_storage[:, :, :used].copy_(
+                    self.packed.residual_zero_point[:, :, :used]
+                )
+        self.packed.residual_quant = quant_storage
+        self.packed.residual_scale = scale_storage
+        self.packed.residual_zero_point = zero_storage
+        self._allocated_units = grown_units
+
     def history_bytes(self) -> int:
         seen: set[tuple[int, int]] = set()
         total = 0
@@ -959,6 +994,7 @@ class IncrementalTensorEncoder:
         appended_units = value.shape[2] // self.packed.stride
         if self.units + appended_units > self.capacity_units:
             raise ValueError("incremental append exceeds the span capacity")
+        self._ensure_capacity(self.units + appended_units)
         if (
             value.shape[:2] != self.packed.shape[:2]
             or value.shape[3] != self.packed.shape[3]
@@ -1605,23 +1641,24 @@ class TempoKVCodec:
         reuse_input: bool = False,
     ) -> IncrementalTensorEncoder:
         """Encode a secondary prefix and keep bounded state for later appends."""
-        packed = self.encode_secondary(
-            tensor,
-            reconstructed_primary,
-            layer=layer,
-            reuse_input=reuse_input,
-        )
-        # The secondary batch API intentionally discards its reconstruction.
-        # The streaming integration uses the in-place path, leaving the exact
-        # decoder-visible values in ``tensor`` without another allocation.
-        if not reuse_input:
-            raise ValueError(
-                "incremental secondary initialization requires in-place "
-                "reconstruction"
+        if reuse_input:
+            packed = self.encode_secondary(
+                tensor,
+                reconstructed_primary,
+                layer=layer,
+                reuse_input=True,
+            )
+            reconstruction = tensor
+        else:
+            packed, reconstruction = self._encode_value_with_reconstruction(
+                tensor,
+                reconstructed_primary,
+                layer=layer,
+                reuse_input=False,
             )
         encoder = IncrementalTensorEncoder(
             packed,
-            tensor,
+            reconstruction,
             self.config,
             capacity_units=capacity_units,
         )
@@ -1657,10 +1694,27 @@ class TempoKVCodec:
         ``reconstructed_key`` is required only when V is predicted from K; the
         temporal V predictor reads its own reconstructed history instead.
         """
+        packed, _ = self._encode_value_with_reconstruction(
+            value,
+            reconstructed_key,
+            layer=layer,
+            reuse_input=reuse_input,
+        )
+        return packed
+
+    def _encode_value_with_reconstruction(
+        self,
+        value: torch.Tensor,
+        reconstructed_key: torch.Tensor | None = None,
+        *,
+        layer: int = 0,
+        reuse_input: bool = False,
+    ) -> tuple[PackedTensor, torch.Tensor]:
+        """Encode V and retain the exact decoder-visible reconstruction."""
         parameters = self._cross_for_layer(value.device, layer)
         if not self.predicts_v_from_key:
             assert isinstance(parameters, TemporalParameters)
-            packed, _ = encode_temporal(
+            return encode_temporal(
                 value,
                 parameters,
                 self.config,
@@ -1668,13 +1722,12 @@ class TempoKVCodec:
                 bits=self.config.v_bits,
                 history_length=self.config.v_history_length,
             )
-            return packed
         if reconstructed_key is None:
             raise ValueError("key-conditioned V encoding requires the reconstructed K")
         assert isinstance(parameters, CrossKVParameters)
         if self.config.v_predictor_mode == "innovation":
             key_parameters = self._temporal_for_layer(value.device, layer)
-            packed, _ = encode_innovation(
+            return encode_innovation(
                 value,
                 reconstructed_key,
                 key_parameters,
@@ -1683,14 +1736,13 @@ class TempoKVCodec:
                 reuse_input_for_reconstruction=reuse_input,
             )
         else:
-            packed, _ = encode_cross_kv(
+            return encode_cross_kv(
                 value,
                 reconstructed_key,
                 parameters,
                 self.config,
                 reuse_input_for_reconstruction=reuse_input,
             )
-        return packed
 
     def encode(
         self, key: torch.Tensor, value: torch.Tensor, *, layer: int = 0

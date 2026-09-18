@@ -324,6 +324,47 @@ class ChunkedKVCache:
             extra_channels=extra_channels,
         )
 
+    def read_bhsd_independent(
+        self,
+        start_index: int,
+        end_index: int,
+        source_tensor: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Return BHSD data that never aliases resident dense cache storage.
+
+        Incremental encoding reconstructs its input in place.  Keeping that
+        ownership requirement explicit prevents a future BHSD/view fast path
+        from silently overwriting the clean cache tensor it is encoding.
+        """
+        result = self.read_bhsd(
+            start_index,
+            end_index,
+            source_tensor=source_tensor,
+        )
+        result_storage = result.untyped_storage()
+        identity = (int(result_storage.data_ptr()), int(result_storage.nbytes()))
+        start_chunk = self._token_to_chunk(start_index)
+        end_chunk = self._token_to_chunk(end_index)
+        for chunk in self.chunks[start_chunk:end_chunk]:
+            if chunk is None:
+                continue
+            storage = chunk.untyped_storage()
+            if identity == (int(storage.data_ptr()), int(storage.nbytes())):
+                return result.clone(memory_format=torch.contiguous_format)
+        return result
+
+    def complete_span_read_start(self, start_index: int) -> int:
+        """Move a requested start backward to the owning packed-span boundary."""
+        start_chunk = self._token_to_chunk(start_index)
+        if start_chunk == self.max_num_chunks:
+            return start_index
+        if self.chunk_state[start_chunk] != ChunkState.QUANTIZED:
+            return start_index
+        span = self._span_by_chunk[start_chunk]
+        if span is None:
+            raise RuntimeError("packed cache span index is inconsistent")
+        return int(span["start_chunk"]) * self.frame_seq_length
+
     def _source_for_span(
         self,
         source_tensor: torch.Tensor | None,
