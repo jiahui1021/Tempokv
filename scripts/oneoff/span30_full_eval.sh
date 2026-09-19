@@ -33,7 +33,7 @@ run_point(){
   local LL=$1 GPU=$2 LAB="spansweep30_lag18_L$1"
   [[ -e $D/done_L${LL} ]] && { log "L$LL 已完成,跳过"; return 0; }
   local RUN=$R/$LAB/pixel_717; mkdir -p "$RUN/videos"
-  local old=$R/spansweep_lag18_L${LL}/pixel_717/videos/0_0.mp4
+  local old=$R/_archive/spansweep1_idx0_0919/spansweep_lag18_L${LL}/pixel_717/videos/0_0.mp4
   [[ -s $old && ! -s $RUN/videos/0_0.mp4 ]] && cp "$old" "$RUN/videos/0_0.mp4"
   log "L$LL 生成+流式+FID 开始(gpu=$GPU)"
   BF16_REF=$REFS30 TEMPOKV_BF16_LAG_FRAMES=18 LABEL=$LAB WATCH_IDLE=90 START=0 END=30 \
