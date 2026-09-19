@@ -53,6 +53,7 @@ while true; do
         >"$OUTDIR/esw_eval_${EXP}_${idx}.log" 2>&1 )   # 日志放 run 目录(硬规则)
     rc=$?; rm -rf "$tr" "$tc"
     if [[ -s "$tmpj" ]]; then
+      new_this_round=$((new_this_round+1))   # 只有成功才算活动,失败不再无限续命 idle
       "$QVG_BIN/python" - "$tmpj" "$CSV" "$idx" <<'PY'
 import json,sys,csv
 d=json.load(open(sys.argv[1]))
@@ -65,13 +66,13 @@ PY
     else
       echo "[watch] $EXP idx=$idx FAILED rc=$rc $(date '+%T')" >>"$LOG"
     fi
-    new_this_round=$((new_this_round+1))
   done
   [[ $new_this_round -gt 0 ]] && last_new=$(date +%s)
 
   dn=$(done_count)
   if [[ "$dn" -ge "$N" ]]; then echo "[watch] $EXP 全部 $N 条完成 -> $CSV $(date '+%T')" >>"$LOG"; exit 0; fi
   now=$(date +%s); idle=$(( (now-last_new)/60 ))
-  if [[ "$idle" -ge "$IDLE_MIN" ]] && [[ "$dn" -gt 0 ]]; then echo "[watch] $EXP 空闲超时(已评 $dn)退出 $(date '+%T')" >>"$LOG"; exit 0; fi
+  # 空闲退出不要求 dn>0:生成失败/无视频时也必须放行,否则整链卡死
+  if [[ "$idle" -ge "$IDLE_MIN" ]]; then echo "[watch] $EXP 空闲超时(已评 $dn)退出 $(date '+%T')" >>"$LOG"; exit 0; fi
   sleep 15
 done

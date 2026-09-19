@@ -12,9 +12,10 @@ PROMPTS="${PROMPTS:-$T/assets/moviegen128_first30.txt}"
 START="${START:-0}"; END="${END:-30}"
 CKPT=/mnt/cpfs/epic-user/hujiahui-20260612/checkpoints/self_forcing_dmd.pt
 WAN=/mnt/cpfs/epic-user/hujiahui-20260612/models--Wan-AI--Wan2.1-T2V-1.3B
-REF=/mnt/cpfs/epic-user/hujiahui-20260612/kv-quant-result/experiments/self-forcing/Self-Forcing/bf16
+REF="${BF16_REF:-/mnt/cpfs/epic-user/hujiahui-20260612/kv-quant-result/experiments/self-forcing/Self-Forcing/bf16}"
 LABEL="${LABEL:-int2_anchor4_span${L}}"
-RUN="$T/results/paper/span-int2/runs/${LABEL}/pixel_717"
+FRAMES="${FRAMES:-717}"   # 像素帧数(须满足 (FRAMES+3)%12==0),默认 717=180 latent
+RUN="$T/results/paper/span-int2/runs/${LABEL}/pixel_${FRAMES}"
 LOG="$RUN/span_bigL.log"   # 日志放该 run 的视频输出文件夹内(硬规则)
 mkdir -p "$RUN/videos" "$(dirname "$LOG")"; cd "$T"
 log(){ printf '[%s] %s\n' "$(date '+%F %T')" "$*" >>"$LOG"; }
@@ -28,7 +29,7 @@ export WAN_MODEL_DIR="$WAN" FORCING_WAN_MODEL_DIR="$WAN" CUDA_VISIBLE_DEVICES="$
   PYTHONPATH="$T/src:$T/experiments/Self-Forcing" TRITON_CACHE_DIR="/dev/shm/triton_${LABEL}"
 $QVG experiments/Self-Forcing/tempokv_adapter/generate.py --mode tempokv \
   --checkpoint "$CKPT" --prompts "$PROMPTS" --output-dir "$RUN" \
-  --frames 717 --samples 1 --seed 0 --start-index "$START" --end-index "$END" --num-gpus 1 --skip-existing \
+  --frames "$FRAMES" --samples 1 --seed 0 --start-index "$START" --end-index "$END" --num-gpus 1 --skip-existing \
   --config "$CFG" --k-params "$KV2/k_temporal.npz" --v-params "$KV2/v_cross_kv.npz" \
   --span-frames "$L" >>"$LOG" 2>&1
 log "generate done rc=$?, 等 watcher 收尾流式评测"
