@@ -12,6 +12,7 @@ from collections.abc import MutableMapping
 from contextvars import ContextVar
 from dataclasses import asdict, dataclass, field, replace
 import importlib
+import os
 from pathlib import Path
 import time
 from typing import Any, Mapping, Sequence
@@ -79,6 +80,10 @@ class PackedTensorSpanSet:
     shape: tuple[int, int, int, int]
     predictor_kind: str
     spans: tuple[PackedTensor, ...]
+    # The newest conditioning latents kept exact, after every packed span.
+    # This is the LongCat form of the Self-Forcing BF16 lag: the frames the
+    # new segment attends to most are not approximated.
+    tail: torch.Tensor | None = None
 
     def __post_init__(self) -> None:
         if not self.spans:
@@ -91,11 +96,23 @@ class PackedTensorSpanSet:
         first_batch, first_heads, _, first_width = self.spans[0].shape
         if (batch, heads, width) != (first_batch, first_heads, first_width):
             raise ValueError("packed spans must share batch, head, and width dimensions")
-        if sum(span.shape[2] for span in self.spans) != sequence:
+        tail_length = 0
+        if self.tail is not None:
+            if (
+                self.tail.ndim != 4
+                or (self.tail.shape[0], self.tail.shape[1], self.tail.shape[3])
+                != (batch, heads, width)
+            ):
+                raise ValueError("the BF16 tail must match the span batch, heads, and width")
+            tail_length = int(self.tail.shape[2])
+        if sum(span.shape[2] for span in self.spans) + tail_length != sequence:
             raise ValueError("packed spans must exactly cover the combined sequence")
 
     def storage_bytes(self) -> int:
-        return sum(span.storage_bytes() for span in self.spans)
+        tail_bytes = (
+            0 if self.tail is None else self.tail.numel() * self.tail.element_size()
+        )
+        return sum(span.storage_bytes() for span in self.spans) + tail_bytes
 
 
 PackedState = PackedTensor | PackedTensorSpanSet
@@ -115,6 +132,7 @@ def move_packed_tensor(packed: PackedState, device: torch.device | str) -> Packe
         return replace(
             packed,
             spans=tuple(move_packed_tensor(span, device) for span in packed.spans),
+            tail=_move_tensor(packed.tail, torch.device(device)),
         )
     if not isinstance(packed, PackedTensor):
         raise TypeError(f"expected PackedTensor, got {type(packed).__name__}")
@@ -253,6 +271,11 @@ def decode_kv_cache(
                 strict_triton=codec.config.strict_triton,
             )
             start = end
+        if (k_cache.tail is None) != (v_cache.tail is None):
+            raise ValueError("LongCat K and V must both carry a BF16 tail or neither")
+        if k_cache.tail is not None:
+            key[:, :, start:, :].copy_(k_cache.tail)
+            value[:, :, start:, :].copy_(v_cache.tail)
         return key, value
     output_dtype = _RECONSTRUCTION_DTYPE[k_cache.reconstruction_dtype]
     key = _prepare_decode_output(
@@ -979,6 +1002,19 @@ class LongCatTempoKVBridge:
             except (AttributeError, StopIteration):
                 encode_device = next(iter(kv_cache_dict.values()))[0].device
         span_units = getattr(dit, "_tempokv_span_temporal_units", None)
+        lag_units = int(os.environ.get("TEMPOKV_BF16_LAG_FRAMES", "0"))
+        if lag_units < 0:
+            raise ValueError("TEMPOKV_BF16_LAG_FRAMES must not be negative")
+        if lag_units:
+            return self._quantize_with_bf16_tail(
+                dit,
+                kv_cache_dict,
+                temporal_units=temporal_units,
+                span_units=span_units,
+                lag_units=lag_units,
+                encode_device=encode_device,
+                storage_device=storage_device,
+            )
         if span_units is not None:
             encoded, report = encode_kv_cache_spans(
                 kv_cache_dict,
@@ -1010,6 +1046,113 @@ class LongCatTempoKVBridge:
             kv_cache_dict.update(encoded)
             return kv_cache_dict
         return encoded
+
+    def _quantize_with_bf16_tail(
+        self,
+        dit: Any,
+        kv_cache_dict: Mapping[int, tuple[Any, Any]],
+        *,
+        temporal_units: int,
+        span_units: Sequence[int] | None,
+        lag_units: int,
+        encode_device: torch.device | None,
+        storage_device: torch.device | None,
+    ) -> Any:
+        """Pack all but the newest ``lag_units`` conditioning latents.
+
+        LongCat builds the whole conditioning cache at once and drops it when
+        the segment ends, so there is no incremental schedule and nothing left
+        to flush afterwards.  What carries over from Self-Forcing is the lag:
+        the newest latents stay exact.  They are taken from the most recent
+        span, so the sink span of an attention-sink cache is never cut.
+        """
+        assert self.codec is not None
+        spans = (
+            tuple(int(item) for item in span_units)
+            if span_units is not None
+            else (int(temporal_units),)
+        )
+        kept = min(lag_units, spans[-1])
+        packed_spans = spans[:-1] + ((spans[-1] - kept,) if spans[-1] > kept else ())
+        first_key = next(iter(kv_cache_dict.values()))[0]
+        stride = int(first_key.shape[2]) // int(temporal_units)
+        head_tokens = sum(packed_spans) * stride
+        # Copy the tail before encoding: the codec reconstructs in place, and a
+        # contiguous head slice shares storage with the clean cache.
+        tails = {
+            int(layer): (
+                pair[0][:, :, head_tokens:, :].clone(),
+                pair[1][:, :, head_tokens:, :].clone(),
+            )
+            for layer, pair in kv_cache_dict.items()
+        }
+        if not packed_spans:
+            # The lag covers the whole conditioning window: nothing is packed.
+            return kv_cache_dict
+        head = {
+            int(layer): (
+                pair[0][:, :, :head_tokens, :],
+                pair[1][:, :, :head_tokens, :],
+            )
+            for layer, pair in kv_cache_dict.items()
+        }
+        encoded, report = encode_kv_cache_spans(
+            head,
+            codec=self.codec,
+            span_temporal_units=packed_spans,
+            spec=self.spec,
+            encode_device=encode_device,
+            storage_device=storage_device,
+            profile=self.profile_encode,
+        )
+        combined: dict[int, tuple[PackedTensorSpanSet, PackedTensorSpanSet]] = {}
+        tail_bytes = 0
+        for layer, (packed_key, packed_value) in encoded.items():
+            key_tail, value_tail = tails[layer]
+            if storage_device is not None:
+                key_tail = key_tail.to(storage_device)
+                value_tail = value_tail.to(storage_device)
+            tail_bytes += (
+                key_tail.numel() * key_tail.element_size()
+                + value_tail.numel() * value_tail.element_size()
+            )
+            combined[layer] = (
+                replace(
+                    packed_key,
+                    shape=(*packed_key.shape[:2], packed_key.shape[2] + key_tail.shape[2], packed_key.shape[3]),
+                    tail=key_tail,
+                ),
+                replace(
+                    packed_value,
+                    shape=(*packed_value.shape[:2], packed_value.shape[2] + value_tail.shape[2], packed_value.shape[3]),
+                    tail=value_tail,
+                ),
+            )
+        storage_bytes = int(report["storage_bytes"]) + tail_bytes
+        uncompressed = int(report["uncompressed_cache_bytes"]) + tail_bytes
+        report = {
+            **report,
+            "temporal_units": int(temporal_units),
+            "sequence": int(first_key.shape[2]),
+            "bf16_lag_units": int(kept),
+            "bf16_tail_bytes": int(tail_bytes),
+            "storage_bytes": storage_bytes,
+            "uncompressed_cache_bytes": uncompressed,
+            "compression_ratio": (
+                float(uncompressed / storage_bytes) if storage_bytes else None
+            ),
+        }
+        events = getattr(dit, "_tempokv_quantization_events", None)
+        if events is None:
+            events = []
+            setattr(dit, "_tempokv_quantization_events", events)
+        events.append(report)
+        self.quantization_events.append(report)
+        if isinstance(kv_cache_dict, MutableMapping):
+            kv_cache_dict.clear()
+            kv_cache_dict.update(combined)
+            return kv_cache_dict
+        return combined
 
     def decode(
         self,

@@ -33,11 +33,15 @@ _TEMPOKV_STATE_KEY = "_tempokv_packed"
 # other frame in it is predicted from reconstructed history, so a larger span
 # means better compression; the most recent (< span) frames stay BF16.
 #
-# The default has to leave room for the packed span to actually be *read*: the
-# 81-frame default rollout is 21 latent frames, so a 24-frame span would never
+# The default has to leave room for the packed span to actually be *read*: a
+# short 81-frame rollout is 21 latent frames, so a 24-frame span would never
 # complete, and even a 21-frame span would only pack after the last forward
 # pass — producing a video that never decoded a single compressed key.
 DEFAULT_SPAN_FRAMES = 12
+# Finalized frames kept exact before they are packed, as on Self-Forcing.  It is
+# sized for the default 180-latent-frame rollout; a short rollout needs a
+# smaller lag, or nothing is packed before the terminal block is discarded.
+DEFAULT_BF16_LAG_FRAMES = 18
 
 
 class _CausalTempoKVRuntimeReport(TempoKVRuntimeReport):
@@ -206,6 +210,22 @@ def install(runtime_root: str | Path | None = None) -> type:
                     self.tempokv_codec
                 ),
             )
+            # Same schedule as the Self-Forcing bridge: pack each finalized
+            # block into the open span once it is TEMPOKV_BF16_LAG_FRAMES
+            # behind the newest one.  Span-mean K and innovation V have no
+            # incremental state, so they keep the batch schedule.
+            incremental = bool(
+                os.environ.get("TEMPOKV_INCREMENTAL", "1") != "0"
+                and not bool(getattr(self.tempokv_codec, "k_channel_mean", False))
+                and getattr(config, "v_predictor_mode", "cross_kv") != "innovation"
+            )
+            bf16_lag_frames = int(
+                os.environ.get(
+                    "TEMPOKV_BF16_LAG_FRAMES", str(DEFAULT_BF16_LAG_FRAMES)
+                )
+            )
+            if bf16_lag_frames < 0:
+                raise ValueError("TEMPOKV_BF16_LAG_FRAMES must not be negative")
             self.tempokv_stream = StreamingTempoKVEncoder(
                 self.tempokv_codec,
                 num_layers=self.num_transformer_blocks,
@@ -213,6 +233,15 @@ def install(runtime_root: str | Path | None = None) -> type:
                 span_frames=_span_frames(),
                 report=self.tempokv_report,
                 wrap_state=wrap_cache_state,
+                incremental=incremental,
+                bf16_lag_frames=bf16_lag_frames,
+            )
+            print(
+                "[TempoKV] span encoding mode: "
+                + ("INCREMENTAL" if incremental else "BATCHED")
+                + f", span_frames={self.tempokv_stream.span_frames}"
+                + f", bf16_lag_frames={bf16_lag_frames}",
+                flush=True,
             )
 
             def decode_with_codec(
@@ -275,11 +304,15 @@ def install(runtime_root: str | Path | None = None) -> type:
             # BF16 tail. Preserve the historical force-flush behavior for
             # interactive callers and unit tests unless the benchmark launcher
             # explicitly disables it.
-            force_partial = os.environ.get("TEMPOKV_FORCE_PARTIAL_SPAN", "1")
-            self.tempokv_stream.flush(
-                self.kv_cache1,
-                force=force_partial not in {"0", "false", "no"},
-            )
+            if self.tempokv_stream.incremental:
+                # The partial span is already packed; what is left is the BF16
+                # lag tail.  Flush it by default, as Self-Forcing does, unless
+                # TEMPOKV_FLUSH_TAIL=0.
+                force = os.environ.get("TEMPOKV_FLUSH_TAIL", "1") != "0"
+            else:
+                force_partial = os.environ.get("TEMPOKV_FORCE_PARTIAL_SPAN", "1")
+                force = force_partial not in {"0", "false", "no"}
+            self.tempokv_stream.flush(self.kv_cache1, force=force)
             self.summary["last_kv_cache_memory"] = self.tempokv_report.to_dict()
 
         def discard_terminal_kv_cache(

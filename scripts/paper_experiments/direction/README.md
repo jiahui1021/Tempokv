@@ -113,7 +113,7 @@ stderr when you do.
 python scripts/paper_experiments/direction/run_quality.py \
     --checkpoint /models/self_forcing_dmd.pt \
     --wan-model-dir /models/Wan2.1-T2V-1.3B \
-    --prompts assets/moviegen128_first30.txt \
+    --prompts assets/moviegen128.txt \
     --trace data/direction/calibration.npz \
     --output-root results/direction/quality
 ```

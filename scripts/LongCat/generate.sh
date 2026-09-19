@@ -1,5 +1,11 @@
 #!/usr/bin/env bash
 # LongCat BF16 / TempoKV generation using the bundled runtime.
+#
+# 环境变量：
+#   TEMPOKV_BF16_LAG_FRAMES  最新多少个条件 latent 保持精确 BF16、不压缩（默认 0）。
+#                   LongCat 每段一次性生成整段条件 cache、段末丢弃，所以没有
+#                   增量调度，也没有结束后要 flush 的尾巴；只保留 lag 这一项。
+#                   有 attention sink 时只从最近的 span 里扣，sink span 不会被切
 set -euo pipefail
 
 # shellcheck source=scripts/LongCat/_common.sh

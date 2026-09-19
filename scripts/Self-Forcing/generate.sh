@@ -54,12 +54,14 @@
 #                   scripts/tools/profile_tempokv_runtime.py 查看
 #   TEMPOKV_PERSISTENT_UNITS_PER_LAUNCH  单次持续解码单元数（Cross 默认 8，
 #                                       temporal 默认 16；范围 1 到 16）
-#   TEMPOKV_BF16_LAG_FRAMES  增量编码的 BF16 滞后帧数（默认 3，即一个模型
+#   TEMPOKV_BF16_LAG_FRAMES  增量编码的 BF16 滞后帧数（默认 18，即 6 个模型
 #                   block）。一帧要落后最新已定稿帧这么多帧才会被编码，因此
 #                   最近这些帧在 attention 里仍是精确的 BF16。设为 0 表示每个
 #                   block 定稿即编码：显存最省，但从第二个 block 起模型读到的
 #                   全部历史都是重建值，self-forcing rollout 会累积误差。代价
 #                   是这么多帧的稠密 KV，已计入 resident_bf16_bytes
+#   TEMPOKV_FLUSH_TAIL  生成结束后是否把 lag 尾巴也压掉，0 或 1（默认 1）。只在
+#                   rollout 结束后执行，不影响生成质量，只影响最终驻留的 cache
 #   TEMPOKV_INCREMENTAL  增量编码开关，0 或 1（默认 1）。设为 0 回到按 span
 #                   批量编码的旧调度，用于 A/B 对比
 #

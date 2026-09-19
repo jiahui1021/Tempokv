@@ -236,7 +236,7 @@ def main(argv: list[str] | None = None) -> int:
         [args.python_bin, str(HERE / "run_quality.py"),
          "--checkpoint", str(checkpoint),
          "--wan-model-dir", str(fake / "wan"),
-         "--prompts", str(PROJECT_ROOT / "assets" / "moviegen128_first30.txt"),
+         "--prompts", str(PROJECT_ROOT / "assets" / "moviegen128.txt"),
          "--trace", str(calibration),
          "--output-root", str(quality_dir),
          "--dry-run"]

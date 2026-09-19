@@ -55,7 +55,7 @@ INT2 使用同一个配置并设置 `BITS=2`；参数目录会自动切换到 IN
 | `PROMPTS` | prompt 列表 | 必填 |
 | `CONFIG` | codec 配置 JSON | `configs/legacy.json` |
 | `GENERATION_MODE` | `chunkwise` 或 `framewise` | `chunkwise` |
-| `FRAMES` | 最终视频帧数 | `81` |
+| `FRAMES` | 最终视频帧数 | `717` |
 | `SPAN_FRAMES` | 每个 TempoKV span 的 latent 帧数 | `12` |
 | `LOCAL_ATTN_SIZE` | 局部注意力窗口 | `-1` |
 | `NUM_GPUS` | torchrun GPU 数 | `1` |
@@ -124,7 +124,8 @@ sync，会扭曲被测对象本身；需要时用 `generation_ms - encode_ms - d
 latent_frames >= SPAN_FRAMES + num_frame_per_block
 ```
 
-`FRAMES=81` 对应 21 个 latent 帧，chunkwise 下 `SPAN_FRAMES` 最大 18，默认 12。
+默认 `FRAMES=717` 对应 180 个 latent 帧；短视频如 `FRAMES=81`（21 个 latent 帧）下
+chunkwise `SPAN_FRAMES` 最大 18。`SPAN_FRAMES` 默认 12。
 不满足时 `generate.py` 会在加载模型之前报错，而不是跑完再失败。
 
 `FIT_DEVICE` 默认 `auto`：有 CUDA 就用 GPU，没有则回退 CPU 并在 stderr 打出告警——

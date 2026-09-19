@@ -12,15 +12,20 @@ import torch
 
 from tempokv.codec import PackedTensor, TempoKVCodec, decode_tensor
 from tempokv.integration import load_codec_from_env
+from tempokv.runtime.metrics import TempoKVRuntimeReport
+from tempokv.runtime.streaming import StreamingTempoKVEncoder
 
 # This module is loaded both as ``bridge`` off the adapter directory and by
 # file path from the test suite, so it puts its own directory on the path
 # rather than relying on whoever imported it having done so.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import efficiency_record as efficiency
+import pruning
 
 
 _TEMPOKV_STATE_KEY = "_tempokv_packed"
+# Finalized frames kept exact before they are packed.
+DEFAULT_BF16_LAG_FRAMES = 18
 
 
 def wrap_cache_state(state: PackedTensor) -> dict[str, Any]:
@@ -147,18 +152,38 @@ def install(runtime_root: str | Path) -> type:
             # that error compounds.  The lag restores a bounded exact tail --
             # a frame is encoded only once it is this many frames behind the
             # newest finalized frame -- and costs exactly that many frames of
-            # dense BF16.  One model block is the cheapest setting that keeps
-            # the immediately preceding block exact.
+            # dense BF16.  The default of 18 frames (six 3-frame blocks) is the
+            # lag that matched the batch schedule's quality at 24-frame spans.
             self._tempokv_bf16_lag_frames = int(
                 os.environ.get(
-                    "TEMPOKV_BF16_LAG_FRAMES",
-                    str(getattr(self, "num_frame_per_block", 1)),
+                    "TEMPOKV_BF16_LAG_FRAMES", str(DEFAULT_BF16_LAG_FRAMES)
                 )
             )
             if self._tempokv_bf16_lag_frames < 0:
                 raise ValueError("TEMPOKV_BF16_LAG_FRAMES must not be negative")
-            self._tempokv_finalized_frames = 0
-            self._tempokv_encoded_frames = 0
+            # The incremental schedule, its lag and the final flush live in the
+            # streaming encoder shared with Causal Forcing; the batch schedule
+            # uses the same encoder's one-shot span encode.
+            num_layers = int(self.num_transformer_blocks)
+            self.tempokv_stream = StreamingTempoKVEncoder(
+                self.tempokv_codec,
+                num_layers=num_layers,
+                frame_seq_length=self.frame_seq_length,
+                span_frames=self._tempokv_span_frames,
+                report=TempoKVRuntimeReport(
+                    model="self_forcing",
+                    kv_mode="tempokv",
+                    num_layers=num_layers,
+                    num_heads=self.codec_shape.num_heads,
+                    head_dim=self.codec_shape.head_dim,
+                    stride=config.stride,
+                ),
+                wrap_state=wrap_cache_state,
+                incremental=self._incremental_tempokv,
+                bf16_lag_frames=self._tempokv_bf16_lag_frames,
+                horizon_frames=self._tempokv_total_frames,
+                event_hook=self._on_incremental_encode,
+            )
             print(
                 "[TempoKV] span encoding mode: "
                 + (
@@ -171,10 +196,6 @@ def install(runtime_root: str | Path) -> type:
                 + f", horizon_frames={self._tempokv_total_frames}",
                 flush=True,
             )
-            self._tempokv_open_start_frame: int | None = None
-            self._tempokv_open_units = 0
-            self._tempokv_open_capacity = 0
-            self._tempokv_open_encoders: list[dict[str, Any]] | None = None
             self._apply_tempokv_cache_settings()
             if config.stride != self.frame_seq_length:
                 raise ValueError(
@@ -196,6 +217,17 @@ def install(runtime_root: str | Path) -> type:
             if getattr(self.quant_config, "kv_cache_cpu_offload", False):
                 raise ValueError("TempoKV Self-Forcing bridge does not support cache offload")
             self._patch_attention_windows()
+            self.tempokv_pruning = pruning.from_env(
+                self.tempokv_codec,
+                num_layers=num_layers,
+                frame_seqlen=self.frame_seq_length,
+                max_frames=self._tempokv_total_frames,
+            )
+            if self.tempokv_pruning is not None:
+                for block, pruner in zip(
+                    self.generator.model.blocks, self.tempokv_pruning.layers
+                ):
+                    block.self_attn.tempokv_pruner = pruner
 
             def decode_with_codec(
                 state: Any,
@@ -255,12 +287,15 @@ def install(runtime_root: str | Path) -> type:
             return result
 
         def reset_quantization_state(self) -> None:
-            self._tempokv_finalized_frames = 0
-            self._tempokv_encoded_frames = 0
-            self._tempokv_open_start_frame = None
-            self._tempokv_open_units = 0
-            self._tempokv_open_capacity = 0
-            self._tempokv_open_encoders = None
+            self.tempokv_stream.reset()
+            if getattr(self, "tempokv_pruning", None) is not None:
+                self.tempokv_pruning.reset()
+
+        def inference(self, *args: Any, **kwargs: Any) -> Any:
+            result = super().inference(*args, **kwargs)
+            if self.tempokv_pruning is not None:
+                self.tempokv_pruning.finish(self._tempokv_total_frames)
+            return result
 
         def _patch_attention_windows(self) -> None:
             # TempoKV takes over cache compression, so the model must keep the
@@ -279,247 +314,59 @@ def install(runtime_root: str | Path) -> type:
                 if hasattr(block.self_attn, "max_attention_size"):
                     block.self_attn.max_attention_size = target
 
-        def _incremental_history_bytes(self) -> int:
-            if self._tempokv_open_encoders is None:
-                return 0
-            return sum(
-                int(encoder.history_bytes())
-                for layer in self._tempokv_open_encoders
-                for encoder in layer.values()
+        def _on_incremental_encode(self, event: dict[str, Any]) -> None:
+            """Log one incremental begin/append the way the run logs expect."""
+            start = event["tokens_start"] // self.frame_seq_length
+            end = event["tokens_end"] // self.frame_seq_length
+            print(
+                f"[TempoKV-incremental] encoded frames [{start},{end}) "
+                + ("as anchor" if event["anchor"] else "as residual")
+                + f", open span {event['span_units']}/{event['span_capacity']}"
+                + f", finalized={event['finalized_frames']}"
+                + f", BF16 tail={self._tempokv_bf16_lag_frames}"
+                + f", {event['duration_ms']:.1f} ms"
+                + (", span closed -> re-anchor next" if event["span_closed"] else ""),
+                flush=True,
             )
-
-        @staticmethod
-        def _read_bhsd_for_encode(
-            cache: Any, token_start: int, token_end: int
-        ) -> torch.Tensor:
-            reader = getattr(cache, "read_bhsd_independent", None)
-            if callable(reader):
-                return reader(token_start, token_end)
-            return cache.read_bhsd(token_start, token_end)
-
-        def _begin_incremental_segment(
-            self,
-            token_start: int,
-            token_end: int,
-        ) -> None:
-            codec = self.tempokv_codec
-            primary_role = codec.primary_role
-            secondary_role = codec.secondary_role
-            encoders: list[dict[str, Any]] = []
-            for layer_index, layer in enumerate(self.kv_cache1):
-                primary = self._read_bhsd_for_encode(
-                    layer[primary_role], token_start, token_end
-                )
-                primary_encoder, reconstructed_primary = (
-                    codec.begin_incremental_primary(
-                        primary,
-                        capacity_units=self._tempokv_open_capacity,
-                        layer=layer_index,
-                        reuse_input=True,
+            self.summary["quantization_events"].append(
+                {
+                    key: event[key]
+                    for key in (
+                        "tokens_start",
+                        "tokens_end",
+                        "num_tokens",
+                        "duration_ms",
+                        "codec",
+                        "span_start_frame",
+                        "span_units",
+                        "span_capacity",
                     )
-                )
-                layer[primary_role].store_quantized(
-                    token_start,
-                    token_end,
-                    wrap_cache_state(primary_encoder.packed),
-                )
-                del primary
-
-                secondary = self._read_bhsd_for_encode(
-                    layer[secondary_role], token_start, token_end
-                )
-                secondary_encoder = codec.begin_incremental_secondary(
-                    secondary,
-                    reconstructed_primary,
-                    capacity_units=self._tempokv_open_capacity,
-                    layer=layer_index,
-                    reuse_input=True,
-                )
-                layer[secondary_role].store_quantized(
-                    token_start,
-                    token_end,
-                    wrap_cache_state(secondary_encoder.packed),
-                )
-                encoders.append(
-                    {
-                        primary_role: primary_encoder,
-                        secondary_role: secondary_encoder,
-                    }
-                )
-                del secondary, reconstructed_primary
-            self._tempokv_open_encoders = encoders
-
-        def _append_incremental_segment(
-            self,
-            token_start: int,
-            token_end: int,
-        ) -> None:
-            if (
-                self._tempokv_open_encoders is None
-                or self._tempokv_open_start_frame is None
-            ):
-                raise RuntimeError("incremental TempoKV span is not open")
-            codec = self.tempokv_codec
-            primary_role = codec.primary_role
-            secondary_role = codec.secondary_role
-            span_token_start = (
-                self._tempokv_open_start_frame * self.frame_seq_length
+                }
             )
-            for layer_index, layer in enumerate(self.kv_cache1):
-                encoders = self._tempokv_open_encoders[layer_index]
-                primary = self._read_bhsd_for_encode(
-                    layer[primary_role], token_start, token_end
-                )
-                reconstructed_primary = encoders[primary_role].append(
-                    primary,
-                    reuse_input_for_reconstruction=True,
-                )
-                layer[primary_role].extend_quantized(
-                    span_token_start, token_end
-                )
-                del primary
-
-                secondary = self._read_bhsd_for_encode(
-                    layer[secondary_role], token_start, token_end
-                )
-                secondary_encoder = encoders[secondary_role]
-                secondary_encoder.append(
-                    secondary,
-                    source=(
-                        None
-                        if secondary_encoder.packed.predictor_kind == "temporal"
-                        else reconstructed_primary
-                    ),
-                    reuse_input_for_reconstruction=True,
-                )
-                layer[secondary_role].extend_quantized(
-                    span_token_start, token_end
-                )
-                del secondary, reconstructed_primary
-
-        def _quantize_incrementally(
-            self,
-            tokens_to_quantize_start: int,
-            tokens_to_quantize_end: int,
-            flush: bool = False,
-        ) -> None:
-            frame_start = tokens_to_quantize_start // self.frame_seq_length
-            finalized_frames = tokens_to_quantize_end // self.frame_seq_length
-            if frame_start != self._tempokv_finalized_frames:
-                raise ValueError(
-                    "incremental TempoKV blocks must be finalized in order: "
-                    f"expected frame {self._tempokv_finalized_frames}, "
-                    f"got {frame_start}"
-                )
-            self._tempokv_finalized_frames = finalized_frames
-            # Everything newer than the lag stays dense BF16 and is encoded on
-            # a later call, once the rollout has moved past it.  A flush is
-            # the last call of all: with generation over, the tail can no
-            # longer serve attention, so pack through the finalized end.
-            if flush:
-                frame_end = min(
-                    self._tempokv_total_frames, finalized_frames
-                )
-            else:
-                frame_end = max(
-                    self._tempokv_encoded_frames,
-                    finalized_frames - self._tempokv_bf16_lag_frames,
-                )
-            cursor = self._tempokv_encoded_frames
-            if cursor >= frame_end:
-                return
-            while cursor < frame_end:
-                if self._tempokv_open_start_frame is None:
-                    if cursor >= self._tempokv_total_frames:
-                        raise ValueError(
-                            "incremental TempoKV write exceeds the configured "
-                            f"{self._tempokv_total_frames}-frame horizon"
-                        )
-                    self._tempokv_open_start_frame = cursor
-                    self._tempokv_open_units = 0
-                    self._tempokv_open_capacity = min(
-                        self._tempokv_span_frames,
-                        self._tempokv_total_frames - cursor,
-                    )
-                expected = (
-                    self._tempokv_open_start_frame + self._tempokv_open_units
-                )
-                if cursor != expected:
-                    raise ValueError(
-                        "incremental TempoKV blocks must be finalized in order: "
-                        f"expected frame {expected}, got {cursor}"
-                    )
-                remaining = self._tempokv_open_capacity - self._tempokv_open_units
-                count = min(remaining, frame_end - cursor)
-                token_start = cursor * self.frame_seq_length
-                token_end = (cursor + count) * self.frame_seq_length
-                started = time.perf_counter()
-                is_anchor_block = self._tempokv_open_units == 0
-                with torch.no_grad():
-                    if is_anchor_block:
-                        self._begin_incremental_segment(token_start, token_end)
-                    else:
-                        self._append_incremental_segment(token_start, token_end)
-                self._tempokv_open_units += count
-                duration_ms = (time.perf_counter() - started) * 1000.0
-                span_closed = (
-                    self._tempokv_open_units == self._tempokv_open_capacity
-                )
-                print(
-                    "[TempoKV-incremental] encoded frames "
-                    f"[{cursor},{cursor + count}) "
-                    + ("as anchor" if is_anchor_block else "as residual")
-                    + f", open span {self._tempokv_open_units}/"
-                    f"{self._tempokv_open_capacity}, finalized="
-                    f"{finalized_frames}, BF16 tail="
-                    f"{self._tempokv_bf16_lag_frames}, {duration_ms:.1f} ms"
-                    + (", span closed -> re-anchor next" if span_closed else ""),
-                    flush=True,
-                )
-                self.summary["quantization_events"].append(
-                    {
-                        "tokens_start": int(token_start),
-                        "tokens_end": int(token_end),
-                        "num_tokens": int(token_end - token_start),
-                        "duration_ms": duration_ms,
-                        "codec": "TempoKV-incremental",
-                        "span_start_frame": int(self._tempokv_open_start_frame),
-                        "span_units": int(self._tempokv_open_units),
-                        "span_capacity": int(self._tempokv_open_capacity),
-                    }
-                )
-                cursor += count
-                self._tempokv_encoded_frames = cursor
-                if span_closed:
-                    self._tempokv_open_start_frame = None
-                    self._tempokv_open_units = 0
-                    self._tempokv_open_capacity = 0
-                    self._tempokv_open_encoders = None
-            self._record_kv_cache_memory()
 
         def flush_incremental_tail(self) -> None:
             """Pack the BF16 tail the incremental schedule still owes.
 
             During generation the newest ``lag`` frames must stay exact for
             attention; once the rollout is over that tail is dead weight, and
-            leaving it unpacked makes the finished cache larger than the
-            batched schedule's, which closes its last span before returning.
+            leaving it unpacked keeps the lag frames dense in the finished
+            cache.  The batch schedule never packs its trailing partial span,
+            so its finished cache is not the reference here.
             ``TEMPOKV_FLUSH_TAIL=0`` restores the unpacked-tail behavior.
             """
             if not getattr(self, "_incremental_tempokv", False):
                 return
             if os.environ.get("TEMPOKV_FLUSH_TAIL", "1") == "0":
                 return
-            if (
-                self._tempokv_encoded_frames
-                >= self._tempokv_finalized_frames
-            ):
+            stream = self.tempokv_stream
+            if stream.encoded_frame >= stream.finalized_frame:
                 return
-            start = self._tempokv_finalized_frames * self.frame_seq_length
-            self._quantize_incrementally(start, start, flush=True)
+            with torch.no_grad():
+                stream.flush(self.kv_cache1, force=True)
+            self._record_kv_cache_memory()
             print(
                 "[TempoKV-incremental] final flush: packed tail through "
-                f"frame {self._tempokv_finalized_frames}",
+                f"frame {stream.encoded_frame}",
                 flush=True,
             )
 
@@ -532,64 +379,35 @@ def install(runtime_root: str | Path) -> type:
             if tokens_to_quantize_end > max_tokens_to_quantize:
                 raise ValueError("quantization range exceeds the available cache")
             if self._incremental_tempokv:
-                self._quantize_incrementally(
-                    tokens_to_quantize_start,
-                    tokens_to_quantize_end,
-                )
+                stream = self.tempokv_stream
+                frame_start = tokens_to_quantize_start // self.frame_seq_length
+                if frame_start != stream.finalized_frame:
+                    raise ValueError(
+                        "incremental TempoKV blocks must be finalized in order: "
+                        f"expected frame {stream.finalized_frame}, "
+                        f"got {frame_start}"
+                    )
+                with torch.no_grad():
+                    packed = stream.finalize(
+                        self.kv_cache1,
+                        num_frames=(
+                            tokens_to_quantize_end - tokens_to_quantize_start
+                        )
+                        // self.frame_seq_length,
+                    )
+                if packed:
+                    self._record_kv_cache_memory()
                 return
             span = tokens_to_quantize_end - tokens_to_quantize_start
             if span < 2 * self.frame_seq_length:
                 raise ValueError("TempoKV needs at least two cache units per span")
             started = time.perf_counter()
             with torch.no_grad():
-                # The cache slots are addressed by codec role, not by name:
-                # the primary tensor is the one predicted from its own temporal
-                # history, and its reconstruction is what the secondary tensor
-                # projects from.  Forward runs K then V; the mirrored direction
-                # runs V then K through the identical code path.
-                codec = self.tempokv_codec
-                primary_role = codec.primary_role
-                secondary_role = codec.secondary_role
-                for layer_index, layer in enumerate(self.kv_cache1):
-                    primary = self._read_bhsd_for_encode(
-                        layer[primary_role],
-                        tokens_to_quantize_start,
-                        tokens_to_quantize_end,
-                    )
-                    if (
-                        primary.shape[1] != self.codec_shape.num_heads
-                        or primary.shape[-1] != self.codec_shape.head_dim
-                    ):
-                        raise ValueError("Self-Forcing cache shape changed unexpectedly")
-                    packed_primary, reconstructed_primary = codec.encode_primary(
-                        primary,
-                        layer=layer_index,
-                        reuse_input=True,
-                    )
-                    layer[primary_role].store_quantized(
-                        tokens_to_quantize_start,
-                        tokens_to_quantize_end,
-                        wrap_cache_state(packed_primary),
-                    )
-                    del primary, packed_primary
-
-                    secondary = self._read_bhsd_for_encode(
-                        layer[secondary_role],
-                        tokens_to_quantize_start,
-                        tokens_to_quantize_end,
-                    )
-                    packed_secondary = codec.encode_secondary(
-                        secondary,
-                        reconstructed_primary,
-                        layer=layer_index,
-                        reuse_input=True,
-                    )
-                    layer[secondary_role].store_quantized(
-                        tokens_to_quantize_start,
-                        tokens_to_quantize_end,
-                        wrap_cache_state(packed_secondary),
-                    )
-                    del secondary, packed_secondary, reconstructed_primary
+                self.tempokv_stream.encode_span(
+                    self.kv_cache1,
+                    tokens_to_quantize_start // self.frame_seq_length,
+                    span // self.frame_seq_length,
+                )
             self.summary["quantization_events"].append(
                 {
                     "tokens_start": int(tokens_to_quantize_start),
@@ -622,7 +440,7 @@ def install(runtime_root: str | Path) -> type:
                             packed, skip_fields=frozenset({"temporal", "cross_kv"})
                         )
                     resident += efficiency.tensor_bytes(cache.chunks)
-            resident += self._incremental_history_bytes()
+            resident += self.tempokv_stream.history_bytes()
             tokens = int(self.kv_cache1[0]["local_end_index"])
             equivalent = efficiency.bf16_equivalent_bytes(
                 batch=self.kv_cache1[0]["k"].batch_size,
@@ -681,13 +499,9 @@ def install(runtime_root: str | Path) -> type:
                     else:
                         v_bytes = bytes_per_cache
                         v_logical_bytes = logical_bytes_per_cache
-                if self._tempokv_open_encoders is not None:
-                    layer_dense_bytes += sum(
-                        int(encoder.history_bytes())
-                        for encoder in self._tempokv_open_encoders[
-                            layer_index
-                        ].values()
-                    )
+                layer_dense_bytes += self.tempokv_stream.layer_history_bytes(
+                    layer_index
+                )
                 total_kv_bytes += k_bytes + v_bytes
                 total_logical_kv_bytes += k_logical_bytes + v_logical_bytes
                 resident_bf16_bytes += layer_dense_bytes

@@ -81,7 +81,7 @@ def check_collection_arithmetic() -> dict[str, int]:
                 **dict(__import__("os").environ),
                 "CHECKPOINT": "/nonexistent",
                 "WAN_MODEL_DIR": "/nonexistent",
-                "PROMPTS": str(PROJECT_ROOT / "assets" / "moviegen128_first30.txt"),
+                "PROMPTS": str(PROJECT_ROOT / "assets" / "moviegen128.txt"),
                 "HORIZON_FRAMES": str(frames),
                 "TRACE_DIR": "/tmp/long-horizon-dryrun",
                 "DRY_RUN": "1",

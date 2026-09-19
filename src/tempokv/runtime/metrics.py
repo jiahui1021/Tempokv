@@ -106,6 +106,34 @@ class TempoKVRuntimeReport:
         self.total_uncompressed_cache_bytes += uncompressed_bytes
         self._refresh_span_peaks()
 
+    def update_span(
+        self, key: Any, *, compressed_bytes: int, uncompressed_bytes: int
+    ) -> None:
+        """Grow a span installed earlier by :meth:`record_span`.
+
+        An incrementally encoded span is recorded once when it opens and again
+        after every append.  Only the growth is added to the cumulative totals,
+        so a span that is appended to eight times is not counted eight times.
+        """
+        previous = self._resident.get(key)
+        if previous is None:
+            self.record_span(
+                key,
+                compressed_bytes=compressed_bytes,
+                uncompressed_bytes=uncompressed_bytes,
+            )
+            return
+        if compressed_bytes < 0 or uncompressed_bytes < 0:
+            raise ValueError("span byte counts must not be negative")
+        self._resident[key] = _SpanBytes(compressed_bytes, uncompressed_bytes)
+        self.total_encoded_cache_bytes += max(
+            0, compressed_bytes - previous.compressed
+        )
+        self.total_uncompressed_cache_bytes += max(
+            0, uncompressed_bytes - previous.uncompressed
+        )
+        self._refresh_span_peaks()
+
     def drop_span(self, key: Any) -> None:
         if self._resident.pop(key, None) is not None:
             self.cache_evictions += 1

@@ -8,6 +8,8 @@ __pycache__/
 htmlcov/
 .venv/
 
+figures/
+
 # Local verification files
 /reports/
 /tests/

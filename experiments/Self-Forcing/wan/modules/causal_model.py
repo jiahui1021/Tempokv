@@ -668,6 +668,21 @@ class CausalWanSelfAttention(nn.Module):
             )
             attn_k = _take_window(absolute_k, window)
             attn_v = _take_window(v_all, window)
+            pruner = getattr(self, "tempokv_pruner", None)
+            if pruner is not None:
+                # Simulated pruning (pruning pilot): drop masked tokens from
+                # the key set only; the cache itself is left untouched.
+                positions = torch.cat([
+                    torch.arange(
+                        decode_start_index + start,
+                        decode_start_index + end,
+                        device=attn_k.device,
+                    )
+                    for start, end in window
+                ])
+                attn_k, attn_v = pruner(
+                    roped_query, k, attn_k, attn_v, positions, local_start_index
+                )
             recorder = getattr(self, "tempokv_trace_recorder", None)
             if recorder is not None:
                 # The attention objective needs the rotated Q and K the model

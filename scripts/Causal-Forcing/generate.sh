@@ -14,7 +14,7 @@
 #   MODEL_ROOT=/models/Wan2.1-T2V-1.3B \
 #   PROMPTS=assets/generation_prompts.txt \
 #   CONFIG=configs/legacy.json \
-#   FRAMES=81 \
+#   FRAMES=717 \
 #   bash scripts/Causal-Forcing/generate.sh
 #
 # 必需变量：
@@ -27,7 +27,7 @@
 #   GENERATION_MODE  chunkwise（默认）或 framewise，决定 num_frame_per_block
 #   PARAM_DIR        参数目录（默认 data/causal-forcing/params/<模式>/<参数方案>）
 #   OUTPUT_DIR       结果输出目录（默认 results/causal_forcing/<模式>/<量化标签>）
-#   FRAMES           最终视频帧数（默认 81）
+#   FRAMES           最终视频帧数（默认 717，即 180 个 latent 帧，与 Self-Forcing 相同）
 #   SPAN_FRAMES      每个 TempoKV span 的 latent 帧数（默认 12）
 #                    需满足 latent_frames >= SPAN_FRAMES + num_frame_per_block，
 #                    否则 span 直到最后一个 block 才打包，没有任何一次注意力读过它
@@ -40,6 +40,15 @@
 #   BITS / K_BITS / V_BITS  K/V residual 位宽 override（1 到 8；默认读取 CONFIG）
 #   ANCHOR_BITS     anchor 位宽（1 到 15 量化，16 表示不量化直接存 bf16；默认 INT4）
 #   K_HISTORY_LENGTH / V_HISTORY_LENGTH  历史帧数（默认读取 CONFIG）
+#   TEMPOKV_INCREMENTAL  增量编码开关，0 或 1（默认 1）。设为 0 回到攒满 span
+#                   再批量编码的旧调度，用于 A/B 对比
+#   TEMPOKV_BF16_LAG_FRAMES  增量编码的 BF16 滞后帧数（默认 18，与 Self-Forcing 相同）。
+#                   lag 必须远小于 latent 帧数：FRAMES=81（21 个 latent 帧）时
+#                   18 会让生成过程一帧都不压，短视频要手动调小
+#                   一帧落后最新已定稿帧这么多帧才会被编码，最近这些帧在
+#                   attention 里保持精确 BF16，与 Self-Forcing 相同
+#   TEMPOKV_FLUSH_TAIL  生成结束保留最终 cache 时是否把 lag 尾巴也压掉，0 或 1
+#                   （默认 1）。增量模式下只看这个开关
 #
 set -euo pipefail
 
@@ -114,7 +123,7 @@ if [[ "$output_dir" == "/" ]]; then
   die "OUTPUT_DIR 不能是文件系统根目录"
 fi
 
-FRAMES="${FRAMES:-81}"
+FRAMES="${FRAMES:-717}"
 NUM_SAMPLES="${NUM_SAMPLES:-1}"
 SEED="${SEED:-0}"
 START_INDEX="${START_INDEX:-0}"

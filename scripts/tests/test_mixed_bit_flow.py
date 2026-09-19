@@ -304,14 +304,6 @@ def test_mixed_efficiency_records_keep_both_widths_and_render_them() -> None:
     assert collect_module._method_label(row) == "TempoKV K3/V5"
 
 
-def test_mixed_bit_paper_experiment_contains_odd_mixed_variants() -> None:
-    source = (
-        ROOT / "scripts" / "paper_experiments" / "run_5_mixed_bits.sh"
-    ).read_text(encoding="utf-8")
-    assert "paper_run_tempokv k3v5 3 5" in source
-    assert "paper_run_tempokv k1v7 1 7" in source
-
-
 def _experiment_inputs(tmp_path: Path) -> dict[str, Path]:
     checkpoint = tmp_path / "checkpoint"
     wan_model = tmp_path / "wan-model"

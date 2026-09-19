@@ -34,7 +34,7 @@ on every run.
 ```bash
 CHECKPOINT=/models/self_forcing_dmd.pt \
 WAN_MODEL_DIR=/models/Wan2.1-T2V-1.3B \
-PROMPTS=assets/moviegen128_first30.txt \
+PROMPTS=assets/moviegen128.txt \
 bash scripts/paper_experiments/long_horizon/collect_trace.sh
 ```
 

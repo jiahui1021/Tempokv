@@ -13,14 +13,11 @@ scripts/
 ├── paper_experiments/ one study per subdirectory, each with its own README
 │                      (calibration, cross_kv_sharing, direction,
 │                      predictor_ablation, reconstruction, ...)
-├── tests/             tests for the scripts in this tree
-└── oneoff/            personal analysis runs, not entry points; every file
-                       hardcodes one machine's absolute paths (see its README)
+└── tests/             tests for the scripts in this tree
 ```
 
 The first seven entries are the supported surface. `paper_experiments/` holds
-per-paper studies rather than commands you would run day to day, and `oneoff/`
-is kept only so the entry points above stay easy to find.
+per-paper studies rather than commands you would run day to day.
 
 Model code is kept under `experiments/`; reusable trace and fitted parameters
 are kept under `data/`.

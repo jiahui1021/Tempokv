@@ -112,7 +112,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--frames",
         type=int,
-        default=81,
+        default=717,
         help="final video frame count; 1 latent frame = 4 video frames",
     )
     parser.add_argument(
@@ -650,6 +650,17 @@ def run(args: argparse.Namespace) -> dict[str, object]:
 
     paths["run"].mkdir(parents=True, exist_ok=True)
     environment = os.environ.copy()
+    # The incremental-schedule knobs are the caller's choice, not state left
+    # over from another run, so they survive the TEMPOKV_* cleanup below.
+    schedule_knobs = {
+        name: environment[name]
+        for name in (
+            "TEMPOKV_INCREMENTAL",
+            "TEMPOKV_BF16_LAG_FRAMES",
+            "TEMPOKV_FLUSH_TAIL",
+        )
+        if name in environment
+    }
     for name in tuple(environment):
         if name.startswith("TEMPOKV_"):
             environment.pop(name)
@@ -676,6 +687,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                 ),
             }
         )
+        environment.update(schedule_knobs)
         if args.triton_cache is not None:
             environment["TEMPOKV_TRITON_CACHE"] = str(
                 args.triton_cache.expanduser().resolve()

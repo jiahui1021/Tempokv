@@ -8,7 +8,7 @@ T=/mnt/cpfs/epic-user/hujiahui-20260612/Tempokv
 QVG=/mnt/cpfs/epic-user/hujiahui-20260612/miniconda3/envs/qvg/bin/python
 KV2="${PARAM_DIR:-$T/data/self-forcing/params/legacy-kh2-vh1-k2-v2-layershared}"
 CFG="${CFG:-$T/results/paper/span-int2/configs/residual_int2_anchor_int4.json}"
-PROMPTS="${PROMPTS:-$T/assets/moviegen128_first30.txt}"
+PROMPTS="${PROMPTS:-$T/assets/moviegen128.txt}"
 START="${START:-0}"; END="${END:-30}"
 CKPT=/mnt/cpfs/epic-user/hujiahui-20260612/checkpoints/self_forcing_dmd.pt
 WAN=/mnt/cpfs/epic-user/hujiahui-20260612/models--Wan-AI--Wan2.1-T2V-1.3B

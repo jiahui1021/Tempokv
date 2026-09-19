@@ -9,7 +9,7 @@ history lengths fixed so the predictor direction is the only difference.
     WAN_MODEL_DIR=/models/Wan2.1-T2V-1.3B \\
     python scripts/paper_experiments/direction/run_quality.py \\
         --checkpoint $CHECKPOINT --wan-model-dir $WAN_MODEL_DIR \\
-        --prompts assets/moviegen128_first30.txt \\
+        --prompts assets/moviegen128.txt \\
         --trace data/self-forcing/trace/clean_trace.npz \\
         --output-root results/direction/quality
 
