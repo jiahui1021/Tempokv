@@ -380,6 +380,12 @@ class CausalInferencePipeline(torch.nn.Module):
                 self._sample_resident_kv()
                 progress_bar.update(1)
 
+        # Pack the BF16 lag tail left by the incremental schedule before the
+        # final residency sample, so the finished cache is fully compressed.
+        flush = getattr(self, "flush_incremental_tail", None)
+        if flush is not None:
+            flush()
+
         self._sample_resident_kv()
         if horizon_probe:
             self.horizon_result = {

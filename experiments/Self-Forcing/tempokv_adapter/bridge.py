@@ -159,6 +159,18 @@ def install(runtime_root: str | Path) -> type:
                 raise ValueError("TEMPOKV_BF16_LAG_FRAMES must not be negative")
             self._tempokv_finalized_frames = 0
             self._tempokv_encoded_frames = 0
+            print(
+                "[TempoKV] span encoding mode: "
+                + (
+                    "INCREMENTAL"
+                    if self._incremental_tempokv
+                    else "BATCHED"
+                )
+                + f", span_frames={self._tempokv_span_frames}"
+                + f", bf16_lag_frames={self._tempokv_bf16_lag_frames}"
+                + f", horizon_frames={self._tempokv_total_frames}",
+                flush=True,
+            )
             self._tempokv_open_start_frame: int | None = None
             self._tempokv_open_units = 0
             self._tempokv_open_capacity = 0
@@ -389,6 +401,7 @@ def install(runtime_root: str | Path) -> type:
             self,
             tokens_to_quantize_start: int,
             tokens_to_quantize_end: int,
+            flush: bool = False,
         ) -> None:
             frame_start = tokens_to_quantize_start // self.frame_seq_length
             finalized_frames = tokens_to_quantize_end // self.frame_seq_length
@@ -400,11 +413,18 @@ def install(runtime_root: str | Path) -> type:
                 )
             self._tempokv_finalized_frames = finalized_frames
             # Everything newer than the lag stays dense BF16 and is encoded on
-            # a later call, once the rollout has moved past it.
-            frame_end = max(
-                self._tempokv_encoded_frames,
-                finalized_frames - self._tempokv_bf16_lag_frames,
-            )
+            # a later call, once the rollout has moved past it.  A flush is
+            # the last call of all: with generation over, the tail can no
+            # longer serve attention, so pack through the finalized end.
+            if flush:
+                frame_end = min(
+                    self._tempokv_total_frames, finalized_frames
+                )
+            else:
+                frame_end = max(
+                    self._tempokv_encoded_frames,
+                    finalized_frames - self._tempokv_bf16_lag_frames,
+                )
             cursor = self._tempokv_encoded_frames
             if cursor >= frame_end:
                 return
@@ -434,18 +454,34 @@ def install(runtime_root: str | Path) -> type:
                 token_start = cursor * self.frame_seq_length
                 token_end = (cursor + count) * self.frame_seq_length
                 started = time.perf_counter()
+                is_anchor_block = self._tempokv_open_units == 0
                 with torch.no_grad():
-                    if self._tempokv_open_units == 0:
+                    if is_anchor_block:
                         self._begin_incremental_segment(token_start, token_end)
                     else:
                         self._append_incremental_segment(token_start, token_end)
                 self._tempokv_open_units += count
+                duration_ms = (time.perf_counter() - started) * 1000.0
+                span_closed = (
+                    self._tempokv_open_units == self._tempokv_open_capacity
+                )
+                print(
+                    "[TempoKV-incremental] encoded frames "
+                    f"[{cursor},{cursor + count}) "
+                    + ("as anchor" if is_anchor_block else "as residual")
+                    + f", open span {self._tempokv_open_units}/"
+                    f"{self._tempokv_open_capacity}, finalized="
+                    f"{finalized_frames}, BF16 tail="
+                    f"{self._tempokv_bf16_lag_frames}, {duration_ms:.1f} ms"
+                    + (", span closed -> re-anchor next" if span_closed else ""),
+                    flush=True,
+                )
                 self.summary["quantization_events"].append(
                     {
                         "tokens_start": int(token_start),
                         "tokens_end": int(token_end),
                         "num_tokens": int(token_end - token_start),
-                        "duration_ms": (time.perf_counter() - started) * 1000.0,
+                        "duration_ms": duration_ms,
                         "codec": "TempoKV-incremental",
                         "span_start_frame": int(self._tempokv_open_start_frame),
                         "span_units": int(self._tempokv_open_units),
@@ -454,12 +490,38 @@ def install(runtime_root: str | Path) -> type:
                 )
                 cursor += count
                 self._tempokv_encoded_frames = cursor
-                if self._tempokv_open_units == self._tempokv_open_capacity:
+                if span_closed:
                     self._tempokv_open_start_frame = None
                     self._tempokv_open_units = 0
                     self._tempokv_open_capacity = 0
                     self._tempokv_open_encoders = None
             self._record_kv_cache_memory()
+
+        def flush_incremental_tail(self) -> None:
+            """Pack the BF16 tail the incremental schedule still owes.
+
+            During generation the newest ``lag`` frames must stay exact for
+            attention; once the rollout is over that tail is dead weight, and
+            leaving it unpacked makes the finished cache larger than the
+            batched schedule's, which closes its last span before returning.
+            ``TEMPOKV_FLUSH_TAIL=0`` restores the unpacked-tail behavior.
+            """
+            if not getattr(self, "_incremental_tempokv", False):
+                return
+            if os.environ.get("TEMPOKV_FLUSH_TAIL", "1") == "0":
+                return
+            if (
+                self._tempokv_encoded_frames
+                >= self._tempokv_finalized_frames
+            ):
+                return
+            start = self._tempokv_finalized_frames * self.frame_seq_length
+            self._quantize_incrementally(start, start, flush=True)
+            print(
+                "[TempoKV-incremental] final flush: packed tail through "
+                f"frame {self._tempokv_finalized_frames}",
+                flush=True,
+            )
 
         def quantize_kv_cache(
             self,
