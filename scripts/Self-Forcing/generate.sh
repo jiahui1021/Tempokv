@@ -62,6 +62,8 @@
 #                   是这么多帧的稠密 KV，已计入 resident_bf16_bytes
 #   TEMPOKV_FLUSH_TAIL  生成结束后是否把 lag 尾巴也压掉，0 或 1（默认 1）。只在
 #                   rollout 结束后执行，不影响生成质量，只影响最终驻留的 cache
+#   SPAN_FRAMES     每个 TempoKV span 的 latent 帧数（默认为整段 latent 帧数，
+#                   即整个 rollout 只有一个 anchor）
 #   TEMPOKV_INCREMENTAL  增量编码开关，0 或 1（默认 1）。设为 0 回到按 span
 #                   批量编码的旧调度，用于 A/B 对比
 #

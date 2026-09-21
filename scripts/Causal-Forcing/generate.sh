@@ -28,9 +28,10 @@
 #   PARAM_DIR        参数目录（默认 data/causal-forcing/params/<模式>/<参数方案>）
 #   OUTPUT_DIR       结果输出目录（默认 results/causal_forcing/<模式>/<量化标签>）
 #   FRAMES           最终视频帧数（默认 717，即 180 个 latent 帧，与 Self-Forcing 相同）
-#   SPAN_FRAMES      每个 TempoKV span 的 latent 帧数（默认 12）
-#                    需满足 latent_frames >= SPAN_FRAMES + num_frame_per_block，
-#                    否则 span 直到最后一个 block 才打包，没有任何一次注意力读过它
+#   SPAN_FRAMES      每个 TempoKV span 的 latent 帧数（默认为整段 latent 帧数，
+#                    即整个 rollout 只有一个 anchor）。增量调度下 span 是边长
+#                    边压边读的，不需要攒满；只有 TEMPOKV_INCREMENTAL=0 的批量
+#                    调度才要求 latent_frames >= SPAN_FRAMES + num_frame_per_block
 #   NUM_SAMPLES      每条 prompt 采样数（默认 1）
 #   SEED             随机种子（默认 0）
 #   START_INDEX / END_INDEX  prompt 序号范围（默认 0 .. -1 全部）

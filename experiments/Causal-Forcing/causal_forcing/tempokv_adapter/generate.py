@@ -587,9 +587,10 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         if config.reconstruction_dtype != "bfloat16":
             raise ValueError("Causal Forcing requires reconstruction_dtype=bfloat16")
         if span_frames is None:
-            from causal_forcing.tempokv_adapter.bridge import DEFAULT_SPAN_FRAMES
-
-            span_frames = DEFAULT_SPAN_FRAMES
+            # One anchor for the whole rollout.  The incremental schedule packs
+            # each finalized block into the open span, so a span that never
+            # closes is still read back, and it spends no second anchor.
+            span_frames = latent_frames
         if span_frames < 2:
             raise ValueError("span-frames must be at least 2")
         if span_frames % args.num_frame_per_block:
@@ -597,18 +598,22 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                 f"span-frames ({span_frames}) must be a whole number of "
                 f"{args.num_frame_per_block}-frame blocks"
             )
-        # A span that completes on the very last block is packed after the last
-        # forward pass, so nothing ever decodes it: the run would produce a
-        # video without reading a single compressed key. Require at least one
-        # more block after the first span closes.
-        minimum_frames = span_frames + args.num_frame_per_block
-        if latent_frames < minimum_frames:
-            raise ValueError(
-                f"generating {latent_frames} latent frames never reads back a "
-                f"{span_frames}-frame TempoKV span; at least {minimum_frames} "
-                "latent frames are needed so a packed span is decoded by a "
-                "later block. Lower --span-frames or raise --frames"
-            )
+        # The batch schedule only packs a span once it is complete, so a span
+        # that closes on the very last block is packed after the last forward
+        # pass and nothing ever decodes it.  The incremental schedule packs
+        # each finalized block as it arrives, so its spans are read back while
+        # they are still open and the span may be as long as the rollout.
+        if os.environ.get("TEMPOKV_INCREMENTAL", "1") == "0":
+            minimum_frames = span_frames + args.num_frame_per_block
+            if latent_frames < minimum_frames:
+                raise ValueError(
+                    f"generating {latent_frames} latent frames never reads back "
+                    f"a {span_frames}-frame TempoKV span under the batch "
+                    f"schedule; at least {minimum_frames} latent frames are "
+                    "needed so a packed span is decoded by a later block. "
+                    "Lower --span-frames, raise --frames, or leave "
+                    "TEMPOKV_INCREMENTAL unset"
+                )
         parameters = _validate_parameters(paths["k_params"], paths["v_params"], config)
 
     generation_command = _generation_command(args, paths, latent_frames)

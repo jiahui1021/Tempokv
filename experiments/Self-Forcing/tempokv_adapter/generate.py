@@ -1027,7 +1027,9 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             "v_backend": "triton",
         }
         report["span_frames"] = (
-            args.span_frames if args.span_frames is not None else 24
+            args.span_frames
+            if args.span_frames is not None
+            else latent_frames_for(args.frames)
         )
     if args.dry_run:
         print(json.dumps(report, indent=2, ensure_ascii=False))

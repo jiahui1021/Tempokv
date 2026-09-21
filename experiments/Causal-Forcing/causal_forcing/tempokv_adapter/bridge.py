@@ -29,14 +29,9 @@ from tempokv.runtime.streaming import StreamingTempoKVEncoder
 
 _TEMPOKV_STATE_KEY = "_tempokv_packed"
 
-# Frames packed into one TempoKV span. One anchor is emitted per span and every
-# other frame in it is predicted from reconstructed history, so a larger span
-# means better compression; the most recent (< span) frames stay BF16.
-#
-# The default has to leave room for the packed span to actually be *read*: a
-# short 81-frame rollout is 21 latent frames, so a 24-frame span would never
-# complete, and even a 21-frame span would only pack after the last forward
-# pass — producing a video that never decoded a single compressed key.
+# Frames per span; one anchor each, so a larger span compresses better.  Only a
+# fallback: generate.py always sets TEMPOKV_SPAN_FRAMES, to the whole rollout,
+# so a normal run spends one anchor.
 DEFAULT_SPAN_FRAMES = 12
 # Finalized frames kept exact before they are packed, as on Self-Forcing.  It is
 # sized for the default 180-latent-frame rollout; a short rollout needs a
@@ -65,10 +60,10 @@ class _CausalTempoKVRuntimeReport(TempoKVRuntimeReport):
         compressed_bytes: int,
     ) -> None:
         self.terminal_discard_events += 1
-        self.terminal_discarded_frames += int(frames)
-        self.terminal_encode_frames_avoided += int(encode_frames_avoided)
-        self.terminal_discarded_bf16_bytes += int(bf16_bytes)
-        self.terminal_discarded_compressed_bytes += int(compressed_bytes)
+        self.terminal_discarded_frames += frames
+        self.terminal_encode_frames_avoided += encode_frames_avoided
+        self.terminal_discarded_bf16_bytes += bf16_bytes
+        self.terminal_discarded_compressed_bytes += compressed_bytes
 
     def to_dict(self) -> dict[str, Any]:
         payload = super().to_dict()
@@ -145,12 +140,7 @@ def _span_frames() -> int:
     raw = os.environ.get("TEMPOKV_SPAN_FRAMES")
     if raw is None:
         return DEFAULT_SPAN_FRAMES
-    try:
-        value = int(raw)
-    except ValueError as error:
-        raise ValueError(
-            f"TEMPOKV_SPAN_FRAMES must be an integer, got {raw!r}"
-        ) from error
+    value = int(raw)
     if value < 2:
         raise ValueError("TEMPOKV_SPAN_FRAMES must be at least 2")
     return value
@@ -190,9 +180,9 @@ def install(runtime_root: str | Path | None = None) -> type:
             # The temporal V predictor has no Cross(K) map, so the diagonal
             # requirement applies only to the CrossKV route.
             if (
-                getattr(config, "v_predictor_mode", "cross_kv")
+                config.v_predictor_mode
                 not in {"temporal", "identity", "taylor", "taylor2", "direct"}
-                and getattr(config, "v_history_length", 0)
+                and config.v_history_length
                 and not self.tempokv_codec.cross_kv.history_diagonal
             ):
                 raise ValueError(
@@ -214,18 +204,16 @@ def install(runtime_root: str | Path | None = None) -> type:
             # block into the open span once it is TEMPOKV_BF16_LAG_FRAMES
             # behind the newest one.  Span-mean K and innovation V have no
             # incremental state, so they keep the batch schedule.
-            incremental = bool(
+            incremental = (
                 os.environ.get("TEMPOKV_INCREMENTAL", "1") != "0"
-                and not bool(getattr(self.tempokv_codec, "k_channel_mean", False))
-                and getattr(config, "v_predictor_mode", "cross_kv") != "innovation"
+                and not self.tempokv_codec.k_channel_mean
+                and config.v_predictor_mode != "innovation"
             )
             bf16_lag_frames = int(
                 os.environ.get(
                     "TEMPOKV_BF16_LAG_FRAMES", str(DEFAULT_BF16_LAG_FRAMES)
                 )
             )
-            if bf16_lag_frames < 0:
-                raise ValueError("TEMPOKV_BF16_LAG_FRAMES must not be negative")
             self.tempokv_stream = StreamingTempoKVEncoder(
                 self.tempokv_codec,
                 num_layers=self.num_transformer_blocks,

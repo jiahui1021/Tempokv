@@ -825,15 +825,12 @@ def _encode(
 class IncrementalTensorEncoder:
     """Append finalized units to one predictor-continuous packed span.
 
-    The public batch codec remains the reference implementation.  This helper
-    starts from a batch-encoded prefix, preallocates the compressed residual
-    capacity for the configured span, and then applies the same closed-loop
-    predictor/quantizer arithmetic only to newly finalized units.  The packed
-    tensor keeps its capacity buffers while ``shape`` and ``unit_lengths``
-    describe the logical prefix visible to the decoder.
-
-    Only reconstructed predictor history is retained in BF16.  It is bounded
-    by the configured history order and released as soon as the span closes.
+    Starts from a batch-encoded prefix and applies the same closed-loop
+    predictor/quantizer arithmetic to newly finalized units, so the packed
+    bytes match a batch encode of the whole span.  ``shape`` and
+    ``unit_lengths`` describe the logical prefix; the residual buffers behind
+    them may be longer.  Only reconstructed predictor history is kept in BF16,
+    bounded by the history order and released when the span closes.
     """
 
     def __init__(
@@ -845,28 +842,14 @@ class IncrementalTensorEncoder:
         capacity_units: int,
     ) -> None:
         if capacity_units < len(packed.unit_lengths):
-            raise ValueError(
-                "incremental capacity is smaller than the encoded prefix"
-            )
-        if capacity_units < 1:
-            raise ValueError("incremental capacity must be positive")
-        if packed.channel_mean is not None:
-            raise ValueError("incremental encoding does not support span-mean K")
-        if packed.predictor_kind == "innovation":
-            raise ValueError("incremental encoding does not support K innovation")
-        if any(length != packed.stride for length in packed.unit_lengths):
-            raise ValueError("incremental prefixes must contain complete units")
-        if tuple(reconstruction.shape) != packed.shape:
-            raise ValueError(
-                "incremental reconstruction does not match packed prefix"
-            )
-
+            raise ValueError("incremental capacity is smaller than the prefix")
+        # Span-mean K only knows its mean once the span is complete, and K
+        # innovation needs a continuation-aware source; neither can be appended.
+        if packed.channel_mean is not None or packed.predictor_kind == "innovation":
+            raise ValueError("this predictor has no incremental form")
         self.packed = packed
-        self.config = config
         self.cache_role: str | None = None
-        self.capacity_units = int(capacity_units)
-        if self.capacity_units * packed.stride < packed.shape[2]:
-            raise ValueError("incremental capacity does not cover the prefix")
+        self.capacity_units = capacity_units
         self._allocated_units = len(packed.unit_lengths)
         self._scale_dtype = (
             packed.residual_scale.dtype
@@ -988,24 +971,13 @@ class IncrementalTensorEncoder:
         reuse_input_for_reconstruction: bool = False,
     ) -> torch.Tensor:
         """Append one or more complete units and return their reconstruction."""
-        _validate_input(value, self.config)
-        if value.shape[2] <= 0 or value.shape[2] % self.packed.stride:
+        if value.shape[2] % self.packed.stride:
             raise ValueError("incremental append must contain complete units")
         appended_units = value.shape[2] // self.packed.stride
         if self.units + appended_units > self.capacity_units:
             raise ValueError("incremental append exceeds the span capacity")
         self._ensure_capacity(self.units + appended_units)
-        if (
-            value.shape[:2] != self.packed.shape[:2]
-            or value.shape[3] != self.packed.shape[3]
-        ):
-            raise ValueError("incremental append shape changed within a span")
         reconstruction_dtype = _dtype(self.packed.reconstruction_dtype)
-        if reuse_input_for_reconstruction and value.dtype != reconstruction_dtype:
-            raise ValueError(
-                "in-place incremental reconstruction requires "
-                f"{reconstruction_dtype}, got {value.dtype}"
-            )
         reconstruction = (
             value
             if reuse_input_for_reconstruction

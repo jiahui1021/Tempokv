@@ -56,7 +56,7 @@ INT2 使用同一个配置并设置 `BITS=2`；参数目录会自动切换到 IN
 | `CONFIG` | codec 配置 JSON | `configs/legacy.json` |
 | `GENERATION_MODE` | `chunkwise` 或 `framewise` | `chunkwise` |
 | `FRAMES` | 最终视频帧数 | `717` |
-| `SPAN_FRAMES` | 每个 TempoKV span 的 latent 帧数 | `12` |
+| `SPAN_FRAMES` | 每个 TempoKV span 的 latent 帧数 | 整段 latent 帧数（单 anchor） |
 | `LOCAL_ATTN_SIZE` | 局部注意力窗口 | `-1` |
 | `NUM_GPUS` | torchrun GPU 数 | `1` |
 | `DRY_RUN` | 只打印命令不执行 | `0` |
@@ -116,16 +116,16 @@ sync，会扭曲被测对象本身；需要时用 `generation_ms - encode_ms - d
 
 ## SPAN_FRAMES 怎么选
 
-一个 span 只有一个 anchor，span 越大压缩越好，但 span 必须**在生成结束前就攒满并
-被后续 block 读回**，否则打包发生在最后一次 forward 之后，没有任何一次注意力读过
-压缩 cache。因此要求：
+一个 span 只有一个 anchor，span 越大压缩越好。增量调度（默认）下每个定稿的 block
+都会立刻并入正在打开的 span，span 不需要攒满就会被后续 block 读回，所以默认直接把
+span 设成整段 latent 帧数：**整个 rollout 只有一个 anchor**。
+
+只有批量调度（`TEMPOKV_INCREMENTAL=0`）才要求 span 在生成结束前攒满并被读回：
 
 ```text
 latent_frames >= SPAN_FRAMES + num_frame_per_block
 ```
 
-默认 `FRAMES=717` 对应 180 个 latent 帧；短视频如 `FRAMES=81`（21 个 latent 帧）下
-chunkwise `SPAN_FRAMES` 最大 18。`SPAN_FRAMES` 默认 12。
 不满足时 `generate.py` 会在加载模型之前报错，而不是跑完再失败。
 
 `FIT_DEVICE` 默认 `auto`：有 CUDA 就用 GPU，没有则回退 CPU 并在 stderr 打出告警——

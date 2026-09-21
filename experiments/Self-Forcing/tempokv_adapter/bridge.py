@@ -4,7 +4,6 @@ import importlib
 import math
 import os
 from pathlib import Path
-from types import SimpleNamespace
 import sys
 import time
 from typing import Any, Callable
@@ -30,8 +29,6 @@ DEFAULT_BF16_LAG_FRAMES = 18
 
 def wrap_cache_state(state: PackedTensor) -> dict[str, Any]:
     """Store one TempoKV state in the bundled Self-Forcing cache."""
-    if not isinstance(state, PackedTensor):
-        raise TypeError(f"expected PackedTensor, got {type(state).__name__}")
     return {
         _TEMPOKV_STATE_KEY: state,
         "predictor_kind": state.predictor_kind,
@@ -98,11 +95,6 @@ def install(runtime_root: str | Path) -> type:
     class TempoKVCausalInferencePipeline(base):
         def __init__(self, *args: Any, **kwargs: Any) -> None:
             super().__init__(*args, **kwargs)
-            self.codec_shape = SimpleNamespace(
-                frame_seq_length=self.frame_seq_length,
-                num_heads=getattr(self, "num_heads", 12),
-                head_dim=getattr(self, "head_dim", 128),
-            )
             # TempoKV intentionally keeps the pre-RoPE, frame-addressable
             # cache so finalized spans can be predicted and re-rotated at
             # absolute positions during reads.  The BF16 baseline gets the
@@ -111,60 +103,47 @@ def install(runtime_root: str | Path) -> type:
             self.tempokv_codec = load_codec_from_env()
             config = self.tempokv_codec.config
             self._tempokv_rope_precision = "complex64"
-            self._tempokv_span_frames = int(
-                os.environ.get("TEMPOKV_SPAN_FRAMES", "24")
-            )
-            # The rollout length, not the attention window.  These coincide by
+            # The rollout length, not the attention window: they coincide by
             # default, but the TEMPOKV_ATTENTION_FRAMES ablation narrows
-            # TEMPOKV_NUM_FRAMES to make a run comparable against a baseline
-            # with a smaller window, and the rollout still runs to the full
-            # horizon.  Reading the window here would size the spans against
-            # the wrong number and reject every write past it.
+            # TEMPOKV_NUM_FRAMES while the rollout still runs to the horizon.
             self._tempokv_total_frames = int(
                 os.environ.get(
                     "TEMPOKV_HORIZON_FRAMES",
                     os.environ.get("TEMPOKV_NUM_FRAMES", "0"),
                 )
             )
-            if self._tempokv_span_frames < 2:
-                raise ValueError("TEMPOKV_SPAN_FRAMES must be at least 2")
             if self._tempokv_total_frames < 1:
                 raise ValueError("TEMPOKV_HORIZON_FRAMES must be positive")
-            # Span-mean K needs the final mean before the first residual can be
-            # encoded, and innovation V needs a continuation-aware K innovation
-            # source.  Preserve their existing batch behavior until those
-            # experimental paths gain dedicated incremental state.
-            self._incremental_tempokv = bool(
-                os.environ.get("TEMPOKV_INCREMENTAL", "1") != "0"
-                and hasattr(self.tempokv_codec, "begin_incremental_primary")
-                and hasattr(self.tempokv_codec, "begin_incremental_secondary")
-                and not bool(getattr(self.tempokv_codec, "k_channel_mean", False))
-                and getattr(config, "v_predictor_mode", "cross_kv") != "innovation"
+            # One anchor for the whole rollout by default: the incremental
+            # schedule reads a span back while it is still open, so a span that
+            # never closes never spends a second anchor.
+            self._tempokv_span_frames = int(
+                os.environ.get(
+                    "TEMPOKV_SPAN_FRAMES", str(self._tempokv_total_frames)
+                )
             )
-            # Incremental encoding decides *when* a finalized frame stops being
-            # readable as exact BF16, and that is a quality knob, not an
-            # implementation detail.  The batch schedule left every frame BF16
-            # until a whole span closed, so the newest finalized block was
-            # always exact and short rollouts were never compressed at all.
-            # Encoding each block the moment it is finalized removes that
-            # window entirely: from the second block on, every key the model
-            # attends to is a reconstruction, and in a self-forcing rollout
-            # that error compounds.  The lag restores a bounded exact tail --
-            # a frame is encoded only once it is this many frames behind the
-            # newest finalized frame -- and costs exactly that many frames of
-            # dense BF16.  The default of 18 frames (six 3-frame blocks) is the
-            # lag that matched the batch schedule's quality at 24-frame spans.
+            if self._tempokv_span_frames < 2:
+                raise ValueError("TEMPOKV_SPAN_FRAMES must be at least 2")
+            # Span-mean K needs the final mean before the first residual, and
+            # innovation V needs a continuation-aware source; neither has
+            # incremental state, so both keep the batch schedule.
+            self._incremental_tempokv = (
+                os.environ.get("TEMPOKV_INCREMENTAL", "1") != "0"
+                and not self.tempokv_codec.k_channel_mean
+                and config.v_predictor_mode != "innovation"
+            )
+            # A frame is encoded only once it is this far behind the newest
+            # finalized one, so the frames the model attends to most are still
+            # exact.  Packing each block the moment it is finalized instead
+            # makes every key a reconstruction from the second block on, and in
+            # a self-forcing rollout that error compounds.  18 frames is the lag
+            # that matched the batch schedule's quality at 24-frame spans.
             self._tempokv_bf16_lag_frames = int(
                 os.environ.get(
                     "TEMPOKV_BF16_LAG_FRAMES", str(DEFAULT_BF16_LAG_FRAMES)
                 )
             )
-            if self._tempokv_bf16_lag_frames < 0:
-                raise ValueError("TEMPOKV_BF16_LAG_FRAMES must not be negative")
-            # The incremental schedule, its lag and the final flush live in the
-            # streaming encoder shared with Causal Forcing; the batch schedule
-            # uses the same encoder's one-shot span encode.
-            num_layers = int(self.num_transformer_blocks)
+            num_layers = self.num_transformer_blocks
             self.tempokv_stream = StreamingTempoKVEncoder(
                 self.tempokv_codec,
                 num_layers=num_layers,
@@ -174,8 +153,8 @@ def install(runtime_root: str | Path) -> type:
                     model="self_forcing",
                     kv_mode="tempokv",
                     num_layers=num_layers,
-                    num_heads=self.codec_shape.num_heads,
-                    head_dim=self.codec_shape.head_dim,
+                    num_heads=self.num_heads,
+                    head_dim=self.head_dim,
                     stride=config.stride,
                 ),
                 wrap_state=wrap_cache_state,
@@ -256,22 +235,13 @@ def install(runtime_root: str | Path) -> type:
             """
             if self.kv_cache1 is None:
                 return
-            # Read defensively, as this bridge already does for the other
-            # codec settings, so a config predating the field still installs.
-            direction = getattr(
-                self.tempokv_codec.config, "predictor_direction", "k_to_v"
-            )
-            # Same defensive read: a config predating the correction installs
-            # with it off, which is also the shipped default.
             config = self.tempokv_codec.config
-            jensen = bool(getattr(config, "jensen_correction", False))
-            group_size = int(getattr(config, "group_size", 64))
             for layer in self.kv_cache1:
                 layer["k"].rope_precision = self._tempokv_rope_precision
                 # The correction reads the K cache's step sizes, so only the K
                 # slot needs to carry it.
-                layer["k"].tempokv_jensen_correction = jensen
-                layer["k"].tempokv_group_size = group_size
+                layer["k"].tempokv_jensen_correction = config.jensen_correction
+                layer["k"].tempokv_group_size = config.group_size
                 # Ablation switch, read from the environment rather than the
                 # codec config: it changes no stored value and exists to tell
                 # the exact correction apart from the cheap approximation.
@@ -279,7 +249,9 @@ def install(runtime_root: str | Path) -> type:
                     os.environ.get("TEMPOKV_JENSEN_CACHE_MEAN") == "1"
                 )
                 for role in ("k", "v"):
-                    layer[role].tempokv_predictor_direction = direction
+                    layer[role].tempokv_predictor_direction = (
+                        config.predictor_direction
+                    )
 
         def _initialize_kv_cache(self, *args: Any, **kwargs: Any) -> Any:
             result = super()._initialize_kv_cache(*args, **kwargs)
@@ -288,7 +260,7 @@ def install(runtime_root: str | Path) -> type:
 
         def reset_quantization_state(self) -> None:
             self.tempokv_stream.reset()
-            if getattr(self, "tempokv_pruning", None) is not None:
+            if self.tempokv_pruning is not None:
                 self.tempokv_pruning.reset()
 
         def inference(self, *args: Any, **kwargs: Any) -> Any:
@@ -298,21 +270,17 @@ def install(runtime_root: str | Path) -> type:
             return result
 
         def _patch_attention_windows(self) -> None:
-            # TempoKV takes over cache compression, so the model must keep the
-            # full sequence span readable instead of capping attention at the
-            # 21-frame default window. The target frame count arrives through
-            # TEMPOKV_NUM_FRAMES because omegaconf args lack num_output_frames.
-            # A bounded local attention window (with or without a sink) is
-            # legitimate: the causal model reads the full resident cache and
-            # slices its attention window afterward, so TempoKV spans are never
-            # cut.
+            # TempoKV compresses the whole cache, so the model keeps the full
+            # sequence readable instead of capping attention at its 21-frame
+            # default.  The frame count arrives through TEMPOKV_NUM_FRAMES
+            # because omegaconf args lack num_output_frames.  A bounded local
+            # window stays legitimate: the causal model reads the full resident
+            # cache and slices afterwards, so spans are never cut.
             frames = int(os.environ.get("TEMPOKV_NUM_FRAMES", "0"))
             if frames <= 0:
                 raise ValueError("TEMPOKV_NUM_FRAMES must be set for TempoKV runs")
-            target = frames * self.frame_seq_length
             for block in self.generator.model.blocks:
-                if hasattr(block.self_attn, "max_attention_size"):
-                    block.self_attn.max_attention_size = target
+                block.self_attn.max_attention_size = frames * self.frame_seq_length
 
         def _on_incremental_encode(self, event: dict[str, Any]) -> None:
             """Log one incremental begin/append the way the run logs expect."""

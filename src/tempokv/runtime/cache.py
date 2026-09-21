@@ -221,8 +221,6 @@ class ChunkedKVCache:
         """
         start_chunk = self._token_to_chunk(start_index)
         end_chunk = self._token_to_chunk(end_index)
-        if data.ndim != 4 or data.shape[self.seq_dim] != end_index - start_index:
-            raise ValueError("cache write tensor does not match the token range")
         expected = list(self._shape())
         expected[self.seq_dim] = end_index - start_index
         if tuple(data.shape) != tuple(expected):
@@ -361,9 +359,7 @@ class ChunkedKVCache:
         if self.chunk_state[start_chunk] != ChunkState.QUANTIZED:
             return start_index
         span = self._span_by_chunk[start_chunk]
-        if span is None:
-            raise RuntimeError("packed cache span index is inconsistent")
-        return int(span["start_chunk"]) * self.frame_seq_length
+        return span["start_chunk"] * self.frame_seq_length
 
     def _source_for_span(
         self,
@@ -400,8 +396,6 @@ class ChunkedKVCache:
         source_tensor: torch.Tensor | None,
         extra_channels: int = 0,
     ) -> torch.Tensor:
-        if extra_channels < 0:
-            raise ValueError("extra_channels must not be negative")
         start_chunk = self._token_to_chunk(start_index)
         end_chunk = self._token_to_chunk(end_index)
         if start_chunk >= end_chunk:
@@ -412,10 +406,7 @@ class ChunkedKVCache:
             and self.layout == output_layout
             and not extra_channels
         ):
-            chunk = self.chunks[start_chunk]
-            if chunk is None:
-                raise RuntimeError("BF16 cache chunk has no tensor")
-            return chunk
+            return self.chunks[start_chunk]
         total_tokens = end_index - start_index
         width = self.head_dim + extra_channels
         shape = (
@@ -439,8 +430,6 @@ class ChunkedKVCache:
             state = self.chunk_state[chunk_index]
             if state == ChunkState.BF16:
                 part = self.chunks[chunk_index]
-                if part is None:
-                    raise RuntimeError("BF16 cache chunk has no tensor")
                 if self.layout != output_layout:
                     part = part.permute(0, 2, 1, 3)
                 output_end = output_start + self.frame_seq_length
@@ -453,8 +442,6 @@ class ChunkedKVCache:
             if state != ChunkState.QUANTIZED:
                 raise ValueError(f"cache chunk {chunk_index} has not been written")
             span = self._span_by_chunk[chunk_index]
-            if span is None:
-                raise RuntimeError("packed cache span index is inconsistent")
             if span["start_chunk"] < start_chunk or span["end_chunk"] > end_chunk:
                 raise ValueError("packed TempoKV spans must be read in full")
             source = self._source_for_span(
@@ -563,21 +550,12 @@ class ChunkedKVCache:
                 chunk_index += 1
                 continue
             span = self._span_by_chunk[chunk_index]
-            if span is None:
-                raise RuntimeError("packed cache span index is inconsistent")
             if span["start_chunk"] < start_chunk or span["end_chunk"] > end_chunk:
                 raise ValueError("packed TempoKV spans must be read in full")
             packed = span["quant_data"]
-            # Self-Forcing's bridge wraps the PackedTensor in a dict; unwrap to
-            # the object that owns step_sizes(), the same way the decode path does.
-            if not hasattr(packed, "step_sizes"):
-                packed = (
-                    next((v for v in packed.values() if hasattr(v, "step_sizes")), None)
-                    if isinstance(packed, dict)
-                    else None
-                )
-                if packed is None:
-                    raise RuntimeError("packed cache span has no quantizer step sizes")
+            # Self-Forcing's bridge wraps the PackedTensor in a dict.
+            if isinstance(packed, dict):
+                packed = next(v for v in packed.values() if hasattr(v, "step_sizes"))
             steps = packed.step_sizes()            # [B, H, S, G]
             if steps.shape[-1] != groups:
                 raise ValueError(
@@ -637,18 +615,10 @@ class ChunkedKVCache:
         if start_chunk >= end_chunk:
             raise ValueError("extended packed cache span must be non-empty")
         span = self._span_by_chunk[start_chunk]
-        if span is None or span["start_chunk"] != start_chunk:
-            raise ValueError("extended packed cache span start is not installed")
-        old_end = int(span["end_chunk"])
-        if end_chunk <= old_end:
-            raise ValueError("extended packed cache span must grow")
+        old_end = span["end_chunk"]
         for chunk_index in range(old_end, end_chunk):
             if self.chunk_state[chunk_index] != ChunkState.BF16:
-                raise ValueError(
-                    f"cache chunk {chunk_index} is not finalized BF16 data"
-                )
-            if self._span_by_chunk[chunk_index] is not None:
-                raise ValueError("extended packed cache span overlaps another span")
+                raise ValueError(f"cache chunk {chunk_index} is not finalized BF16")
         span["end_chunk"] = end_chunk
         for chunk_index in range(old_end, end_chunk):
             self.chunks[chunk_index] = None

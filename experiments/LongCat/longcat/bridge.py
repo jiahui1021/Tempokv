@@ -96,15 +96,7 @@ class PackedTensorSpanSet:
         first_batch, first_heads, _, first_width = self.spans[0].shape
         if (batch, heads, width) != (first_batch, first_heads, first_width):
             raise ValueError("packed spans must share batch, head, and width dimensions")
-        tail_length = 0
-        if self.tail is not None:
-            if (
-                self.tail.ndim != 4
-                or (self.tail.shape[0], self.tail.shape[1], self.tail.shape[3])
-                != (batch, heads, width)
-            ):
-                raise ValueError("the BF16 tail must match the span batch, heads, and width")
-            tail_length = int(self.tail.shape[2])
+        tail_length = 0 if self.tail is None else self.tail.shape[2]
         if sum(span.shape[2] for span in self.spans) + tail_length != sequence:
             raise ValueError("packed spans must exactly cover the combined sequence")
 
@@ -271,8 +263,6 @@ def decode_kv_cache(
                 strict_triton=codec.config.strict_triton,
             )
             start = end
-        if (k_cache.tail is None) != (v_cache.tail is None):
-            raise ValueError("LongCat K and V must both carry a BF16 tail or neither")
         if k_cache.tail is not None:
             key[:, :, start:, :].copy_(k_cache.tail)
             value[:, :, start:, :].copy_(v_cache.tail)
@@ -1003,8 +993,6 @@ class LongCatTempoKVBridge:
                 encode_device = next(iter(kv_cache_dict.values()))[0].device
         span_units = getattr(dit, "_tempokv_span_temporal_units", None)
         lag_units = int(os.environ.get("TEMPOKV_BF16_LAG_FRAMES", "0"))
-        if lag_units < 0:
-            raise ValueError("TEMPOKV_BF16_LAG_FRAMES must not be negative")
         if lag_units:
             return self._quantize_with_bf16_tail(
                 dit,
@@ -1060,11 +1048,10 @@ class LongCatTempoKVBridge:
     ) -> Any:
         """Pack all but the newest ``lag_units`` conditioning latents.
 
-        LongCat builds the whole conditioning cache at once and drops it when
-        the segment ends, so there is no incremental schedule and nothing left
-        to flush afterwards.  What carries over from Self-Forcing is the lag:
-        the newest latents stay exact.  They are taken from the most recent
-        span, so the sink span of an attention-sink cache is never cut.
+        LongCat rebuilds the whole conditioning cache each segment and drops it
+        at the end, so it has no incremental schedule and nothing to flush.
+        Only the lag carries over from Self-Forcing, and it is taken from the
+        most recent span so an attention sink is never cut.
         """
         assert self.codec is not None
         spans = (
