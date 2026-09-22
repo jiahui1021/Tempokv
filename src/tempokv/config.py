@@ -345,13 +345,9 @@ class CodecConfig:
                 raise ValueError(
                     "predictor_direction=v_to_k requires v_predictor_mode=cross_kv"
                 )
-            # The two tensors exchange roles wholesale, so unequal widths would
-            # move bits between them and confound the direction comparison.
-            if self.k_bits != self.v_bits:
-                raise ValueError(
-                    "predictor_direction=v_to_k requires k_bits == v_bits so the "
-                    "role exchange does not also reallocate bit width"
-                )
+            # Relaxed: asymmetric K/V widths under the mirror are allowed (the
+            # caller owns the interpretation that bit budget no longer matches
+            # 1:1 after the role exchange). cross_kv source is still required.
         # A V predictor that reads its own history has nothing to consume when
         # the history is empty.  Fixed Taylor modes also require enough history
         # to express the requested finite-difference order; silently falling

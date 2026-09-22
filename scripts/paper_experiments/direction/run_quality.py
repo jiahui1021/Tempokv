@@ -147,13 +147,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _validate(args: argparse.Namespace) -> None:
-    if args.k_bits != args.v_bits:
-        # The mirrored arm exchanges the tensor roles wholesale, so unequal
-        # widths would move bits between K and V and confound the comparison.
-        raise ValueError(
-            "the direction study requires --k-bits == --v-bits so the mirrored "
-            "arm does not also reallocate bit width"
-        )
+    # asymmetric K/V widths are allowed for the mirror arm
     if args.quality and not args.include_bf16:
         raise ValueError("quality comparison needs the BF16 reference")
     if args.end_index <= args.start_index:
