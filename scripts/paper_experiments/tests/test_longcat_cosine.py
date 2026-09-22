@@ -7,6 +7,7 @@ import numpy as np
 import pytest
 
 from scripts.paper_experiments.direction import (
+    collect_longcat_four_way_cosine as four_way,
     collect_longcat_k_identity_mean_cosine as experiment,
 )
 
@@ -72,6 +73,12 @@ def _args(trace: Path, output: Path) -> argparse.Namespace:
     )
 
 
+def _four_args(trace: Path, output: Path) -> argparse.Namespace:
+    args = _args(trace, output)
+    args.iterations = 1
+    return args
+
+
 def test_raw_and_merged_longcat_traces_match(tmp_path: Path) -> None:
     raw, merged = _write_inputs(tmp_path)
     raw_report = experiment.run(_args(raw, tmp_path / "raw_result.json"))
@@ -94,3 +101,27 @@ def test_raw_and_merged_longcat_traces_match(tmp_path: Path) -> None:
         assert (tmp_path / f"{stem}_per_layer.csv").is_file()
         assert (tmp_path / f"{stem}_per_frame.csv").is_file()
 
+
+def test_four_way_raw_and_merged_longcat_traces_match(tmp_path: Path) -> None:
+    raw, merged = _write_inputs(tmp_path)
+    raw_report = four_way.run(_four_args(raw, tmp_path / "four_raw.json"))
+    merged_report = four_way.run(
+        _four_args(merged, tmp_path / "four_merged.json")
+    )
+
+    assert set(raw_report["cosine_comparison"]["mean_cosine"]) == set(
+        four_way.METHODS
+    )
+    assert len(raw_report["cosine_comparison"]["per_layer"]) == 2
+    assert len(raw_report["cosine_comparison"]["per_frame"]) == 5
+    assert raw_report["matched_k_fit"]["max_abs_weight_difference"] == 0.0
+    assert raw_report["matched_k_fit"]["max_abs_bias_difference"] == 0.0
+    for method in four_way.METHODS:
+        assert raw_report["cosine_comparison"]["mean_cosine"][method] == pytest.approx(
+            merged_report["cosine_comparison"]["mean_cosine"][method], abs=1e-12
+        )
+
+    for stem in ("four_raw", "four_merged"):
+        assert (tmp_path / f"{stem}_summary.csv").is_file()
+        assert (tmp_path / f"{stem}_per_layer.csv").is_file()
+        assert (tmp_path / f"{stem}_per_frame.csv").is_file()

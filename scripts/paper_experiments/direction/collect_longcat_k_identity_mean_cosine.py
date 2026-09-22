@@ -84,6 +84,7 @@ class LongCatTrace:
         self.path = path.expanduser().resolve()
         self.frames = frames
         self._merged_keys: np.ndarray | None = None
+        self._merged_values: np.ndarray | None = None
         self._event_dirs: list[Path] | None = None
         if self.path.is_file():
             self._inspect_merged()
@@ -94,11 +95,17 @@ class LongCatTrace:
 
     def _inspect_merged(self) -> None:
         with np.load(self.path, allow_pickle=False) as archive:
-            if "keys" not in archive:
-                raise ValueError("merged LongCat trace is missing keys")
+            missing = [name for name in ("keys", "values") if name not in archive]
+            if missing:
+                raise ValueError(
+                    "merged LongCat trace is missing " + ", ".join(missing)
+                )
             keys = archive["keys"]
+            values = archive["values"]
             if keys.ndim != 5:
                 raise ValueError("merged LongCat keys must use [L,S,T,H,D]")
+            if values.shape != keys.shape:
+                raise ValueError("merged LongCat K/V shapes must match")
             layers, samples, available_frames, heads, dim = map(int, keys.shape)
             if available_frames < self.frames:
                 raise ValueError(
@@ -137,9 +144,15 @@ class LongCatTrace:
             event_samples: int | None = None
             for file_index, path in enumerate(files):
                 with np.load(path, allow_pickle=False) as archive:
-                    if "k_pre_rope" not in archive:
-                        raise ValueError(f"{path} is missing k_pre_rope")
+                    missing = [
+                        name for name in ("k_pre_rope", "v") if name not in archive
+                    ]
+                    if missing:
+                        raise ValueError(f"{path} is missing {', '.join(missing)}")
                     key = archive["k_pre_rope"]
+                    value = archive["v"]
+                    if value.shape != key.shape:
+                        raise ValueError(f"{path} K/V shapes must match")
                     layer = int(scalar(archive, "layer_index", file_index))
                     current_ids.append(layer)
                     if key.ndim != 5:
@@ -209,19 +222,34 @@ class LongCatTrace:
             )
 
     def layers(self, selected: tuple[int, ...]) -> Iterator[tuple[int, np.ndarray]]:
+        for layer, key, _ in self.kv_layers(selected):
+            yield layer, key
+
+    def kv_layers(
+        self, selected: tuple[int, ...]
+    ) -> Iterator[tuple[int, np.ndarray, np.ndarray]]:
         if self.path.is_file():
             if self._merged_keys is None:
                 with np.load(self.path, allow_pickle=False) as archive:
                     self._merged_keys = np.array(
                         archive["keys"][:, :, : self.frames], copy=True
                     )
+                    self._merged_values = np.array(
+                        archive["values"][:, :, : self.frames], copy=True
+                    )
+            assert self._merged_values is not None
             for layer in selected:
                 position = self.layer_ids.index(layer)
-                yield layer, np.ascontiguousarray(self._merged_keys[position])
+                yield (
+                    layer,
+                    np.ascontiguousarray(self._merged_keys[position]),
+                    np.ascontiguousarray(self._merged_values[position]),
+                )
             return
         assert self._event_dirs is not None
         for layer in selected:
             records: list[np.ndarray] = []
+            value_records: list[np.ndarray] = []
             for event_dir in self._event_dirs:
                 matches = sorted(event_dir.glob(f"layer_{layer:02d}.npz"))
                 if len(matches) != 1:
@@ -232,13 +260,23 @@ class LongCatTrace:
                     key = np.array(
                         archive["k_pre_rope"][:, : self.frames], copy=True
                     )
+                    value = np.array(archive["v"][:, : self.frames], copy=True)
                 batch, frames, positions, heads, dim = key.shape
                 records.append(
                     key.transpose(0, 2, 1, 3, 4).reshape(
                         batch * positions, frames, heads, dim
                     )
                 )
-            yield layer, np.ascontiguousarray(np.concatenate(records, axis=0))
+                value_records.append(
+                    value.transpose(0, 2, 1, 3, 4).reshape(
+                        batch * positions, frames, heads, dim
+                    )
+                )
+            yield (
+                layer,
+                np.ascontiguousarray(np.concatenate(records, axis=0)),
+                np.ascontiguousarray(np.concatenate(value_records, axis=0)),
+            )
 
 
 @torch.no_grad()
