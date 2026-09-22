@@ -518,6 +518,42 @@ def encode_kv_cache(
     }
 
 
+def _env_span_splits(temporal_units: int) -> tuple[int, ...] | None:
+    """Parse ``TEMPOKV_SPAN_SPLITS="first+step"`` into span unit sizes.
+
+    ``"19+5"`` cuts the cumulative LongCat window into a 19-unit span followed
+    by 5-unit spans, i.e. one anchor per generation segment even though the
+    cache itself starts at frame 0 every call.  Unset (or a window too short to
+    split) returns ``None`` so the batched single-span path — one anchor for
+    the whole video — runs unchanged.
+    """
+    raw = os.environ.get("TEMPOKV_SPAN_SPLITS", "").strip()
+    if not raw:
+        return None
+    try:
+        first, step = (int(part) for part in raw.split("+", 1))
+    except ValueError as error:
+        raise ValueError(
+            f"TEMPOKV_SPAN_SPLITS must look like '19+5', got {raw!r}"
+        ) from error
+    if first < 2 or step < 1:
+        raise ValueError("TEMPOKV_SPAN_SPLITS parts must be >= 2 and >= 1")
+    if temporal_units <= first:
+        return None
+    units = [first]
+    remaining = temporal_units - first
+    while remaining > step:
+        units.append(step)
+        remaining -= step
+    if remaining == 1:
+        # A one-unit span carries only an anchor; merge it into the last span.
+        units[-1] += 1
+    else:
+        units.append(remaining)
+    assert sum(units) == temporal_units
+    return tuple(units)
+
+
 def encode_kv_cache_spans(
     kv_cache_dict: Mapping[int, tuple[torch.Tensor, torch.Tensor]],
     *,
@@ -992,6 +1028,8 @@ class LongCatTempoKVBridge:
             except (AttributeError, StopIteration):
                 encode_device = next(iter(kv_cache_dict.values()))[0].device
         span_units = getattr(dit, "_tempokv_span_temporal_units", None)
+        if span_units is None:
+            span_units = _env_span_splits(temporal_units)
         lag_units = int(os.environ.get("TEMPOKV_BF16_LAG_FRAMES", "0"))
         if lag_units:
             return self._quantize_with_bf16_tail(

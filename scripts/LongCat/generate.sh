@@ -136,6 +136,7 @@ args=(
 [[ -n "${INIT_VIDEO_PATH:-}" ]] && \
   args+=(--init_video_path "$(resolve_path "$INIT_VIDEO_PATH")")
 [[ "$OFFLOAD_KV_CACHE" == "1" ]] && args+=(--offload_kv_cache) || args+=(--no_offload_kv_cache)
+[[ "${CUMULATIVE_COND:-0}" == "1" ]] && args+=(--cumulative_cond)
 [[ "$ENABLE_COMPILE" == "1" ]] && args+=(--enable_compile)
 [[ "$SAVE_SEGMENT_SNAPSHOTS" == "1" ]] && args+=(--save_segment_snapshots)
 [[ -n "${CACHE_STRIDE:-}" ]] && args+=(--stride "$CACHE_STRIDE")

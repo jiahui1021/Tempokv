@@ -47,6 +47,17 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--num_segments", type=int, default=1)
     parser.add_argument("--num_frames", type=int, default=93)
     parser.add_argument("--num_cond_frames", type=int, default=53)
+    parser.add_argument(
+        "--cumulative_cond",
+        action="store_true",
+        help=(
+            "condition every segment on the whole generated prefix instead of "
+            "the last num_cond_frames: the cached window starts at frame 0 and "
+            "grows, so a batched re-encode anchors frame 0 for the entire "
+            "video (global single anchor).  The anchor-count ablation arms "
+            "share this mode and differ only in TEMPOKV_SPAN_SPLITS."
+        ),
+    )
     parser.add_argument("--num_inference_steps", type=int, default=50)
     parser.add_argument("--guidance_scale", type=float, default=4.0)
     parser.add_argument("--height", type=int, default=480)
@@ -246,14 +257,34 @@ def generate(args: argparse.Namespace) -> None:
         all_frames = list(current_video)
 
     target_size = current_video[0].size
+    frames_per_segment = args.num_frames - args.num_cond_frames
     for segment_index in range(1, args.num_segments + 1):
+        if args.cumulative_cond:
+            # Grow the conditioning prefix instead of sliding it, so the
+            # cached window always starts at frame 0 of the video.
+            cond_frames = len(all_frames)
+            if (cond_frames - 1) % 4:
+                raise ValueError(
+                    f"cumulative conditioning needs (len - 1) % 4 == 0, got {cond_frames}"
+                )
+            video, call_cond, call_frames = (
+                all_frames,
+                cond_frames,
+                cond_frames + frames_per_segment,
+            )
+        else:
+            video, call_cond, call_frames = (
+                current_video,
+                args.num_cond_frames,
+                args.num_frames,
+            )
         output = pipeline.generate_vc(
-            video=current_video,
+            video=video,
             prompt=args.prompt,
             negative_prompt=args.negative_prompt,
             resolution="480p",
-            num_frames=args.num_frames,
-            num_cond_frames=args.num_cond_frames,
+            num_frames=call_frames,
+            num_cond_frames=call_cond,
             num_inference_steps=args.num_inference_steps,
             guidance_scale=args.guidance_scale,
             generator=generator,
@@ -265,7 +296,7 @@ def generate(args: argparse.Namespace) -> None:
             frame.resize(target_size, Image.Resampling.BICUBIC)
             for frame in _to_pil_frames(output)
         ]
-        all_frames.extend(new_video[args.num_cond_frames :])
+        all_frames.extend(new_video[call_cond:])
         current_video = new_video
         if global_rank == 0 and args.save_segment_snapshots:
             _write_video(
