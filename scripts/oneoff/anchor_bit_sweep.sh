@@ -42,7 +42,7 @@ run_anchor(){
   # 复用已跑过的同配置视频(anchor16 ← anchorcmp 10 条;idx0 ← 单条扫/anchorcmp)
   if [[ $B == 16 ]]; then for f in $R/anchorcmp_abf16_lag18_10p/pixel_717/videos/*_0.mp4; do [[ -e $f && ! -e $RUN/videos/$(basename $f) ]] && cp "$f" "$RUN/videos/"; done; fi
   echo "[$(date '+%F %T')] a$B 生成+流式+FID 开始(gpu=$GPU)" >>$D/driver.log
-  CONFIG=$cfg BF16_REF=$REFS30 PARAM_DIR=$param TEMPOKV_BF16_LAG_FRAMES=18 LABEL=$LAB WATCH_IDLE=90 START=0 END=30 \
+  CFG=$cfg BF16_REF=$REFS30 PARAM_DIR=$param TEMPOKV_BF16_LAG_FRAMES=18 LABEL=$LAB WATCH_IDLE=90 START=0 END=30 \
     bash scripts/paper_experiments/span/span_bigL.sh 24 "$GPU" >>"$D/a${B}.log" 2>&1
   echo "[$(date '+%F %T')] a$B 生成 rc=$?" >>$D/driver.log
   local V=$R/$LAB/vbench_long8
