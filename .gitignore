@@ -9,6 +9,9 @@ htmlcov/
 .venv/
 
 figures/
+_local_archive/
+logs/
+tmp/
 
 # Local verification files
 /reports/
