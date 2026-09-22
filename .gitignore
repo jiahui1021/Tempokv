@@ -18,6 +18,8 @@ figures/
 /tests/visual-composer/
 .planning/
 
+supplementary/
+
 # Build and packaging output
 build/
 dist/
