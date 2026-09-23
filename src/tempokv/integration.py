@@ -75,7 +75,7 @@ def check_parameters_match_config(
 # and layer_head is LongCat's production layout (layer0 V is unfit-able under
 # layer_shared, 9.6 hybrid-bits) as well as the CrossKV sharing experiments'.
 # Native only fits layer_head.  head_shared and shared exist for the sharing
-# ablation alone.  codec_slug in scripts/*/_common.sh repeats this table without
+# ablation alone.  scripts/common/codec_slug.py repeats this table without
 # importing tempokv, so the two must change together.
 DEPLOYABLE_CROSS_KV_WEIGHT_MODES: dict[str, tuple[str, ...]] = {
     "legacy": ("layer_shared", "layer_head"),

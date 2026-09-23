@@ -655,14 +655,18 @@ def run(args: argparse.Namespace) -> dict[str, object]:
 
     paths["run"].mkdir(parents=True, exist_ok=True)
     environment = os.environ.copy()
-    # The incremental-schedule knobs are the caller's choice, not state left
-    # over from another run, so they survive the TEMPOKV_* cleanup below.
+    # The incremental-schedule and kernel knobs are the caller's choice, not
+    # state left over from another run, so they survive the TEMPOKV_* cleanup
+    # below.  generate.sh exports the validated Cross launch size; dropping it
+    # here silently ran a different decode launch configuration.
     schedule_knobs = {
         name: environment[name]
         for name in (
             "TEMPOKV_INCREMENTAL",
             "TEMPOKV_BF16_LAG_FRAMES",
             "TEMPOKV_FLUSH_TAIL",
+            "TEMPOKV_PERSISTENT_UNITS_PER_LAUNCH",
+            "TEMPOKV_ROPE_BACKEND",
         )
         if name in environment
     }

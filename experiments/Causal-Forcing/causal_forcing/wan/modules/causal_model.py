@@ -353,11 +353,20 @@ class CausalWanSelfAttention(nn.Module):
                     if direction == "v_to_k"
                     else (primary_all, secondary_all)
                 )
+                # Rotate the decoded K in place once the V decode has consumed
+                # it.  A one-chunk read hands back the resident BF16 chunk
+                # itself, and rotating that would overwrite the stored
+                # pre-RoPE K, so it keeps a separate output.
                 absolute_k = apply_rope_by_span(
                     k_all,
                     grid_sizes,
                     freqs,
                     kv_cache["k"].spans(attention_start, local_end_index),
+                    out=(
+                        k_all
+                        if local_end_index - attention_start > frame_seqlen
+                        else None
+                    ),
                 ).type_as(v)
                 recorder = getattr(self, "tempokv_trace_recorder", None)
                 if recorder is not None:

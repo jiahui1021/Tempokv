@@ -50,6 +50,10 @@
 #                   attention 里保持精确 BF16，与 Self-Forcing 相同
 #   TEMPOKV_FLUSH_TAIL  生成结束保留最终 cache 时是否把 lag 尾巴也压掉，0 或 1
 #                   （默认 1）。增量模式下只看这个开关
+#   TEMPOKV_ROPE_BACKEND  读 cache 时 K 的 float64 RoPE 实现：auto（默认，CUDA 上
+#                   用单次 Triton kernel）、torch（原逐块 PyTorch 实现，用于 A/B）、
+#                   triton（强制 kernel）。kernel 按原实现的运算顺序计算，首次调用
+#                   会与原实现逐位比对，不一致直接报错
 #
 set -euo pipefail
 
@@ -86,43 +90,21 @@ fi
 
 if [[ "$mode" == "tempokv" ]]; then
   config_path="$(resolve_path "$CONFIG")"
-  [[ -f "$config_path" ]] || die "CONFIG 不存在：$config_path"
-  read -r fit_mode v_predictor_mode <<<"$(resolve_codec_modes "$config_path" "${V_PREDICTOR:-}")"
+  read -r _ v_predictor_mode _ <<<"$(codec_modes "$config_path" "${V_PREDICTOR:-}")"
   # This only selects the matching fitted parameter directory; runtime always
   # consumes reconstructed cache state regardless of the fitting ablation.
   FIT_HISTORY_SOURCE="${FIT_HISTORY_SOURCE:-reconstructed}"
   parameter_name="${PARAM_NAME:-$(codec_slug "$config_path" "${K_HISTORY_LENGTH:-}" "${V_HISTORY_LENGTH:-}" "${K_BITS:-}" "${V_BITS:-}" "" "$v_predictor_mode" "$FIT_HISTORY_SOURCE" "${ANCHOR_BITS:-}")}"
   param_dir="$(resolve_path "${PARAM_DIR:-data/causal-forcing/params/$generation_mode/$parameter_name}")"
   result_label="$parameter_name"
-  case "$v_predictor_mode" in
-    temporal|identity|taylor|taylor2|direct) v_artifact_name="v_temporal.npz" ;;
-    cross_kv_identity|cross_kv_taylor|cross_kv_taylor2) v_artifact_name="v_cross_kv.npz" ;;
-    innovation) v_artifact_name="v_innovation.npz" ;;
-    cross_kv) v_artifact_name="v_cross_kv.npz" ;;
-    *) v_artifact_name="v_cross_kv.npz" ;;
-  esac
+  v_artifact_name="$(v_artifact_name "$v_predictor_mode")"
+  default_units_per_launch "$v_predictor_mode"
 else
   param_dir=""
   result_label="bf16"
 fi
 
-# Use the validated Cross production launch size by default.  Temporal and
-# fixed temporal predictors keep the shared runtime default, and callers can
-# still override this explicitly.
-if [[ "$mode" == "tempokv" && (
-      "$v_predictor_mode" == "cross_kv" ||
-      "$v_predictor_mode" == "cross_kv_identity" ||
-      "$v_predictor_mode" == "cross_kv_taylor" ||
-      "$v_predictor_mode" == "cross_kv_taylor2" ||
-      "$v_predictor_mode" == "innovation"
-    ) ]]; then
-  export TEMPOKV_PERSISTENT_UNITS_PER_LAUNCH="${TEMPOKV_PERSISTENT_UNITS_PER_LAUNCH:-8}"
-fi
-
 output_dir="$(resolve_path "${OUTPUT_DIR:-results/causal_forcing/$generation_mode/$result_label}")"
-if [[ "$output_dir" == "/" ]]; then
-  die "OUTPUT_DIR 不能是文件系统根目录"
-fi
 
 FRAMES="${FRAMES:-717}"
 NUM_SAMPLES="${NUM_SAMPLES:-1}"
@@ -156,17 +138,6 @@ check_int LOCAL_ATTN_SIZE -1
 period=$(( 4 * num_frame_per_block ))
 if (( (FRAMES + 3) % period != 0 )); then
   die "FRAMES 必须满足 (FRAMES + 3) % $period == 0，保证视频帧精确对应完整的 ${num_frame_per_block}-frame latent block（当前值：${FRAMES}）"
-fi
-if [[ -n "${K_HISTORY_LENGTH:-}" ]]; then
-  check_int K_HISTORY_LENGTH 1
-  (( K_HISTORY_LENGTH <= 8 )) || die "K_HISTORY_LENGTH 必须 <= 8（当前值：${K_HISTORY_LENGTH}）"
-fi
-if [[ -n "${V_HISTORY_LENGTH:-}" ]]; then
-  check_int V_HISTORY_LENGTH 0
-  (( V_HISTORY_LENGTH <= 5 )) || die "V_HISTORY_LENGTH 必须 <= 5（当前值：${V_HISTORY_LENGTH}）"
-fi
-if [[ -n "${SPAN_FRAMES:-}" ]]; then
-  check_int SPAN_FRAMES 2
 fi
 
 generate_command=(

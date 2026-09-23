@@ -10,15 +10,67 @@ frame.  Once eviction leaves a sink/recent gap the resident frames no longer
 form one arithmetic sequence, so each run is rotated with its own absolute
 start and only then concatenated: rotating `[0, 1, 100, 101]` as if it were
 `[0, 1, 2, 3]` would silently corrupt every post-gap key.
+
+The ``native`` (complex128) rotation of a CUDA BF16 read runs as one Triton
+kernel (:mod:`tempokv.runtime.rope_triton`) instead of the per-block PyTorch
+sequence below, which streams a float64 copy of the whole read through memory
+several times.  ``TEMPOKV_ROPE_BACKEND=torch`` keeps the PyTorch sequence;
+``triton`` requires the kernel; the default ``auto`` uses it whenever it
+applies.
 """
 
 from __future__ import annotations
 
-from typing import Iterable, Sequence
+import os
+from typing import Any, Iterable, Sequence
 
 import torch
 
 from .cache import CacheSpan
+
+
+ROPE_BACKEND_ENV = "TEMPOKV_ROPE_BACKEND"
+
+# Geometries whose fused rotation was compared against the reference in this
+# process; see _verify_fused_rotation.
+_VERIFIED_FUSED: set[tuple[Any, ...]] = set()
+
+
+def rope_backend() -> str:
+    backend = os.environ.get(ROPE_BACKEND_ENV, "auto")
+    if backend not in {"auto", "torch", "triton"}:
+        raise ValueError(f"{ROPE_BACKEND_ENV} must be auto, torch or triton")
+    return backend
+
+
+def _fused_rotation(
+    x: torch.Tensor, result: torch.Tensor, freqs: torch.Tensor, precision: str
+) -> Any | None:
+    """The fused kernel module when it reproduces this rotation, else None."""
+    backend = rope_backend()
+    if backend == "torch":
+        return None
+    required = backend == "triton"
+    if precision != "native" or not x.is_cuda:
+        if required:
+            raise ValueError(
+                "the Triton RoPE kernel covers the native precision on CUDA only"
+            )
+        return None
+    try:
+        from . import rope_triton
+    except ImportError:
+        if required:
+            raise
+        return None
+    if not rope_triton.supports(x, result, freqs):
+        if required:
+            raise ValueError(
+                "the Triton RoPE kernel needs BF16 input and output with a "
+                "contiguous head dimension and a complex128 RoPE table"
+            )
+        return None
+    return rope_triton
 
 
 def _rotate_frames(
@@ -78,6 +130,80 @@ def _rotate_frames(
         result[batch_index, block_start:block_end].copy_(rotated.to(dtype=x.dtype))
 
 
+def _verify_fused_rotation(
+    fused: Any,
+    freqs: torch.Tensor,
+    *,
+    device: torch.device,
+    heads: int,
+    head_dim: int,
+    height: int,
+    width: int,
+    block_frames: int,
+    temporal: torch.Tensor,
+    height_freqs: torch.Tensor,
+    width_freqs: torch.Tensor,
+) -> None:
+    """Compare the fused kernel with the reference once per geometry.
+
+    The kernel exists to change speed, not values, so the first time it meets
+    a geometry it rotates synthetic keys at the first and the last frames of
+    the RoPE table both ways and refuses to continue unless every bit agrees.
+    """
+    key = (str(device), heads, head_dim, height, width)
+    if key in _VERIFIED_FUSED:
+        return
+    tokens_per_frame = height * width
+    frames = min(3, temporal.shape[0])
+    generator = torch.Generator(device=device).manual_seed(0)
+    probe = torch.randn(
+        1,
+        frames * tokens_per_frame,
+        heads,
+        head_dim,
+        generator=generator,
+        device=device,
+    ).to(torch.bfloat16)
+    channels = head_dim // 2
+    for start_frame in (0, temporal.shape[0] - frames):
+        expected = torch.empty_like(probe)
+        _rotate_frames(
+            probe,
+            expected,
+            batch_index=0,
+            token_start=0,
+            num_frames=frames,
+            absolute_start_frame=start_frame,
+            tokens_per_frame=tokens_per_frame,
+            height=height,
+            width=width,
+            block_frames=block_frames,
+            temporal=temporal,
+            height_freqs=height_freqs,
+            width_freqs=width_freqs,
+            precision="native",
+        )
+        actual = torch.empty_like(probe)
+        fused.rotate_frames(
+            probe[0],
+            actual[0],
+            freqs,
+            absolute_start_frame=start_frame,
+            tokens_per_frame=tokens_per_frame,
+            grid_width=width,
+            temporal_pairs=channels - 2 * (channels // 3),
+            height_pairs=channels // 3,
+        )
+        if not torch.equal(actual, expected):
+            mismatched = int((actual != expected).sum())
+            raise RuntimeError(
+                f"the Triton RoPE kernel differs from the float64 reference in "
+                f"{mismatched} values at frame {start_frame}; set "
+                f"{ROPE_BACKEND_ENV}=torch to use the reference"
+            )
+    _VERIFIED_FUSED.add(key)
+
+
 def apply_rope_by_span(
     x: torch.Tensor,
     grid_sizes: torch.Tensor,
@@ -121,6 +247,7 @@ def apply_rope_by_span(
         if out.shape != x.shape or out.dtype != x.dtype:
             raise ValueError("RoPE output buffer must match the input")
         result = out
+    fused = _fused_rotation(x, result, freqs, precision)
     for batch_index, (model_block_frames, height, width) in enumerate(
         grid_sizes.tolist()
     ):
@@ -134,8 +261,44 @@ def apply_rope_by_span(
                 f"{x.shape[1] // tokens_per_frame}"
             )
         block_frames = max(1, int(model_block_frames))
+        if fused is not None:
+            if max(height, width) > temporal.shape[0]:
+                raise ValueError("RoPE table is smaller than the latent grid")
+            _verify_fused_rotation(
+                fused,
+                freqs,
+                device=x.device,
+                heads=x.size(2),
+                head_dim=x.size(3),
+                height=height,
+                width=width,
+                block_frames=block_frames,
+                temporal=temporal,
+                height_freqs=height_freqs,
+                width_freqs=width_freqs,
+            )
         token_start = 0
         for span in spans:
+            if fused is not None:
+                if span.global_start_frame + span.num_frames > temporal.shape[0]:
+                    raise ValueError(
+                        f"RoPE table supports {temporal.shape[0]} frames, "
+                        f"requested [{span.global_start_frame}, "
+                        f"{span.global_start_frame + span.num_frames})"
+                    )
+                token_end = token_start + span.num_frames * tokens_per_frame
+                fused.rotate_frames(
+                    x[batch_index, token_start:token_end],
+                    result[batch_index, token_start:token_end],
+                    freqs,
+                    absolute_start_frame=span.global_start_frame,
+                    tokens_per_frame=tokens_per_frame,
+                    grid_width=width,
+                    temporal_pairs=channels - 2 * (channels // 3),
+                    height_pairs=channels // 3,
+                )
+                token_start = token_end
+                continue
             _rotate_frames(
                 x,
                 result,
@@ -182,4 +345,9 @@ def causal_rope_apply_long_input(
     )
 
 
-__all__ = ["apply_rope_by_span", "causal_rope_apply_long_input"]
+__all__ = [
+    "ROPE_BACKEND_ENV",
+    "apply_rope_by_span",
+    "causal_rope_apply_long_input",
+    "rope_backend",
+]

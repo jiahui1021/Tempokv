@@ -23,14 +23,14 @@
 #   PROMPTS      采集用 prompt 列表
 #
 # 常用可选变量：
-#   CONFIG          codec 配置（默认 configs/legacy.json）
 #   GENERATION_MODE  chunkwise（默认）或 framewise
-#   TRACE_DIR        trace 目录（默认 data/causal-forcing/trace/<模式>）
+#   TRACE_DIR        trace 目录（默认 data/causal-forcing/trace/<模式>_legacy）
 #   TRACE_FILE       合并后的拟合输入（默认 <TRACE_DIR>/clean_trace.npz）
-#   TRACE_FRAMES     每个 prompt 生成的 latent 帧数（legacy 默认 51）
-#   TRACE_TOKENS_PER_FRAME  每帧抽取的空间位置数（默认 8）
-#   NUM_GPUS / BASE_SEED / OVERWRITE / DRY_RUN
+#   OVERWRITE / DRY_RUN
 #   USE_EMA          是否读取 checkpoint 的 generator_ema（默认 0，官方权重只有 generator）
+#
+# 采集固定使用 legacy 协议：PROMPTS 必须是 moviegen128.txt 的前 12 条，每条 51
+# 个 latent 帧、每帧 8 个空间位置、seed 0、单卡（多卡 seed 扰动会打乱 event 顺序）。
 #
 set -euo pipefail
 
@@ -38,12 +38,10 @@ set -euo pipefail
 source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)/_common.sh"
 
 require_env CHECKPOINT MODEL_ROOT PROMPTS
-CONFIG="${CONFIG:-$default_codec_config}"
 
 generation_mode="${GENERATION_MODE:-chunkwise}"
 case "$generation_mode" in
-  chunkwise) frames_per_block=3 ;;
-  framewise) frames_per_block=1 ;;
+  chunkwise|framewise) ;;
   *) die "GENERATION_MODE 必须是 chunkwise 或 framewise（当前值：${generation_mode}）" ;;
 esac
 
@@ -54,65 +52,29 @@ if [[ -n "${MODEL_CONFIG:-}" ]]; then
 else
   model_config="$runtime_root/configs/causal_forcing_dmd_$generation_mode.yaml"
 fi
-config_path="$(resolve_path "$CONFIG")"
-[[ -f "$config_path" ]] || die "CONFIG 不存在：$config_path"
-resolve_codec_modes "$config_path" "${V_PREDICTOR:-}" >/dev/null
-if [[ -n "${LEGACY_PROTOCOL:-}" && "$LEGACY_PROTOCOL" != "1" ]]; then
-  die "LEGACY_PROTOCOL 现在必须为 1"
-fi
-LEGACY_PROTOCOL=1
-default_trace_frames=51
-default_trace_dir="data/causal-forcing/trace/${generation_mode}_legacy"
 checkpoint="$(resolve_path "$CHECKPOINT")"
 model_root="$(resolve_path "$MODEL_ROOT")"
 prompts="$(resolve_path "$PROMPTS")"
-trace_dir="$(resolve_path "${TRACE_DIR:-$default_trace_dir}")"
+trace_dir="$(resolve_path "${TRACE_DIR:-data/causal-forcing/trace/${generation_mode}_legacy}")"
 trace_file="$(resolve_path "${TRACE_FILE:-$trace_dir/clean_trace.npz}")"
 raw_trace_dir="$trace_dir/raw"
 trace_output_dir="$trace_dir/output"
 
-if [[ "$trace_dir" == "/" ]]; then
-  die "TRACE_DIR 不能是文件系统根目录"
-fi
-TRACE_FRAMES="${TRACE_FRAMES:-$default_trace_frames}"
-TRACE_TOKENS_PER_FRAME="${TRACE_TOKENS_PER_FRAME:-8}"
-NUM_GPUS="${NUM_GPUS:-1}"
-BASE_SEED="${BASE_SEED:-0}"
 OVERWRITE="${OVERWRITE:-0}"
 DRY_RUN="${DRY_RUN:-0}"
 USE_EMA="${USE_EMA:-0}"
-
 check_flag OVERWRITE
 check_flag DRY_RUN
 check_flag USE_EMA
-check_flag LEGACY_PROTOCOL
-check_int TRACE_FRAMES "$frames_per_block"
-(( TRACE_FRAMES % frames_per_block == 0 )) || \
-  die "TRACE_FRAMES 必须是 $frames_per_block 的倍数（当前值：${TRACE_FRAMES}）"
-check_int TRACE_TOKENS_PER_FRAME 1
-(( TRACE_TOKENS_PER_FRAME <= 1560 )) || \
-  die "TRACE_TOKENS_PER_FRAME 必须 <= 1560（当前值：${TRACE_TOKENS_PER_FRAME}）"
-check_int NUM_GPUS 1
-check_int BASE_SEED 0
-if [[ "$LEGACY_PROTOCOL" == "1" ]]; then
-  [[ "$TRACE_FRAMES" == "51" ]] || die "LEGACY_PROTOCOL 要求 TRACE_FRAMES=51（当前值：${TRACE_FRAMES}）"
-  [[ "$TRACE_TOKENS_PER_FRAME" == "8" ]] || die "LEGACY_PROTOCOL 要求 TRACE_TOKENS_PER_FRAME=8（当前值：${TRACE_TOKENS_PER_FRAME}）"
-  [[ "$BASE_SEED" == "0" ]] || die "LEGACY_PROTOCOL 要求 BASE_SEED=0（当前值：${BASE_SEED}）"
-  [[ "$NUM_GPUS" == "1" ]] || die "LEGACY_PROTOCOL 要求 NUM_GPUS=1（多卡 seed 扰动会导致 event 顺序不一致）"
-fi
-
-trace_environment=(
-  env
-  "TEMPOKV_TRACE_DIR=$raw_trace_dir"
-  "TEMPOKV_TRACE_TOKENS_PER_FRAME=$TRACE_TOKENS_PER_FRAME"
-)
-[[ "$LEGACY_PROTOCOL" == "1" ]] && trace_environment+=("TEMPOKV_TRACE_EVENT_FRAMES=24")
 
 trace_command=(
-  "${trace_environment[@]}"
+  env
+  "TEMPOKV_TRACE_DIR=$raw_trace_dir"
+  "TEMPOKV_TRACE_TOKENS_PER_FRAME=8"
+  "TEMPOKV_TRACE_EVENT_FRAMES=24"
   "$python_bin" -m torch.distributed.run
   --standalone
-  "--nproc_per_node=$NUM_GPUS"
+  --nproc_per_node=1
   "$adapter_root/worker.py"
   --mode trace
   --
@@ -121,19 +83,18 @@ trace_command=(
   --model_root "$model_root"
   --data_path "$prompts"
   --output_folder "$trace_output_dir"
-  --num_output_frames "$TRACE_FRAMES"
+  --num_output_frames 51
   --num_samples 1
-  --seed "$BASE_SEED"
+  --seed 0
   --save_with_index
+  --local_attn_size 180
 )
-[[ "$LEGACY_PROTOCOL" == "1" ]] && trace_command+=(--local_attn_size 180)
 [[ "$USE_EMA" == "1" ]] && trace_command+=(--use_ema)
 
 merge_command=(
   "$python_bin" "$adapter_root/prepare_trace.py"
-  "$raw_trace_dir" "$trace_file"
+  "$raw_trace_dir" "$trace_file" --legacy-protocol
 )
-[[ "$LEGACY_PROTOCOL" == "1" ]] && merge_command+=(--legacy-protocol)
 
 if [[ "$DRY_RUN" == "1" ]]; then
   printf '[collect_trace] 干跑模式：打印将要执行的命令，不执行\n'
@@ -146,48 +107,29 @@ if [[ "$DRY_RUN" == "1" ]]; then
   exit 0
 fi
 
-[[ -f "$runtime_root/inference.py" ]] || \
-  die "仓库内置的 Causal Forcing 采集代码不完整：$runtime_root"
-[[ -f "$model_config" ]] || die "MODEL_CONFIG 不存在：$model_config"
-[[ -f "$checkpoint" ]] || die "CHECKPOINT 不存在：$checkpoint"
-[[ -d "$model_root" ]] || die "MODEL_ROOT 不存在：$model_root"
-[[ -f "$prompts" ]] || die "PROMPTS 不存在：$prompts"
-if [[ "$LEGACY_PROTOCOL" == "1" ]]; then
-  "$python_bin" - "$prompts" "$project_root/assets/moviegen128.txt" <<'PY'
+"$python_bin" - "$prompts" "$project_root/assets/moviegen128.txt" <<'PY'
 from pathlib import Path
 import sys
 
-PROMPT_COUNT = 12
 actual = Path(sys.argv[1]).read_text(encoding="utf-8").splitlines()
-reference = Path(sys.argv[2]).read_text(encoding="utf-8").splitlines()[:PROMPT_COUNT]
-if len(actual) != PROMPT_COUNT or any(not line.strip() for line in actual):
-    raise SystemExit("LEGACY_PROTOCOL 的 PROMPTS 必须恰好包含 12 条非空 prompt")
+reference = Path(sys.argv[2]).read_text(encoding="utf-8").splitlines()[:12]
 if actual != reference:
-    raise SystemExit("LEGACY_PROTOCOL 的 PROMPTS 必须是 moviegen128.txt 的前 12 条")
+    raise SystemExit("PROMPTS 必须是 moviegen128.txt 的前 12 条（legacy 采集协议）")
 PY
-fi
 
-if [[ "$OVERWRITE" != "1" ]]; then
-  if [[ -e "$trace_file" ]]; then
-    die "已存在拟合输入：${trace_file}。设置 OVERWRITE=1 覆盖，或换一个 TRACE_FILE。"
-  fi
+if [[ "$OVERWRITE" == "1" ]]; then
+  rm -rf -- "$raw_trace_dir" "$trace_output_dir"
+else
+  [[ -e "$trace_file" ]] && die "已存在拟合输入：${trace_file}。设置 OVERWRITE=1 覆盖，或换一个 TRACE_FILE。"
   if [[ -d "$raw_trace_dir" ]]; then
     existing="$(find "$raw_trace_dir" -type f -name 'layer_*.npz' -print -quit)"
-    if [[ -n "$existing" ]]; then
-      die "已存在逐层 trace：${existing}。设置 OVERWRITE=1 覆盖，或换一个 TRACE_DIR。"
-    fi
+    [[ -z "$existing" ]] || die "已存在逐层 trace：${existing}。设置 OVERWRITE=1 覆盖，或换一个 TRACE_DIR。"
   fi
-fi
-
-if [[ "$OVERWRITE" == "1" && -d "$raw_trace_dir" ]]; then
-  rm -rf -- "$raw_trace_dir" "$trace_output_dir"
 fi
 mkdir -p -- "$raw_trace_dir" "$trace_output_dir"
 
 printf '\n[1/2] 采集 clean trace ...\n'
-(
-  "${trace_command[@]}"
-)
+"${trace_command[@]}"
 
 printf '\n[2/2] 合并逐层 trace -> %s ...\n' "$trace_file"
 "${merge_command[@]}"

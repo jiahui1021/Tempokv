@@ -53,73 +53,27 @@ case "$generation_mode" in
 esac
 
 config_path="$(resolve_path "$CONFIG")"
-[[ -f "$config_path" ]] || die "CONFIG 不存在：$config_path"
-read -r fit_mode v_predictor_mode <<<"$(resolve_codec_modes "$config_path" "${V_PREDICTOR:-}")"
+read -r fit_mode v_predictor_mode _ <<<"$(codec_modes "$config_path" "${V_PREDICTOR:-}")"
 # The legacy protocol collects into its own directory, so the default trace
 # file follows the config's fit mode.
 if [[ "$fit_mode" == "legacy" ]]; then
   default_trace_file="data/causal-forcing/trace/${generation_mode}_legacy/clean_trace.npz"
+  default_temporal_ridge=1.0
 else
   default_trace_file="data/causal-forcing/trace/$generation_mode/clean_trace.npz"
+  default_temporal_ridge=0.1
 fi
 trace_file="$(resolve_path "${TRACE_FILE:-$default_trace_file}")"
 FIT_HISTORY_SOURCE="${FIT_HISTORY_SOURCE:-reconstructed}"
 parameter_name="${PARAM_NAME:-$(codec_slug "$config_path" "${K_HISTORY_LENGTH:-}" "${V_HISTORY_LENGTH:-}" "${K_BITS:-}" "${V_BITS:-}" "" "$v_predictor_mode" "$FIT_HISTORY_SOURCE" "${ANCHOR_BITS:-}")}"
 output_dir="$(resolve_path "${OUTPUT_DIR:-data/causal-forcing/params/$generation_mode/$parameter_name}")"
-case "$v_predictor_mode" in
-  temporal|identity|taylor|taylor2|direct) v_artifact_name="v_temporal.npz" ;;
-  cross_kv_identity|cross_kv_taylor|cross_kv_taylor2) v_artifact_name="v_cross_kv.npz" ;;
-  innovation) v_artifact_name="v_innovation.npz" ;;
-  cross_kv) v_artifact_name="v_cross_kv.npz" ;;
-  *) v_artifact_name="v_cross_kv.npz" ;;
-esac
-
-if [[ "$output_dir" == "/" ]]; then
-  die "OUTPUT_DIR 不能是文件系统根目录"
-fi
+v_artifact_name="$(v_artifact_name "$v_predictor_mode")"
 
 ITERATIONS="${ITERATIONS:-2}"
-# Legacy fitting reproduces the reference implementation and pins its controls;
-# fit_params.py rejects any other value, so the default has to follow fit_mode.
-if [[ "$fit_mode" == "legacy" ]]; then
-  default_temporal_ridge=1.0
-else
-  default_temporal_ridge=0.1
-fi
-TEMPORAL_RIDGE="${TEMPORAL_RIDGE:-$default_temporal_ridge}"
-CROSS_RIDGE="${CROSS_RIDGE:-0.1}"
-V_HISTORY_RIDGE="${V_HISTORY_RIDGE:-0.0}"
-MAX_GAIN="${MAX_GAIN:-1.0}"
-FIT_DEVICE="${FIT_DEVICE:-auto}"
-ATTENTION_LAYER_CHUNK="${ATTENTION_LAYER_CHUNK:-4}"
-ATTENTION_LR="${ATTENTION_LR:-0.001}"
-ATTENTION_PATIENCE="${ATTENTION_PATIENCE:-10}"
-ATTENTION_MIN_RELATIVE_IMPROVEMENT="${ATTENTION_MIN_RELATIVE_IMPROVEMENT:-0.0001}"
-ATTENTION_OPTIMIZER="${ATTENTION_OPTIMIZER:-adam}"
-ATTENTION_RECONSTRUCTION_WEIGHT="${ATTENTION_RECONSTRUCTION_WEIGHT:-0.5}"
-ATTENTION_OUTPUT_WEIGHT="${ATTENTION_OUTPUT_WEIGHT:-0.5}"
-if [[ -z "${ATTENTION_REFINE_TENSORS:-}" ]]; then
-  if [[ "$v_predictor_mode" == "cross_kv" ]]; then
-    ATTENTION_REFINE_TENSORS="key"
-  else
-    ATTENTION_REFINE_TENSORS="key_value"
-  fi
-fi
-read -r -a attention_sign_step_sizes <<<"${ATTENTION_SIGN_STEP_SIZES:-0.01}"
-OVERWRITE="${OVERWRITE:-0}"
 DRY_RUN="${DRY_RUN:-0}"
-
 check_flag OVERWRITE
 check_flag DRY_RUN
 check_int ITERATIONS 1
-check_int ATTENTION_LAYER_CHUNK 1
-if [[ -n "${ATTENTION_STEPS:-}" ]]; then
-  check_int ATTENTION_STEPS 1
-  check_int ATTENTION_PATIENCE 1
-  [[ -z "${ATTENTION_MAX_TOKENS:-}" ]] || check_int ATTENTION_MAX_TOKENS 1
-  case "$ATTENTION_OPTIMIZER" in adam|sign_gradient) ;; *) die "ATTENTION_OPTIMIZER 必须是 adam 或 sign_gradient" ;; esac
-  case "$ATTENTION_REFINE_TENSORS" in key|value|key_value) ;; *) die "ATTENTION_REFINE_TENSORS 必须是 key、value 或 key_value" ;; esac
-fi
 
 fit_command=(
   "$python_bin" "$project_root/scripts/common/fit_params.py"
@@ -128,34 +82,18 @@ fit_command=(
   --output-dir "$output_dir"
   --iterations "$ITERATIONS"
   --fit-history-source "$FIT_HISTORY_SOURCE"
-  --temporal-ridge "$TEMPORAL_RIDGE"
-  --cross-ridge "$CROSS_RIDGE"
-  --v-history-ridge "$V_HISTORY_RIDGE"
-  --max-gain "$MAX_GAIN"
-  --device "$FIT_DEVICE"
+  --temporal-ridge "${TEMPORAL_RIDGE:-$default_temporal_ridge}"
+  --cross-ridge "${CROSS_RIDGE:-0.1}"
+  --v-history-ridge "${V_HISTORY_RIDGE:-0.0}"
+  --max-gain "${MAX_GAIN:-1.0}"
+  --device "${FIT_DEVICE:-auto}"
   --stride 1560
   --coordinate-system pre_rope_normalized
-  # The runtime CrossKV decoder only accelerates a diagonal V history; a dense
-  # per-lag matrix is refused by the bridge, so it must never be fitted here.
+  # The runtime CrossKV decoder only accelerates a diagonal V history.
   --v-history-mode diagonal
   --v-predictor-mode "$v_predictor_mode"
 )
-if [[ -n "${ATTENTION_STEPS:-}" ]]; then
-  fit_command+=(
-    --attention-steps "$ATTENTION_STEPS"
-    --attention-lr "$ATTENTION_LR"
-    --attention-patience "$ATTENTION_PATIENCE"
-    --attention-min-relative-improvement "$ATTENTION_MIN_RELATIVE_IMPROVEMENT"
-    --attention-layer-chunk "$ATTENTION_LAYER_CHUNK"
-    --attention-optimizer "$ATTENTION_OPTIMIZER"
-    --attention-reconstruction-weight "$ATTENTION_RECONSTRUCTION_WEIGHT"
-    --attention-output-weight "$ATTENTION_OUTPUT_WEIGHT"
-    --attention-refine-tensors "$ATTENTION_REFINE_TENSORS"
-    --attention-sign-step-sizes "${attention_sign_step_sizes[@]}"
-  )
-  [[ -n "${ATTENTION_MAX_TOKENS:-}" ]] && \
-    fit_command+=(--attention-max-tokens "$ATTENTION_MAX_TOKENS")
-fi
+append_attention_refinement "$v_predictor_mode"
 [[ -n "${K_HISTORY_LENGTH:-}" ]] && fit_command+=(--k-history-length "$K_HISTORY_LENGTH")
 [[ -n "${V_HISTORY_LENGTH:-}" ]] && fit_command+=(--v-history-length "$V_HISTORY_LENGTH")
 [[ -n "${K_BITS:-}" ]] && fit_command+=(--k-bits "$K_BITS")
@@ -164,31 +102,17 @@ fi
 
 if [[ "$DRY_RUN" == "1" ]]; then
   printf '[fit_params] 干跑模式：打印将要执行的命令，不执行\n'
-  printf '  $'
-  printf ' %q' "${fit_command[@]}"
-  printf '\n'
+  print_command "${fit_command[@]}"
   exit 0
 fi
 
-[[ -f "$config_path" ]] || die "CONFIG 不存在：$config_path"
 [[ -f "$trace_file" ]] || die "TRACE_FILE 不存在：$trace_file"
-
-if [[ "$OVERWRITE" != "1" ]]; then
-  for artifact in "$output_dir/k_temporal.npz" "$output_dir/$v_artifact_name"; do
-    if [[ -e "$artifact" ]]; then
-      die "已存在参数：${artifact}。设置 OVERWRITE=1 覆盖，或换一个 OUTPUT_DIR。"
-    fi
-  done
-fi
-
+refuse_existing_params "$output_dir/k_temporal.npz" "$output_dir/$v_artifact_name"
 mkdir -p -- "$output_dir"
 
 printf '\n拟合 TempoKV 参数 ...\n'
 "${fit_command[@]}"
-
-for artifact in "$output_dir/k_temporal.npz" "$output_dir/$v_artifact_name"; do
-  [[ -s "$artifact" ]] || die "拟合后未生成参数文件：$artifact"
-done
+require_params_written "$output_dir/k_temporal.npz" "$output_dir/$v_artifact_name"
 
 printf '\n完成。参数已写入：\n  %s\n  %s\n' \
   "$output_dir/k_temporal.npz" "$output_dir/$v_artifact_name"

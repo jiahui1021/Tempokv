@@ -27,13 +27,6 @@ require_env CHECKPOINT_DIR
 
 if [[ "$mode" == "tempokv" ]]; then
   config_path="$(resolve_path "$CONFIG")"
-  [[ -f "$config_path" ]] || die "CONFIG 不存在：$config_path"
-  if [[ -n "${V_PREDICTOR:-}" ]]; then
-    case "$V_PREDICTOR" in
-      cross_kv|temporal|identity|taylor|taylor2|cross_kv_identity|cross_kv_taylor|cross_kv_taylor2|innovation|direct) ;;
-      *) die "V_PREDICTOR 必须是 cross_kv、temporal、identity、taylor、taylor2、cross_kv_identity、cross_kv_taylor、cross_kv_taylor2、innovation 或 direct（当前值：${V_PREDICTOR}）" ;;
-    esac
-  fi
   FIT_HISTORY_SOURCE="${FIT_HISTORY_SOURCE:-reconstructed}"
   parameter_name="${PARAM_NAME:-$(
     codec_slug "$config_path" \
@@ -42,39 +35,14 @@ if [[ "$mode" == "tempokv" ]]; then
       "${V_PREDICTOR:-}" "$FIT_HISTORY_SOURCE" "${ANCHOR_BITS:-}"
   )}"
   param_dir="$(resolve_path "${PARAM_DIR:-data/longcat/params/$parameter_name}")"
-  v_predictor_mode="$("$python_bin" - "$config_path" <<'PY'
-import json
-import sys
-
-config = json.load(open(sys.argv[1], encoding="utf-8"))
-print(config.get("codec", config).get("v_predictor_mode", "cross_kv"))
-PY
-)"
-  v_predictor_mode="${V_PREDICTOR:-$v_predictor_mode}"
-  case "$v_predictor_mode" in
-    temporal|identity|taylor|taylor2|direct) v_artifact_name="v_temporal.npz" ;;
-    cross_kv_identity|cross_kv_taylor|cross_kv_taylor2) v_artifact_name="v_cross_kv.npz" ;;
-    innovation) v_artifact_name="v_innovation.npz" ;;
-    cross_kv) v_artifact_name="v_cross_kv.npz" ;;
-    *) v_artifact_name="v_cross_kv.npz" ;;
-  esac
+  read -r _ v_predictor_mode _ <<<"$(codec_modes "$config_path" "${V_PREDICTOR:-}")"
   if [[ -n "${K_PARAMS:-}" || -n "${V_PARAMS:-}" ]]; then
     [[ -n "${K_PARAMS:-}" && -n "${V_PARAMS:-}" ]] || \
       die "K_PARAMS 与 V_PARAMS 必须同时设置"
   fi
   k_params="$(resolve_path "${K_PARAMS:-$param_dir/k_temporal.npz}")"
-  v_params="$(resolve_path "${V_PARAMS:-$param_dir/$v_artifact_name}")"
-
-  # Use the validated Cross production launch size by default.  Temporal and
-  # fixed temporal predictors keep the shared runtime default, and explicit
-  # overrides still win.
-  if [[ "$v_predictor_mode" == "cross_kv" ||
-        "$v_predictor_mode" == "cross_kv_identity" ||
-        "$v_predictor_mode" == "cross_kv_taylor" ||
-        "$v_predictor_mode" == "cross_kv_taylor2" ||
-        "$v_predictor_mode" == "innovation" ]]; then
-    export TEMPOKV_PERSISTENT_UNITS_PER_LAUNCH="${TEMPOKV_PERSISTENT_UNITS_PER_LAUNCH:-8}"
-  fi
+  v_params="$(resolve_path "${V_PARAMS:-$param_dir/$(v_artifact_name "$v_predictor_mode")}")"
+  default_units_per_launch "$v_predictor_mode"
 fi
 
 CONTEXT_PARALLEL_SIZE="${CONTEXT_PARALLEL_SIZE:-1}"

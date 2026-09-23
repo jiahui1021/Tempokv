@@ -24,6 +24,37 @@ def persistent_units_per_launch(value: str | int | None = None) -> int:
     return units
 
 
+def persistent_launch_plan(
+    units: int, units_per_launch: int, lead_units: int
+) -> list[tuple[int, int, int]]:
+    """Split units ``1 .. units-1`` of a span into persistent-kernel launches.
+
+    Each entry is ``(shift_units, start_unit, chunk_units)``: the launch decodes
+    absolute units ``shift_units + start_unit`` onward, with every base pointer
+    advanced by ``shift_units`` units and the kernel indexing from
+    ``start_unit``.
+
+    ``start_unit`` and ``chunk_units`` are ``tl.constexpr``, so every distinct
+    pair compiles its own kernel.  A span as long as the rollout reaches a new
+    launch offset every few blocks, and a cold Triton cache then stalls the
+    generation on a compile each time.  Once a unit is at least ``lead_units``
+    into the span it reads a full history and nothing about it depends on its
+    absolute index any more, so every later launch is shifted onto
+    ``start_unit = lead_units`` and reuses that kernel.  The arithmetic each
+    unit performs is unchanged; only the base pointers move.
+    """
+    if units_per_launch < 1 or lead_units < 1:
+        raise ValueError("units_per_launch and lead_units must be positive")
+    plan = []
+    for start in range(1, units, units_per_launch):
+        chunk = min(units_per_launch, units - start)
+        if start <= lead_units:
+            plan.append((0, start, chunk))
+        else:
+            plan.append((start - lead_units, lead_units, chunk))
+    return plan
+
+
 def configure_triton_cache(
     root: str | Path | None = None,
     *,

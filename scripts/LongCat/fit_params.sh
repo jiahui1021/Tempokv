@@ -38,13 +38,6 @@ K_HISTORY_LENGTH="$(resolve_history K_HISTORY_LENGTH KH)"
 V_HISTORY_LENGTH="$(resolve_history V_HISTORY_LENGTH VH)"
 K_BITS="$(resolve_bits K_BITS)"
 V_BITS="$(resolve_bits V_BITS)"
-# V_PREDICTOR overrides the config so one file covers all supported predictors.
-if [[ -n "${V_PREDICTOR:-}" ]]; then
-  case "$V_PREDICTOR" in
-    cross_kv|temporal|identity|taylor|taylor2|cross_kv_identity|cross_kv_taylor|cross_kv_taylor2|innovation|direct) ;;
-    *) die "V_PREDICTOR 必须是 cross_kv、temporal、identity、taylor、taylor2、cross_kv_identity、cross_kv_taylor、cross_kv_taylor2、innovation 或 direct（当前值：${V_PREDICTOR}）" ;;
-  esac
-fi
 
 # collect_trace.sh 写出的是 TRACE_FILE；TRACE 是本脚本的旧名字，继续支持。
 trace="$(resolve_path "${TRACE_FILE:-${TRACE:-data/longcat/trace/clean_trace.npz}}")"
@@ -52,47 +45,20 @@ config="$(resolve_path "${CONFIG:-$default_codec_config}")"
 FIT_HISTORY_SOURCE="${FIT_HISTORY_SOURCE:-reconstructed}"
 parameter_name="${PARAM_NAME:-$(codec_slug "$config" "${K_HISTORY_LENGTH:-}" "${V_HISTORY_LENGTH:-}" "${K_BITS:-}" "${V_BITS:-}" "${CACHE_STRIDE:-}" "${V_PREDICTOR:-}" "$FIT_HISTORY_SOURCE" "${ANCHOR_BITS:-}")}"
 output_dir="$(resolve_path "${OUTPUT_DIR:-data/longcat/params/$parameter_name}")"
-
-if [[ "$output_dir" == "/" ]]; then
-  die "OUTPUT_DIR 不能是文件系统根目录"
-fi
-[[ -f "$config" ]] || die "CONFIG 不存在：$config"
-
-FIT_DEVICE="${FIT_DEVICE:-auto}"
-DRY_RUN="${DRY_RUN:-0}"
-OVERWRITE="${OVERWRITE:-0}"
-check_flag DRY_RUN
-check_flag OVERWRITE
-ITERATIONS="${ITERATIONS:-2}"
-read -r fit_mode config_v_predictor <<<"$("$python_bin" - "$config" <<'PY'
-import json
-import sys
-
-config = json.load(open(sys.argv[1], encoding="utf-8"))
-config = config.get("codec", config)
-print(config.get("fit_mode", "legacy"), config.get("v_predictor_mode", "cross_kv"))
-PY
-)"
-case "$fit_mode" in
-  legacy|native) ;;
-  *) die "CONFIG 的 fit_mode 必须是 legacy 或 native（当前值：${fit_mode}）" ;;
-esac
-v_predictor_mode="${V_PREDICTOR:-$config_v_predictor}"
-case "$v_predictor_mode" in
-  temporal|identity|taylor|taylor2|direct) v_artifact_name="v_temporal.npz" ;;
-  innovation) v_artifact_name="v_innovation.npz" ;;
-  *) v_artifact_name="v_cross_kv.npz" ;;
-esac
-# Legacy fitting reproduces the reference implementation and pins its controls;
-# fit_params.py rejects any other value, so the default has to follow fit_mode.
+read -r fit_mode v_predictor_mode _ <<<"$(codec_modes "$config" "${V_PREDICTOR:-}")"
+v_artifact_name="$(v_artifact_name "$v_predictor_mode")"
+# Legacy fitting reproduces the reference implementation and pins its ridge;
+# fit_params.py rejects any other value, so the default follows fit_mode.
 if [[ "$fit_mode" == "legacy" ]]; then
   default_temporal_ridge=1.0
 else
   default_temporal_ridge=0.1
 fi
-TEMPORAL_RIDGE="${TEMPORAL_RIDGE:-$default_temporal_ridge}"
-CROSS_RIDGE="${CROSS_RIDGE:-0.1}"
-MAX_GAIN="${MAX_GAIN:-1.0}"
+
+DRY_RUN="${DRY_RUN:-0}"
+ITERATIONS="${ITERATIONS:-2}"
+check_flag DRY_RUN
+check_flag OVERWRITE
 check_int ITERATIONS 1
 
 fit_command=(
@@ -103,10 +69,10 @@ fit_command=(
   --coordinate-system pre_rope_normalized
   --iterations "$ITERATIONS"
   --fit-history-source "$FIT_HISTORY_SOURCE"
-  --temporal-ridge "$TEMPORAL_RIDGE"
-  --cross-ridge "$CROSS_RIDGE"
-  --max-gain "$MAX_GAIN"
-  --device "$FIT_DEVICE"
+  --temporal-ridge "${TEMPORAL_RIDGE:-$default_temporal_ridge}"
+  --cross-ridge "${CROSS_RIDGE:-0.1}"
+  --max-gain "${MAX_GAIN:-1.0}"
+  --device "${FIT_DEVICE:-auto}"
 )
 [[ -n "${K_HISTORY_LENGTH:-}" ]] && fit_command+=(--k-history-length "$K_HISTORY_LENGTH")
 [[ -n "${V_HISTORY_LENGTH:-}" ]] && fit_command+=(--v-history-length "$V_HISTORY_LENGTH")
@@ -118,25 +84,12 @@ fit_command=(
 
 if [[ "$DRY_RUN" == "1" ]]; then
   printf '[fit_params] 干跑模式：打印将要执行的命令，不执行\n'
-  printf '  $'
-  printf ' %q' "${fit_command[@]}" "$@"
-  printf '\n'
+  print_command "${fit_command[@]}" "$@"
   exit 0
 fi
 
 [[ -f "$trace" ]] || die "TRACE_FILE 不存在：${trace}（先跑 collect_trace.sh）"
-
-if [[ "$OVERWRITE" != "1" ]]; then
-  for artifact in "$output_dir/k_temporal.npz" "$output_dir/$v_artifact_name"; do
-    if [[ -e "$artifact" ]]; then
-      die "已存在参数：${artifact}。设置 OVERWRITE=1 覆盖，或换一个 OUTPUT_DIR。"
-    fi
-  done
-fi
-
+refuse_existing_params "$output_dir/k_temporal.npz" "$output_dir/$v_artifact_name"
 mkdir -p -- "$output_dir"
 "${fit_command[@]}" "$@"
-
-for artifact in "$output_dir/k_temporal.npz" "$output_dir/$v_artifact_name"; do
-  [[ -s "$artifact" ]] || die "拟合未生成参数：$artifact"
-done
+require_params_written "$output_dir/k_temporal.npz" "$output_dir/$v_artifact_name"

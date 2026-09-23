@@ -7,7 +7,7 @@ import triton
 import triton.language as tl
 
 from .quantization import MAX_BITS
-from .runtime import persistent_units_per_launch
+from .runtime import persistent_launch_plan, persistent_units_per_launch
 
 if TYPE_CHECKING:
     from .codec import PackedTensor
@@ -795,6 +795,13 @@ def _logical_bhsd_output(
     )
 
 
+def _advance(tensor: torch.Tensor, dim: int, offset: int) -> torch.Tensor:
+    """View of ``tensor`` starting ``offset`` along ``dim``; strides unchanged."""
+    if not offset:
+        return tensor
+    return tensor.narrow(dim, offset, tensor.shape[dim] - offset)
+
+
 def decode(
     packed: "PackedTensor",
     *,
@@ -822,10 +829,12 @@ def decode(
         output_stride_b, output_stride_s, output_stride_h, output_stride_d = (
             output.stride()
         )
+        output_sequence_dim = 1
     else:
         output_stride_b, output_stride_h, output_stride_s, output_stride_d = (
             output.stride()
         )
+        output_sequence_dim = 2
     anchor_length = packed.unit_lengths[0]
     if packed.raw_anchor:
         # There is nothing to unpack: the stored anchor already holds values.
@@ -911,21 +920,20 @@ def decode(
                 _ceil_div(packed.stride, block_s),
                 _ceil_div(width, block_d),
             )
-            persistent_units = persistent_units_per_launch()
-            for start_unit in range(1, len(packed.unit_lengths), persistent_units):
-                chunk_units = min(
-                    persistent_units, len(packed.unit_lengths) - start_unit
-                )
+            for shift_units, start_unit, chunk_units in persistent_launch_plan(
+                len(packed.unit_lengths), persistent_units_per_launch(), 1
+            ):
+                shift = shift_units * packed.stride
                 _direct_persistent_decode_kernel[grid](
-                    quant,
-                    scale,
-                    zero,
-                    output,
+                    _advance(quant, 1, shift),
+                    _advance(scale, 1, shift),
+                    _advance(zero, 1, shift),
+                    _advance(output, output_sequence_dim, shift),
                     output_stride_b,
                     output_stride_h,
                     output_stride_s,
                     output_stride_d,
-                    sequence,
+                    sequence - shift,
                     residual_sequence,
                     heads,
                     width,
@@ -964,22 +972,26 @@ def decode(
         # original bound unless the production-size order is small.
         if parameters.history_length > 4:
             persistent_units = min(persistent_units, 8)
-        for start_unit in range(1, len(packed.unit_lengths), persistent_units):
-            chunk_units = min(
-                persistent_units, len(packed.unit_lengths) - start_unit
-            )
+        # From unit ``history_length`` on, a unit reads its full history, so
+        # later launches share one start_unit instead of compiling per offset.
+        for shift_units, start_unit, chunk_units in persistent_launch_plan(
+            len(packed.unit_lengths),
+            persistent_units,
+            max(1, parameters.history_length),
+        ):
+            shift = shift_units * packed.stride
             _temporal_persistent_decode_kernel[grid](
-                quant,
-                scale,
-                zero,
+                _advance(quant, 1, shift),
+                _advance(scale, 1, shift),
+                _advance(zero, 1, shift),
                 parameters.history_weights.contiguous(),
                 parameters.history_bias.contiguous(),
-                output,
+                _advance(output, output_sequence_dim, shift),
                 output_stride_b,
                 output_stride_h,
                 output_stride_s,
                 output_stride_d,
-                sequence,
+                sequence - shift,
                 residual_sequence,
                 heads,
                 width,
@@ -1046,22 +1058,27 @@ def decode(
     # the reference implementation does rather than at the temporal route's
     # larger default, which only has to keep elementwise state alive.
     persistent_units = min(persistent_units_per_launch(), 8)
-    for start_unit in range(
-        1, len(packed.unit_lengths), persistent_units
+    for shift_units, start_unit, chunk_units in persistent_launch_plan(
+        len(packed.unit_lengths),
+        persistent_units,
+        max(1, parameters.history_length),
     ):
-        chunk_units = min(
-            persistent_units, len(packed.unit_lengths) - start_unit
-        )
+        shift = shift_units * packed.stride
+        launch_quant = _advance(quant, 1, shift)
+        launch_scale = _advance(scale, 1, shift)
+        launch_zero = _advance(zero, 1, shift)
+        launch_source = _advance(source, 2, shift)
+        launch_output = _advance(output, output_sequence_dim, shift)
         if parameters.history_length:
             _cross_kv_history_persistent_decode_kernel[grid](
-                quant,
-                scale,
-                zero,
-                source,
+                launch_quant,
+                launch_scale,
+                launch_zero,
+                launch_source,
                 weight,
                 bias,
                 history_weight,
-                output,
+                launch_output,
                 source_stride_b,
                 source_stride_h,
                 source_stride_s,
@@ -1070,7 +1087,7 @@ def decode(
                 output_stride_h,
                 output_stride_s,
                 output_stride_d,
-                sequence,
+                sequence - shift,
                 residual_sequence,
                 heads,
                 width,
@@ -1090,13 +1107,13 @@ def decode(
             )
         else:
             _cross_kv_persistent_decode_kernel[grid](
-                quant,
-                scale,
-                zero,
-                source,
+                launch_quant,
+                launch_scale,
+                launch_zero,
+                launch_source,
                 weight,
                 bias,
-                output,
+                launch_output,
                 source_stride_b,
                 source_stride_h,
                 source_stride_s,
@@ -1105,7 +1122,7 @@ def decode(
                 output_stride_h,
                 output_stride_s,
                 output_stride_d,
-                sequence,
+                sequence - shift,
                 residual_sequence,
                 heads,
                 width,

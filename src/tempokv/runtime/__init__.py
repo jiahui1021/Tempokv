@@ -21,6 +21,7 @@ from .jensen import bias as jensen_bias
 from .launch import (
     PERSISTENT_UNITS_ENV,
     configure_triton_cache,
+    persistent_launch_plan,
     persistent_units_per_launch,
 )
 from .metrics import BF16_BYTES_PER_VALUE, TempoKVRuntimeReport, bf16_bytes
@@ -41,6 +42,7 @@ __all__ = [
     "causal_rope_apply_long_input",
     "configure_triton_cache",
     "jensen_bias",
+    "persistent_launch_plan",
     "persistent_units_per_launch",
     "set_quantized_decoder",
     "uncompress_single_kv_cache",

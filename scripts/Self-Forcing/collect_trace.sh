@@ -39,7 +39,6 @@ set -euo pipefail
 
 # shellcheck source=scripts/Self-Forcing/_common.sh
 source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)/_common.sh"
-script_dir="$self_forcing_dir"
 
 require_env CHECKPOINT WAN_MODEL_DIR PROMPTS
 
@@ -57,10 +56,6 @@ trace_dir="$(resolve_path "${TRACE_DIR:-data/self-forcing/trace}")"
 trace_file="$(resolve_path "${TRACE_FILE:-$trace_dir/clean_trace.npz}")"
 raw_trace_dir="$trace_dir/raw"
 trace_output_dir="$trace_dir/output"
-
-if [[ "$trace_dir" == "/" ]]; then
-  die "TRACE_DIR 不能是文件系统根目录"
-fi
 
 LEGACY_PROTOCOL="${LEGACY_PROTOCOL:-1}"
 check_flag LEGACY_PROTOCOL

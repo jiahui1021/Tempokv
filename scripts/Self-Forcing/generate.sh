@@ -77,9 +77,7 @@ V_HISTORY_LENGTH="$(resolve_history V_HISTORY_LENGTH VH)"
 K_BITS="$(resolve_bits K_BITS)"
 V_BITS="$(resolve_bits V_BITS)"
 CONFIG="${CONFIG:-$default_codec_config}"
-script_dir="$self_forcing_dir"
 mode="${MODE:-tempokv}"
-k_predictor_mode="shared"
 
 # ---------- 模式与必需变量 ----------
 
@@ -100,68 +98,22 @@ if [[ "$mode" == "tempokv" ]]; then
   parameter_name="${PARAM_NAME:-$(codec_slug "$(resolve_path "$CONFIG")" "${K_HISTORY_LENGTH:-}" "${V_HISTORY_LENGTH:-}" "${K_BITS:-}" "${V_BITS:-}" "" "${V_PREDICTOR:-}" "$FIT_HISTORY_SOURCE" "${ANCHOR_BITS:-}")}"
   param_dir="$(resolve_path "${PARAM_DIR:-data/self-forcing/params/$parameter_name}")"
   result_label="$parameter_name"
-  v_predictor_mode="$("$python_bin" - "$(resolve_path "$CONFIG")" <<'PY'
-import json
-import sys
-
-config = json.load(open(sys.argv[1], encoding="utf-8"))
-print(config.get("codec", config).get("v_predictor_mode", "cross_kv"))
-PY
-)"
-  k_predictor_mode="$("$python_bin" - "$(resolve_path "$CONFIG")" <<'PY'
-import json
-import sys
-
-config = json.load(open(sys.argv[1], encoding="utf-8"))
-print(config.get("codec", config).get("k_predictor_mode", "shared"))
-PY
-)"
-  # V_PREDICTOR overrides the config so one file covers all supported predictors.
-  if [[ -n "${V_PREDICTOR:-}" ]]; then
-    case "$V_PREDICTOR" in
-      cross_kv|temporal|identity|taylor|taylor2|cross_kv_identity|cross_kv_taylor|cross_kv_taylor2|innovation|direct) ;;
-      *) die "V_PREDICTOR 必须是 cross_kv、temporal、identity、taylor、taylor2、cross_kv_identity、cross_kv_taylor、cross_kv_taylor2、innovation 或 direct（当前值：${V_PREDICTOR}）" ;;
-    esac
-    v_predictor_mode="$V_PREDICTOR"
-  fi
+  read -r _ v_predictor_mode _ <<<"$(codec_modes "$(resolve_path "$CONFIG")" "${V_PREDICTOR:-}")"
   # DIRECTION mirrors the K/V roles; the artifacts are named for the role each
   # parameter set plays, and --k-params/--v-params are positional by role
   # (temporal first, cross projection second) rather than by tensor name.
   predictor_direction="${DIRECTION:-k_to_v}"
-  case "$predictor_direction" in
-    k_to_v|v_to_k) ;;
-    *) die "DIRECTION 必须是 k_to_v 或 v_to_k（当前值：${predictor_direction}）" ;;
-  esac
   if [[ "$predictor_direction" == "v_to_k" ]]; then
-    [[ "$v_predictor_mode" == "cross_kv" ]] \
-      || die "DIRECTION=v_to_k 需要 V_PREDICTOR=cross_kv（当前值：${v_predictor_mode}）"
     k_artifact_name="v_temporal_primary.npz"
     v_artifact_name="k_cross_from_v.npz"
   else
     k_artifact_name="k_temporal.npz"
-    case "$v_predictor_mode" in
-      # Direct V has no predictor; its empty temporal map shares the temporal layout.
-      temporal|identity|taylor|taylor2|direct) v_artifact_name="v_temporal.npz" ;;
-      cross_kv_identity|cross_kv_taylor|cross_kv_taylor2) v_artifact_name="v_cross_kv.npz" ;;
-      innovation) v_artifact_name="v_innovation.npz" ;;
-      cross_kv) v_artifact_name="v_cross_kv.npz" ;;
-      # Keep command-only dry runs usable with PYTHON_BIN=/bin/echo; the Python
-      # generation preflight performs authoritative config validation.
-      *) v_artifact_name="v_cross_kv.npz" ;;
-    esac
+    v_artifact_name="$(v_artifact_name "$v_predictor_mode")"
   fi
+  default_units_per_launch "$v_predictor_mode"
 else
   param_dir=""
   result_label="bf16"
-fi
-
-# The Cross production kernel is validated at eight recurrent units per
-# launch.  Keep temporal's existing default and preserve explicit overrides.
-if [[ "$mode" == "tempokv" ]]; then
-  case "$v_predictor_mode" in
-    temporal|identity|taylor|taylor2|direct) ;;
-    *) export TEMPOKV_PERSISTENT_UNITS_PER_LAUNCH="${TEMPOKV_PERSISTENT_UNITS_PER_LAUNCH:-8}" ;;
-  esac
 fi
 
 model_type="${MODEL_TYPE:-self_forcing}"
@@ -181,9 +133,6 @@ if [[ "$mode" == "tempokv" && "${JENSEN:-0}" == "1" ]]; then
   fi
 fi
 output_dir="$(resolve_path "${OUTPUT_DIR:-$project_root/results/$model_type/$result_label}")"
-if [[ "$output_dir" == "/" ]]; then
-  die "OUTPUT_DIR 不能是文件系统根目录"
-fi
 
 # ---------- 生成参数 ----------
 
@@ -219,18 +168,6 @@ if [[ "$BENCHMARK" == "1" && "$SKIP_EXISTING" == "1" ]]; then
 fi
 if (( (FRAMES + 3) % 12 != 0 )); then
   die "FRAMES 必须满足 (FRAMES + 3) % 12 == 0，保证视频帧精确对应完整的 3-frame latent block（当前值：${FRAMES}）"
-fi
-if [[ -n "${K_HISTORY_LENGTH:-}" ]]; then
-  if [[ "$mode" == "tempokv" && "$k_predictor_mode" == "direct" ]]; then
-    check_int K_HISTORY_LENGTH 0
-  else
-    check_int K_HISTORY_LENGTH 1
-  fi
-  (( K_HISTORY_LENGTH <= 8 )) || die "K_HISTORY_LENGTH 必须 <= 8（当前值：${K_HISTORY_LENGTH}）"
-fi
-if [[ -n "${V_HISTORY_LENGTH:-}" ]]; then
-  check_int V_HISTORY_LENGTH 0
-  (( V_HISTORY_LENGTH <= 5 )) || die "V_HISTORY_LENGTH 必须 <= 5（当前值：${V_HISTORY_LENGTH}）"
 fi
 
 latent_frames=$(( (FRAMES + 3) / 4 ))
