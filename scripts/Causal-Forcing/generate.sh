@@ -54,6 +54,9 @@
 #                   用单次 Triton kernel）、torch（原逐块 PyTorch 实现，用于 A/B）、
 #                   triton（强制 kernel）。kernel 按原实现的运算顺序计算，首次调用
 #                   会与原实现逐位比对，不一致直接报错
+#   TEMPOKV_DECODE_TIMING  是否为每个压缩 span 解码记录 CUDA event（0/1，默认 0）。
+#                   只在分析 encode/decode 耗时拆分时开启；普通生成保持关闭，避免
+#                   上万次 event 记录和计时池中途同步进入端到端 latency
 #
 set -euo pipefail
 

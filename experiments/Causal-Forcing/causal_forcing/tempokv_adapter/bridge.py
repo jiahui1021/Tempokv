@@ -37,11 +37,20 @@ DEFAULT_SPAN_FRAMES = 12
 # sized for the default 180-latent-frame rollout; a short rollout needs a
 # smaller lag, or nothing is packed before the terminal block is discarded.
 DEFAULT_BF16_LAG_FRAMES = 18
+DECODE_TIMING_ENV = "TEMPOKV_DECODE_TIMING"
+
+
+def _decode_timing_enabled() -> bool:
+    raw = os.environ.get(DECODE_TIMING_ENV, "0")
+    if raw not in {"0", "1"}:
+        raise ValueError(f"{DECODE_TIMING_ENV} must be 0 or 1")
+    return raw == "1"
 
 
 class _CausalTempoKVRuntimeReport(TempoKVRuntimeReport):
     """TempoKV counters plus explicit terminal-cache discard accounting."""
 
+    decode_timing_enabled: bool = False
     terminal_discard_events: int = 0
     # Frames in the final block whose clean refresh/finalize was skipped.
     terminal_discarded_frames: int = 0
@@ -67,6 +76,9 @@ class _CausalTempoKVRuntimeReport(TempoKVRuntimeReport):
 
     def to_dict(self) -> dict[str, Any]:
         payload = super().to_dict()
+        payload["decode_timing_enabled"] = self.decode_timing_enabled
+        if not self.decode_timing_enabled:
+            payload["decode_ms"] = None
         payload.update(
             {
                 "terminal_discard_events": self.terminal_discard_events,
@@ -200,6 +212,7 @@ def install(runtime_root: str | Path | None = None) -> type:
                     self.tempokv_codec
                 ),
             )
+            self.tempokv_report.decode_timing_enabled = _decode_timing_enabled()
             # Same schedule as the Self-Forcing bridge: pack each finalized
             # block into the open span once it is TEMPOKV_BF16_LAG_FRAMES
             # behind the newest one.  Span-mean K and innovation V have no
@@ -239,15 +252,24 @@ def install(runtime_root: str | Path | None = None) -> type:
                 output_layout: str = "BSHD",
             ) -> torch.Tensor:
                 self.tempokv_report.decode_tensor_calls += 1
-                with self.tempokv_report.timer("decode_ms"):
-                    return decode_cache_state(
-                        state,
-                        source_tensor=source_tensor,
-                        output_tensor=output_tensor,
-                        output_layout=output_layout,
-                        codec=self.tempokv_codec,
-                        fallback=fallback_decode,
-                    )
+                if self.tempokv_report.decode_timing_enabled:
+                    with self.tempokv_report.timer("decode_ms"):
+                        return decode_cache_state(
+                            state,
+                            source_tensor=source_tensor,
+                            output_tensor=output_tensor,
+                            output_layout=output_layout,
+                            codec=self.tempokv_codec,
+                            fallback=fallback_decode,
+                        )
+                return decode_cache_state(
+                    state,
+                    source_tensor=source_tensor,
+                    output_tensor=output_tensor,
+                    output_layout=output_layout,
+                    codec=self.tempokv_codec,
+                    fallback=fallback_decode,
+                )
 
             cache_module.set_quantized_decoder(decode_with_codec)
 

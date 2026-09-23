@@ -233,6 +233,8 @@ class ChunkedKVCache:
         elif global_start_frame < 0:
             raise ValueError("global_start_frame must not be negative")
         self._remove_covered_spans(start_chunk, end_chunk)
+        destinations: list[torch.Tensor] = []
+        sources: list[torch.Tensor] = []
         for offset, chunk_index in enumerate(range(start_chunk, end_chunk)):
             token_start = offset * self.frame_seq_length
             token_end = token_start + self.frame_seq_length
@@ -241,11 +243,17 @@ class ChunkedKVCache:
                 chunk = torch.empty(self._shape(), dtype=self.dtype, device=self.device)
                 self.chunks[chunk_index] = chunk
             if self.layout == "BSHD":
-                chunk.copy_(data[:, token_start:token_end])
+                source = data[:, token_start:token_end]
             else:
-                chunk.copy_(data[:, :, token_start:token_end])
+                source = data[:, :, token_start:token_end]
+            destinations.append(chunk)
+            sources.append(source)
             self.chunk_state[chunk_index] = ChunkState.BF16
             self.global_frames[chunk_index] = global_start_frame + offset
+        if len(sources) == 1:
+            destinations[0].copy_(sources[0])
+        elif sources:
+            torch._foreach_copy_(destinations, sources)
 
     def spans(self, start_index: int, end_index: int) -> list[CacheSpan]:
         """Group a token range into runs of consecutive absolute frames.
@@ -422,6 +430,12 @@ class ChunkedKVCache:
             result = wide[..., : self.head_dim]
         else:
             wide = result = torch.empty(shape, device=self.device, dtype=self.dtype)
+        # Dense tail chunks are separate allocations.  Queueing one ``copy_``
+        # per frame made Causal Forcing launch one tiny copy kernel for every
+        # resident BF16 frame in every K/V read.  Collect the independent
+        # slices and issue them through the foreach path once after decoding.
+        bf16_destinations: list[torch.Tensor] = []
+        bf16_sources: list[torch.Tensor] = []
         chunk_index = start_chunk
         while chunk_index < end_chunk:
             output_start = (
@@ -434,9 +448,11 @@ class ChunkedKVCache:
                     part = part.permute(0, 2, 1, 3)
                 output_end = output_start + self.frame_seq_length
                 if output_layout == "BSHD":
-                    result[:, output_start:output_end].copy_(part)
+                    destination = result[:, output_start:output_end]
                 else:
-                    result[:, :, output_start:output_end].copy_(part)
+                    destination = result[:, :, output_start:output_end]
+                bf16_destinations.append(destination)
+                bf16_sources.append(part)
                 chunk_index += 1
                 continue
             if state != ChunkState.QUANTIZED:
@@ -485,6 +501,10 @@ class ChunkedKVCache:
                 else:
                     direct_output.copy_(decoded)
             chunk_index = span["end_chunk"]
+        if len(bf16_sources) == 1:
+            bf16_destinations[0].copy_(bf16_sources[0])
+        elif bf16_sources:
+            torch._foreach_copy_(bf16_destinations, bf16_sources)
         return wide
 
     def read_step_sizes(

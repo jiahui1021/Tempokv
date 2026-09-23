@@ -98,9 +98,11 @@ TempoKV 生成结束后 `tempokv_report.json` 至少包含 `encode_key_calls`、
 `ephemeral_writes`，以及 `encode_ms` / `decode_ms` / `generation_ms`。任何一个
 计数为 0 都会让本次运行直接失败——视频正常生成但其实没走 TempoKV 是必须暴露的错误。
 
-报告只写真正测过的量。attention 单独耗时**不在报告里**：逐层计时需要 device
-sync，会扭曲被测对象本身；需要时用 `generation_ms - encode_ms - decode_ms` 估算。
-逐 prompt 的墙钟时间在同目录的 `videos/summary.json`。
+报告只写真正测过的量。普通生成默认不记录逐 span decode CUDA event，此时
+`decode_timing_enabled=false`、`decode_ms=null`，避免计时本身增加 latency。需要拆分
+decode 耗时时设置 `TEMPOKV_DECODE_TIMING=1`；只有这时才可用
+`generation_ms - encode_ms - decode_ms` 估算其余生成耗时。attention 单独耗时不在
+报告里。逐 prompt 的墙钟时间在同目录的 `videos/summary.json`。
 
 内存有两套数字，不要混用：
 

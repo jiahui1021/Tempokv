@@ -391,7 +391,7 @@ def _merge_tempokv_reports(ranks: list[dict[str, object]]) -> dict[str, object]:
         "resident_total_bytes",
         "peak_resident_total_bytes",
     )
-    slowest = ("encode_ms", "decode_ms", "generation_ms")
+    slowest = ("encode_ms", "generation_ms")
     merged: dict[str, object] = {
         name: reports[0].get(name)
         for name in ("model", "kv_mode", "num_layers", "num_heads", "head_dim", "stride")
@@ -402,6 +402,24 @@ def _merge_tempokv_reports(ranks: list[dict[str, object]]) -> dict[str, object]:
         merged[name] = max(int(report.get(name) or 0) for report in reports)
     for name in slowest:
         merged[name] = max(float(report.get(name) or 0) for report in reports)
+    # Older reports always timed every decoded span and therefore have no
+    # explicit flag.  New production runs skip those thousands of CUDA events
+    # unless TEMPOKV_DECODE_TIMING=1 is set; a missing measurement is ``null``,
+    # never a misleading zero.
+    merged["decode_timing_enabled"] = all(
+        bool(report.get("decode_timing_enabled", True)) for report in reports
+    )
+    decode_times = [
+        float(report["decode_ms"])
+        for report in reports
+        if bool(report.get("decode_timing_enabled", True))
+        and report.get("decode_ms") is not None
+    ]
+    merged["decode_ms"] = (
+        max(decode_times)
+        if merged["decode_timing_enabled"] and decode_times
+        else None
+    )
     merged["predictor_parameter_bytes"] = max(
         int(report.get("predictor_parameter_bytes") or 0) for report in reports
     )
@@ -655,10 +673,10 @@ def run(args: argparse.Namespace) -> dict[str, object]:
 
     paths["run"].mkdir(parents=True, exist_ok=True)
     environment = os.environ.copy()
-    # The incremental-schedule and kernel knobs are the caller's choice, not
-    # state left over from another run, so they survive the TEMPOKV_* cleanup
-    # below.  generate.sh exports the validated Cross launch size; dropping it
-    # here silently ran a different decode launch configuration.
+    # The schedule, kernel, and instrumentation knobs are the caller's choice,
+    # not state left over from another run, so they survive the TEMPOKV_*
+    # cleanup below.  generate.sh exports the validated Cross launch size;
+    # dropping it here silently ran a different decode launch configuration.
     schedule_knobs = {
         name: environment[name]
         for name in (
@@ -667,6 +685,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             "TEMPOKV_FLUSH_TAIL",
             "TEMPOKV_PERSISTENT_UNITS_PER_LAUNCH",
             "TEMPOKV_ROPE_BACKEND",
+            "TEMPOKV_DECODE_TIMING",
         )
         if name in environment
     }
