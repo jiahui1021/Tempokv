@@ -29,12 +29,17 @@ from tempokv.config import (  # noqa: E402
     TEMPORAL_V_PREDICTOR_MODES,
     config_from_mapping,
     fixed_temporal_predictor_mode,
+    read_config_payload,
     is_cross_kv_v_predictor,
     is_fixed_temporal_predictor,
     is_fixed_v_predictor,
     is_temporal_v_predictor,
 )
-from tempokv.fitting import fit_predictors, refine_attention  # noqa: E402
+from tempokv.fitting import (  # noqa: E402
+    fit_predictors,
+    refine_attention,
+    stamp_parameter_identity,
+)
 from tempokv.parameters import CrossKVParameters, TemporalParameters  # noqa: E402
 
 
@@ -231,29 +236,8 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _read_json_config(path: Path | None) -> dict[str, Any]:
-    if path is None:
-        return {}
-    try:
-        loaded = json.loads(path.read_text(encoding="utf-8"))
-    except OSError as error:
-        raise ValueError(f"cannot read config {path}: {error}") from error
-    except json.JSONDecodeError as error:
-        raise ValueError(f"config is not valid JSON: {error}") from error
-    if not isinstance(loaded, dict):
-        raise ValueError("config JSON must contain an object")
-    if "codec" in loaded:
-        if len(loaded) != 1 or not isinstance(loaded["codec"], dict):
-            raise ValueError("when present, 'codec' must be the only top-level config object")
-        loaded = loaded["codec"]
-    unknown = sorted(set(loaded) - CODEC_FIELDS)
-    if unknown:
-        raise ValueError(f"unknown CodecConfig fields: {', '.join(unknown)}")
-    return loaded
-
-
 def _codec_config(args: argparse.Namespace) -> CodecConfig:
-    values = _read_json_config(args.config)
+    values = read_config_payload(args.config) if args.config is not None else {}
     for name in CODEC_FIELDS:
         override = getattr(args, name, None)
         if override is not None:
@@ -269,11 +253,7 @@ def _codec_config(args: argparse.Namespace) -> CodecConfig:
         )
     ):
         values["cross_kv_weight_mode"] = "layer_shared"
-    try:
-        config = config_from_mapping(values)
-    except (TypeError, ValueError) as error:
-        raise ValueError(f"invalid codec config: {error}") from error
-    return config
+    return config_from_mapping(values)
 
 
 def _load_trace(
@@ -288,83 +268,66 @@ def _load_trace(
     dict[str, object],
     dict[str, torch.Tensor],
 ]:
-    try:
-        with np.load(path, allow_pickle=False) as archive:
-            missing = [name for name in (keys_name, values_name) if name not in archive]
-            if missing:
-                raise ValueError(f"trace is missing arrays: {', '.join(missing)}")
-            keys_array = np.array(archive[keys_name], copy=True)
-            values_array = np.array(archive[values_name], copy=True)
-            # Present only in traces collected for the attention objective.
-            rotated = {
-                name: torch.from_numpy(np.array(archive[name], copy=True))
-                for name in ATTENTION_ARRAYS
-                if name in archive
-            }
-            layer_ids_array = (
-                np.array(archive["layer_ids"], copy=True) if "layer_ids" in archive else None
-            )
-            metadata: dict[str, object] = {}
-            for name in (
-                "temporal_units",
-                "num_layers",
-                "num_heads",
-                "head_dim",
-                "coordinate_system",
-                "cross_source_kind",
-                "trace_layout",
-                "trace_event_count",
-                "prompt_count",
-                "frames_per_event",
-                "tokens_per_frame",
-                "legacy_trace_protocol",
-                "trace_role",
-            ):
-                if name in archive:
-                    metadata[name] = np.asarray(archive[name]).item()
-            for name in (
-                "token_indices",
-                "event_tokens_start",
-                "event_tokens_end",
-            ):
-                if name in archive:
-                    array = np.asarray(archive[name])
-                    if array.ndim != 1 or not np.issubdtype(
-                        array.dtype, np.integer
-                    ):
-                        raise ValueError(
-                            f"trace {name} metadata must be a one-dimensional "
-                            "integer array"
-                        )
-                    metadata[name] = tuple(int(item) for item in array)
-            named_trace_stride = (
-                np.asarray(archive["trace_stride"]).item()
-                if "trace_stride" in archive
-                else None
-            )
-            legacy_stride = (
-                np.asarray(archive["stride"]).item()
-                if "stride" in archive
-                else None
-            )
-            if (
-                named_trace_stride is not None
-                and legacy_stride is not None
-                and int(named_trace_stride) != int(legacy_stride)
-            ):
-                raise ValueError("trace contains conflicting trace stride metadata")
-            trace_stride = (
-                named_trace_stride
-                if named_trace_stride is not None
-                else legacy_stride
-            )
-            if trace_stride is not None:
-                trace_stride = int(trace_stride)
-                if trace_stride <= 0:
-                    raise ValueError("trace_stride metadata must be positive")
-                metadata["trace_stride"] = trace_stride
-    except OSError as error:
-        raise ValueError(f"cannot read trace {path}: {error}") from error
+    with np.load(path, allow_pickle=False) as archive:
+        keys_array = np.array(archive[keys_name], copy=True)
+        values_array = np.array(archive[values_name], copy=True)
+        # Present only in traces collected for the attention objective.
+        rotated = {
+            name: torch.from_numpy(np.array(archive[name], copy=True))
+            for name in ATTENTION_ARRAYS
+            if name in archive
+        }
+        layer_ids_array = (
+            np.array(archive["layer_ids"], copy=True) if "layer_ids" in archive else None
+        )
+        metadata: dict[str, object] = {}
+        for name in (
+            "temporal_units",
+            "num_layers",
+            "num_heads",
+            "head_dim",
+            "coordinate_system",
+            "cross_source_kind",
+            "trace_layout",
+            "trace_event_count",
+            "prompt_count",
+            "frames_per_event",
+            "tokens_per_frame",
+            "legacy_trace_protocol",
+            "trace_role",
+        ):
+            if name in archive:
+                metadata[name] = np.asarray(archive[name]).item()
+        for name in (
+            "token_indices",
+            "event_tokens_start",
+            "event_tokens_end",
+        ):
+            if name in archive:
+                metadata[name] = tuple(int(item) for item in archive[name])
+        named_trace_stride = (
+            np.asarray(archive["trace_stride"]).item()
+            if "trace_stride" in archive
+            else None
+        )
+        legacy_stride = (
+            np.asarray(archive["stride"]).item()
+            if "stride" in archive
+            else None
+        )
+        if (
+            named_trace_stride is not None
+            and legacy_stride is not None
+            and int(named_trace_stride) != int(legacy_stride)
+        ):
+            raise ValueError("trace contains conflicting trace stride metadata")
+        trace_stride = (
+            named_trace_stride
+            if named_trace_stride is not None
+            else legacy_stride
+        )
+        if trace_stride is not None:
+            metadata["trace_stride"] = int(trace_stride)
 
     keys = torch.from_numpy(keys_array)
     values = torch.from_numpy(values_array)
@@ -373,18 +336,11 @@ def _load_trace(
             "keys and values must have matching [L, ..., T, H, D] shapes, got "
             f"{tuple(keys.shape)} and {tuple(values.shape)}"
         )
-    if not keys.is_floating_point() or not values.is_floating_point():
-        raise ValueError("keys and values must use floating-point dtypes")
-
-    layer_ids = None
-    if layer_ids_array is not None:
-        if layer_ids_array.ndim != 1 or layer_ids_array.shape[0] != keys.shape[0]:
-            raise ValueError("layer_ids must be one-dimensional with one entry per layer")
-        if not np.issubdtype(layer_ids_array.dtype, np.integer):
-            raise ValueError("layer_ids must contain integers")
-        layer_ids = tuple(int(item) for item in layer_ids_array)
-        if len(set(layer_ids)) != len(layer_ids):
-            raise ValueError("layer_ids must be unique")
+    layer_ids = (
+        None
+        if layer_ids_array is None
+        else tuple(int(item) for item in layer_ids_array)
+    )
     return keys, values, layer_ids, metadata, rotated
 
 
@@ -406,20 +362,9 @@ def _fit_device(name: str) -> torch.device:
             file=sys.stderr,
         )
         return torch.device("cpu")
-    try:
-        device = torch.device(name)
-    except (RuntimeError, TypeError) as error:
-        raise ValueError("fit device must be auto, cpu, cuda, or cuda:N") from error
-    if device.type not in ("cpu", "cuda"):
-        raise ValueError("fit device must be auto, cpu, cuda, or cuda:N")
+    device = torch.device(name)
     if device.type == "cuda" and not torch.cuda.is_available():
         raise ValueError("CUDA fitting was requested but CUDA is unavailable")
-    if (
-        device.type == "cuda"
-        and device.index is not None
-        and not 0 <= device.index < torch.cuda.device_count()
-    ):
-        raise ValueError(f"CUDA device index is unavailable: {device.index}")
     return device
 
 
@@ -435,12 +380,6 @@ def _limit_attention_tracks(
     """Flatten non-layer sample axes and keep a deterministic prefix."""
     if max_tokens is None:
         return tensor
-    if max_tokens <= 0:
-        raise ValueError("attention_max_tokens must be positive")
-    if tensor.ndim < 5:
-        raise ValueError(
-            "attention token limiting needs [L, ..., F, H, D] with a sample axis"
-        )
     tracks = int(np.prod(tensor.shape[1:-3]))
     flattened = tensor.reshape(
         tensor.shape[0], tracks, tensor.shape[-3], tensor.shape[-2], tensor.shape[-1]
@@ -452,14 +391,7 @@ def _split_calibration_spans(
     tensor: torch.Tensor, span_frames: int, *, legacy: bool
 ) -> torch.Tensor:
     """Reset fitting history at each non-overlapping calibration span."""
-    if span_frames < 2:
-        raise ValueError("span_frames must be at least 2")
-    frame_count = int(tensor.shape[-3])
-    windows = frame_count // span_frames
-    if windows < 1:
-        raise ValueError(
-            f"span_frames={span_frames} exceeds trace length {frame_count}"
-        )
+    windows = int(tensor.shape[-3]) // span_frames
     pieces = [
         tensor[..., index * span_frames : (index + 1) * span_frames, :, :]
         for index in range(windows)
@@ -477,8 +409,6 @@ def _pad_temporal_history(
     current = parameters.history_length
     if current == target:
         return parameters
-    if not 0 < current < target:
-        raise ValueError("invalid temporal history padding request")
     weights = parameters.history_weights
     bias = parameters.history_bias
     if weights.ndim == 5:
@@ -508,8 +438,6 @@ def _pad_cross_history(
     current = parameters.history_length
     if current == target:
         return parameters
-    if not 0 <= current < target:
-        raise ValueError("invalid CrossKV history padding request")
     history = parameters.history_weights
     if parameters.layered:
         padded = history.new_zeros(
@@ -528,66 +456,6 @@ def _pad_cross_history(
         history_weights=padded,
         projection_source=parameters.projection_source,
     )
-
-
-def _bind_requested_config(
-    temporal: TemporalParameters,
-    value_parameters: CrossKVParameters | TemporalParameters,
-    config: CodecConfig,
-    coordinate_system: str,
-) -> tuple[TemporalParameters, CrossKVParameters | TemporalParameters]:
-    """Bind padded, span-specific fits to the production codec identity."""
-    signature = config.format_signature()
-    identity = hashlib.sha256(signature.encode("utf-8"))
-    identity.update(coordinate_system.encode("utf-8"))
-    tensors = [temporal.history_weights, temporal.history_bias]
-    if isinstance(value_parameters, TemporalParameters):
-        tensors.extend(
-            [value_parameters.history_weights, value_parameters.history_bias]
-        )
-    else:
-        tensors.extend(
-            [
-                value_parameters.weight,
-                value_parameters.history_weights,
-                value_parameters.bias,
-            ]
-        )
-    for tensor in tensors:
-        identity.update(tensor.detach().cpu().contiguous().numpy().tobytes())
-    parameter_set_id = identity.hexdigest()
-    rebound_temporal = TemporalParameters(
-        temporal.history_weights,
-        temporal.history_bias,
-        temporal.stride,
-        temporal.layer_ids,
-        signature,
-        parameter_set_id,
-        coordinate_system,
-    )
-    if isinstance(value_parameters, TemporalParameters):
-        rebound_value = TemporalParameters(
-            value_parameters.history_weights,
-            value_parameters.history_bias,
-            value_parameters.stride,
-            value_parameters.layer_ids,
-            signature,
-            parameter_set_id,
-            coordinate_system,
-        )
-    else:
-        rebound_value = CrossKVParameters(
-            value_parameters.weight,
-            value_parameters.bias,
-            value_parameters.stride,
-            value_parameters.layer_ids,
-            signature,
-            parameter_set_id,
-            coordinate_system,
-            value_parameters.history_weights,
-            value_parameters.projection_source,
-        )
-    return rebound_temporal, rebound_value
 
 
 def run(args: argparse.Namespace) -> dict[str, Any]:
@@ -823,8 +691,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             cross = _pad_temporal_history(cross, int(config.v_history_length))
     elif cross.history_length != int(config.v_history_length):
         cross = _pad_cross_history(cross, int(config.v_history_length))
-    temporal, cross = _bind_requested_config(
-        temporal, cross, config, coordinate_system
+    # Padded, span-specific fits are bound to the production codec identity.
+    temporal, cross = stamp_parameter_identity(
+        temporal,
+        cross,
+        signature=config.format_signature(),
+        coordinate_system=coordinate_system,
     )
     if device.type == "cuda":
         torch.cuda.synchronize(device)

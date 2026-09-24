@@ -21,6 +21,7 @@ import torch
 
 from tempokv.codec import PackedTensor, TempoKVCodec, decode_tensor
 from tempokv.integration import load_codec
+from tempokv.parameters import CrossKVParameters
 
 from .trace import DEFAULT_TRACE_SPATIAL_POSITIONS, LongCatTraceCollector
 
@@ -52,21 +53,6 @@ class LongCatRuntimeSpec:
     stride: int | None = LONGCAT_STRIDE
     coordinate_system: str = LONGCAT_COORDINATE_SYSTEM
 
-    def __post_init__(self) -> None:
-        for name in ("num_layers", "num_heads", "head_dim"):
-            value = getattr(self, name)
-            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-                raise ValueError(f"LongCat {name} must be a positive integer")
-        if self.stride is not None:
-            if (
-                isinstance(self.stride, bool)
-                or not isinstance(self.stride, int)
-                or self.stride <= 0
-            ):
-                raise ValueError("LongCat stride must be a positive integer or None")
-        if not isinstance(self.coordinate_system, str) or not self.coordinate_system:
-            raise ValueError("LongCat coordinate_system must be non-empty")
-
 
 @dataclass(frozen=True, slots=True)
 class PackedTensorSpanSet:
@@ -84,21 +70,6 @@ class PackedTensorSpanSet:
     # This is the LongCat form of the Self-Forcing BF16 lag: the frames the
     # new segment attends to most are not approximated.
     tail: torch.Tensor | None = None
-
-    def __post_init__(self) -> None:
-        if not self.spans:
-            raise ValueError("a PackedTensorSpanSet must contain at least one span")
-        if any(span.predictor_kind != self.predictor_kind for span in self.spans):
-            raise ValueError("all packed spans must use the same predictor kind")
-        batch, heads, sequence, width = self.shape
-        if min(batch, heads, sequence, width) <= 0:
-            raise ValueError("packed span shape must be positive")
-        first_batch, first_heads, _, first_width = self.spans[0].shape
-        if (batch, heads, width) != (first_batch, first_heads, first_width):
-            raise ValueError("packed spans must share batch, head, and width dimensions")
-        tail_length = 0 if self.tail is None else self.tail.shape[2]
-        if sum(span.shape[2] for span in self.spans) + tail_length != sequence:
-            raise ValueError("packed spans must exactly cover the combined sequence")
 
     def storage_bytes(self) -> int:
         tail_bytes = (
@@ -126,8 +97,6 @@ def move_packed_tensor(packed: PackedState, device: torch.device | str) -> Packe
             spans=tuple(move_packed_tensor(span, device) for span in packed.spans),
             tail=_move_tensor(packed.tail, torch.device(device)),
         )
-    if not isinstance(packed, PackedTensor):
-        raise TypeError(f"expected PackedTensor, got {type(packed).__name__}")
     target = torch.device(device)
     components = (
         packed.anchor_quant,
@@ -152,18 +121,14 @@ def move_kv_cache(
     kv_cache: tuple[Any, Any], device: torch.device | str
 ) -> tuple[Any, Any]:
     """Move a LongCat cache pair, supporting both tensors and PackedTensor."""
-    if not isinstance(kv_cache, (tuple, list)) or len(kv_cache) != 2:
-        raise TypeError("LongCat KV cache entries must be a two-item pair")
     target = torch.device(device)
-    moved: list[Any] = []
-    for item in kv_cache:
-        if isinstance(item, (PackedTensor, PackedTensorSpanSet)):
-            moved.append(move_packed_tensor(item, target))
-        elif isinstance(item, torch.Tensor):
-            moved.append(item.to(target))
-        else:
-            raise TypeError(f"unsupported LongCat cache item: {type(item).__name__}")
-    return moved[0], moved[1]
+    key, value = (
+        item.to(target)
+        if isinstance(item, torch.Tensor)
+        else move_packed_tensor(item, target)
+        for item in kv_cache
+    )
+    return key, value
 
 
 def decode_kv_cache(
@@ -175,13 +140,7 @@ def decode_kv_cache(
     value_output: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Decode LongCat K/V in the required K-first closed-loop order."""
-    k_is_packed = isinstance(k_cache, (PackedTensor, PackedTensorSpanSet))
-    v_is_packed = isinstance(v_cache, (PackedTensor, PackedTensorSpanSet))
-    if k_is_packed != v_is_packed:
-        raise TypeError("LongCat K and V cache formats must match")
-    if not k_is_packed:
-        if not isinstance(k_cache, torch.Tensor) or not isinstance(v_cache, torch.Tensor):
-            raise TypeError("uncompressed LongCat cache entries must be tensors")
+    if isinstance(k_cache, torch.Tensor):
         if key_output is not None:
             key_output.copy_(k_cache)
             k_cache = key_output
@@ -190,33 +149,9 @@ def decode_kv_cache(
             v_cache = value_output
         return k_cache, v_cache
     # Exactly one side is predicted temporally and supplies the projection
-    # source for the other.  Which side that is follows the codec direction:
-    # forward is K temporal / V cross, mirrored is V temporal / K cross.
-    kinds = (k_cache.predictor_kind, v_cache.predictor_kind)
-    if codec.config.mirrored:
-        if v_cache.predictor_kind != "temporal":
-            raise ValueError(
-                "mirrored LongCat caches need a temporal V to project K from, "
-                f"got {kinds}"
-            )
-        if k_cache.predictor_kind != "cross_kv":
-            raise ValueError(
-                f"mirrored LongCat K cache must use cross_kv prediction, got {kinds}"
-            )
-    else:
-        if k_cache.predictor_kind != "temporal":
-            raise ValueError("LongCat K cache must use temporal TempoKV prediction")
-        if v_cache.predictor_kind not in ("cross_kv", "temporal"):
-            raise ValueError(
-                "LongCat V cache must use cross_kv or temporal TempoKV prediction"
-            )
-    if isinstance(k_cache, PackedTensorSpanSet) != isinstance(v_cache, PackedTensorSpanSet):
-        raise TypeError("LongCat K and V span formats must match")
+    # source for the other: forward is K temporal / V cross, mirrored is
+    # V temporal / K cross.
     if isinstance(k_cache, PackedTensorSpanSet):
-        if len(k_cache.spans) != len(v_cache.spans):
-            raise ValueError("LongCat K and V must contain the same number of spans")
-        if k_cache.shape != v_cache.shape:
-            raise ValueError("LongCat K and V span sets must have matching shapes")
         output_dtype = _RECONSTRUCTION_DTYPE[
             k_cache.spans[0].reconstruction_dtype
         ]
@@ -226,14 +161,12 @@ def decode_kv_cache(
             shape=k_cache.shape,
             dtype=output_dtype,
             device=device,
-            name="key_output",
         )
         value = _prepare_decode_output(
             value_output,
             shape=v_cache.shape,
             dtype=output_dtype,
             device=device,
-            name="value_output",
         )
         start = 0
         mirrored = codec.config.mirrored
@@ -273,14 +206,12 @@ def decode_kv_cache(
         shape=k_cache.shape,
         dtype=output_dtype,
         device=k_cache.anchor_quant.device,
-        name="key_output",
     )
     value = _prepare_decode_output(
         value_output,
         shape=v_cache.shape,
         dtype=output_dtype,
         device=v_cache.anchor_quant.device,
-        name="value_output",
     )
     mirrored = codec.config.mirrored
     packed_primary, packed_secondary = (
@@ -313,26 +244,8 @@ def _prepare_decode_output(
     shape: tuple[int, int, int, int],
     dtype: torch.dtype,
     device: torch.device,
-    name: str,
 ) -> torch.Tensor:
-    if output is None:
-        return torch.empty(shape, dtype=dtype, device=device)
-    if tuple(output.shape) != tuple(shape):
-        raise ValueError(f"LongCat {name} must have shape {shape}, got {tuple(output.shape)}")
-    if output.dtype != dtype:
-        raise ValueError(f"LongCat {name} must use {dtype}, got {output.dtype}")
-    if output.device != device:
-        raise ValueError(f"LongCat {name} must be on {device}, got {output.device}")
-    return output
-
-
-def _layer_pair(
-    kv_cache_dict: Mapping[int, tuple[Any, Any]], layer_id: int
-) -> tuple[Any, Any]:
-    pair = kv_cache_dict[layer_id]
-    if not isinstance(pair, (tuple, list)) or len(pair) != 2:
-        raise TypeError(f"LongCat layer {layer_id} must contain a K/V pair")
-    return pair[0], pair[1]
+    return torch.empty(shape, dtype=dtype, device=device) if output is None else output
 
 
 def validate_cache_layout(
@@ -344,34 +257,14 @@ def validate_cache_layout(
 ) -> dict[str, int | str]:
     """Validate a clean LongCat cache and calculate its runtime stride."""
     resolved_spec = spec or LongCatRuntimeSpec()
-    if temporal_units <= 0:
-        raise ValueError("LongCat temporal_units must be positive")
-    if not kv_cache_dict:
-        raise ValueError("LongCat returned an empty KV cache")
-    for name, parameters in (
-        ("K", codec.temporal),
-        ("V", codec.v_parameters),
-    ):
-        if parameters.coordinate_system != resolved_spec.coordinate_system:
-            raise ValueError(
-                f"LongCat {name} parameters must use coordinate system "
-                f"{resolved_spec.coordinate_system!r}, got "
-                f"{parameters.coordinate_system!r}"
-            )
     layer_ids = sorted(int(layer) for layer in kv_cache_dict)
-    if layer_ids != list(range(len(layer_ids))):
-        raise ValueError(f"LongCat layer ids must be contiguous from zero, got {layer_ids}")
-    if len(layer_ids) != resolved_spec.num_layers:
+    if layer_ids != list(range(resolved_spec.num_layers)):
         raise ValueError(
             f"LongCat checkpoint must expose {resolved_spec.num_layers} layers, "
             f"got {len(layer_ids)}"
         )
 
-    first_key, first_value = _layer_pair(kv_cache_dict, layer_ids[0])
-    if not isinstance(first_key, torch.Tensor) or not isinstance(first_value, torch.Tensor):
-        raise TypeError("cache layout validation requires clean Tensor K/V entries")
-    if first_key.ndim != 4 or first_key.shape != first_value.shape:
-        raise ValueError("LongCat K/V entries must have matching [B,H,S,D] shapes")
+    first_key, _ = kv_cache_dict[layer_ids[0]]
     batch, heads, sequence, width = (int(item) for item in first_key.shape)
     if heads != resolved_spec.num_heads or width != resolved_spec.head_dim:
         raise ValueError(
@@ -394,14 +287,6 @@ def validate_cache_layout(
             f"TempoKV stride {codec.config.stride} does not match LongCat runtime "
             f"stride {runtime_stride}"
         )
-
-    expected_shape = (batch, heads, sequence, width)
-    for layer_id in layer_ids[1:]:
-        key, value = _layer_pair(kv_cache_dict, layer_id)
-        if not isinstance(key, torch.Tensor) or not isinstance(value, torch.Tensor):
-            raise TypeError("cache layout validation requires clean Tensor K/V entries")
-        if tuple(key.shape) != expected_shape or key.shape != value.shape:
-            raise ValueError("all LongCat layers must share the same K/V cache shape")
 
     return {
         "batch": batch,
@@ -434,17 +319,14 @@ def encode_kv_cache(
     )
     uncompressed_cache_bytes = sum(
         int(key.numel() * key.element_size() + value.numel() * value.element_size())
-        for layer_id in sorted(kv_cache_dict)
-        for key, value in (_layer_pair(kv_cache_dict, int(layer_id)),)
+        for key, value in kv_cache_dict.values()
     )
     encoded: dict[int, tuple[PackedState, PackedState]] = {}
     target_device = None if encode_device is None else torch.device(encode_device)
     started = time.perf_counter() if profile else None
     with torch.no_grad():
         for layer_id in sorted(kv_cache_dict):
-            key, value = _layer_pair(kv_cache_dict, int(layer_id))
-            if key.device != value.device:
-                raise ValueError(f"LongCat layer {layer_id} K/V devices do not match")
+            key, value = kv_cache_dict[layer_id]
             if target_device is not None:
                 key = key.to(target_device)
                 value = value.to(target_device)
@@ -566,8 +448,6 @@ def encode_kv_cache_spans(
 ) -> tuple[dict[int, tuple[PackedTensorSpanSet, PackedTensorSpanSet]], dict[str, object]]:
     """Encode independent temporal spans and concatenate them for attention."""
     units = tuple(int(item) for item in span_temporal_units)
-    if not units or any(item <= 0 for item in units):
-        raise ValueError("span_temporal_units must contain positive values")
     layout = validate_cache_layout(
         kv_cache_dict,
         temporal_units=sum(units),
@@ -740,28 +620,6 @@ class LongCatTempoKVBridge:
         if self.mode == "tempokv" and self.codec is None:
             raise ValueError("tempokv mode requires a loaded TempoKV codec")
         if (
-            isinstance(self.context_parallel_size, bool)
-            or not isinstance(self.context_parallel_size, int)
-            or self.context_parallel_size <= 0
-        ):
-            raise ValueError("context_parallel_size must be positive")
-        if (
-            isinstance(self.context_parallel_rank, bool)
-            or not isinstance(self.context_parallel_rank, int)
-            or not 0 <= self.context_parallel_rank < self.context_parallel_size
-        ):
-            raise ValueError(
-                "context_parallel_rank must be in [0, context_parallel_size)"
-            )
-        if (
-            isinstance(self.max_trace_spatial_positions, bool)
-            or not isinstance(self.max_trace_spatial_positions, int)
-            or self.max_trace_spatial_positions <= 0
-        ):
-            raise ValueError("max_trace_spatial_positions must be positive")
-        if self.attention_sink_frames < 0:
-            raise ValueError("attention_sink_frames must be non-negative")
-        if (
             self.context_parallel_size > 1
             and self.auto_context_parallel_stride
             and self.spec.stride == LONGCAT_STRIDE
@@ -785,9 +643,7 @@ class LongCatTempoKVBridge:
 
     def validate_model(self, dit: Any) -> None:
         model = _unwrap_compiled_module(dit)
-        blocks = getattr(model, "blocks", None)
-        if blocks is None:
-            raise TypeError("LongCat DIT does not expose blocks")
+        blocks = model.blocks
         if len(blocks) != self.spec.num_layers:
             raise ValueError(
                 f"LongCat checkpoint must expose {self.spec.num_layers} blocks, got {len(blocks)}"
@@ -805,8 +661,6 @@ class LongCatTempoKVBridge:
         cp_split_hw = getattr(dit, "cp_split_hw", None)
         actual_context_parallel_size = 1
         if cp_split_hw is not None:
-            if len(cp_split_hw) != 2 or any(int(value) <= 0 for value in cp_split_hw):
-                raise ValueError("LongCat cp_split_hw must contain two positive integers")
             actual_context_parallel_size = int(cp_split_hw[0]) * int(cp_split_hw[1])
         if actual_context_parallel_size != self.context_parallel_size:
             raise ValueError(
@@ -814,82 +668,38 @@ class LongCatTempoKVBridge:
                 f"{self.context_parallel_size}, model uses {actual_context_parallel_size}"
             )
         if self.codec is not None:
+            # The codec signature already pins bits, modes, history lengths and
+            # stride; what it cannot see is which model the trace came from.
             expected_layers = tuple(range(self.spec.num_layers))
-            temporal_v = not self.codec.predicts_v_from_key
-            for name, parameters, allow_shared in (
-                ("temporal K", self.codec.temporal, True),
-                (
-                    "temporal V" if temporal_v else "CrossKV V",
-                    self.codec.v_parameters,
-                    temporal_v,
-                ),
+            for name, parameters in (
+                ("K", self.codec.temporal),
+                ("V", self.codec.v_parameters),
             ):
-                if (
-                    parameters.coordinate_system
-                    != self.spec.coordinate_system
-                ):
+                if parameters.coordinate_system != self.spec.coordinate_system:
                     raise ValueError(
                         f"{name} parameters use coordinate system "
                         f"{parameters.coordinate_system!r}; LongCat requires "
                         f"{self.spec.coordinate_system!r}"
-                    )
-                if parameters.stride is not None and parameters.stride != self.codec.config.stride:
-                    raise ValueError(
-                        f"{name} parameters use stride {parameters.stride}, while "
-                        f"the codec uses {self.codec.config.stride}"
-                    )
-                if not parameters.layered and not allow_shared:
-                    raise ValueError(
-                        f"{name} parameters must be layered for a multi-layer "
-                        "LongCat model"
                     )
                 if parameters.layered and parameters.layer_ids != expected_layers:
                     raise ValueError(
                         f"{name} parameters must contain layer ids 0 through "
                         f"{self.spec.num_layers - 1}, got {parameters.layer_ids}"
                     )
-            temporal = self.codec.temporal
-            if temporal.history_weights.shape[-1] != self.spec.head_dim:
-                raise ValueError(
-                    "temporal K parameters do not match LongCat head dimension "
-                    f"{self.spec.head_dim}"
-                )
-            if (
-                temporal.layered or temporal.per_head
-            ) and temporal.history_weights.shape[-2] != self.spec.num_heads:
-                raise ValueError(
-                    "temporal K parameters do not match LongCat head count "
-                    f"{self.spec.num_heads}"
-                )
-            if temporal_v:
-                value = self.codec.v_parameters
-                if value.history_weights.shape[-1] != self.spec.head_dim:
+                if isinstance(parameters, CrossKVParameters):
+                    geometry = tuple(parameters.weight.shape[-3:-1])
+                elif parameters.layered or parameters.per_head:
+                    geometry = tuple(parameters.history_weights.shape[-2:])
+                else:
+                    geometry = (self.spec.num_heads, int(parameters.history_weights.shape[-1]))
+                # A one-head map would otherwise broadcast silently over every head.
+                if geometry != (self.spec.num_heads, self.spec.head_dim):
                     raise ValueError(
-                        "temporal V parameters do not match LongCat head "
-                        f"dimension {self.spec.head_dim}"
-                    )
-                if (
-                    value.layered or value.per_head
-                ) and value.history_weights.shape[-2] != self.spec.num_heads:
-                    raise ValueError(
-                        "temporal V parameters do not match LongCat head count "
-                        f"{self.spec.num_heads}"
-                    )
-            else:
-                cross = self.codec.cross_kv
-                if tuple(cross.weight.shape[-2:]) != (
-                    self.spec.head_dim,
-                    self.spec.head_dim,
-                ) or cross.weight.shape[-3] != self.spec.num_heads:
-                    raise ValueError(
-                        "CrossKV V parameters do not match LongCat [heads, head_dim] "
-                        f"= [{self.spec.num_heads}, {self.spec.head_dim}]"
+                        f"{name} parameters have [heads, head_dim]={list(geometry)}; "
+                        f"LongCat has [{self.spec.num_heads}, {self.spec.head_dim}]"
                     )
         for index, block_wrapper in enumerate(blocks):
-            block = _unwrap_compiled_module(block_wrapper)
-            attention = getattr(block, "attn", None)
-            if attention is None:
-                raise TypeError(f"LongCat block {index} does not expose self attention")
+            attention = _unwrap_compiled_module(block_wrapper).attn
             heads = int(getattr(attention, "num_heads", -1))
             head_dim = int(getattr(attention, "head_dim", -1))
             if heads != self.spec.num_heads or head_dim != self.spec.head_dim:
@@ -940,20 +750,12 @@ class LongCatTempoKVBridge:
         setattr(vae, "_tempokv_rope_release_patch", True)
 
     def on_clean_cache(self, pipeline: Any, cond_latents: torch.Tensor) -> None:
-        if cond_latents.ndim < 3:
-            raise ValueError("LongCat cond_latents must expose a temporal dimension")
         temporal_units = int(cond_latents.shape[2])
-        if temporal_units <= 0:
-            raise ValueError("LongCat cond_latents must contain temporal units")
-        dit = getattr(pipeline, "dit", None)
-        if dit is None:
-            raise TypeError("LongCat pipeline does not expose dit")
+        dit = pipeline.dit
         setattr(dit, "_tempokv_num_units", temporal_units)
         sink_units = 0
         if self.attention_sink_frames:
             temporal_factor = int(getattr(pipeline, "vae_scale_factor_temporal", 4))
-            if temporal_factor <= 0:
-                raise ValueError("LongCat vae_scale_factor_temporal must be positive")
             sink_units = 1 + (self.attention_sink_frames - 1) // temporal_factor
             if sink_units >= temporal_units:
                 raise ValueError(
@@ -995,8 +797,6 @@ class LongCatTempoKVBridge:
             # BF16 runs the original uncompressed LongCat attention path.  Trace
             # collection uses the same clean path after saving the raw cache.
             return kv_cache_dict
-        if self.codec is None:
-            raise RuntimeError("TempoKV codec is not loaded")
         if kv_cache_dict and all(
             isinstance(pair[0], (PackedTensor, PackedTensorSpanSet))
             and isinstance(pair[1], (PackedTensor, PackedTensorSpanSet))
@@ -1187,8 +987,6 @@ class LongCatTempoKVBridge:
         key_output: torch.Tensor | None = None,
         value_output: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if self.codec is None:
-            raise RuntimeError("TempoKV codec is not loaded")
         # Synchronizing around every layer decode serializes the entire GPU
         # pipeline.  Production runs keep aggregate counters only.  Optional
         # profiling measures host enqueue time and deliberately never waits for
@@ -1448,20 +1246,7 @@ class LongCatTempoKVBridge:
                             "direct LongCat cache output requires an active TempoKV bridge"
                         )
                     return original_uncompress(k_cache, v_cache)
-                if isinstance(k_cache, PackedTensor) or isinstance(v_cache, PackedTensor):
-                    if bridge.codec is None:
-                        raise RuntimeError("TempoKV codec is not loaded")
-                    return bridge.decode(
-                        k_cache,
-                        v_cache,
-                        key_output=key_output,
-                        value_output=value_output,
-                    )
-                if isinstance(k_cache, PackedTensorSpanSet) or isinstance(
-                    v_cache, PackedTensorSpanSet
-                ):
-                    if bridge.codec is None:
-                        raise RuntimeError("TempoKV codec is not loaded")
+                if isinstance(k_cache, (PackedTensor, PackedTensorSpanSet)):
                     return bridge.decode(
                         k_cache,
                         v_cache,

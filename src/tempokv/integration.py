@@ -1,73 +1,14 @@
 from __future__ import annotations
 
-import json
 import os
 from pathlib import Path
 
-from .codec import TempoKVCodec
 from typing import Any, Mapping
 
-from .config import CodecConfig, config_from_mapping
-from .parameters import (
-    CrossKVParameters,
-    TemporalParameters,
-    load_parameters,
-)
+from .codec import TempoKVCodec
+from .config import CodecConfig, load_config
+from .parameters import TemporalParameters, load_parameters
 from .runtime import configure_triton_cache
-
-
-def check_parameters_match_config(
-    temporal: TemporalParameters,
-    cross_kv: CrossKVParameters | TemporalParameters,
-    config: CodecConfig,
-) -> None:
-    """Refuse parameters that were fitted for a different codec configuration.
-
-    Every fitted file is stamped with the signature of the config it was fitted
-    under, so running INT2-fitted predictors against an INT4 config — the kind
-    of mix-up an overwritten parameter directory produces — fails here instead
-    of quietly producing wrong numbers.
-
-    Hand-built parameters carry no stamp; those are left alone, since there is
-    nothing to compare against.
-    """
-    expected = config.format_signature()
-    for name, parameters in (("K", temporal), ("V", cross_kv)):
-        signature = parameters.codec_signature
-        if signature is not None and signature != expected:
-            raise ValueError(
-                f"{name} parameters were fitted for codec {signature!r}, but this "
-                f"run is configured as {expected!r}; refit them or point at the "
-                "parameter directory that matches this config"
-            )
-    if temporal.parameter_set_id != cross_kv.parameter_set_id:
-        # One stamped and one unstamped file means a freshly fitted parameter
-        # was paired with a leftover from an older run. Both being unstamped is
-        # a legitimate hand-built pair and compares equal here.
-        raise ValueError(
-            "K and V parameters come from different fitting runs "
-            f"({temporal.parameter_set_id!r} vs {cross_kv.parameter_set_id!r}); "
-            "use the k_temporal.npz and v_cross_kv.npz written by the same fit"
-        )
-    if (
-        temporal.coordinate_system is not None
-        and cross_kv.coordinate_system is not None
-        and temporal.coordinate_system != cross_kv.coordinate_system
-    ):
-        raise ValueError(
-            "K and V parameters use different coordinate systems: "
-            f"{temporal.coordinate_system!r} vs {cross_kv.coordinate_system!r}"
-        )
-    if isinstance(cross_kv, CrossKVParameters):
-        expected_source = (
-            "innovation" if config.v_predictor_mode == "innovation" else "cross_kv"
-        )
-        if cross_kv.projection_source != expected_source:
-            raise ValueError(
-                f"v_predictor_mode={config.v_predictor_mode} requires V "
-                f"projection_source={expected_source}, got "
-                f"{cross_kv.projection_source}"
-            )
 
 
 # CrossKV layouts a fitted parameter set is deployed with, per fitting family.
@@ -117,23 +58,12 @@ def load_codec(
     set to a mirrored config is rejected here rather than silently running the
     wrong predictor.
     """
-    with Path(config_path).open("r", encoding="utf-8") as handle:
-        payload = json.load(handle)
-    if not isinstance(payload, dict):
-        raise ValueError("codec config must be a JSON object")
-    if "codec" in payload:
-        if len(payload) != 1 or not isinstance(payload["codec"], dict):
-            raise ValueError("'codec' must be the only top-level config object")
-        payload = payload["codec"]
-    if overrides:
-        payload = {**payload, **overrides}
-    config = config_from_mapping(payload)
+    config = load_config(config_path, overrides)
     check_deployable_cross_kv_layout(config)
     if config.use_triton:
         configure_triton_cache(triton_cache)
     temporal = TemporalParameters.load(k_parameters_path)
     cross_kv = load_parameters(v_parameters_path)
-    check_parameters_match_config(temporal, cross_kv, config)
     return TempoKVCodec(temporal, cross_kv, config)
 
 

@@ -32,8 +32,8 @@ if SOURCE_ROOT.is_dir() and str(SOURCE_ROOT) not in sys.path:
     sys.path.insert(0, str(SOURCE_ROOT))
 
 from tempokv.config import (  # noqa: E402
+    load_config,
     CodecConfig,
-    config_from_mapping,
     is_temporal_v_predictor,
 )
 from tempokv.codec import anchor_roundtrip  # noqa: E402
@@ -41,13 +41,6 @@ from tempokv.fitting import _quantization_roundtrip  # noqa: E402
 from tempokv.parameters import CrossKVParameters, TemporalParameters  # noqa: E402
 
 
-def _load_config(path: Path) -> CodecConfig:
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    if "codec" in payload:
-        if len(payload) != 1:
-            raise ValueError("'codec' must be the only top-level config object")
-        payload = payload["codec"]
-    return config_from_mapping(payload)
 
 
 def reconstruct_temporal(
@@ -328,7 +321,7 @@ def main() -> None:
     with np.load(args.trace, allow_pickle=False) as archive:
         keys = torch.from_numpy(np.array(archive["keys"], copy=True))
         values = torch.from_numpy(np.array(archive["values"], copy=True))
-    config = _load_config(args.config)
+    config = load_config(args.config)
     temporal = TemporalParameters.load(args.k_params)
     value_parameters = (
         TemporalParameters.load(args.v_params)

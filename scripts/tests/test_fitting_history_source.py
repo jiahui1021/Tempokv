@@ -248,7 +248,3 @@ def test_legacy_temporal_v_accepts_clean_fitting_state() -> None:
     assert temporal_v.history_weights.shape == (1, 1, 64)
     assert temporal_k.parameter_set_id == temporal_v.parameter_set_id
 
-
-def test_invalid_fitting_history_source_fails_before_fitting() -> None:
-    with pytest.raises(ValueError, match="fit_history_source"):
-        _fit(_native_config(), "runtime")

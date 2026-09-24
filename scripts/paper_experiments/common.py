@@ -8,7 +8,6 @@ paper table.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import math
 from pathlib import Path
@@ -73,14 +72,6 @@ def write_json(path: Path, payload: Any) -> None:
         encoding="utf-8",
     )
     temporary.replace(path)
-
-
-def sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for block in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
 
 
 def percentile(values: Sequence[float], fraction: float) -> float:

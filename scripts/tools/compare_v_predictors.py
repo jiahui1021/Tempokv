@@ -34,7 +34,7 @@ from tempokv.attention_objective import (  # noqa: E402
     temporal_rollout,
 )
 from tempokv.codec import _cuda_matmul_precision  # noqa: E402
-from tempokv.config import CodecConfig, config_from_mapping  # noqa: E402
+from tempokv.config import CodecConfig, load_config  # noqa: E402
 from tempokv.parameters import (  # noqa: E402
     CrossKVParameters,
     TemporalParameters,
@@ -44,11 +44,6 @@ from tempokv.parameters import (  # noqa: E402
 EPS = 1e-12
 
 
-def _load_config(path: Path) -> CodecConfig:
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    if "codec" in payload:
-        payload = payload["codec"]
-    return config_from_mapping(payload)
 
 
 def _sha256(path: Path) -> str:
@@ -379,7 +374,7 @@ def main() -> None:
     if args.prompt_count <= 0:
         parser.error("--prompt-count must be positive")
     device = torch.device(args.device)
-    base_config = _load_config(args.config)
+    base_config = load_config(args.config)
     temporal_config = replace(base_config, v_predictor_mode="temporal")
     cross_config = replace(base_config, v_predictor_mode="cross_kv")
 

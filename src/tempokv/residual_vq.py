@@ -16,16 +16,6 @@ class ResidualVQCodebook:
 
     centroids: torch.Tensor
 
-    def __post_init__(self) -> None:
-        if self.centroids.ndim != 4:
-            raise ValueError("centroids must use [L,H,C,D] layout")
-        if min(map(int, self.centroids.shape)) <= 0:
-            raise ValueError("centroid dimensions must be positive")
-        if not self.centroids.is_floating_point():
-            raise ValueError("centroids must be floating point")
-        if not torch.isfinite(self.centroids).all():
-            raise ValueError("centroids must be finite")
-
     @property
     def num_centroids(self) -> int:
         return int(self.centroids.shape[2])
@@ -65,25 +55,9 @@ def fit_residual_vq_codebook(
     storage_dtype: torch.dtype = torch.bfloat16,
 ) -> ResidualVQCodebook:
     """Fit deterministic per-layer/head Lloyd codebooks on ``[L,...,H,D]`` samples."""
-    if samples.ndim < 4:
-        raise ValueError("samples must use [L,...,H,D] layout")
-    if not samples.is_floating_point() or not torch.isfinite(samples).all():
-        raise ValueError("samples must be finite floating-point values")
-    if isinstance(num_centroids, bool) or int(num_centroids) != num_centroids:
-        raise ValueError("num_centroids must be an integer")
-    if isinstance(iterations, bool) or int(iterations) != iterations or iterations < 1:
-        raise ValueError("iterations must be a positive integer")
-    if isinstance(max_points, bool) or int(max_points) != max_points or max_points < 1:
-        raise ValueError("max_points must be a positive integer")
-
     layers = int(samples.shape[0])
     heads = int(samples.shape[-2])
     dim = int(samples.shape[-1])
-    points_per_group = int(samples[0, ..., 0, :].numel() // dim)
-    if not 1 <= num_centroids <= points_per_group:
-        raise ValueError(
-            f"num_centroids must be in [1, {points_per_group}], got {num_centroids}"
-        )
 
     output = torch.empty(
         layers,
@@ -124,13 +98,10 @@ def nearest_centroid(
     codebook: ResidualVQCodebook,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return selected centroids and UINT8-compatible indices for ``[L,...,H,D]``."""
-    if values.ndim < 4:
-        raise ValueError("values must use [L,...,H,D] layout")
     layers = int(values.shape[0])
     heads = int(values.shape[-2])
     dim = int(values.shape[-1])
-    if tuple(codebook.centroids.shape[:2]) != (layers, heads) or codebook.dim != dim:
-        raise ValueError("codebook does not match values layer/head/dimension layout")
+    # Larger codebooks would silently wrap in the UINT8 indices.
     if codebook.num_centroids > 256:
         raise ValueError("QVG-compatible UINT8 indices support at most 256 centroids")
 

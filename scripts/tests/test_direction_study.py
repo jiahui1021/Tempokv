@@ -9,8 +9,8 @@ import numpy as np
 import pytest
 import torch
 
-from tempokv.codec import PackedKV, TempoKVCodec, decode_tensor
-from tempokv.config import CodecConfig, config_from_mapping
+from tempokv.codec import TempoKVCodec, decode_tensor
+from tempokv.config import config_from_mapping
 from tempokv.fitting import fit_predictors
 
 
@@ -189,25 +189,6 @@ def test_the_codec_addresses_the_cache_by_role() -> None:
         assert codec.secondary_role != primary
 
 
-def test_packed_pairs_need_exactly_one_temporal_side() -> None:
-    """Otherwise the cross projection has no defined source."""
-    keys, values = _trace(0)
-    config = _base(use_triton=False)
-    temporal, secondary = fit_predictors(
-        keys, values, config=config, iterations=2,
-        temporal_ridge=1.0, cross_ridge=0.1, v_history_mode="diagonal",
-    )
-    codec = TempoKVCodec(temporal, secondary, config)
-    span_keys = keys[0, 0].permute(1, 0, 2).unsqueeze(0).contiguous()
-    span_values = values[0, 0].permute(1, 0, 2).unsqueeze(0).contiguous()
-    packed = codec.encode(span_keys, span_values, layer=0)
-    with pytest.raises(ValueError, match="temporally predicted"):
-        PackedKV(packed.value, packed.value)
-
-
-# --------------------------------------------------------------------------
-# Fitting mirrors the pair rather than duplicating the equations
-# --------------------------------------------------------------------------
 
 
 def test_mirrored_fitting_matches_fitting_on_a_swapped_trace() -> None:

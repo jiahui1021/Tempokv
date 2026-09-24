@@ -43,11 +43,6 @@ def main() -> None:
     lc = video["longcat-video"]
     sf = video["self-forcing-wan2.1-1.3b"]
 
-    def layers_of(col):
-        kind, sub, arg = col[1], None, col[2]
-        if kind == "video_k":
-            return (lc if arg is None else sf)["layers"]["k"] if False else (lc if arg is None else sf)["layers"]["k"]
-        return None
 
     def src_layers(name):
         if name == "LongCat-K":
@@ -77,8 +72,8 @@ def main() -> None:
     lines = [
         "# AR 视频模型 vs LLM:KV cache 激活统计对比(扩展版)",
         "",
-        f"- 视频侧:生成时 clean trace。LongCat(48L×32H,T=14 帧×S=32 子采样位置,d=128,MHA)、"
-        f"Wan2.1/Self-Forcing(30L×12H,T=24×S=192,d=128,MHA)",
+        "- 视频侧:生成时 clean trace。LongCat(48L×32H,T=14 帧×S=32 子采样位置,d=128,MHA)、"
+        "Wan2.1/Self-Forcing(30L×12H,T=24×S=192,d=128,MHA)",
         f"- LLM 侧:{llm['model'].split('/')[-1]}(共 {llm['n_layers_total']} 层,仅 "
         f"{llm['arms']['long_context']['shape']['L']} 层 full_attention 携带 KV cache;"
         f"GQA {llm['arms']['long_context']['shape']['H']} KV 头 × {llm['arms']['long_context']['shape']['D']}d),"

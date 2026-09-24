@@ -18,16 +18,11 @@ import torch
 import torch.nn.functional as F
 
 from .config import CodecConfig
-from .codec import _cuda_matmul_precision, anchor_roundtrip
+from .codec import _cuda_matmul_precision, _dtype, anchor_roundtrip
 from .quantization import roundtrip
 
 
 EPS = 1e-12
-_SCALE_DTYPES = {
-    "float32": torch.float32,
-    "float16": torch.float16,
-    "bfloat16": torch.bfloat16,
-}
 
 
 def _reconstruction_dtype(config: CodecConfig) -> torch.dtype:
@@ -38,7 +33,7 @@ def _reconstruction_dtype(config: CodecConfig) -> torch.dtype:
     simulated at a precision it never uses, and the refinement objective was
     optimizing against a slightly different codec from the deployed one.
     """
-    return _SCALE_DTYPES[config.reconstruction_dtype]
+    return _dtype(config.reconstruction_dtype)
 
 
 
@@ -49,7 +44,7 @@ def _round_trip(
         value,
         bits=bits,
         group_size=config.group_size,
-        scale_dtype=_SCALE_DTYPES[config.scale_dtype],
+        scale_dtype=_dtype(config.scale_dtype),
         symmetric=symmetric,
     )
 
@@ -71,38 +66,9 @@ def temporal_rollout(
     refinement relies on: the residual is refreshed from the current
     prediction each step, but only the prediction path carries gradient.
     """
-    if target.ndim < 3:
-        raise ValueError("rollout target must be [..., F, H, D]")
-    if weight.ndim not in (3, 4, 5):
-        raise ValueError(
-            "weight must be [P,P,D], [P,P,H,D], or [L,P,P,H,D]"
-        )
     layered = weight.ndim == 5
-    history_axis = 1 if layered else 0
-    history_length = int(weight.shape[history_axis])
-    if int(weight.shape[history_axis + 1]) != history_length:
-        raise ValueError("temporal weight must have a square history block")
-    expected_bias = (
-        (weight.shape[0], history_length, weight.shape[-2], weight.shape[-1])
-        if layered
-        else (
-            (history_length, weight.shape[-2], weight.shape[-1])
-            if weight.ndim == 4
-            else (history_length, weight.shape[-1])
-        )
-    )
-    if tuple(bias.shape) != tuple(expected_bias):
-        raise ValueError(f"temporal bias must have shape {tuple(expected_bias)}")
-    if layered and int(target.shape[0]) != int(weight.shape[0]):
-        raise ValueError("layered temporal parameters do not match the trace")
-    if weight.ndim >= 4 and int(target.shape[-2]) != int(weight.shape[-2]):
-        raise ValueError("temporal parameters do not match the trace head count")
-    if int(target.shape[-1]) != int(weight.shape[-1]):
-        raise ValueError("temporal parameters do not match the trace head dimension")
+    history_length = int(weight.shape[1 if layered else 0])
     frames = int(target.shape[-3])
-    if history_length >= frames:
-        raise ValueError("history length must be smaller than the frame count")
-
     if history_length == 0:
         # Direct K is represented by an empty temporal map.  It still follows
         # the same anchor/residual quantization protocol as the production
@@ -205,29 +171,10 @@ def cross_kv_rollout(
     unlayered equivalents omit ``L``.  As in :func:`temporal_rollout`, the
     quantized residual is refreshed at every frame but detached by default.
     """
-    if source.shape != target.shape or target.ndim < 3:
-        raise ValueError("source and target must have matching [..., F, H, D] shapes")
     layered = weight.ndim == 4
-    expected_weight_ndim = 4 if layered else 3
-    expected_bias_ndim = 3 if layered else 2
-    if weight.ndim != expected_weight_ndim or bias.ndim != expected_bias_ndim:
-        raise ValueError("CrossKV weight and bias layouts do not match")
-    if layered and int(source.shape[0]) != int(weight.shape[0]):
-        raise ValueError("layered CrossKV parameters do not match the trace")
-    if tuple(weight.shape[-3:-1]) != tuple(bias.shape[-2:]):
-        raise ValueError("CrossKV weight and bias head dimensions do not match")
-    if int(weight.shape[-1]) != int(target.shape[-1]):
-        raise ValueError("CrossKV parameters do not match the trace head dimension")
-
-    dense_history_ndim = 5 if layered else 4
     diagonal_history_ndim = 4 if layered else 3
-    if history_weights.ndim not in {dense_history_ndim, diagonal_history_ndim}:
-        raise ValueError("CrossKV history weights must be diagonal or dense")
-    history_axis = 1 if layered else 0
-    history_length = int(history_weights.shape[history_axis])
+    history_length = int(history_weights.shape[1 if layered else 0])
     frames = int(target.shape[-3])
-    if history_length >= frames:
-        raise ValueError("history length must be smaller than the frame count")
 
     reconstructed = [
         anchor_roundtrip(target[..., 0, :, :], config)
@@ -306,10 +253,6 @@ def recover_rotation(
     independent of every RoPE implementation detail: table dtype, frame
     offsets, and block sizes are already baked into the recorded pair.
     """
-    if pre_rope.shape != post_rope.shape:
-        raise ValueError("pre- and post-RoPE tensors must have the same shape")
-    if int(pre_rope.shape[-1]) % 2:
-        raise ValueError("RoPE recovery requires an even head dimension")
     x = pre_rope[..., 0::2].float()
     y = pre_rope[..., 1::2].float()
     u = post_rope[..., 0::2].float()
@@ -406,8 +349,6 @@ def objective_terms(
 
 def normalized_errors(sums: torch.Tensor) -> dict[str, float]:
     """Turn accumulated squared-error sums into comparable NMSE values."""
-    if tuple(sums.shape) != (6,):
-        raise ValueError("expected the six accumulated objective sums")
     values = sums.detach().double().tolist()
     return {
         "key_nmse": values[0] / max(values[1], EPS),
@@ -431,8 +372,6 @@ def phase_score(
     selection rather than sharing a hidden fixed scoring rule.
     """
     metric = f"{tensor}_nmse"
-    if metric not in {"key_nmse", "value_nmse"}:
-        raise ValueError(f"phase tensor must be key or value, got {tensor!r}")
     return reconstruction_weight * errors[metric] / max(
         baseline[metric], EPS
     ) + attention_weight * errors["attention_nmse"] / max(

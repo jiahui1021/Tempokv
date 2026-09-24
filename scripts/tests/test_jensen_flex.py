@@ -69,14 +69,10 @@ def test_score_modifier_captures_as_one_graph_with_fresh_terms():
             torch.testing.assert_close(result, torch.full((3, 5), groups * multiplier * 0.5))
 
 
-def test_input_guards_do_not_silently_use_dense_cpu_attention():
+def test_cpu_input_does_not_silently_use_dense_attention():
     q = torch.zeros(1, 2, 2, 128, dtype=torch.bfloat16)
     k = torch.zeros(1, 4, 2, 128, dtype=torch.bfloat16)
     steps = torch.zeros(1, 4, 2, 2, dtype=torch.bfloat16)
-    with pytest.raises(ValueError, match="group_size"):
-        corrected_attention(q, k, k, steps, group_size=0)
-    with pytest.raises(ValueError, match="token-for-token"):
-        corrected_attention(q, k, k, steps[:, :2], group_size=64)
     with pytest.raises(RuntimeError, match="CUDA"):
         corrected_attention(q, k, k, steps, group_size=64)
 

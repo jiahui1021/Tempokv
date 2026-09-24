@@ -15,6 +15,42 @@ def _tensor(value: torch.Tensor | np.ndarray) -> torch.Tensor:
     return torch.as_tensor(value, dtype=torch.float32).detach().contiguous()
 
 
+def _layer_ids(layer_ids: Any, layers: int | None) -> tuple[int, ...] | None:
+    """Default layered parameters to layers 0..L-1; single-layer ones carry none."""
+    if layers is None:
+        return None
+    ids = tuple(range(layers)) if layer_ids is None else tuple(int(i) for i in layer_ids)
+    if len(ids) != layers or len(set(ids)) != layers:
+        raise ValueError("layer_ids must uniquely identify every parameter layer")
+    return ids
+
+
+def _metadata(data: Any) -> dict[str, Any]:
+    """Stride, layer ids and identity stamps shared by both archive kinds."""
+
+    def text(key: str) -> str | None:
+        return str(np.asarray(data[key]).item()) or None if key in data else None
+
+    stride = int(np.asarray(data["stride"]).item()) if "stride" in data else -1
+    return {
+        "stride": None if stride < 0 else stride,
+        "layer_ids": (
+            tuple(int(item) for item in data["layer_ids"])
+            if "layer_ids" in data and data["layer_ids"].size
+            else None
+        ),
+        "codec_signature": text("codec_signature"),
+        "parameter_set_id": text("parameter_set_id"),
+        "coordinate_system": text("coordinate_system"),
+    }
+
+
+def _check_kind(data: Any, expected: str) -> None:
+    kind = str(np.asarray(data["kind"]).item())
+    if kind != expected:
+        raise ValueError(f"expected {expected} parameters, got {kind!r}")
+
+
 @dataclass(frozen=True, slots=True)
 class TemporalParameters:
     """Warm-up-aware multi-history parameters, including zero-order K."""
@@ -37,7 +73,7 @@ class TemporalParameters:
             )
         history_axis = 1 if weights.ndim == 5 else 0
         history = int(weights.shape[history_axis])
-        if history < 0 or weights.shape[history_axis + 1] != history:
+        if weights.shape[history_axis + 1] != history:
             raise ValueError("history_weights must be square in its first two axes")
         if weights.ndim == 3:
             expected_bias = (history, weights.shape[-1])
@@ -49,28 +85,13 @@ class TemporalParameters:
             )
         if tuple(bias.shape) != expected_bias:
             raise ValueError(f"history_bias must have shape {expected_bias}")
-        layered = weights.ndim == 5
-        if self.stride is not None and int(self.stride) <= 0:
-            raise ValueError("stride must be positive")
-        layer_ids = self.layer_ids
-        if layered:
-            if layer_ids is None:
-                layer_ids = tuple(range(int(weights.shape[0])))
-            else:
-                layer_ids = tuple(int(item) for item in layer_ids)
-            if len(layer_ids) != weights.shape[0] or len(set(layer_ids)) != len(layer_ids):
-                raise ValueError("layer_ids must uniquely identify every parameter layer")
-        elif layer_ids is not None:
-            raise ValueError("layer_ids are only valid for layered temporal parameters")
         object.__setattr__(self, "history_weights", weights)
         object.__setattr__(self, "history_bias", bias)
-        object.__setattr__(self, "layer_ids", layer_ids)
-        if self.codec_signature is not None and not str(self.codec_signature):
-            raise ValueError("codec_signature must be non-empty")
-        if self.parameter_set_id is not None and not str(self.parameter_set_id):
-            raise ValueError("parameter_set_id must be non-empty")
-        if self.coordinate_system is not None and not str(self.coordinate_system):
-            raise ValueError("coordinate_system must be non-empty")
+        object.__setattr__(
+            self,
+            "layer_ids",
+            _layer_ids(self.layer_ids, weights.shape[0] if weights.ndim == 5 else None),
+        )
 
     @property
     def history_length(self) -> int:
@@ -105,14 +126,8 @@ class TemporalParameters:
 
     def for_layer(self, layer: int) -> "TemporalParameters":
         if not self.layered:
-            if layer not in (0, -1):
-                raise IndexError("non-layered temporal parameters only contain layer 0")
             return self
-        assert self.layer_ids is not None
-        try:
-            index = self.layer_ids.index(int(layer))
-        except ValueError as error:
-            raise IndexError(f"layer {layer} is not present in {self.layer_ids}") from error
+        index = self.layer_ids.index(int(layer))
         return TemporalParameters(
             self.history_weights[index],
             self.history_bias[index],
@@ -158,65 +173,8 @@ class TemporalParameters:
     @classmethod
     def load(cls, path: str | Path) -> "TemporalParameters":
         with np.load(path, allow_pickle=False) as data:
-            kind = str(np.asarray(data["kind"]).item())
-            if kind != "temporal":
-                raise ValueError(f"expected temporal parameters, got {kind!r}")
-            stride = int(np.asarray(data["stride"]).item()) if "stride" in data else -1
-            layer_ids = (
-                tuple(int(item) for item in data["layer_ids"])
-                if "layer_ids" in data and data["layer_ids"].size
-                else None
-            )
-            codec_signature = (
-                str(np.asarray(data["codec_signature"]).item())
-                if "codec_signature" in data
-                and str(np.asarray(data["codec_signature"]).item())
-                else None
-            )
-            parameter_set_id = (
-                str(np.asarray(data["parameter_set_id"]).item())
-                if "parameter_set_id" in data
-                and str(np.asarray(data["parameter_set_id"]).item())
-                else None
-            )
-            coordinate_system = (
-                str(np.asarray(data["coordinate_system"]).item())
-                if "coordinate_system" in data
-                and str(np.asarray(data["coordinate_system"]).item())
-                else None
-            )
-            # Reject a file from the withdrawn shared-history format by name.
-            # Its weights are [H,D] rather than [P,P,D], so the shape check
-            # below would otherwise report a confusing dimension error instead
-            # of saying that the file has to be refitted.
-            history_mode = (
-                str(np.asarray(data["history_mode"]).item())
-                if "history_mode" in data
-                else "independent"
-            )
-            if history_mode != "independent":
-                raise ValueError(
-                    f"temporal history_mode {history_mode!r} is no longer "
-                    "supported; refit the parameters with the current fitter"
-                )
-            parameters = cls(
-                data["history_weights"],
-                data["history_bias"],
-                None if stride < 0 else stride,
-                layer_ids,
-                codec_signature,
-                parameter_set_id,
-                coordinate_system,
-            )
-            if "history_length" in data:
-                declared_history_length = int(
-                    np.asarray(data["history_length"]).item()
-                )
-                if declared_history_length != parameters.history_length:
-                    raise ValueError(
-                        "history_length does not match the history_weights array"
-                    )
-            return parameters
+            _check_kind(data, "temporal")
+            return cls(data["history_weights"], data["history_bias"], **_metadata(data))
 
 
 @dataclass(frozen=True, slots=True)
@@ -304,30 +262,14 @@ class CrossKVParameters:
             raise ValueError(
                 "history_weights must contain between 0 and 5 V history maps"
             )
-        if self.stride is not None and int(self.stride) <= 0:
-            raise ValueError("stride must be positive")
-        layer_ids = self.layer_ids
-        if weight.ndim == 4:
-            if layer_ids is None:
-                layer_ids = tuple(range(int(weight.shape[0])))
-            else:
-                layer_ids = tuple(int(item) for item in layer_ids)
-            if len(layer_ids) != weight.shape[0] or len(set(layer_ids)) != len(layer_ids):
-                raise ValueError("layer_ids must uniquely identify every parameter layer")
-        elif layer_ids is not None:
-            raise ValueError("layer_ids are only valid for layered CrossKV parameters")
         object.__setattr__(self, "weight", weight)
         object.__setattr__(self, "bias", bias)
         object.__setattr__(self, "history_weights", history_weights)
-        object.__setattr__(self, "layer_ids", layer_ids)
-        if self.codec_signature is not None and not str(self.codec_signature):
-            raise ValueError("codec_signature must be non-empty")
-        if self.parameter_set_id is not None and not str(self.parameter_set_id):
-            raise ValueError("parameter_set_id must be non-empty")
-        if self.coordinate_system is not None and not str(self.coordinate_system):
-            raise ValueError("coordinate_system must be non-empty")
-        if self.projection_source not in {"cross_kv", "innovation"}:
-            raise ValueError("projection_source must be cross_kv or innovation")
+        object.__setattr__(
+            self,
+            "layer_ids",
+            _layer_ids(self.layer_ids, weight.shape[0] if weight.ndim == 4 else None),
+        )
 
     @property
     def layered(self) -> bool:
@@ -362,14 +304,8 @@ class CrossKVParameters:
 
     def for_layer(self, layer: int) -> "CrossKVParameters":
         if not self.layered:
-            if layer not in (0, -1):
-                raise IndexError("single-layer CrossKV parameters only contain layer 0")
             return self
-        assert self.layer_ids is not None
-        try:
-            index = self.layer_ids.index(int(layer))
-        except ValueError as error:
-            raise IndexError(f"layer {layer} is not present in {self.layer_ids}") from error
+        index = self.layer_ids.index(int(layer))
         return CrossKVParameters(
             self.weight[index],
             self.bias[index],
@@ -425,79 +361,21 @@ class CrossKVParameters:
     @classmethod
     def load(cls, path: str | Path) -> "CrossKVParameters":
         with np.load(path, allow_pickle=False) as data:
-            kind = str(np.asarray(data["kind"]).item())
-            if kind != "cross_kv":
-                raise ValueError(f"expected CrossKV parameters, got {kind!r}")
-            stride = int(np.asarray(data["stride"]).item()) if "stride" in data else -1
-            layer_ids = (
-                tuple(int(item) for item in data["layer_ids"])
-                if "layer_ids" in data and data["layer_ids"].size
-                else None
-            )
-            codec_signature = (
-                str(np.asarray(data["codec_signature"]).item())
-                if "codec_signature" in data
-                and str(np.asarray(data["codec_signature"]).item())
-                else None
-            )
-            parameter_set_id = (
-                str(np.asarray(data["parameter_set_id"]).item())
-                if "parameter_set_id" in data
-                and str(np.asarray(data["parameter_set_id"]).item())
-                else None
-            )
-            coordinate_system = (
-                str(np.asarray(data["coordinate_system"]).item())
-                if "coordinate_system" in data
-                and str(np.asarray(data["coordinate_system"]).item())
-                else None
-            )
-            history_weights = (
-                data["history_weights"] if "history_weights" in data else None
-            )
-            declared_history_mode = (
-                str(np.asarray(data["history_mode"]).item())
-                if "history_mode" in data
-                else None
-            )
-            projection_source = (
-                str(np.asarray(data["projection_source"]).item())
-                if "projection_source" in data
-                else "cross_kv"
-            )
-            # Name the withdrawn shared-history layout explicitly: its history
-            # weights are [H,D], so the constructor would otherwise reject them
-            # as a malformed diagonal map instead of asking for a refit.
-            if declared_history_mode == "shared_diagonal":
-                raise ValueError(
-                    "shared_diagonal V history is no longer supported; refit "
-                    "the parameters with the current fitter"
-                )
-            parameters = cls(
+            _check_kind(data, "cross_kv")
+            return cls(
                 data["weight"],
                 data["bias"],
-                None if stride < 0 else stride,
-                layer_ids,
-                codec_signature,
-                parameter_set_id,
-                coordinate_system,
-                history_weights,
-                projection_source,
+                history_weights=(
+                    data["history_weights"] if "history_weights" in data else None
+                ),
+                # Old archives predate this field and always project reconstructed K.
+                projection_source=(
+                    str(np.asarray(data["projection_source"]).item())
+                    if "projection_source" in data
+                    else "cross_kv"
+                ),
+                **_metadata(data),
             )
-            if declared_history_mode is not None:
-                if declared_history_mode != parameters.history_mode:
-                    raise ValueError(
-                        "history_mode does not match the history_weights array"
-                    )
-            if history_weights is not None and "history_length" in data:
-                declared_history_length = int(
-                    np.asarray(data["history_length"]).item()
-                )
-                if declared_history_length != parameters.history_length:
-                    raise ValueError(
-                        "history_length does not match the history_weights array"
-                    )
-            return parameters
 
 
 def load_parameters(path: str | Path) -> TemporalParameters | CrossKVParameters:

@@ -7,8 +7,7 @@ correlation TempoKV exists to exploit.  This encoder accumulates finalized
 blocks into one span so a span spends one anchor.
 
 A new anchor is emitted only at a span boundary, and only an explicit event
-creates one: construction, :meth:`reset`, :meth:`reset_span` (scene change,
-eviction gap, sink/recent discontinuity), or a full span.  Nothing is inferred
+creates one: construction, :meth:`reset`, or a full span.  Nothing is inferred
 from timesteps or block indices.
 
 Batch mode holds a span in BF16 until it is complete, then packs it in one
@@ -95,16 +94,6 @@ class StreamingTempoKVEncoder:
         """First frame not yet packed (incremental mode)."""
         return self._encoded_frame
 
-    @property
-    def open_units(self) -> int:
-        """Frames packed into the span that is still open."""
-        return self._open_units
-
-    @property
-    def open_capacity(self) -> int:
-        """Frames the open span will hold before it closes."""
-        return self._open_capacity
-
     def layer_history_bytes(self, layer_index: int) -> int:
         """Dense predictor history one layer's open span keeps alive."""
         if self._open_encoders is None:
@@ -135,20 +124,6 @@ class StreamingTempoKVEncoder:
         self._encoded_frame = 0
         self._close_open_span()
         self.report.reset_cache()
-
-    def reset_span(self, *, at_frame: int | None = None) -> None:
-        """Force the next packed span to start a new anchor.
-
-        Call this whenever the temporal chain is genuinely broken — an evicted
-        interior range, a sink/recent boundary, a scene reset.  Any frames
-        already accumulated for the current span stay BF16 and are dropped from
-        the predictor chain rather than being predicted across the break.
-        """
-        self._span_start_frame = (
-            self._finalized_frame if at_frame is None else at_frame
-        )
-        self._encoded_frame = self._span_start_frame
-        self._close_open_span()
 
     # -- driving ---------------------------------------------------------
 

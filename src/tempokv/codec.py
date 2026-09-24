@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Literal
+from typing import Any, Literal
 import warnings
 
 import torch
@@ -53,74 +53,6 @@ class PackedTensor:
     # Mean-split K spans store the per-channel mean [B, H, D] subtracted
     # before prediction; decode adds it back after reconstruction.
     channel_mean: torch.Tensor | None = None
-
-    def __post_init__(self) -> None:
-        batch, heads, sequence, width = self.shape
-        if min(batch, heads, sequence, width) <= 0:
-            raise ValueError("packed shape must be positive")
-        if width % self.group_size:
-            raise ValueError("group_size must divide the head dimension")
-        if sum(self.unit_lengths) != sequence or not self.unit_lengths:
-            raise ValueError("unit_lengths must exactly cover the sequence")
-        if any(length <= 0 or length > self.stride for length in self.unit_lengths):
-            raise ValueError("unit lengths must be in [1, stride]")
-        if any(length != self.stride for length in self.unit_lengths[:-1]):
-            raise ValueError("only the final packed unit may be shorter than stride")
-        if self.predictor_kind == "temporal" and self.temporal is None:
-            raise ValueError("temporal packed state is missing predictor parameters")
-        if self.predictor_kind == "cross_kv" and self.cross_kv is None:
-            raise ValueError("CrossKV packed state is missing predictor parameters")
-        if self.predictor_kind == "innovation" and (
-            self.temporal is None or self.cross_kv is None
-        ):
-            raise ValueError(
-                "innovation packed state needs K temporal and V projection parameters"
-            )
-        if self.cross_kv is not None and self.predictor_kind in {
-            "cross_kv",
-            "innovation",
-        }:
-            expected_source = (
-                "innovation" if self.predictor_kind == "innovation" else "cross_kv"
-            )
-            if self.cross_kv.projection_source != expected_source:
-                raise ValueError(
-                    f"{self.predictor_kind} packed state requires projection_source="
-                    f"{expected_source}"
-                )
-        if self.temporal is not None and self.temporal.layered:
-            raise ValueError("packed temporal parameters must contain one selected layer")
-        if self.cross_kv is not None and self.cross_kv.layered:
-            raise ValueError("packed CrossKV parameters must contain one selected layer")
-        if self.cross_matmul_precision not in {"ieee", "tf32"}:
-            raise ValueError("cross_matmul_precision must be ieee or tf32")
-        if self.compatibility_mode not in {"native", "legacy"}:
-            raise ValueError("compatibility_mode must be native or legacy")
-        if self.anchor_bits == RAW_ANCHOR_BITS:
-            # The width alone cannot tell codes from values, and a packed state
-            # built under the older INT16 reading has the same anchor_bits.
-            # Both decoders read this tensor as values, so a mismatch here
-            # would reinterpret code bytes as floats and decode the anchor span
-            # to garbage without raising.
-            if self.anchor_quant.dtype != _dtype(self.reconstruction_dtype):
-                raise ValueError(
-                    "an unquantized anchor must be stored in "
-                    f"{self.reconstruction_dtype}, got {self.anchor_quant.dtype}"
-                )
-            if int(self.anchor_quant.shape[-1]) != width:
-                raise ValueError(
-                    "an unquantized anchor stores one value per channel, "
-                    f"expected width {width}, got {self.anchor_quant.shape[-1]}"
-                )
-            if self.anchor_scale.numel():
-                raise ValueError("an unquantized anchor has no group scale")
-        has_residual = len(self.unit_lengths) > 1
-        if has_residual != (self.residual_quant is not None):
-            raise ValueError("residual tensors do not match unit layout")
-        if self.residual_mode == "asymmetric" and has_residual:
-            if self.residual_zero_point is None:
-                raise ValueError("asymmetric residuals require zero points")
-        _dtype(self.reconstruction_dtype)
 
     def step_sizes(self) -> torch.Tensor:
         """Per-token per-group quantizer step size, shaped ``[B, H, S, D/g]``.
@@ -212,34 +144,6 @@ class PackedKV:
     key: PackedTensor
     value: PackedTensor
 
-    # Exactly one side carries the cross dependency, and which side that is
-    # depends on ``predictor_direction``: forward runs K temporal / V cross,
-    # mirrored runs V temporal / K cross.  Both orientations are accepted here
-    # and the pair is rejected only when neither side predicts temporally,
-    # which would leave the cross source undefined.
-    _SOURCE_KINDS = {"cross_kv", "innovation"}
-
-    def __post_init__(self) -> None:
-        kinds = (self.key.predictor_kind, self.value.predictor_kind)
-        if self.key.predictor_kind in self._SOURCE_KINDS:
-            if self.value.predictor_kind != "temporal":
-                raise ValueError(
-                    "a CrossKV-predicted K needs a temporally predicted V to "
-                    f"project from, got {kinds}"
-                )
-        elif self.value.predictor_kind in self._SOURCE_KINDS:
-            if self.key.predictor_kind != "temporal":
-                raise ValueError(
-                    "a CrossKV-predicted V needs a temporally predicted K to "
-                    f"project from, got {kinds}"
-                )
-        elif not set(kinds) <= {"temporal", "direct"}:
-            raise ValueError(f"unsupported PackedKV predictor pair {kinds}")
-        if self.key.shape != self.value.shape:
-            raise ValueError("packed K and V must have the same shape")
-        if self.key.reconstruction_dtype != self.value.reconstruction_dtype:
-            raise ValueError("packed K and V must use the same reconstruction dtype")
-
 
 def _dtype(name: str) -> torch.dtype:
     return {
@@ -249,13 +153,6 @@ def _dtype(name: str) -> torch.dtype:
     }[name]
 
 
-def _validate_input(value: torch.Tensor, config: CodecConfig) -> None:
-    if value.ndim != 4:
-        raise ValueError(f"expected [B,H,S,D], got {tuple(value.shape)}")
-    if value.shape[-1] % config.group_size:
-        raise ValueError("group_size must divide the head dimension")
-
-
 def predict_temporal(
     history: list[torch.Tensor],
     parameters: TemporalParameters,
@@ -263,10 +160,6 @@ def predict_temporal(
     legacy: bool = False,
 ) -> torch.Tensor:
     """Predict one unit from newest-to-oldest reconstructed K units."""
-    if not history:
-        raise ValueError("temporal prediction requires reconstructed history")
-    if parameters.layered:
-        raise ValueError("select one layer before using temporal parameters")
     order = min(len(history), parameters.history_length)
     weights = parameters.history_weights[order - 1, :order].to(history[0].device)
     bias = parameters.history_bias[order - 1].to(history[0].device)
@@ -275,8 +168,6 @@ def predict_temporal(
         if parameters.per_head:
             # Legacy layer_head K: the same out-of-place FP32 accumulation as
             # the shared predictor, with one coefficient row per head.
-            if weights.shape[1] != history[0].shape[1]:
-                raise ValueError("per-head temporal parameters do not match the cache")
             head_shape = (1, weights.shape[1], 1, weights.shape[-1])
             for index in range(order):
                 prediction += history[index].float() * weights[index].view(head_shape)
@@ -290,8 +181,6 @@ def predict_temporal(
             *([1] * (history[0].ndim - 1)), history[0].shape[-1]
         )
     if parameters.per_head:
-        if weights.shape[1] != history[0].shape[1]:
-            raise ValueError("per-head temporal parameters do not match the cache")
         for index in range(order):
             prediction.addcmul_(
                 history[index], weights[index][None, :, None, :]
@@ -319,21 +208,6 @@ def reconstructed_key_innovation(
     Every later unit subtracts the same prediction the K decoder can reproduce,
     then rounds the innovation to reconstructed K's dtype before V projects it.
     """
-    if reconstructed_key.ndim != 4:
-        raise ValueError("reconstructed K must have shape [B,H,S,D]")
-    if not unit_lengths or sum(unit_lengths) != reconstructed_key.shape[2]:
-        raise ValueError("unit_lengths must exactly cover reconstructed K")
-    if any(length <= 0 for length in unit_lengths):
-        raise ValueError("unit_lengths must be positive")
-    if parameters.layered:
-        raise ValueError("select one K temporal layer before building innovation")
-    if parameters.history_length < 1:
-        raise ValueError("K innovation requires a temporal K predictor")
-    if parameters.stride is not None and any(
-        length != parameters.stride for length in unit_lengths[:-1]
-    ):
-        raise ValueError("K temporal parameters do not match innovation unit lengths")
-
     innovation = torch.zeros_like(reconstructed_key)
     anchor_length = unit_lengths[0]
     history = [reconstructed_key[:, :, :anchor_length]]
@@ -371,12 +245,8 @@ def cross_projection(
     replaces both.  Encoder and decoder must call this the same way, otherwise
     the residual is quantized against a prediction the decoder cannot rebuild.
     """
-    if parameters.layered:
-        raise ValueError("select one layer before using CrossKV parameters")
     weight = parameters.weight.to(source.device)
     bias = parameters.bias.to(source.device)
-    if source.shape[1] != weight.shape[0] or source.shape[-1] != weight.shape[-1]:
-        raise ValueError("CrossKV parameters do not match cache heads/head dimension")
     batch, heads, tokens, dim = source.shape
     with _cuda_matmul_precision(source.device, matmul_precision):
         # Head-major and contiguous: the cache read is usually a strided
@@ -409,23 +279,12 @@ def predict_cross_kv(
     ``projection`` supplies ``Cross(K)+bias`` computed for this unit ahead of
     time by :func:`cross_projection`; the recurrence then costs no GEMM at all.
     """
-    if parameters.layered:
-        raise ValueError("select one layer before using CrossKV parameters")
     resolved_history = () if history is None else tuple(history)
     order = min(len(resolved_history), parameters.history_length)
-    for previous in resolved_history[:order]:
-        if tuple(previous.shape) != tuple(source.shape):
-            raise ValueError("reconstructed K and V history must have the same shape")
-        if previous.device != source.device:
-            raise ValueError("reconstructed K and V history must be on the same device")
     weight = parameters.weight.to(source.device)
     bias = parameters.bias.to(source.device)
-    if source.shape[1] != weight.shape[0] or source.shape[-1] != weight.shape[-1]:
-        raise ValueError("CrossKV parameters do not match cache heads/head dimension")
     with _cuda_matmul_precision(source.device, matmul_precision):
         if projection is not None:
-            if tuple(projection.shape) != tuple(source.shape):
-                raise ValueError("projection must cover exactly this unit")
             prediction = projection if legacy else projection.clone()
         elif legacy:
             prediction = torch.matmul(
@@ -439,26 +298,21 @@ def predict_cross_kv(
             prediction = torch.matmul(source.float(), weight)
             prediction.add_(bias[None, :, None, :])
         for lag, previous in enumerate(resolved_history[:order]):
-                history_weight = parameters.history_weights[lag].to(source.device)
-                if parameters.history_diagonal:
-                    if legacy:
-                        prediction = prediction + history_weight.view(
-                            1, source.shape[1], 1, source.shape[-1]
-                        ) * previous.float()
-                    else:
-                        prediction.addcmul_(
-                            previous, history_weight[None, :, None, :]
-                        )
-                else:
-                    prediction.add_(torch.matmul(previous.float(), history_weight))
+            history_weight = parameters.history_weights[lag].to(source.device)
+            if not parameters.history_diagonal:
+                prediction.add_(torch.matmul(previous.float(), history_weight))
+            elif legacy:
+                prediction = prediction + history_weight.view(
+                    1, source.shape[1], 1, source.shape[-1]
+                ) * previous.float()
+            else:
+                prediction.addcmul_(previous, history_weight[None, :, None, :])
     return prediction
 
 
 @contextmanager
 def _cuda_matmul_precision(device: torch.device, precision: str):
     """Apply one explicit FP32 GEMM policy around a CrossKV projection."""
-    if precision not in {"ieee", "tf32"}:
-        raise ValueError("matmul precision must be ieee or tf32")
     if device.type != "cuda":
         yield
         return
@@ -530,8 +384,6 @@ def _dequantize(
     mode: str,
 ) -> torch.Tensor:
     if mode == "asymmetric":
-        if zero_point is None:
-            raise ValueError("asymmetric residual is missing zero points")
         return dequantize_asymmetric(
             quant, scale, zero_point, bits, group_size, width, torch.float32
         )
@@ -553,64 +405,28 @@ def _encode(
     history_length: int | None = None,
     channel_mean: bool = False,
 ) -> tuple[PackedTensor, torch.Tensor]:
-    _validate_input(value, config)
     batch, heads, sequence, width = map(int, value.shape)
     stride = min(config.stride, sequence)
     scale_dtype = _dtype(config.scale_dtype)
     reconstruction_dtype = _dtype(config.reconstruction_dtype)
     span_mean: torch.Tensor | None = None
     if channel_mean:
-        if predictor_kind != "temporal":
-            raise ValueError("channel-mean encoding is only supported for K")
         # The mean is stored at reconstruction dtype so encoder and decoder
         # add back bit-identical values.
         span_mean = (
             value.float().mean(dim=2, keepdim=True).to(reconstruction_dtype)
         )
         value = (value.float() - span_mean).to(reconstruction_dtype)
-    if reuse_input_for_reconstruction and value.dtype != reconstruction_dtype:
-        raise ValueError(
-            "in-place reconstruction requires input dtype to match "
-            f"{reconstruction_dtype}, got {value.dtype}"
-        )
     if predictor_kind == "temporal":
-        if temporal is None:
-            raise ValueError("temporal encoding requires temporal parameters")
         temporal = temporal.with_history_length(
             config.k_history_length if history_length is None else history_length
-        )
-        if temporal.stride is not None and temporal.stride != config.stride:
-            raise ValueError("temporal parameters were fitted for a different stride")
-        temporal = temporal.to(value.device)
+        ).to(value.device)
     else:
-        if cross_kv is None or source is None:
-            raise ValueError("V encoding requires projection parameters and reconstructed K")
-        if tuple(source.shape) != tuple(value.shape):
-            raise ValueError("reconstructed K and V must have the same shape")
-        if source.device != value.device:
-            raise ValueError("reconstructed K and V must be on the same device")
-        if source.dtype != reconstruction_dtype:
-            raise ValueError(
-                "reconstructed K dtype must match config.reconstruction_dtype "
-                f"{reconstruction_dtype}, got {source.dtype}"
-            )
-        if cross_kv.stride is not None and cross_kv.stride != config.stride:
-            raise ValueError("CrossKV parameters were fitted for a different stride")
-        cross_kv = cross_kv.with_history_length(config.v_history_length)
-        cross_kv = cross_kv.to(value.device)
-        expected_source = "innovation" if predictor_kind == "innovation" else "cross_kv"
-        if cross_kv.projection_source != expected_source:
-            raise ValueError(
-                f"{predictor_kind} encoding requires projection_source="
-                f"{expected_source}, got {cross_kv.projection_source}"
-            )
+        cross_kv = cross_kv.with_history_length(config.v_history_length).to(value.device)
         if predictor_kind == "innovation":
-            if temporal is None:
-                raise ValueError("innovation encoding requires K temporal parameters")
-            temporal = temporal.with_history_length(config.k_history_length)
-            if temporal.stride is not None and temporal.stride != config.stride:
-                raise ValueError("K temporal parameters were fitted for a different stride")
-            temporal = temporal.to(value.device)
+            temporal = temporal.with_history_length(config.k_history_length).to(
+                value.device
+            )
             source = reconstructed_key_innovation(
                 source,
                 temporal,
@@ -725,7 +541,6 @@ def _encode(
         unit_length = min(stride, sequence - offset)
         current = value[:, :, offset : offset + unit_length]
         if predictor_kind == "temporal":
-            assert temporal is not None
             if temporal.history_length == 0:
                 # Zero-order K is the direct-quantization ablation. Keep the
                 # temporal packed-state contract while spending all residual
@@ -738,7 +553,6 @@ def _encode(
                     legacy=config.fit_mode == "legacy",
                 )
         else:
-            assert cross_kv is not None and source is not None
             prediction = predict_cross_kv(
                 source[:, :, offset : offset + unit_length],
                 cross_kv,
@@ -778,18 +592,15 @@ def _encode(
                     *history[: temporal.history_length - 1],
                 ]
         else:
-            assert cross_kv is not None
             if cross_kv.history_length:
                 history = [
                     rebuilt_history,
                     *history[: cross_kv.history_length - 1],
                 ]
         residual_end = residual_offset + unit_length
-        assert residual_quant is not None and residual_scale is not None
         residual_quant[:, :, residual_offset:residual_end].copy_(quant)
         residual_scale[:, :, residual_offset:residual_end].copy_(scale)
         if zero_point is not None:
-            assert residual_zero_point is not None
             residual_zero_point[:, :, residual_offset:residual_end].copy_(zero_point)
         residual_offset = residual_end
         unit_lengths.append(unit_length)
@@ -841,12 +652,8 @@ class IncrementalTensorEncoder:
         *,
         capacity_units: int,
     ) -> None:
-        if capacity_units < len(packed.unit_lengths):
-            raise ValueError("incremental capacity is smaller than the prefix")
-        # Span-mean K only knows its mean once the span is complete, and K
-        # innovation needs a continuation-aware source; neither can be appended.
-        if packed.channel_mean is not None or packed.predictor_kind == "innovation":
-            raise ValueError("this predictor has no incremental form")
+        # Span-mean K and innovation V have no incremental form; the streaming
+        # encoder keeps them on the batch schedule.
         self.packed = packed
         self.cache_role: str | None = None
         self.capacity_units = capacity_units
@@ -875,9 +682,7 @@ class IncrementalTensorEncoder:
     @property
     def _history_length(self) -> int:
         if self.packed.predictor_kind == "temporal":
-            assert self.packed.temporal is not None
             return int(self.packed.temporal.history_length)
-        assert self.packed.cross_kv is not None
         return int(self.packed.cross_kv.history_length)
 
     @property
@@ -933,8 +738,6 @@ class IncrementalTensorEncoder:
         )
         used = self.packed.shape[2] - self.packed.stride
         if used:
-            assert self.packed.residual_quant is not None
-            assert self.packed.residual_scale is not None
             quant_storage[:, :, :used].copy_(
                 self.packed.residual_quant[:, :, :used]
             )
@@ -942,7 +745,6 @@ class IncrementalTensorEncoder:
                 self.packed.residual_scale[:, :, :used]
             )
             if zero_storage is not None:
-                assert self.packed.residual_zero_point is not None
                 zero_storage[:, :, :used].copy_(
                     self.packed.residual_zero_point[:, :, :used]
                 )
@@ -971,11 +773,7 @@ class IncrementalTensorEncoder:
         reuse_input_for_reconstruction: bool = False,
     ) -> torch.Tensor:
         """Append one or more complete units and return their reconstruction."""
-        if value.shape[2] % self.packed.stride:
-            raise ValueError("incremental append must contain complete units")
         appended_units = value.shape[2] // self.packed.stride
-        if self.units + appended_units > self.capacity_units:
-            raise ValueError("incremental append exceeds the span capacity")
         self._ensure_capacity(self.units + appended_units)
         reconstruction_dtype = _dtype(self.packed.reconstruction_dtype)
         reconstruction = (
@@ -985,23 +783,14 @@ class IncrementalTensorEncoder:
         )
 
         if self.packed.predictor_kind == "temporal":
-            if source is not None:
-                raise ValueError("temporal incremental encoding does not use a source")
             projection = None
         else:
-            if source is None or tuple(source.shape) != tuple(value.shape):
-                raise ValueError("CrossKV incremental source must match the append")
-            if source.dtype != reconstruction_dtype or source.device != value.device:
-                raise ValueError("CrossKV incremental source dtype/device mismatch")
-            assert self.packed.cross_kv is not None
             projection = cross_projection(
                 source,
                 self.packed.cross_kv,
                 matmul_precision=self.packed.cross_matmul_precision,
             )
 
-        assert self.packed.residual_quant is not None
-        assert self.packed.residual_scale is not None
         residual_offset = self.packed.shape[2] - self.packed.stride
         output_offset = 0
         new_lengths = list(self.packed.unit_lengths)
@@ -1009,7 +798,6 @@ class IncrementalTensorEncoder:
             unit_length = self.packed.stride
             current = value[:, :, output_offset : output_offset + unit_length]
             if self.packed.predictor_kind == "temporal":
-                assert self.packed.temporal is not None
                 if self.packed.temporal.history_length == 0:
                     prediction = torch.zeros_like(current, dtype=torch.float32)
                 else:
@@ -1019,9 +807,6 @@ class IncrementalTensorEncoder:
                         legacy=self.packed.compatibility_mode == "legacy",
                     )
             else:
-                assert source is not None
-                assert projection is not None
-                assert self.packed.cross_kv is not None
                 source_unit = source[
                     :, :, output_offset : output_offset + unit_length
                 ]
@@ -1064,7 +849,6 @@ class IncrementalTensorEncoder:
                 :, :, residual_offset:residual_end
             ].copy_(scale)
             if zero_point is not None:
-                assert self.packed.residual_zero_point is not None
                 self.packed.residual_zero_point[
                     :, :, residual_offset:residual_end
                 ].copy_(zero_point)
@@ -1163,42 +947,6 @@ def encode_innovation(
     )
 
 
-def _direct_output_shape(
-    packed_shape: tuple[int, int, int, int],
-    output_layout: str,
-) -> tuple[int, int, int, int]:
-    batch, heads, sequence, width = packed_shape
-    if output_layout == "BHSD":
-        return batch, heads, sequence, width
-    if output_layout == "BSHD":
-        return batch, sequence, heads, width
-    raise ValueError(
-        f"direct decode output_layout must be 'BHSD' or 'BSHD', got {output_layout!r}"
-    )
-
-
-def _has_non_overlapping_positive_strides(tensor: torch.Tensor) -> bool:
-    """Return whether a strided output is safe for independent kernel stores.
-
-    A sequence slice of a larger BSHD/BHSD allocation is commonly not dense:
-    its batch or head stride still includes the omitted suffix.  Sorting the
-    dimensions by stride and requiring every dimension to start beyond the
-    complete span of the faster dimensions accepts those slices while
-    conservatively rejecting overlapping ``as_strided`` views.
-    """
-    dimensions = sorted(
-        (stride, size)
-        for size, stride in zip(tensor.shape, tensor.stride())
-        if size > 1
-    )
-    covered_span = 1
-    for stride, size in dimensions:
-        if stride <= 0 or stride < covered_span:
-            return False
-        covered_span += (size - 1) * stride
-    return all(stride > 0 for stride in tensor.stride())
-
-
 def decode_tensor(
     packed: PackedTensor,
     *,
@@ -1211,72 +959,26 @@ def decode_tensor(
 ) -> torch.Tensor:
     """Decode a packed cache, using Triton when its CUDA path is available.
 
-    ``output_tensor`` may be a non-overlapping positive-stride BHSD or BSHD
-    view.  ``output_layout`` describes that physical target and defaults to the
-    historical BSHD direct-output API.  The returned tensor remains BHSD so a
-    reconstructed K can always be passed directly as the CrossKV ``source``.
+    ``output_tensor`` may be a strided BHSD or BSHD view with non-overlapping
+    positive strides; ``output_layout`` names its layout.  The returned tensor
+    is always BHSD, so a reconstructed K can be passed straight on as the
+    CrossKV ``source``.
     """
-    stored_dtype = _dtype(packed.reconstruction_dtype)
-    if output_dtype is None:
-        output_dtype = stored_dtype
-    elif output_dtype != stored_dtype:
-        raise ValueError(
-            "decode dtype must match the closed-loop reconstruction dtype "
-            f"{stored_dtype}, got {output_dtype}"
+    # Decoding replays the closed loop, so it always produces the dtype the
+    # encoder reconstructed in.
+    output_dtype = _dtype(packed.reconstruction_dtype)
+    if packed.predictor_kind == "innovation":
+        source = reconstructed_key_innovation(
+            source,
+            packed.temporal,
+            packed.unit_lengths,
+            legacy=packed.compatibility_mode == "legacy",
         )
-    expected_shape = _direct_output_shape(packed.shape, output_layout)
-    if output_tensor is not None:
-        if tuple(output_tensor.shape) != expected_shape:
-            layout_shape = "[B,S,H,D]" if output_layout == "BSHD" else "[B,H,S,D]"
-            raise ValueError(
-                f"direct decode output must use {layout_shape} shape "
-                f"{expected_shape}, got {tuple(output_tensor.shape)}"
-            )
-        if output_tensor.device != packed.anchor_quant.device:
-            raise ValueError("direct decode output must be on the packed tensor device")
-        if output_tensor.dtype != output_dtype:
-            raise ValueError(
-                f"direct decode output must use {output_dtype}, got {output_tensor.dtype}"
-            )
-        if not _has_non_overlapping_positive_strides(output_tensor):
-            raise ValueError(
-                "direct decode output must have non-overlapping positive strides"
-            )
-    if packed.predictor_kind in {"cross_kv", "innovation"}:
-        if source is None:
-            raise ValueError("V decoding requires reconstructed K")
-        if tuple(source.shape) != packed.shape:
-            raise ValueError("reconstructed K does not match the packed V shape")
-        if source.device != packed.anchor_quant.device:
-            raise ValueError("reconstructed K and packed V must be on the same device")
-        if source.dtype != stored_dtype:
-            raise ValueError(
-                "reconstructed K dtype must match the packed V reconstruction dtype "
-                f"{stored_dtype}, got {source.dtype}"
-            )
-        if packed.predictor_kind == "innovation":
-            if packed.temporal is None:
-                raise ValueError("innovation decoding is missing K temporal parameters")
-            source = reconstructed_key_innovation(
-                source,
-                packed.temporal,
-                packed.unit_lengths,
-                legacy=packed.compatibility_mode == "legacy",
-            )
     # Legacy mode picks its decode route deliberately, so a silent PyTorch
     # fallback would hide both a correctness and a throughput regression.
     effective_strict_triton = (
         strict_triton or packed.compatibility_mode == "legacy"
     )
-    # Every Triton route projects Cross(K) inside its own kernel, so the
-    # batched projection is built only if the Torch decoder is reached.
-    needs_projection = (
-        packed.predictor_kind in {"cross_kv", "innovation"}
-        and packed.cross_kv is not None
-        and source is not None
-        and len(packed.unit_lengths) > 1
-    )
-    projection = None
     if use_triton and packed.anchor_quant.is_cuda:
         try:
             from .triton_ops import decode as decode_triton
@@ -1332,24 +1034,25 @@ def decode_tensor(
         if packed.channel_mean is not None:
             output.add_(packed.channel_mean.unsqueeze(2))
         return output
-    assert packed.residual_scale is not None
     history = (
         [anchor]
         if packed.compatibility_mode == "legacy"
         else [output[:, :, :anchor_length]]
     )
     del anchor
-    if needs_projection and projection is None:
-        projection = cross_projection(
-            source,
-            packed.cross_kv,
-            matmul_precision=packed.cross_matmul_precision,
+    # Every Triton route projects Cross(K) inside its own kernel, so the
+    # batched projection is built only when the Torch decoder is reached.
+    projection = (
+        cross_projection(
+            source, packed.cross_kv, matmul_precision=packed.cross_matmul_precision
         )
+        if packed.predictor_kind != "temporal"
+        else None
+    )
     offset = anchor_length
     residual_offset = 0
     for unit_length in packed.unit_lengths[1:]:
         if packed.predictor_kind == "temporal":
-            assert packed.temporal is not None
             if packed.temporal.history_length == 0:
                 prediction = torch.zeros(
                     output.shape[0],
@@ -1366,8 +1069,6 @@ def decode_tensor(
                     legacy=packed.compatibility_mode == "legacy",
                 )
         else:
-            if source is None or packed.cross_kv is None:
-                raise ValueError("CrossKV decoding requires reconstructed K")
             prediction = predict_cross_kv(
                 source[:, :, offset : offset + unit_length],
                 packed.cross_kv,
@@ -1409,7 +1110,6 @@ def decode_tensor(
                     *history[: packed.temporal.history_length - 1],
                 ]
         else:
-            assert packed.cross_kv is not None
             if packed.cross_kv.history_length:
                 history = [
                     rebuilt_history,
@@ -1421,6 +1121,55 @@ def decode_tensor(
     if packed.channel_mean is not None:
         output.add_(packed.channel_mean.unsqueeze(2))
     return output
+
+
+def check_parameters_match_config(
+    temporal: TemporalParameters,
+    cross_kv: CrossKVParameters | TemporalParameters,
+    config: CodecConfig,
+) -> None:
+    """Refuse parameters fitted for a different codec configuration.
+
+    Every fitted file carries the signature of the config it was fitted under,
+    so running INT2-fitted predictors against an INT4 config -- the mix-up an
+    overwritten parameter directory produces -- fails here instead of quietly
+    producing wrong numbers.  Hand-built parameters carry no stamp.
+    """
+    expected = config.format_signature()
+    for name, parameters in (("K", temporal), ("V", cross_kv)):
+        signature = parameters.codec_signature
+        if signature is not None and signature != expected:
+            raise ValueError(
+                f"{name} parameters were fitted for codec {signature!r}, but this "
+                f"run is configured as {expected!r}; refit them or point at the "
+                "parameter directory that matches this config"
+            )
+    # One stamped and one unstamped file means a fresh fit was paired with a
+    # leftover from an older run; two unstamped files compare equal.
+    if temporal.parameter_set_id != cross_kv.parameter_set_id:
+        raise ValueError(
+            "K and V parameters come from different fitting runs "
+            f"({temporal.parameter_set_id!r} vs {cross_kv.parameter_set_id!r})"
+        )
+    if (
+        temporal.coordinate_system is not None
+        and cross_kv.coordinate_system is not None
+        and temporal.coordinate_system != cross_kv.coordinate_system
+    ):
+        raise ValueError(
+            "K and V parameters use different coordinate systems: "
+            f"{temporal.coordinate_system!r} vs {cross_kv.coordinate_system!r}"
+        )
+    if isinstance(cross_kv, CrossKVParameters):
+        expected_source = (
+            "innovation" if config.v_predictor_mode == "innovation" else "cross_kv"
+        )
+        if cross_kv.projection_source != expected_source:
+            raise ValueError(
+                f"v_predictor_mode={config.v_predictor_mode} requires V "
+                f"projection_source={expected_source}, got "
+                f"{cross_kv.projection_source}"
+            )
 
 
 class TempoKVCodec:
@@ -1438,94 +1187,33 @@ class TempoKVCodec:
         self.k_channel_mean = os.environ.get("TEMPOKV_K_MEAN_SPLIT") == "1"
         expects_temporal_v = is_temporal_v_predictor(self.config.v_predictor_mode)
         if expects_temporal_v != isinstance(cross_kv, TemporalParameters):
-            expected = "TemporalParameters" if expects_temporal_v else "CrossKVParameters"
             raise ValueError(
-                f"v_predictor_mode={self.config.v_predictor_mode} requires V "
-                f"parameters of type {expected}, got {type(cross_kv).__name__}"
+                f"v_predictor_mode={self.config.v_predictor_mode} does not match "
+                f"V parameters of type {type(cross_kv).__name__}"
             )
-        if isinstance(cross_kv, CrossKVParameters):
-            expected_source = (
-                "innovation"
-                if self.config.v_predictor_mode == "innovation"
-                else "cross_kv"
-            )
-            if cross_kv.projection_source != expected_source:
-                raise ValueError(
-                    f"v_predictor_mode={self.config.v_predictor_mode} requires V "
-                    f"projection_source={expected_source}, got "
-                    f"{cross_kv.projection_source}"
-                )
-        temporal = temporal.with_history_length(self.config.k_history_length)
-        cross_kv = cross_kv.with_history_length(self.config.v_history_length)
-        self.temporal = temporal
-        self.v_parameters = cross_kv
-        expected_signature = self.config.format_signature()
-        for name, parameters in (("K", self.temporal), ("V", self.v_parameters)):
-            signature = parameters.codec_signature
-            if signature is not None and signature != expected_signature:
-                raise ValueError(
-                    f"{name} parameters were fitted with a different codec config"
-                )
-        if (
-            self.temporal.codec_signature is not None
-            and self.v_parameters.codec_signature is not None
-            and self.temporal.codec_signature != self.v_parameters.codec_signature
-        ):
-            raise ValueError("K and V parameters use different codec configs")
-        if (
-            self.temporal.parameter_set_id is not None
-            and self.v_parameters.parameter_set_id is not None
-            and self.temporal.parameter_set_id != self.v_parameters.parameter_set_id
-        ):
-            raise ValueError("K and V parameters were not fitted together")
-        if (
-            self.temporal.coordinate_system is not None
-            and self.v_parameters.coordinate_system is not None
-            and self.temporal.coordinate_system != self.v_parameters.coordinate_system
-        ):
-            raise ValueError("K and V parameters use different coordinate systems")
-        self._temporal_by_device: dict[str, TemporalParameters] = {}
-        self._cross_by_device: dict[
-            str, CrossKVParameters | TemporalParameters
-        ] = {}
-        # Per (device, layer) caches so every packed span shares the same
-        # single-layer parameter object instead of building a fresh copy.
-        self._temporal_layer_cache: dict[tuple[str, int], TemporalParameters] = {}
-        self._cross_layer_cache: dict[
-            tuple[str, int], CrossKVParameters | TemporalParameters
-        ] = {}
+        check_parameters_match_config(temporal, cross_kv, self.config)
+        self.temporal = temporal.with_history_length(self.config.k_history_length)
+        self.v_parameters = cross_kv.with_history_length(self.config.v_history_length)
+        # One single-layer parameter object per (device, layer), shared by
+        # every packed span instead of rebuilt per encode.
+        self._layer_cache: dict[tuple[str, str, int], Any] = {}
 
-    def _temporal_for_layer(
-        self, device: torch.device, layer: int
-    ) -> TemporalParameters:
-        device_key = str(device)
-        cache_key = (device_key, layer)
-        cached = self._temporal_layer_cache.get(cache_key)
-        if cached is not None:
-            return cached
-        parameters = self._temporal_by_device.get(device_key)
-        if parameters is None:
-            parameters = self.temporal.to(device)
-            self._temporal_by_device[device_key] = parameters
-        selected = parameters.for_layer(layer) if parameters.layered else parameters
-        self._temporal_layer_cache[cache_key] = selected
-        return selected
+    def _for_layer(self, role: str, device: torch.device, layer: int) -> Any:
+        key = (role, str(device), layer)
+        cached = self._layer_cache.get(key)
+        if cached is None:
+            parameters = (self.temporal if role == "k" else self.v_parameters).to(device)
+            cached = parameters.for_layer(layer) if parameters.layered else parameters
+            self._layer_cache[key] = cached
+        return cached
+
+    def _temporal_for_layer(self, device: torch.device, layer: int) -> TemporalParameters:
+        return self._for_layer("k", device, layer)
 
     def _cross_for_layer(
         self, device: torch.device, layer: int
     ) -> CrossKVParameters | TemporalParameters:
-        device_key = str(device)
-        cache_key = (device_key, layer)
-        cached = self._cross_layer_cache.get(cache_key)
-        if cached is not None:
-            return cached
-        parameters = self._cross_by_device.get(device_key)
-        if parameters is None:
-            parameters = self.v_parameters.to(device)
-            self._cross_by_device[device_key] = parameters
-        selected = parameters.for_layer(layer) if parameters.layered else parameters
-        self._cross_layer_cache[cache_key] = selected
-        return selected
+        return self._for_layer("v", device, layer)
 
     def encode_key(
         self,
@@ -1685,7 +1373,6 @@ class TempoKVCodec:
         """Encode V and retain the exact decoder-visible reconstruction."""
         parameters = self._cross_for_layer(value.device, layer)
         if not self.predicts_v_from_key:
-            assert isinstance(parameters, TemporalParameters)
             return encode_temporal(
                 value,
                 parameters,
@@ -1694,9 +1381,6 @@ class TempoKVCodec:
                 bits=self.config.v_bits,
                 history_length=self.config.v_history_length,
             )
-        if reconstructed_key is None:
-            raise ValueError("key-conditioned V encoding requires the reconstructed K")
-        assert isinstance(parameters, CrossKVParameters)
         if self.config.v_predictor_mode == "innovation":
             key_parameters = self._temporal_for_layer(value.device, layer)
             return encode_innovation(
@@ -1719,10 +1403,6 @@ class TempoKVCodec:
     def encode(
         self, key: torch.Tensor, value: torch.Tensor, *, layer: int = 0
     ) -> PackedKV:
-        if tuple(key.shape) != tuple(value.shape):
-            raise ValueError("K and V must have the same shape")
-        if key.device != value.device:
-            raise ValueError("K and V must be on the same device")
         # Under the mirrored direction V leads and K is projected from it, so
         # address the pair by role and put the results back under their own
         # names.

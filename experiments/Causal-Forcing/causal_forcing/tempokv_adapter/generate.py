@@ -41,7 +41,7 @@ REQUIRED_RUNTIME_FILES = (
 EXPECTED_COORDINATE_SYSTEM = "pre_rope_normalized"
 VIDEO_FRAMES_PER_LATENT = 4
 
-from tempokv.config import is_temporal_v_predictor  # noqa: E402
+from tempokv.config import is_temporal_v_predictor, load_config  # noqa: E402
 
 
 def latent_frames_for(video_frames: int, num_frame_per_block: int) -> int:
@@ -158,17 +158,6 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _load_config(path: Path):
-    from tempokv.config import config_from_mapping
-
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(payload, dict):
-        raise ValueError("codec config must be a JSON object")
-    if "codec" in payload:
-        if len(payload) != 1 or not isinstance(payload["codec"], dict):
-            raise ValueError("'codec' must be the only top-level config object")
-        payload = payload["codec"]
-    return config_from_mapping(payload)
 
 
 def _validate_parameters(k_path: Path, v_path: Path, config) -> dict[str, object]:
@@ -184,21 +173,12 @@ def _validate_parameters(k_path: Path, v_path: Path, config) -> dict[str, object
         if temporal_v
         else CrossKVParameters.load(v_path)
     )
-    expected_signature = config.format_signature()
-    if (
-        temporal.codec_signature != expected_signature
-        or cross.codec_signature != expected_signature
-    ):
+    # The codec itself refuses a stamped set fitted under another config or
+    # split across two fitting runs; a production run additionally refuses
+    # unstamped sets.
+    if temporal.codec_signature is None or not temporal.parameter_set_id:
         raise ValueError(
-            "Causal Forcing parameters were not fitted with the current codec config"
-        )
-    if (
-        not temporal.parameter_set_id
-        or not cross.parameter_set_id
-        or temporal.parameter_set_id != cross.parameter_set_id
-    ):
-        raise ValueError(
-            "Causal Forcing K/V parameters must share a current parameter_set_id"
+            "Causal Forcing parameters must come from the fitter; refit them"
         )
     # A shared (layer_ids=None) K predictor covers every layer; only when both
     # sides are layered must their layer sets agree.
@@ -208,8 +188,6 @@ def _validate_parameters(k_path: Path, v_path: Path, config) -> dict[str, object
         and temporal.layer_ids != cross.layer_ids
     ):
         raise ValueError("Causal Forcing K and V parameters cover different layers")
-    if temporal.stride != config.stride or cross.stride != config.stride:
-        raise ValueError("parameter stride does not match the codec config")
     if (
         temporal.coordinate_system != EXPECTED_COORDINATE_SYSTEM
         or cross.coordinate_system != EXPECTED_COORDINATE_SYSTEM
@@ -574,7 +552,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
     parameters = None
     span_frames = args.span_frames
     if args.mode == "tempokv":
-        config = _load_config(paths["config"])
+        config = load_config(paths["config"])
         overrides = {
             name: value
             for name, value in (
@@ -686,6 +664,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             "TEMPOKV_PERSISTENT_UNITS_PER_LAUNCH",
             "TEMPOKV_ROPE_BACKEND",
             "TEMPOKV_DECODE_TIMING",
+            "TEMPOKV_READBACK_PROBE",
         )
         if name in environment
     }

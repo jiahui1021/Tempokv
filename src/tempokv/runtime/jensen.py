@@ -47,8 +47,6 @@ def _work_dtype(tensor: torch.Tensor) -> torch.dtype:
 def query_channels(query: torch.Tensor, group_size: int) -> torch.Tensor:
     """The ``G`` extra query channels, for ``query`` shaped ``[..., D]``."""
     dim = int(query.shape[-1])
-    if dim % group_size:
-        raise ValueError("group_size must divide the head dimension")
     work = query.to(_work_dtype(query))
     norms = work.pow(2).reshape(*query.shape[:-1], -1, group_size).sum(-1)
     return -norms / (24.0 * math.sqrt(dim))
@@ -77,24 +75,11 @@ def augment(
     ``pad_to`` widens the augmented head dimension with zero channels, for
     backends that only accept particular head dimensions.
     """
-    if query.shape[-1] != key.shape[-1]:
-        raise ValueError("query and key must share a head dimension")
-    if step_sizes.shape[:-1] != key.shape[:-1]:
-        raise ValueError(
-            f"step sizes {tuple(step_sizes.shape)} do not align with keys "
-            f"{tuple(key.shape)}"
-        )
     dim = int(query.shape[-1])
     groups = dim // group_size
-    if step_sizes.shape[-1] != groups:
-        raise ValueError(
-            f"step sizes carry {step_sizes.shape[-1]} groups, expected {groups}"
-        )
     extra_query = query_channels(query, group_size).to(query.dtype)
     extra_key = key_channels(step_sizes).to(key.dtype)
     width = dim + groups if pad_to is None else pad_to
-    if width < dim + groups:
-        raise ValueError(f"pad_to={pad_to} cannot hold {dim + groups} channels")
     padding = width - dim - groups
     parts_query = [query, extra_query]
     parts_key = [key, extra_key]

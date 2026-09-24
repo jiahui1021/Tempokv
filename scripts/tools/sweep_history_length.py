@@ -68,9 +68,9 @@ from analyze_predictor import (  # noqa: E402
     reconstruct_v,
 )
 from tempokv.config import (  # noqa: E402
+    load_config,
     FIXED_TEMPORAL_PREDICTOR_MIN_HISTORY,
     CodecConfig,
-    config_from_mapping,
     fixed_temporal_predictor_mode,
     is_cross_kv_v_predictor,
     is_temporal_v_predictor,
@@ -81,13 +81,6 @@ K_HISTORY_CHOICES = tuple(range(0, 9))
 V_HISTORY_CHOICES = tuple(range(0, 6))
 
 
-def _load_config(path: Path) -> CodecConfig:
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    if "codec" in payload:
-        if len(payload) != 1:
-            raise ValueError("'codec' must be the only top-level config object")
-        payload = payload["codec"]
-    return config_from_mapping(payload)
 
 
 def _int_list(raw: str, *, name: str, allowed: tuple[int, ...]) -> tuple[int, ...]:
@@ -479,7 +472,7 @@ def main(argv: list[str] | None = None) -> int:
         else None
     )
     device = _resolve_device(args.device)
-    base = _load_config(args.config)
+    base = load_config(args.config)
     if base.fit_mode != "legacy":
         parser.error("history sweep requires fit_mode=legacy")
     if base.cross_kv_weight_mode != "layer_shared":

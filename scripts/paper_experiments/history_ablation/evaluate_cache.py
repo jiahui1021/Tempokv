@@ -28,22 +28,12 @@ from analyze_predictor import (  # noqa: E402
     reconstruct_v,
 )
 from tempokv.config import (  # noqa: E402
-    CodecConfig,
-    config_from_mapping,
+    load_config,
     is_temporal_v_predictor,
 )
 from tempokv.parameters import CrossKVParameters, TemporalParameters  # noqa: E402
 
 
-def _load_config(path: Path) -> CodecConfig:
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(payload, dict):
-        raise ValueError("codec config must be a JSON object")
-    if "codec" in payload:
-        if len(payload) != 1 or not isinstance(payload["codec"], dict):
-            raise ValueError("'codec' must be the only top-level config object")
-        payload = payload["codec"]
-    return config_from_mapping(payload)
 
 
 def _device(name: str) -> torch.device:
@@ -91,7 +81,7 @@ def evaluate(
     device_name: str = "auto",
 ) -> dict[str, Any]:
     device = _device(device_name)
-    config = _load_config(config_path)
+    config = load_config(config_path)
     with np.load(trace_path, allow_pickle=False) as archive:
         missing = [name for name in ("keys", "values") if name not in archive]
         if missing:

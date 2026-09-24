@@ -12,19 +12,6 @@ import torch
 MAX_BITS = 16
 
 
-def _validate(value: torch.Tensor, bits: int, group_size: int) -> None:
-    _validate_bits(bits)
-    if value.ndim != 4:
-        raise ValueError(f"expected [B,H,S,D], got {tuple(value.shape)}")
-    if group_size <= 0 or value.shape[-1] % group_size:
-        raise ValueError("group_size must divide the head dimension")
-
-
-def _validate_bits(bits: int) -> None:
-    if not 1 <= bits <= MAX_BITS:
-        raise ValueError(f"bits must be between 1 and {MAX_BITS}")
-
-
 def code_dtype(bits: int) -> torch.dtype:
     """Smallest integer dtype that holds one unsigned ``bits``-wide code."""
     return torch.uint8 if bits <= 8 else torch.int32
@@ -47,10 +34,7 @@ def _pack(values: torch.Tensor, bits: int) -> torch.Tensor:
     cross a byte boundary, and unused low bits in the final byte are zero.
     This is byte-for-byte compatible with the previous INT2/INT4/INT8 layout.
     """
-    _validate_bits(bits)
     width = int(values.shape[-1])
-    if width <= 0:
-        raise ValueError("width must be positive")
     packed_width = (width * bits + 7) // 8
     if 8 % bits == 0:
         if bits == 8:
@@ -104,14 +88,7 @@ def _pack(values: torch.Tensor, bits: int) -> torch.Tensor:
 
 def _unpack(packed: torch.Tensor, bits: int, width: int) -> torch.Tensor:
     """Reverse :func:`_pack` for an explicitly supplied logical width."""
-    _validate_bits(bits)
-    if width <= 0:
-        raise ValueError("width must be positive")
     expected_width = (width * bits + 7) // 8
-    if packed.shape[-1] != expected_width:
-        raise ValueError(
-            f"packed width must be {expected_width} bytes for {width} INT{bits} values"
-        )
     if 8 % bits == 0:
         if bits == 8:
             return packed.to(torch.uint8)
@@ -152,7 +129,6 @@ def quantize_symmetric(
     group_size: int,
     scale_dtype: torch.dtype,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    _validate(value, bits, group_size)
     groups = value.float().reshape(*value.shape[:-1], -1, group_size)
     if bits == 1:
         # Binary symmetric quantization has no exact zero code.  Use a stable
@@ -229,7 +205,6 @@ def quantize_asymmetric(
     group_size: int,
     scale_dtype: torch.dtype,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    _validate(value, bits, group_size)
     groups = value.float().reshape(*value.shape[:-1], -1, group_size)
     zeros = torch.zeros_like(groups[..., :1])
     low = torch.minimum(groups.amin(dim=-1, keepdim=True), zeros)

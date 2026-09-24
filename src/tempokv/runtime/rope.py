@@ -14,9 +14,8 @@ start and only then concatenated: rotating `[0, 1, 100, 101]` as if it were
 The ``native`` (complex128) rotation of a CUDA BF16 read runs as one Triton
 kernel (:mod:`tempokv.runtime.rope_triton`) instead of the per-block PyTorch
 sequence below, which streams a float64 copy of the whole read through memory
-several times.  ``TEMPOKV_ROPE_BACKEND=torch`` keeps the PyTorch sequence;
-``triton`` requires the kernel; the default ``auto`` uses it whenever it
-applies.
+several times.  ``TEMPOKV_ROPE_BACKEND=torch`` keeps the PyTorch sequence for A/B runs; by
+default the kernel is used whenever it applies.
 """
 
 from __future__ import annotations
@@ -36,41 +35,17 @@ ROPE_BACKEND_ENV = "TEMPOKV_ROPE_BACKEND"
 _VERIFIED_FUSED: set[tuple[Any, ...]] = set()
 
 
-def rope_backend() -> str:
-    backend = os.environ.get(ROPE_BACKEND_ENV, "auto")
-    if backend not in {"auto", "torch", "triton"}:
-        raise ValueError(f"{ROPE_BACKEND_ENV} must be auto, torch or triton")
-    return backend
-
-
 def _fused_rotation(
     x: torch.Tensor, result: torch.Tensor, freqs: torch.Tensor, precision: str
 ) -> Any | None:
     """The fused kernel module when it reproduces this rotation, else None."""
-    backend = rope_backend()
-    if backend == "torch":
+    if os.environ.get(ROPE_BACKEND_ENV, "auto") == "torch":
         return None
-    required = backend == "triton"
     if precision != "native" or not x.is_cuda:
-        if required:
-            raise ValueError(
-                "the Triton RoPE kernel covers the native precision on CUDA only"
-            )
         return None
-    try:
-        from . import rope_triton
-    except ImportError:
-        if required:
-            raise
-        return None
-    if not rope_triton.supports(x, result, freqs):
-        if required:
-            raise ValueError(
-                "the Triton RoPE kernel needs BF16 input and output with a "
-                "contiguous head dimension and a complex128 RoPE table"
-            )
-        return None
-    return rope_triton
+    from . import rope_triton
+
+    return rope_triton if rope_triton.supports(x, result, freqs) else None
 
 
 def _rotate_frames(
@@ -91,13 +66,6 @@ def _rotate_frames(
     precision: str,
 ) -> None:
     heads = x.size(2)
-    if absolute_start_frame + num_frames > temporal.shape[0]:
-        raise ValueError(
-            f"RoPE table supports {temporal.shape[0]} frames, requested "
-            f"[{absolute_start_frame}, {absolute_start_frame + num_frames})"
-        )
-    if precision not in {"native", "complex64"}:
-        raise ValueError("RoPE precision must be native or complex64")
     work_dtype = torch.float32 if precision == "complex64" else torch.float64
     # The native path follows upstream causal_rope_apply in complex128.  The
     # legacy long cached-K reader intentionally converts each model block to
@@ -223,47 +191,19 @@ def apply_rope_by_span(
     so rotating a cache read in place is safe and saves a tensor the size of
     the whole resident range on every forward.
     """
-    if x.ndim != 4:
-        raise ValueError("RoPE input must have shape [B,S,H,D]")
-    if grid_sizes.ndim != 2 or grid_sizes.shape[1] != 3:
-        raise ValueError("grid_sizes must have shape [B,3]")
-    if grid_sizes.shape[0] != x.shape[0]:
-        raise ValueError(
-            f"grid_sizes batch {grid_sizes.shape[0]} does not match input batch "
-            f"{x.shape[0]}"
-        )
-    if torch.any(grid_sizes <= 0):
-        raise ValueError("grid sizes must be positive")
     spans = list(spans)
-    if not spans:
-        raise ValueError("RoPE requires at least one cache span")
     channels = x.size(3) // 2
     temporal, height_freqs, width_freqs = freqs.split(
         [channels - 2 * (channels // 3), channels // 3, channels // 3], dim=1
     )
-    if out is None:
-        result = torch.empty_like(x)
-    else:
-        if out.shape != x.shape or out.dtype != x.dtype:
-            raise ValueError("RoPE output buffer must match the input")
-        result = out
+    result = torch.empty_like(x) if out is None else out
     fused = _fused_rotation(x, result, freqs, precision)
     for batch_index, (model_block_frames, height, width) in enumerate(
         grid_sizes.tolist()
     ):
         tokens_per_frame = height * width
-        if x.shape[1] % tokens_per_frame:
-            raise ValueError("cached sequence is not frame aligned")
-        total_frames = sum(span.num_frames for span in spans)
-        if total_frames * tokens_per_frame != x.shape[1]:
-            raise ValueError(
-                f"spans cover {total_frames} frames but the cache read holds "
-                f"{x.shape[1] // tokens_per_frame}"
-            )
         block_frames = max(1, int(model_block_frames))
         if fused is not None:
-            if max(height, width) > temporal.shape[0]:
-                raise ValueError("RoPE table is smaller than the latent grid")
             _verify_fused_rotation(
                 fused,
                 freqs,
@@ -280,6 +220,8 @@ def apply_rope_by_span(
         token_start = 0
         for span in spans:
             if fused is not None:
+                # The kernel has no bounds check, so a frame past the table
+                # would read unrelated memory instead of failing.
                 if span.global_start_frame + span.num_frames > temporal.shape[0]:
                     raise ValueError(
                         f"RoPE table supports {temporal.shape[0]} frames, "
@@ -330,10 +272,6 @@ def causal_rope_apply_long_input(
 ) -> torch.Tensor:
     """Rotate one contiguous pre-RoPE cache read starting at ``start_frame``."""
     tokens_per_frame = int(grid_sizes[0][1]) * int(grid_sizes[0][2])
-    if tokens_per_frame <= 0:
-        raise ValueError("grid sizes must be positive")
-    if x.shape[1] % tokens_per_frame:
-        raise ValueError("cached sequence is not frame aligned")
     frames = x.shape[1] // tokens_per_frame
     return apply_rope_by_span(
         x,
@@ -345,9 +283,4 @@ def causal_rope_apply_long_input(
     )
 
 
-__all__ = [
-    "ROPE_BACKEND_ENV",
-    "apply_rope_by_span",
-    "causal_rope_apply_long_input",
-    "rope_backend",
-]
+__all__ = ["ROPE_BACKEND_ENV", "apply_rope_by_span", "causal_rope_apply_long_input"]

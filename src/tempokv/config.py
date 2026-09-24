@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+from pathlib import Path
 from typing import Any, Mapping
 
 # Storing the anchor as INT16 codes costs 16 bits per element *plus* the group
@@ -11,41 +12,26 @@ from typing import Any, Mapping
 # ``reconstruction_dtype``, which is exactly 16 bits per element and exact.
 RAW_ANCHOR_BITS = 16
 
-# The dtypes for which "16 bits" is the honest description of a stored value.
-RAW_ANCHOR_DTYPES = frozenset({"bfloat16", "float16"})
-
-
-# Settings that existed in an earlier format and no longer do.  A hand-written
-# config, or a ``runtime_config.json`` stored alongside an older run, would
-# otherwise fail with an unexpected-keyword ``TypeError`` that does not say what
-# to remove.
-WITHDRAWN_SETTINGS = {
-    "k_max_history_length": "shared-history K parameters were removed",
-    "v_max_history_length": "shared-history V parameters were removed",
-}
-
-
 # Fixed temporal predictors are used symmetrically for K and V.  CrossKV V
 # variants add the source projection while retaining the selected fixed V
 # history recurrence.
 FIXED_TEMPORAL_PREDICTOR_MODES = frozenset({"identity", "taylor", "taylor2"})
 FIXED_TEMPORAL_PREDICTOR_MIN_HISTORY = {"identity": 1, "taylor": 2, "taylor2": 3}
-FIXED_TEMPORAL_V_PREDICTOR_MODES = FIXED_TEMPORAL_PREDICTOR_MODES
 FIXED_CROSS_KV_V_PREDICTOR_MODES = frozenset(
     {f"cross_kv_{mode}" for mode in FIXED_TEMPORAL_PREDICTOR_MODES}
 )
-FIXED_V_PREDICTOR_MODES = (
-    FIXED_TEMPORAL_V_PREDICTOR_MODES | FIXED_CROSS_KV_V_PREDICTOR_MODES
-)
 TEMPORAL_V_PREDICTOR_MODES = frozenset(
-    {"temporal", "direct", *FIXED_TEMPORAL_V_PREDICTOR_MODES}
+    {"temporal", "direct", *FIXED_TEMPORAL_PREDICTOR_MODES}
 )
 CROSS_KV_V_PREDICTOR_MODES = frozenset(
     {"cross_kv", "innovation", *FIXED_CROSS_KV_V_PREDICTOR_MODES}
 )
-V_PREDICTOR_MODES = frozenset(
-    {*TEMPORAL_V_PREDICTOR_MODES, *CROSS_KV_V_PREDICTOR_MODES}
+V_PREDICTOR_MODES = TEMPORAL_V_PREDICTOR_MODES | CROSS_KV_V_PREDICTOR_MODES
+K_PREDICTOR_MODES = frozenset(
+    {"layer_head", "shared", "direct", *FIXED_TEMPORAL_PREDICTOR_MODES}
 )
+CROSS_KV_WEIGHT_MODES = frozenset({"layer_head", "layer_shared", "head_shared", "shared"})
+DTYPES = frozenset({"float32", "float16", "bfloat16"})
 
 
 def is_temporal_v_predictor(mode: str) -> bool:
@@ -63,14 +49,9 @@ def is_fixed_temporal_predictor(mode: str) -> bool:
     return mode in FIXED_TEMPORAL_PREDICTOR_MODES
 
 
-def is_fixed_temporal_v_predictor(mode: str) -> bool:
-    """Return whether a V mode has deterministic, non-fitted coefficients."""
-    return mode in FIXED_TEMPORAL_V_PREDICTOR_MODES
-
-
 def is_fixed_v_predictor(mode: str) -> bool:
     """Return whether a V mode has deterministic temporal coefficients."""
-    return mode in FIXED_V_PREDICTOR_MODES
+    return fixed_temporal_predictor_mode(mode) is not None
 
 
 def fixed_temporal_predictor_mode(mode: str) -> str | None:
@@ -83,22 +64,13 @@ def fixed_temporal_predictor_mode(mode: str) -> str | None:
 
 
 def config_from_mapping(payload: Mapping[str, Any]) -> "CodecConfig":
-    """Build a codec config from parsed JSON, naming withdrawn settings."""
-    withdrawn = sorted(set(payload) & set(WITHDRAWN_SETTINGS))
-    if withdrawn:
-        raise ValueError(
-            "this codec config uses settings that no longer exist: "
-            + "; ".join(
-                f"{name} ({WITHDRAWN_SETTINGS[name]})" for name in withdrawn
-            )
-            + " — remove them and refit if the parameters were shared"
-        )
+    """Build a codec config from parsed JSON.
+
+    A config that does not name a fitting family is legacy, because every
+    shipped config and fitted parameter set is; the remaining defaults then
+    follow the family, so writing ``fit_mode`` is enough to pick one.
+    """
     resolved = dict(payload)
-    # Both families are selectable.  A config that does not name one is legacy,
-    # because that is what every shipped config and every fitted parameter set
-    # uses; the remaining defaults then follow the family rather than being
-    # guessed from unrelated settings, so writing ``fit_mode`` is enough to
-    # pick a family and nothing else has to be restated.
     resolved.setdefault("fit_mode", "legacy")
     if resolved["fit_mode"] == "legacy":
         resolved.setdefault("k_predictor_mode", "shared")
@@ -107,6 +79,19 @@ def config_from_mapping(payload: Mapping[str, Any]) -> "CodecConfig":
         resolved.setdefault("k_predictor_mode", "layer_head")
         resolved.setdefault("cross_kv_weight_mode", "layer_head")
     return CodecConfig(**resolved)
+
+
+def read_config_payload(path: str | Path) -> dict[str, Any]:
+    """Read a codec config JSON file, unwrapping an optional ``codec`` object."""
+    payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    return dict(payload.get("codec", payload))
+
+
+def load_config(
+    path: str | Path, overrides: Mapping[str, Any] | None = None
+) -> "CodecConfig":
+    """Load a codec config file, with individual settings optionally replaced."""
+    return config_from_mapping({**read_config_payload(path), **(overrides or {})})
 
 
 @dataclass(frozen=True, slots=True)
@@ -215,250 +200,99 @@ class CodecConfig:
         if resolved_fit_mode == "legacy" and self.k_history_length is None:
             object.__setattr__(self, "k_history_length", 2)
 
-        # Coerce the integral settings before anything reads them.  A float
-        # that happens to be whole (``4.0`` from JSON) used to survive into the
-        # config, reach quantization or a reshape as a float, and produce a
-        # different parameter signature from the identical integer config.
-        integral = ["k_bits", "v_bits", "anchor_bits", "group_size", "stride",
-                    "v_history_length"]
-        if self.k_history_length is not None:
-            integral.append("k_history_length")
-        for name in integral:
+        # JSON can spell an integer as ``4.0``; coerce so the signature matches
+        # the identical integer config.
+        for name in ("k_bits", "v_bits", "anchor_bits", "group_size", "stride",
+                     "v_history_length", "k_history_length"):
             value = getattr(self, name)
-            if isinstance(value, bool) or int(value) != value:
-                raise ValueError(f"{name} must be a whole number, got {value!r}")
-            object.__setattr__(self, name, int(value))
-        if not isinstance(self.jensen_correction, bool):
-            raise ValueError("jensen_correction must be a boolean")
-        for name in ("k_bits", "v_bits"):
-            value = getattr(self, name)
-            if not 1 <= value <= 8:
-                raise ValueError(f"{name} must be an integer from 1 to 8, got {value}")
-        # The anchor is one span in every unit, and it is the only reconstruction
-        # the residuals are predicted from, so trading its width against the
-        # residual width is a real knob.  1 through 15 are quantized codes; 16
-        # is the unquantized anchor described at RAW_ANCHOR_BITS.
-        if not 1 <= self.anchor_bits <= RAW_ANCHOR_BITS:
-            raise ValueError(
-                f"anchor_bits must be an integer from 1 to {RAW_ANCHOR_BITS}, "
-                f"got {self.anchor_bits}"
-            )
-        if self.group_size <= 0:
-            raise ValueError("group_size must be positive")
-        if self.stride <= 0:
-            raise ValueError("stride must be positive")
-        if (
-            isinstance(self.v_history_length, bool)
-            or int(self.v_history_length) != self.v_history_length
-            or not 0 <= int(self.v_history_length) <= 5
-        ):
-            raise ValueError("v_history_length must be an integer from 0 to 5")
-        if self.k_history_length is not None and (
-            isinstance(self.k_history_length, bool)
-            or int(self.k_history_length) != self.k_history_length
-            or int(self.k_history_length) < 0
-            or int(self.k_history_length) > 8
-        ):
-            raise ValueError("k_history_length must be an integer from 0 to 8 or null")
-        if self.residual_mode not in {"symmetric", "asymmetric"}:
-            raise ValueError("residual_mode must be symmetric or asymmetric")
-        supported_dtypes = {"float32", "float16", "bfloat16"}
-        if self.scale_dtype not in supported_dtypes:
-            raise ValueError("scale_dtype must be float32, float16, or bfloat16")
-        if self.reconstruction_dtype not in supported_dtypes:
-            raise ValueError(
-                "reconstruction_dtype must be float32, float16, or bfloat16"
-            )
-        # Checked after the dtype itself is validated, so an unsupported dtype
-        # is reported as the dtype problem it is rather than as an anchor
-        # problem.
-        if (
-            self.anchor_bits == RAW_ANCHOR_BITS
-            and self.reconstruction_dtype not in RAW_ANCHOR_DTYPES
-        ):
-            raise ValueError(
-                "anchor_bits=16 stores the anchor unquantized in "
-                "reconstruction_dtype, so it needs a 16-bit "
-                f"reconstruction_dtype, not {self.reconstruction_dtype}"
-            )
-        if self.cross_matmul_precision not in {"ieee", "tf32"}:
-            raise ValueError("cross_matmul_precision must be ieee or tf32")
-        if self.k_predictor_mode not in {
-            "layer_head",
-            "shared",
-            "direct",
-            *FIXED_TEMPORAL_PREDICTOR_MODES,
-        }:
-            raise ValueError(
-                "k_predictor_mode must be layer_head, shared, identity, taylor, "
-                "taylor2, or direct"
-            )
-        if self.k_predictor_mode == "direct":
-            if self.k_history_length != 0:
-                raise ValueError(
-                    "k_predictor_mode=direct requires k_history_length=0"
-                )
-        elif self.k_history_length == 0:
-            raise ValueError(
-                "k_history_length=0 requires k_predictor_mode=direct"
-            )
-        k_minimum_history = FIXED_TEMPORAL_PREDICTOR_MIN_HISTORY.get(
-            self.k_predictor_mode
-        )
-        if (
-            k_minimum_history is not None
-            and self.k_history_length is not None
-            and self.k_history_length < k_minimum_history
-        ):
-            raise ValueError(
-                f"k_predictor_mode={self.k_predictor_mode} needs "
-                f"k_history_length >= {k_minimum_history}"
-            )
-        if self.v_predictor_mode not in V_PREDICTOR_MODES:
-            raise ValueError(
-                "v_predictor_mode must be cross_kv, temporal, identity, taylor, "
-                "taylor2, cross_kv_identity, cross_kv_taylor, "
-                "cross_kv_taylor2, innovation, or direct"
-            )
-        if self.v_predictor_mode == "direct" and self.v_history_length:
-            raise ValueError(
-                "v_predictor_mode=direct requires v_history_length=0 "
-                "(pure quantization, no V predictor)"
-            )
-        if self.cross_kv_weight_mode not in {
-            "layer_head",
-            "layer_shared",
-            "head_shared",
-            "shared",
-        }:
-            raise ValueError(
-                "cross_kv_weight_mode must be layer_head, layer_shared, "
-                "head_shared, or shared"
-            )
-        if self.predictor_direction not in {"k_to_v", "v_to_k"}:
-            raise ValueError("predictor_direction must be k_to_v or v_to_k")
-        if self.predictor_direction == "v_to_k":
-            # The mirror only means something when there is a cross term to
-            # point the other way; every other V mode ignores the source
-            # tensor entirely, so the flag would silently do nothing.
-            if self.v_predictor_mode != "cross_kv":
-                raise ValueError(
-                    "predictor_direction=v_to_k requires v_predictor_mode=cross_kv"
-                )
-            # Relaxed: asymmetric K/V widths under the mirror are allowed (the
-            # caller owns the interpretation that bit budget no longer matches
-            # 1:1 after the role exchange). cross_kv source is still required.
+            if value is not None:
+                if isinstance(value, bool) or int(value) != value:
+                    raise ValueError(f"{name} must be a whole number, got {value!r}")
+                object.__setattr__(self, name, int(value))
+        self._validate()
+
+    def _validate(self) -> None:
+        def require(condition: bool, message: str) -> None:
+            if not condition:
+                raise ValueError(message)
+
+        require(1 <= self.k_bits <= 8 and 1 <= self.v_bits <= 8,
+                "k_bits and v_bits must be from 1 to 8")
+        # 1 through 15 are quantized anchor codes; 16 is the unquantized anchor
+        # described at RAW_ANCHOR_BITS, which needs a 16-bit storage dtype.
+        require(1 <= self.anchor_bits <= RAW_ANCHOR_BITS,
+                f"anchor_bits must be from 1 to {RAW_ANCHOR_BITS}")
+        require(self.group_size > 0 and self.stride > 0,
+                "group_size and stride must be positive")
+        require(0 <= self.v_history_length <= 5, "v_history_length must be from 0 to 5")
+        require(self.k_history_length is None or 0 <= self.k_history_length <= 8,
+                "k_history_length must be from 0 to 8 or null")
+        require(self.residual_mode in {"symmetric", "asymmetric"},
+                "residual_mode must be symmetric or asymmetric")
+        require(self.scale_dtype in DTYPES and self.reconstruction_dtype in DTYPES,
+                "scale_dtype and reconstruction_dtype must be float32, float16 or bfloat16")
+        require(not self.raw_anchor or self.reconstruction_dtype != "float32",
+                "anchor_bits=16 stores the anchor unquantized in reconstruction_dtype, "
+                "so it needs a 16-bit reconstruction_dtype")
+        require(self.cross_matmul_precision in {"ieee", "tf32"},
+                "cross_matmul_precision must be ieee or tf32")
+        require(self.k_predictor_mode in K_PREDICTOR_MODES,
+                f"k_predictor_mode must be one of {sorted(K_PREDICTOR_MODES)}")
+        require((self.k_predictor_mode == "direct") == (self.k_history_length == 0),
+                "k_predictor_mode=direct and k_history_length=0 go together")
+        require(self.v_predictor_mode in V_PREDICTOR_MODES,
+                f"v_predictor_mode must be one of {sorted(V_PREDICTOR_MODES)}")
+        require(self.v_predictor_mode != "direct" or not self.v_history_length,
+                "v_predictor_mode=direct requires v_history_length=0")
+        require(self.cross_kv_weight_mode in CROSS_KV_WEIGHT_MODES,
+                f"cross_kv_weight_mode must be one of {sorted(CROSS_KV_WEIGHT_MODES)}")
+        require(self.predictor_direction in {"k_to_v", "v_to_k"},
+                "predictor_direction must be k_to_v or v_to_k")
+        # The mirror only means something when there is a cross term to point
+        # the other way; every other V mode ignores the source tensor.
+        require(self.predictor_direction == "k_to_v" or self.v_predictor_mode == "cross_kv",
+                "predictor_direction=v_to_k requires v_predictor_mode=cross_kv")
         # A V predictor that reads its own history has nothing to consume when
-        # the history is empty.  Fixed Taylor modes also require enough history
-        # to express the requested finite-difference order; silently falling
-        # back to identity would make the named ablation misleading.
-        if is_temporal_v_predictor(self.v_predictor_mode) and (
-            self.v_predictor_mode != "direct" and self.v_history_length < 1
+        # the history is empty, and a fixed Taylor mode needs enough history for
+        # its finite-difference order; silently falling back would make the
+        # named ablation misleading.
+        require(not is_temporal_v_predictor(self.v_predictor_mode)
+                or self.v_predictor_mode == "direct" or self.v_history_length >= 1,
+                f"v_predictor_mode={self.v_predictor_mode} needs v_history_length >= 1")
+        for role, mode, history in (
+            ("k", self.k_predictor_mode, self.k_history_length),
+            ("v", fixed_temporal_predictor_mode(self.v_predictor_mode), self.v_history_length),
         ):
-            raise ValueError(
-                f"v_predictor_mode={self.v_predictor_mode} needs "
-                "v_history_length >= 1"
-            )
-        minimum_history = FIXED_TEMPORAL_PREDICTOR_MIN_HISTORY.get(
-            fixed_temporal_predictor_mode(self.v_predictor_mode)
-        )
-        if minimum_history is not None and self.v_history_length < minimum_history:
-            raise ValueError(
-                f"v_predictor_mode={self.v_predictor_mode} needs "
-                f"v_history_length >= {minimum_history}"
-            )
+            minimum = FIXED_TEMPORAL_PREDICTOR_MIN_HISTORY.get(mode)
+            require(minimum is None or history is None or history >= minimum,
+                    f"{role}_predictor_mode={mode} needs {role}_history_length >= {minimum}")
+
+        if self.fit_mode == "native":
+            require(self.cross_kv_weight_mode == "layer_head",
+                    "native fitting only supports cross_kv_weight_mode=layer_head")
+            require(self.k_predictor_mode != "shared",
+                    "k_predictor_mode=shared requires fit_mode=legacy")
+            require(self.v_predictor_mode != "innovation",
+                    "v_predictor_mode=innovation requires fit_mode=legacy")
+            return
+        # Legacy reproduces the reference implementation, which fixes the
+        # quantizer grouping and dtypes; bit widths, anchor width and stride
+        # stay free.
+        require(self.k_history_length is not None,
+                "legacy fitting requires an explicit k_history_length")
+        require(self.group_size == 64, "legacy fitting requires group_size=64")
+        require(self.residual_mode == "asymmetric",
+                "legacy fitting requires asymmetric residuals")
+        require(self.scale_dtype == "bfloat16" and self.reconstruction_dtype == "bfloat16",
+                "legacy fitting requires bfloat16 scales and reconstruction")
         if self.v_predictor_mode == "innovation":
-            if self.fit_mode != "legacy":
-                raise ValueError("v_predictor_mode=innovation requires fit_mode=legacy")
-            if self.k_predictor_mode != "shared":
-                raise ValueError(
-                    "v_predictor_mode=innovation requires k_predictor_mode=shared"
-                )
-            if self.cross_kv_weight_mode != "layer_shared":
-                raise ValueError(
-                    "v_predictor_mode=innovation requires "
-                    "cross_kv_weight_mode=layer_shared"
-                )
-        requires_shared_cross = (
-            self.v_predictor_mode in FIXED_CROSS_KV_V_PREDICTOR_MODES
-            or self.v_predictor_mode == "innovation"
-            or (
-                is_temporal_v_predictor(self.v_predictor_mode)
-                and self.v_predictor_mode != "direct"
-            )
-        )
-        if (
-            self.fit_mode == "legacy"
-            and requires_shared_cross
-            and self.cross_kv_weight_mode != "layer_shared"
-        ):
-            raise ValueError(
-                "temporal V configurations must use "
-                "cross_kv_weight_mode=layer_shared"
-            )
-        if self.fit_mode not in {"native", "legacy"}:
-            raise ValueError("fit_mode must be native or legacy")
-        if self.cross_kv_weight_mode != "layer_head" and self.fit_mode != "legacy":
-            raise ValueError(
-                f"cross_kv_weight_mode={self.cross_kv_weight_mode} "
-                "requires fit_mode=legacy; native fitting does not support "
-                "shared CrossKV weights"
-            )
-        if (
-            self.k_predictor_mode == "shared"
-            and self.fit_mode != "legacy"
-        ):
-            raise ValueError(
-                "k_predictor_mode=shared requires fit_mode=legacy"
-            )
-        if self.fit_mode == "legacy":
-            # ``layer_head`` keeps the legacy fitting math (FP64 statistics,
-            # ridge toward persistence, IEEE arithmetic) but solves one K
-            # predictor per layer and head instead of pooling them.
-            if self.k_predictor_mode not in {
-                "shared",
-                "layer_head",
-                "direct",
-                *FIXED_TEMPORAL_PREDICTOR_MODES,
-            }:
-                raise ValueError(
-                    "legacy fitting requires k_predictor_mode=shared, layer_head, "
-                    "identity, taylor, taylor2, or direct"
-                )
-            if self.k_history_length is None:
-                raise ValueError(
-                    "legacy fitting requires an explicit k_history_length"
-                )
-            if not 0 <= self.v_history_length <= 5:
-                raise ValueError(
-                    "legacy fitting supports V history length 0 through 5"
-                )
-            # ieee reproduces the reference arithmetic and stays the default;
-            # tf32 trades the last mantissa bits of the Cross projection for
-            # tensor cores, which is worth measuring end to end.
-            # K and V are packed and decoded independently.  Legacy keeps its
-            # shared predictor and reference arithmetic, but does not require
-            # the two cache tensors to use the same residual bit width.
-            # group_size fixes the quantizer's grouping, so the reference
-            # implementation is only reproduced at 64.  anchor_bits is not one
-            # of them: it selects a width within the same quantizer, the
-            # signature records it, and INT4 stays the default, so a wider or
-            # narrower anchor is a configuration rather than a second codec.
-            # stride is likewise free: it only decides where the encoder cuts
-            # units. Self-Forcing and Causal-Forcing use the fixed legacy event
-            # protocol at stride 1560; LongCat uses its regular model-shaped
-            # trace and records the matching runtime stride in that archive.
-            if self.group_size != 64:
-                raise ValueError("legacy fitting requires group_size=64")
-            if self.residual_mode != "asymmetric":
-                raise ValueError("legacy fitting requires asymmetric residuals")
-            if (
-                self.scale_dtype != "bfloat16"
-                or self.reconstruction_dtype != "bfloat16"
-            ):
-                raise ValueError(
-                    "legacy fitting requires bfloat16 scales and reconstruction"
-                )
+            require(self.k_predictor_mode == "shared",
+                    "v_predictor_mode=innovation requires k_predictor_mode=shared")
+        # Only CrossKV V reads a per-layer matrix; every other legacy V
+        # predictor uses the layer-shared layout.
+        if self.v_predictor_mode not in {"cross_kv", "direct"}:
+            require(self.cross_kv_weight_mode == "layer_shared",
+                    "temporal V configurations must use cross_kv_weight_mode=layer_shared")
 
     @property
     def raw_anchor(self) -> bool:

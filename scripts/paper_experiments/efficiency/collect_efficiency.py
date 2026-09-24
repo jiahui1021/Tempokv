@@ -9,7 +9,7 @@ import json
 from pathlib import Path
 import re
 import sys
-from typing import Iterable, Sequence
+from typing import Sequence
 
 try:
     from efficiency_record import largest_grid_horizon

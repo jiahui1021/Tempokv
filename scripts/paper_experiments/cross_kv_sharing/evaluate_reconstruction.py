@@ -19,7 +19,7 @@ SOURCE_ROOT = PROJECT_ROOT / "src"
 if str(SOURCE_ROOT) not in sys.path:
     sys.path.insert(0, str(SOURCE_ROOT))
 
-from tempokv.config import config_from_mapping  # noqa: E402
+from tempokv.config import load_config  # noqa: E402
 from tempokv.fitting import (  # noqa: E402
     _reconstruct_cross_kv_trace,
     _reconstruct_temporal_trace,
@@ -27,12 +27,6 @@ from tempokv.fitting import (  # noqa: E402
 from tempokv.parameters import CrossKVParameters, TemporalParameters  # noqa: E402
 
 
-def _load_config(path: Path):
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    codec = payload.get("codec", payload)
-    if not isinstance(codec, dict):
-        raise ValueError(f"invalid codec config: {path}")
-    return config_from_mapping(codec)
 
 
 def _energy(clean: torch.Tensor, rebuilt: torch.Tensor) -> dict[str, float | int | None]:
@@ -126,7 +120,7 @@ def evaluate(
     device: str = "cpu",
 ) -> dict[str, Any]:
     """Replay the production reconstruction helpers and summarize NMSE."""
-    config = _load_config(config_path)
+    config = load_config(config_path)
     with np.load(trace, allow_pickle=False) as archive:
         missing = [name for name in ("keys", "values") if name not in archive]
         if missing:

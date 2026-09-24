@@ -38,6 +38,12 @@ DEFAULT_SPAN_FRAMES = 12
 # smaller lag, or nothing is packed before the terminal block is discarded.
 DEFAULT_BF16_LAG_FRAMES = 18
 DECODE_TIMING_ENV = "TEMPOKV_DECODE_TIMING"
+# Diagnostic: compare what attention reads back from the packed cache with the
+# clean K/V it replaced (layer 0, a few tokens per frame) and print the NMSE.
+# A readback error that does not move with k_bits/v_bits means the bit widths
+# never reach the cache; one that does move puts the problem downstream.
+READBACK_PROBE_ENV = "TEMPOKV_READBACK_PROBE"
+_PROBE_TOKENS_PER_FRAME = 16
 
 
 def _decode_timing_enabled() -> bool:
@@ -213,6 +219,8 @@ def install(runtime_root: str | Path | None = None) -> type:
                 ),
             )
             self.tempokv_report.decode_timing_enabled = _decode_timing_enabled()
+            self._readback_probe = os.environ.get(READBACK_PROBE_ENV, "0") == "1"
+            self._probe_clean: dict[str, list[torch.Tensor]] = {"k": [], "v": []}
             # Same schedule as the Self-Forcing bridge: pack each finalized
             # block into the open span once it is TEMPOKV_BF16_LAG_FRAMES
             # behind the newest one.  Span-mean K and innovation V have no
@@ -289,7 +297,11 @@ def install(runtime_root: str | Path | None = None) -> type:
                     f"{start_frame} out of order; expected {expected}"
                 )
             previous_span_start = self.tempokv_stream.span_start_frame
+            if self._readback_probe:
+                self._probe_record(start_frame, num_frames)
             self.tempokv_stream.finalize(self.kv_cache1, num_frames=num_frames)
+            if self._readback_probe:
+                self._probe_compare()
             if os.environ.get("CAUSAL_FORCING_BENCHMARK") == "1":
                 packed_until = self.tempokv_stream.span_start_frame
                 while previous_span_start < packed_until:
@@ -307,6 +319,57 @@ def install(runtime_root: str | Path | None = None) -> type:
                     previous_span_start = span_end
             self.summary["finalize_events"].append(
                 {"start_frame": int(start_frame), "num_frames": int(num_frames)}
+            )
+
+        def _probe_tokens(self, frames: int) -> torch.Tensor:
+            step = max(1, self.frame_seq_length // _PROBE_TOKENS_PER_FRAME)
+            offsets = torch.arange(0, self.frame_seq_length, step)
+            return (
+                torch.arange(frames)[:, None] * self.frame_seq_length + offsets
+            ).reshape(-1)
+
+        def _probe_record(self, start_frame: int, num_frames: int) -> None:
+            if start_frame == 0:
+                self._probe_clean = {"k": [], "v": []}
+            layer = self.kv_cache1[0]
+            start = start_frame * self.frame_seq_length
+            end = start + num_frames * self.frame_seq_length
+            index = self._probe_tokens(num_frames).to(layer["k"].device)
+            for role in ("k", "v"):
+                dense = layer[role].read(start, end)
+                self._probe_clean[role].append(
+                    dense.index_select(1, index).float().cpu()
+                )
+
+        def _probe_compare(self) -> None:
+            encoded = self.tempokv_stream.encoded_frame
+            if not encoded:
+                return
+            layer = self.kv_cache1[0]
+            end = encoded * self.frame_seq_length
+            role_primary = self.tempokv_codec.primary_role
+            role_secondary = self.tempokv_codec.secondary_role
+            primary = layer[role_primary].read(0, end)
+            decoded = {
+                role_primary: primary,
+                role_secondary: layer[role_secondary].read(
+                    0, end, source_tensor=primary
+                ),
+            }
+            index = self._probe_tokens(encoded).to(primary.device)
+            errors = {}
+            for role in ("k", "v"):
+                clean = torch.cat(self._probe_clean[role], dim=1)[:, : index.numel()]
+                read = decoded[role].index_select(1, index).float().cpu()
+                errors[role] = float(
+                    (read - clean).square().sum() / clean.square().sum().clamp_min(1e-30)
+                )
+            config = self.tempokv_codec.config
+            print(
+                f"[TempoKVReadback] k{config.k_bits}v{config.v_bits} "
+                f"packed_frames={encoded} "
+                f"k_nmse={errors['k']:.3e} v_nmse={errors['v']:.3e}",
+                flush=True,
             )
 
         def flush_kv_cache(self) -> None:

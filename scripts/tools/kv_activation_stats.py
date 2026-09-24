@@ -16,7 +16,6 @@ axes can be separated; LLM tokens only have the sequence axis.
 
 from __future__ import annotations
 
-import math
 
 import numpy as np
 

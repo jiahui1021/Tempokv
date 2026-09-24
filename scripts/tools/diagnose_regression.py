@@ -151,9 +151,6 @@ def main() -> None:
     )
     codec = TempoKVCodec(_restride(temporal, stride), _restride(cross_kv, stride), config)
 
-    triton_config = CodecConfig(
-        **{**payload, "stride": stride, "use_triton": True, "strict_triton": True}
-    )
 
     requested = [int(x) for x in args.layers.split(",") if x.strip()]
     needed = max(temporal.history_length, cross_kv.history_length) + 1

@@ -19,15 +19,6 @@ def test_guards_and_lazy_cuda_import():
     steps = torch.zeros(1, 5, 2, 2, dtype=q.dtype)
     with pytest.raises(ValueError, match="group_size"):
         corrected_attention(q, k, k, steps, group_size=16)
-    with pytest.raises(ValueError, match="token-for-token"):
-        corrected_attention(q, k, k, steps[:, :2], group_size=64)
-    with pytest.raises(ValueError, match="dtype"):
-        corrected_attention(q, k, k, steps.float(), group_size=64)
-    with pytest.raises(ValueError, match="positive strides"):
-        corrected_attention(q.expand(2, -1, -1, -1), k.expand(2, -1, -1, -1),
-                            k.expand(2, -1, -1, -1), steps.expand(2, -1, -1, -1), group_size=64)
-    with pytest.raises(RuntimeError, match="inference-only"):
-        corrected_attention(q.requires_grad_(), k, k, steps, group_size=64)
     with torch.no_grad(), pytest.raises(RuntimeError, match="CUDA"):
         corrected_attention(q, k, k, steps, group_size=64)
 

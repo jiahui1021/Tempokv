@@ -22,7 +22,7 @@ if SOURCE_ROOT.is_dir() and str(SOURCE_ROOT) not in sys.path:
 
 from tempokv.runtime import persistent_units_per_launch  # noqa: E402
 from tempokv.config import (  # noqa: E402
-    is_fixed_temporal_predictor,
+    load_config,
     is_temporal_v_predictor,
 )
 
@@ -184,19 +184,6 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _load_config(path: Path):
-    from tempokv.config import config_from_mapping
-
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(payload, dict):
-        raise ValueError("codec config must be a JSON object")
-    if "codec" in payload:
-        if len(payload) != 1 or not isinstance(payload["codec"], dict):
-            raise ValueError("'codec' must be the only top-level config object")
-        payload = payload["codec"]
-    return config_from_mapping(payload)
-
-
 def _validate_parameters(
     k_path: Path, v_path: Path, config
 ) -> dict[str, object]:
@@ -210,51 +197,13 @@ def _validate_parameters(
         if temporal_v
         else CrossKVParameters.load(v_path)
     )
-    expected_signature = config.format_signature()
-    if (
-        temporal.codec_signature != expected_signature
-        or cross.codec_signature != expected_signature
-    ):
+    # The codec itself refuses a stamped set fitted under another config or
+    # split across two fitting runs; a production run additionally refuses
+    # unstamped sets and parameters fitted in another coordinate system.
+    if temporal.codec_signature is None or not temporal.parameter_set_id:
         raise ValueError(
-            "Self-Forcing parameters were not fitted with the current codec config"
+            "Self-Forcing parameters must come from the fitter; refit them"
         )
-    if (
-        not temporal.parameter_set_id
-        or not cross.parameter_set_id
-        or temporal.parameter_set_id != cross.parameter_set_id
-    ):
-        raise ValueError(
-            "Self-Forcing K/V parameters must share a current parameter_set_id"
-        )
-    codec = TempoKVCodec(temporal, cross, config)
-    if config.k_predictor_mode == "direct":
-        if temporal.layer_ids is not None:
-            raise ValueError("direct K parameters must not carry layer ids")
-        if tuple(temporal.history_weights.shape) != (0, 0, 128) or tuple(
-            temporal.history_bias.shape
-        ) != (0, 128):
-            raise ValueError(
-                "direct K parameters must contain empty [0,0,128] weights "
-                "and [0,128] bias"
-            )
-    elif config.k_predictor_mode == "shared" or is_fixed_temporal_predictor(
-        config.k_predictor_mode
-    ):
-        if temporal.layer_ids is not None:
-            raise ValueError("legacy K parameters must be shared across layers")
-    elif temporal.layer_ids != EXPECTED_LAYER_IDS:
-        raise ValueError("K parameters must contain layers 0 through 29")
-    # The repository-wide fitting family pools legacy temporal parameters across
-    # layers and heads.
-    if temporal_v:
-        if cross.layer_ids is not None:
-            raise ValueError(
-                "legacy temporal V parameters must be shared across layers"
-            )
-    elif cross.layer_ids != EXPECTED_LAYER_IDS:
-        raise ValueError("V parameters must contain layers 0 through 29")
-    if temporal.stride != config.stride or cross.stride != config.stride:
-        raise ValueError("parameter stride does not match the codec config")
     if (
         temporal.coordinate_system != EXPECTED_COORDINATE_SYSTEM
         or cross.coordinate_system != EXPECTED_COORDINATE_SYSTEM
@@ -262,78 +211,10 @@ def _validate_parameters(
         raise ValueError(
             "Self-Forcing parameters must use pre_rope_normalized coordinates"
         )
-    if config.k_predictor_mode == "shared" or is_fixed_temporal_predictor(
-        config.k_predictor_mode
-    ):
-        expected_k_history_shape = (
-            config.k_history_length,
-            config.k_history_length,
-            128,
-        )
-        expected_k_bias_shape = (config.k_history_length, 128)
-        if (
-            tuple(temporal.history_weights.shape) != expected_k_history_shape
-            or tuple(temporal.history_bias.shape) != expected_k_bias_shape
-        ):
-            raise ValueError(
-                "legacy K parameters must be shared across all layers "
-                "and heads"
-            )
-    elif config.k_history_length is not None and config.k_history_length > 0:
-        expected_k_history_shape = (
-            30,
-            config.k_history_length,
-            config.k_history_length,
-            12,
-            128,
-        )
-        if tuple(temporal.history_weights.shape) != expected_k_history_shape:
-            raise ValueError(
-                "K history parameters must match 30 layers, the configured history "
-                "length, 12 heads, and dimension 128"
-            )
-    elif config.k_history_length == 0 or tuple(temporal.history_weights.shape[-2:]) == (12, 128):
-        pass  # k_history_length=0 has no history weights; otherwise check heads/dim
-    else:
-        raise ValueError("K parameters must contain 12 heads with dimension 128")
-    if temporal_v:
-        order = config.v_history_length
-        legacy_family = config.fit_mode == "legacy"
-        if legacy_family:
-            # Legacy pools every layer and head, so the parameters carry
-            # neither axis.
-            expected_v_shape = (order, order, 128)
-            expected_v_bias_shape = (order, 128)
-        else:
-            expected_v_shape = (30, order, order, 12, 128)
-            expected_v_bias_shape = (30, order, 12, 128)
-        if (
-            tuple(cross.history_weights.shape) != expected_v_shape
-            or tuple(cross.history_bias.shape) != expected_v_bias_shape
-        ):
-            raise ValueError(
-                f"temporal V parameters must have shape {expected_v_shape} with "
-                f"bias {expected_v_bias_shape}, got "
-                f"{tuple(cross.history_weights.shape)} and "
-                f"{tuple(cross.history_bias.shape)}"
-            )
-    elif tuple(cross.weight.shape[-3:]) != (12, 128, 128):
-        raise ValueError("V parameters must contain 12 heads with 128x128 weights")
-    elif cross.projection_source != (
-        "innovation" if config.v_predictor_mode == "innovation" else "cross_kv"
-    ):
-        raise ValueError(
-            "V parameter projection source does not match v_predictor_mode: "
-            f"{cross.projection_source!r} vs {config.v_predictor_mode!r}"
-        )
-    elif config.v_history_length:
-        expected_v_history_shape = (30, config.v_history_length, 12, 128)
-        if tuple(cross.history_weights.shape) != expected_v_history_shape:
-            raise ValueError(
-                "Self-Forcing requires fast diagonal V history parameters matching "
-                "30 layers, the configured history length, 12 heads, and dimension "
-                "128; refit the selected V parameter artifact with the current fitter"
-            )
+    codec = TempoKVCodec(temporal, cross, config)
+    for name, parameters in (("K", temporal), ("V", cross)):
+        if parameters.layered and parameters.layer_ids != EXPECTED_LAYER_IDS:
+            raise ValueError(f"{name} parameters must contain layers 0 through 29")
     parameter_tensors = (
         (
             temporal.history_weights,
@@ -456,73 +337,22 @@ def _load_worker_metrics(
         path = metrics_dir / f"rank-{expected_rank}.json"
         if not path.is_file():
             raise RuntimeError(f"missing metrics for rank {expected_rank}: {path}")
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError) as error:
-            raise RuntimeError(
-                f"invalid metrics for rank {expected_rank}: {path}"
-            ) from error
-        if not isinstance(payload, dict):
-            raise RuntimeError(f"metrics for rank {expected_rank} must be an object")
-        required = {
-            "rank",
-            "wall_seconds",
-            "peak_allocated_bytes",
-            "peak_reserved_bytes",
-            "gpu_name",
-        }
-        missing = sorted(required.difference(payload))
-        if missing:
-            raise RuntimeError(
-                f"metrics for rank {expected_rank} are missing: {', '.join(missing)}"
-            )
-        if payload["rank"] != expected_rank:
-            raise RuntimeError(
-                f"metrics rank mismatch in {path}: expected {expected_rank}"
-            )
-        try:
-            wall_seconds = float(payload["wall_seconds"])
-            peak_allocated = int(payload["peak_allocated_bytes"])
-            peak_reserved = int(payload["peak_reserved_bytes"])
-        except (TypeError, ValueError) as error:
-            raise RuntimeError(
-                f"metrics for rank {expected_rank} contain invalid numbers"
-            ) from error
-        if wall_seconds < 0 or peak_allocated < 0 or peak_reserved < 0:
-            raise RuntimeError(
-                f"metrics for rank {expected_rank} must not be negative"
-            )
-        rank_metrics.append(
-            {
-                **payload,
-                "wall_seconds": wall_seconds,
-                "peak_allocated_bytes": peak_allocated,
-                "peak_reserved_bytes": peak_reserved,
-            }
-        )
-    peak_allocated_bytes = max(
-        metric["peak_allocated_bytes"] for metric in rank_metrics
-    )
-    peak_reserved_bytes = max(
-        metric["peak_reserved_bytes"] for metric in rank_metrics
-    )
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if payload.get("rank") != expected_rank:
+            raise RuntimeError(f"metrics rank mismatch in {path}")
+        rank_metrics.append(payload)
     decode_routes: dict[str, int] = {}
     for metric in rank_metrics:
-        routes = metric.get("decode_routes", {})
-        if not isinstance(routes, dict):
-            raise RuntimeError("worker decode_routes must be an object")
-        for name, count in routes.items():
-            if not isinstance(name, str) or not isinstance(count, int) or count < 0:
-                raise RuntimeError("worker decode_routes contains an invalid entry")
-            decode_routes[name] = decode_routes.get(name, 0) + count
+        for name, count in (metric.get("decode_routes") or {}).items():
+            decode_routes[name] = decode_routes.get(name, 0) + int(count)
+    peak_allocated = max(int(m["peak_allocated_bytes"]) for m in rank_metrics)
+    peak_reserved = max(int(m["peak_reserved_bytes"]) for m in rank_metrics)
     return {
-        "max_worker_seconds": max(
-            metric["wall_seconds"] for metric in rank_metrics
-        ),
-        "peak_allocated_bytes": peak_allocated_bytes,
-        "peak_reserved_bytes": peak_reserved_bytes,
-        "peak_allocated_gib": peak_allocated_bytes / (1024**3),
-        "peak_reserved_gib": peak_reserved_bytes / (1024**3),
+        "max_worker_seconds": max(float(m["wall_seconds"]) for m in rank_metrics),
+        "peak_allocated_bytes": peak_allocated,
+        "peak_reserved_bytes": peak_reserved,
+        "peak_allocated_gib": peak_allocated / (1024**3),
+        "peak_reserved_gib": peak_reserved / (1024**3),
         "decode_routes": decode_routes,
         "ranks": rank_metrics,
     }
@@ -949,7 +779,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
     config = None
     parameters = None
     if args.mode == "tempokv":
-        config = _load_config(paths["config"])
+        config = load_config(paths["config"])
         overrides = {
             name: value
             for name, value in (

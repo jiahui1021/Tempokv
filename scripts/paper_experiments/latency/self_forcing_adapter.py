@@ -11,7 +11,6 @@ the loaded instance is not proven to be the same process).
 """
 from __future__ import annotations
 
-import argparse
 import json
 import os
 import subprocess

@@ -10,17 +10,9 @@ PERSISTENT_UNITS_ENV = "TEMPOKV_PERSISTENT_UNITS_PER_LAUNCH"
 
 def persistent_units_per_launch(value: str | int | None = None) -> int:
     """Resolve the recurrent unit batch used by persistent decode kernels."""
-    raw = os.environ.get(PERSISTENT_UNITS_ENV, "16") if value is None else value
-    try:
-        units = int(raw)
-    except (TypeError, ValueError) as error:
-        raise ValueError(
-            f"{PERSISTENT_UNITS_ENV} must be an integer from 1 to 16"
-        ) from error
-    if isinstance(raw, bool) or not 1 <= units <= 16:
-        raise ValueError(
-            f"{PERSISTENT_UNITS_ENV} must be an integer from 1 to 16"
-        )
+    units = int(os.environ.get(PERSISTENT_UNITS_ENV, "16") if value is None else value)
+    if not 1 <= units <= 16:
+        raise ValueError(f"{PERSISTENT_UNITS_ENV} must be an integer from 1 to 16")
     return units
 
 
@@ -43,8 +35,6 @@ def persistent_launch_plan(
     ``start_unit = lead_units`` and reuses that kernel.  The arithmetic each
     unit performs is unchanged; only the base pointers move.
     """
-    if units_per_launch < 1 or lead_units < 1:
-        raise ValueError("units_per_launch and lead_units must be positive")
     plan = []
     for start in range(1, units, units_per_launch):
         chunk = min(units_per_launch, units - start)

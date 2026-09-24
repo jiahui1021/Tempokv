@@ -108,16 +108,6 @@ class ChunkedKVCache:
         cache_role: str | None = None,
         quantized_decoder: Callable[..., torch.Tensor] | None = None,
     ) -> None:
-        if layout not in {"BSHD", "BHSD"}:
-            raise ValueError(f"unsupported cache layout: {layout}")
-        if min(
-            batch_size,
-            frame_seq_length,
-            num_heads,
-            head_dim,
-            max_num_chunks,
-        ) <= 0:
-            raise ValueError("cache dimensions must be positive")
         self.batch_size = batch_size
         self.frame_seq_length = frame_seq_length
         self.num_heads = num_heads
@@ -164,10 +154,7 @@ class ChunkedKVCache:
                 f"token index {token_index} is not aligned to "
                 f"{self.frame_seq_length}"
             )
-        chunk = token_index // self.frame_seq_length
-        if not 0 <= chunk <= self.max_num_chunks:
-            raise ValueError(f"cache index exceeds capacity: {token_index}")
-        return chunk
+        return token_index // self.frame_seq_length
 
     def _shape(self) -> tuple[int, int, int, int]:
         if self.layout == "BSHD":
@@ -230,8 +217,6 @@ class ChunkedKVCache:
             )
         if global_start_frame is None:
             global_start_frame = start_chunk
-        elif global_start_frame < 0:
-            raise ValueError("global_start_frame must not be negative")
         self._remove_covered_spans(start_chunk, end_chunk)
         destinations: list[torch.Tensor] = []
         sources: list[torch.Tensor] = []
@@ -406,8 +391,6 @@ class ChunkedKVCache:
     ) -> torch.Tensor:
         start_chunk = self._token_to_chunk(start_index)
         end_chunk = self._token_to_chunk(end_index)
-        if start_chunk >= end_chunk:
-            raise ValueError("cache read range must be non-empty")
         if (
             end_chunk - start_chunk == 1
             and self.chunk_state[start_chunk] == ChunkState.BF16
@@ -484,17 +467,6 @@ class ChunkedKVCache:
                 output_layout=output_layout,
                 decoder=self._quantized_decoder,
             )
-            expected_shape = (
-                self.batch_size,
-                self.num_heads,
-                expected_tokens,
-                self.head_dim,
-            )
-            if tuple(decoded.shape) != expected_shape:
-                raise ValueError(
-                    f"decoded TempoKV shape mismatch: expected {expected_shape}, "
-                    f"got {tuple(decoded.shape)}"
-                )
             if decoded.data_ptr() != direct_output.data_ptr():
                 if output_layout == "BSHD":
                     direct_output.copy_(decoded.permute(0, 2, 1, 3))
@@ -536,14 +508,8 @@ class ChunkedKVCache:
         padding channels of a widened cache read directly.
         """
         layout = output_layout or self.layout
-        if layout not in {"BSHD", "BHSD"}:
-            raise ValueError(f"unsupported step-size layout: {layout}")
-        if group_size <= 0 or self.head_dim % group_size:
-            raise ValueError("group_size must divide the head dimension")
         start_chunk = self._token_to_chunk(start_index)
         end_chunk = self._token_to_chunk(end_index)
-        if start_chunk >= end_chunk:
-            raise ValueError("cache read range must be non-empty")
         groups = self.head_dim // group_size
         total_tokens = end_index - start_index
         shape = (
@@ -557,10 +523,6 @@ class ChunkedKVCache:
             # Writing into the caller's buffer -- typically the padding
             # channels of a widened cache read -- avoids a second tensor the
             # size of the window on every forward.
-            if tuple(out.shape) != shape:
-                raise ValueError(
-                    f"step-size buffer {tuple(out.shape)} does not match {shape}"
-                )
             out.zero_()
             result = out
         chunk_index = start_chunk
@@ -577,11 +539,6 @@ class ChunkedKVCache:
             if isinstance(packed, dict):
                 packed = next(v for v in packed.values() if hasattr(v, "step_sizes"))
             steps = packed.step_sizes()            # [B, H, S, G]
-            if steps.shape[-1] != groups:
-                raise ValueError(
-                    f"span stores {steps.shape[-1]} groups, the caller asked for "
-                    f"{groups}; group_size must match the codec config"
-                )
             output_end = output_start + steps.shape[2]
             if layout == "BSHD":
                 result[:, output_start:output_end] = steps.permute(0, 2, 1, 3)
@@ -602,13 +559,6 @@ class ChunkedKVCache:
     ) -> None:
         start_chunk = self._token_to_chunk(start_index)
         end_chunk = self._token_to_chunk(end_index)
-        if start_chunk >= end_chunk:
-            raise ValueError("packed cache span must be non-empty")
-        for chunk_index in range(start_chunk, end_chunk):
-            if self.chunk_state[chunk_index] == ChunkState.EMPTY:
-                raise ValueError(
-                    f"cache chunk {chunk_index} was packed before it was written"
-                )
         self._remove_covered_spans(start_chunk, end_chunk)
         span = {
             "start_chunk": start_chunk,
@@ -632,8 +582,6 @@ class ChunkedKVCache:
         """
         start_chunk = self._token_to_chunk(start_index)
         end_chunk = self._token_to_chunk(end_index)
-        if start_chunk >= end_chunk:
-            raise ValueError("extended packed cache span must be non-empty")
         span = self._span_by_chunk[start_chunk]
         old_end = span["end_chunk"]
         for chunk_index in range(old_end, end_chunk):

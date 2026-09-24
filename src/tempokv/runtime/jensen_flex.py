@@ -25,15 +25,6 @@ def jensen_backend() -> str:
 
 def score_terms(query, step_squared, group_size):
     """Return contiguous [G,B,H,Q/K] FP32 planes with legacy rounding."""
-    if query.ndim != 4 or step_squared.ndim != 4:
-        raise ValueError("query and squared steps must have BSHD/BSHG layout")
-    dim = query.shape[-1]
-    if dim <= 0 or group_size <= 0 or dim % group_size:
-        raise ValueError("group_size must divide the head dimension")
-    if (query.shape[0], query.shape[2], dim // group_size) != (
-        step_squared.shape[0], step_squared.shape[2], step_squared.shape[3]
-    ):
-        raise ValueError("squared steps must match query batch, heads and groups")
     q_term = query_channels(query, group_size).to(query.dtype).float()
     return (
         q_term.permute(3, 0, 2, 1).contiguous(),
@@ -79,26 +70,8 @@ def corrected_attention(query, key, value, step_squared, *, group_size):
     This is not a general replacement for masked training attention. Failure
     is explicit: no silent fallback to a dense score matrix or widened head.
     """
-    if query.ndim != 4 or key.ndim != 4 or value.shape != key.shape:
-        raise ValueError("Q/K/V must be rank-4 BSHD tensors, with matching K/V")
-    if min(*query.shape, *key.shape) <= 0:
-        raise ValueError("Q/K dimensions must be non-empty")
-    if (query.shape[0], query.shape[2], query.shape[3]) != (
-        key.shape[0], key.shape[2], key.shape[3]
-    ):
-        raise ValueError("Q/K must have matching batch, heads and head dimension")
-    if group_size <= 0 or query.shape[-1] % group_size:
-        raise ValueError("group_size must divide the head dimension")
-    if step_squared.shape != (*key.shape[:-1], query.shape[-1] // group_size):
-        raise ValueError("squared steps must align token-for-token with K")
-    if any(t.device != query.device for t in (key, value, step_squared)):
-        raise ValueError("Q/K/V and squared steps must share a device")
     if query.device.type != "cuda":
         raise RuntimeError("fused Jensen attention requires CUDA and torch.compile")
-    if query.dtype not in (torch.bfloat16, torch.float16) or any(
-        t.dtype != query.dtype for t in (key, value, step_squared)
-    ):
-        raise ValueError("fused Jensen Q/K/V and squared steps must share a half dtype")
     q_terms, k_terms = score_terms(query, step_squared, group_size)
     scale = query.shape[-1] ** -0.5
     out = _compiled_attention()(

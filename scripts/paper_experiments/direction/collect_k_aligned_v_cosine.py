@@ -12,7 +12,7 @@ from __future__ import annotations
 import argparse
 import csv
 from copy import deepcopy
-from dataclasses import asdict, replace
+from dataclasses import asdict
 import hashlib
 import json
 from pathlib import Path
