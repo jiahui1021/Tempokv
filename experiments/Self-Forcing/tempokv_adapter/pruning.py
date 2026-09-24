@@ -1,30 +1,12 @@
-"""Simulated KV-token pruning for the TempoKV pruning pilot.
+"""Simulated KV-token pruning for the pruning pilot.
 
-Nothing is removed from the cache.  A pruned token is only dropped from the
-key set every later attention call reads, so the TempoKV predictors keep their
-full history and the quantization is identical to the unpruned run.  K and V
-share one mask per layer (a token is dropped from both), shared across heads.
+Pruned tokens are dropped from the attention key set only; the cache and its
+predictor history are untouched.  Scores come from the open-loop K residual,
+adjacent-frame cosine and received attention mass.
 
-Per layer, at the first denoising step of every AR block this module
-  1. registers the previous block's clean pre-RoPE K: the open-loop TempoKV
-     K residual ``E = ||K_t - pred(K_{t-1..t-H})||`` and the adjacent-frame
-     cosine ``cos(K_t, K_{t-1})`` of every token,
-  2. accumulates the attention mass every cached token receives from a strided
-     subset of the block's queries,
-  3. decides the pruned tokens of every frame that has just left the protected
-     recent window: the ``ratio`` fraction with the lowest score.
-
-The residual uses clean history rather than the codec's reconstructed history,
-so it is the fitted predictor's innovation without the quantization noise.
-
-Environment:
-  TEMPOKV_PRUNE_CRITERION   none | random | attention | similarity | residual
-                            | attn_residual   (unset: pruning not installed)
-  TEMPOKV_PRUNE_RATIO       fraction of each eligible frame to prune
-  TEMPOKV_PRUNE_PROTECT     newest frames never pruned (default 6)
-  TEMPOKV_PRUNE_LAMBDA      residual weight in attn_residual (default 1)
-  TEMPOKV_PRUNE_QSTRIDE     query subsampling for attention stats (default 8)
-  TEMPOKV_PRUNE_STATS_DIR   where per-video statistics are written
+Environment: TEMPOKV_PRUNE_CRITERION (none|random|attention|similarity|
+residual|attn_residual), TEMPOKV_PRUNE_RATIO, TEMPOKV_PRUNE_PROTECT (6),
+TEMPOKV_PRUNE_LAMBDA (1), TEMPOKV_PRUNE_QSTRIDE (8), TEMPOKV_PRUNE_STATS_DIR.
 """
 
 from __future__ import annotations

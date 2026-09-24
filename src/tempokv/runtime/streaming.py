@@ -1,22 +1,9 @@
 """Streaming TempoKV encoder for causal autoregressive video caches.
 
-The codec is a batch API: every call starts a fresh anchor at the front of the
-tensor it is given.  Encoding each finalized block on its own would therefore
-re-anchor every few frames, wasting bits and throwing away the temporal
-correlation TempoKV exists to exploit.  This encoder accumulates finalized
-blocks into one span so a span spends one anchor.
-
-A new anchor is emitted only at a span boundary, and only an explicit event
-creates one: construction, :meth:`reset`, or a full span.  Nothing is inferred
-from timesteps or block indices.
-
-Batch mode holds a span in BF16 until it is complete, then packs it in one
-call.  Incremental mode appends each finalized frame to the open span once it
-is ``bf16_lag_frames`` behind the newest one, through the same closed-loop
-arithmetic, so the packed bytes are identical and only the lag stays dense.
-The lag is a quality knob: with no lag every frame the model attends to is a
-reconstruction, and in an autoregressive rollout that error compounds.
-:meth:`flush` with ``force`` packs the lag tail once no later block reads it.
+Finalized blocks accumulate into one span so the span spends one anchor; a new
+anchor starts only at construction, :meth:`reset` or a full span.  Batch mode
+packs a span once complete; incremental mode appends each frame once it is
+``bf16_lag_frames`` behind the newest, producing the same bytes.
 """
 
 from __future__ import annotations
@@ -61,9 +48,7 @@ class StreamingTempoKVEncoder:
         self.span_frames = span_frames
         self.report = report
         self._wrap_state = wrap_state or (lambda state: state)
-        # Absolute model-timeline positions: the span being accumulated, the
-        # first unfinalized frame, and (incremental only) the first unpacked
-        # one.  Batch mode packs whole spans, so the last two coincide.
+        # Span start, first unfinalized frame and (incremental) first unpacked frame.
         self._span_start_frame = 0
         self._finalized_frame = 0
         self._encoded_frame = 0
@@ -138,11 +123,7 @@ class StreamingTempoKVEncoder:
         num_frames: int,
         flush: bool = True,
     ) -> int:
-        """Accept ``num_frames`` of clean cache and pack any complete spans.
-
-        ``caches`` is the per-layer list of ``{"k": ..., "v": ...}`` cache
-        objects.  Returns the number of frames packed by this call.
-        """
+        """Accept ``num_frames`` of clean cache; returns the frames packed."""
         self._finalized_frame += num_frames
         self.report.finalized_frames += num_frames
         # Measure before packing too: the moment before a span is compressed is
@@ -153,11 +134,7 @@ class StreamingTempoKVEncoder:
         return self.flush(caches)
 
     def flush(self, caches: Sequence[Mapping[str, Any]], *, force: bool = False) -> int:
-        """Pack every complete span; with ``force`` also pack a partial one.
-
-        In incremental mode this packs every frame older than the BF16 lag, and
-        ``force`` packs the lag tail as well.
-        """
+        """Pack complete spans (incremental: frames older than the lag); ``force`` packs the rest."""
         if self.incremental:
             return self._flush_incremental(caches, force=force)
         packed_frames = 0
@@ -285,10 +262,7 @@ class StreamingTempoKVEncoder:
         """Pack one complete span in a single batch call."""
         token_start = start_frame * self.frame_seq_length
         token_end = token_start + num_frames * self.frame_seq_length
-        # Slots are addressed by codec role, not by name: the primary tensor is
-        # predicted from its own temporal history and the secondary one from the
-        # primary's reconstruction, so the mirrored direction runs V then K
-        # through this same loop.
+        # Slots are addressed by role, so the mirrored direction runs V then K.
         primary_role = self.codec.primary_role
         secondary_role = self.codec.secondary_role
         with self.report.timer("encode_ms"), torch.no_grad():

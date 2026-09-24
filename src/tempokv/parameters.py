@@ -110,12 +110,7 @@ class TemporalParameters:
         return self.history_weights.ndim == 5
 
     def with_history_length(self, history_length: int | None) -> "TemporalParameters":
-        """Assert a requested history length matches the fitted one.
-
-        Parameters carry exactly the history they were fitted for, so this only
-        checks agreement; it is kept as a method because the codec resolves a
-        configured length against whatever the parameter file provides.
-        """
+        """Check that a requested history length matches the fitted one."""
         if history_length is None:
             return self
         if history_length != self.history_length:

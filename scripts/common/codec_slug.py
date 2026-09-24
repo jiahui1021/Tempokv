@@ -3,9 +3,7 @@
 Usage: codec_slug.py CONFIG K_HIST V_HIST K_BITS V_BITS STRIDE V_PREDICTOR
        FIT_HISTORY_SOURCE ANCHOR_BITS   (empty strings mean "use the config")
 
-Standard library only: this runs on every fit and generate invocation, and
-importing tempokv would pull in torch just to build a directory name.
-tests/test_configs.py ties these defaults back to CodecConfig.
+Standard library only, so shell entry points do not import torch.
 """
 
 import json

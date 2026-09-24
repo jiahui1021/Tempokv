@@ -1,7 +1,7 @@
 #!/bin/bash
 # 出一组评一组:每个 tag 的 SA 视频 vs BF16/0 与 vs 3-anchor,写 single_anchor/eval/*.json
 set -u
-W=/mnt/cpfs/epic-user/hujiahui-20260612
+W=${WORKSPACE:?set WORKSPACE to the experiment root}
 T=$W/Tempokv
 R=$W/kv-quant-result/LongCat
 OUT=$R/single_anchor

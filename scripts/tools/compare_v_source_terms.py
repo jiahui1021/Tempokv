@@ -1,11 +1,8 @@
 #!/usr/bin/env python3
-"""Held-out ablation of Cross, temporal, and K-innovation V sources.
+"""Held-out ablation of Cross, temporal and K-innovation V sources.
 
-K always uses one shared temporal predictor.  Each V candidate is fitted from
-scratch with exactly the requested source terms and one shared affine bias.
-The default innovation follows the experiment definition ``K_origin-K_pred``;
-this is an offline oracle because a decoder only observes the quantized K
-residual.  ``--innovation-source reconstructed`` runs the deployable analogue.
+The default innovation ``K_origin - K_pred`` is an offline oracle;
+``--innovation-source reconstructed`` is the deployable analogue.
 """
 
 from __future__ import annotations

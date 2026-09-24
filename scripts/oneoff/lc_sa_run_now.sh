@@ -1,9 +1,9 @@
 #!/bin/bash
-T=/mnt/cpfs/epic-user/hujiahui-20260612/Tempokv
-OUT=/mnt/cpfs/epic-user/hujiahui-20260612/kv-quant-result/LongCat/single_anchor
-CKPT=/mnt/cpfs/epic-user/hujiahui-20260612/checkpoints/LongCat-Video
-Q=/mnt/cpfs/epic-user/hujiahui-20260612/miniconda3/envs/qvg/bin
-PROMPT="$(head -1 /mnt/cpfs/epic-user/hujiahui-20260612/kv-quant-result/shared/prompts/moviegen_128.txt)"
+T=${WORKSPACE:?set WORKSPACE to the experiment root}/Tempokv
+OUT=${WORKSPACE}/kv-quant-result/LongCat/single_anchor
+CKPT=${WORKSPACE}/checkpoints/LongCat-Video
+Q=${WORKSPACE}/miniconda3/envs/qvg/bin
+PROMPT="$(head -1 ${WORKSPACE}/kv-quant-result/shared/prompts/moviegen_128.txt)"
 run_job(){
   local tag=$1 card=$2 pdir=$3
   for r in 1 2; do

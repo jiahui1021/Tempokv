@@ -1,7 +1,7 @@
 #!/bin/bash
 # single_anchor 生成完成后:每组 vs BF16/0 与 vs 3-anchor 基线,汇总 SUMMARY.md,再接 tkint2 VBench
 set -u
-W=/mnt/cpfs/epic-user/hujiahui-20260612
+W=${WORKSPACE:?set WORKSPACE to the experiment root}
 T=$W/Tempokv
 R=$W/kv-quant-result/LongCat
 OUT=$R/single_anchor

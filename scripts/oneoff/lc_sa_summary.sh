@@ -1,7 +1,7 @@
 #!/bin/bash
 # 汇总 single_anchor 的压缩比 + paired 指标 → single_anchor/SUMMARY.md
 set -u
-W=/mnt/cpfs/epic-user/hujiahui-20260612
+W=${WORKSPACE:?set WORKSPACE to the experiment root}
 $W/miniconda3/envs/qvg/bin/python - "$W/kv-quant-result/LongCat/single_anchor" "$W/kv-quant-result/LongCat" <<'PY'
 import json, sys, time
 from pathlib import Path

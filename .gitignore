@@ -55,3 +55,6 @@ dist/
 .idea/
 .vscode/
 .nfs*
+
+# Local assistant settings
+.claude/

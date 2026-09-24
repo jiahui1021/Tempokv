@@ -3,7 +3,7 @@
 # 协议对齐 hybrid-bits:idx 固定 prompt、seed 0、9段273f、INIT=LongCat/base/<idx>/0-0.mp4、sa_* config + legacy-lh 参数
 # 用法: bash lc_gsa_run.sh (nohup setsid 启动;重复启动可续排队列)
 set -u
-W=/mnt/cpfs/epic-user/hujiahui-20260612
+W=${WORKSPACE:?set WORKSPACE to the experiment root}
 T=$W/Tempokv
 OUT=$W/kv-quant-result/LongCat/global_single_anchor
 CKPT=$W/checkpoints/LongCat-Video

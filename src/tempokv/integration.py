@@ -11,13 +11,8 @@ from .parameters import TemporalParameters, load_parameters
 from .runtime import configure_triton_cache
 
 
-# CrossKV layouts a fitted parameter set is deployed with, per fitting family.
-# Legacy fits both: layer_shared is the Self-Forcing / Causal-Forcing default,
-# and layer_head is LongCat's production layout (layer0 V is unfit-able under
-# layer_shared, 9.6 hybrid-bits) as well as the CrossKV sharing experiments'.
-# Native only fits layer_head.  head_shared and shared exist for the sharing
-# ablation alone.  scripts/common/codec_slug.py repeats this table without
-# importing tempokv, so the two must change together.
+# CrossKV layouts each fitting family may deploy.  scripts/common/codec_slug.py
+# repeats this table without importing tempokv; keep them in step.
 DEPLOYABLE_CROSS_KV_WEIGHT_MODES: dict[str, tuple[str, ...]] = {
     "legacy": ("layer_shared", "layer_head"),
     "native": ("layer_head",),
@@ -43,20 +38,10 @@ def load_codec(
     triton_cache: str | Path | None = None,
     overrides: Mapping[str, Any] | None = None,
 ) -> TempoKVCodec:
-    """Load a model-ready codec from JSON and fitted parameter files.
+    """Load a codec from a JSON config (plus overrides) and fitted parameters.
 
-    ``overrides`` replaces individual codec settings after the file is read, so
-    one committed config can serve every bit width instead of needing a second
-    file per combination.  The override participates in the codec signature, so
-    a mismatched parameter directory still fails the check below.
-
-    The two parameter arguments are positional by *role*, not by tensor name:
-    the first holds the temporal predictor and the second the cross projection.
-    Under ``predictor_direction="v_to_k"`` those describe V and K respectively,
-    so the caller passes the mirrored artifacts in the same order.  The
-    direction is part of the codec signature, so passing a forward parameter
-    set to a mirrored config is rejected here rather than silently running the
-    wrong predictor.
+    The parameter arguments are by role: temporal predictor first, cross
+    projection second, which under ``v_to_k`` are V then K.
     """
     config = load_config(config_path, overrides)
     check_deployable_cross_kv_layout(config)

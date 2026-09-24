@@ -17,28 +17,6 @@ _HEAD_DIM = 128
 _LAYERS = 30
 
 
-def _positive_env(name: str, default: int) -> int:
-    value = os.environ.get(name, str(default))
-    try:
-        parsed = int(value)
-    except ValueError as error:
-        raise ValueError(f"{name} must be an integer, got {value!r}") from error
-    if parsed < 1:
-        raise ValueError(f"{name} must be positive, got {parsed}")
-    return parsed
-
-
-def _nonnegative_env(name: str, default: int) -> int:
-    value = os.environ.get(name, str(default))
-    try:
-        parsed = int(value)
-    except ValueError as error:
-        raise ValueError(f"{name} must be an integer, got {value!r}") from error
-    if parsed < 0:
-        raise ValueError(f"{name} must not be negative, got {parsed}")
-    return parsed
-
-
 # Pre-RoPE K and V feed the predictors; rotated Q and K feed the attention
 # objective.  All four are sampled at the same token positions.
 _TRACE_KINDS = ("k_pre_rope", "v", "q_post_rope", "k_post_rope")
@@ -49,28 +27,7 @@ def _sample_projection(
     *,
     tokens_per_frame: int,
 ) -> tuple[np.ndarray, np.ndarray]:
-    if tensor.ndim != 3:
-        raise ValueError(
-            "Self-Forcing projection must use [B,S,C], got "
-            f"{tuple(tensor.shape)}"
-        )
-    batch, sequence, channels = tensor.shape
-    if channels != _HEADS * _HEAD_DIM:
-        raise ValueError(
-            "Self-Forcing trace requires 12 heads with dimension 128, got "
-            f"projection width {channels}"
-        )
-    if sequence % _FRAME_SEQ_LENGTH:
-        raise ValueError(
-            f"projection sequence {sequence} is not divisible by frame size "
-            f"{_FRAME_SEQ_LENGTH}"
-        )
-    if tokens_per_frame > _FRAME_SEQ_LENGTH:
-        raise ValueError(
-            "TEMPOKV_TRACE_TOKENS_PER_FRAME cannot exceed the frame size "
-            f"{_FRAME_SEQ_LENGTH}"
-        )
-
+    batch, sequence, _ = tensor.shape
     frame_count = sequence // _FRAME_SEQ_LENGTH
     # Match the legacy deterministic sampler: rounded linspace over both ends.
     token_indices = torch.linspace(
@@ -116,15 +73,9 @@ def install(runtime_root: str | Path) -> type:
     if not output_value:
         raise ValueError("TEMPOKV_TRACE_DIR must be set for trace collection")
     output_root = Path(output_value).expanduser().resolve()
-    tokens_per_frame = _positive_env("TEMPOKV_TRACE_TOKENS_PER_FRAME", 8)
-    event_frames = _nonnegative_env("TEMPOKV_TRACE_EVENT_FRAMES", 0)
-    rope_precision = os.environ.get(
-        "TEMPOKV_TRACE_ROPE_PRECISION", "native"
-    ).strip()
-    if rope_precision not in {"native", "complex64"}:
-        raise ValueError(
-            "TEMPOKV_TRACE_ROPE_PRECISION must be native or complex64"
-        )
+    tokens_per_frame = int(os.environ.get("TEMPOKV_TRACE_TOKENS_PER_FRAME", "8"))
+    event_frames = int(os.environ.get("TEMPOKV_TRACE_EVENT_FRAMES", "0"))
+    rope_precision = os.environ.get("TEMPOKV_TRACE_ROPE_PRECISION", "native").strip()
 
     pipeline_package = importlib.import_module("pipeline")
     pipeline_module = importlib.import_module("pipeline.causal_inference")
@@ -165,20 +116,7 @@ def install(runtime_root: str | Path) -> type:
             self._uses_pre_rope_cache = True
             self._trace_rope_precision = rope_precision
             self._apply_trace_rope_precision()
-            frame_seq_length = int(getattr(self, "frame_seq_length", 0))
-            if frame_seq_length != _FRAME_SEQ_LENGTH:
-                raise ValueError(
-                    "TempoKV Self-Forcing trace collection requires frame size "
-                    f"{_FRAME_SEQ_LENGTH}, got {frame_seq_length}"
-                )
-
-            blocks = getattr(getattr(self.generator, "model", None), "blocks", None)
-            if blocks is None or len(blocks) != _LAYERS:
-                actual = "missing" if blocks is None else str(len(blocks))
-                raise ValueError(
-                    f"Self-Forcing trace requires exactly {_LAYERS} layers, got "
-                    f"{actual}"
-                )
+            blocks = self.generator.model.blocks
 
             output_root.mkdir(parents=True, exist_ok=True)
             self._trace_enabled = False
@@ -255,8 +193,6 @@ def install(runtime_root: str | Path) -> type:
             self._trace_layers = {}
             self._trace_token_indices = None
             if self._trace_enabled:
-                if current_start is None:
-                    raise ValueError("clean Self-Forcing call is missing current_start")
                 self._trace_start = int(current_start)
 
         def _trace_projection_hook(self, layer_index: int, kind: str):
@@ -268,14 +204,10 @@ def install(runtime_root: str | Path) -> type:
                 del module, args
                 if not self._trace_enabled:
                     return
-                sampled, token_indices = _sample_projection(
+                sampled, self._trace_token_indices = _sample_projection(
                     output,
                     tokens_per_frame=tokens_per_frame,
                 )
-                if self._trace_token_indices is None:
-                    self._trace_token_indices = token_indices
-                elif not np.array_equal(self._trace_token_indices, token_indices):
-                    raise RuntimeError("Self-Forcing trace token samples do not match")
                 self._trace_layers.setdefault(layer_index, {})[kind] = sampled
 
             return capture
@@ -295,13 +227,9 @@ def install(runtime_root: str | Path) -> type:
                         tensor = tensor.reshape(
                             tensor.shape[0], tensor.shape[1], -1
                         )
-                    sampled, token_indices = _sample_projection(
+                    sampled, _ = _sample_projection(
                         tensor, tokens_per_frame=tokens_per_frame
                     )
-                    if not np.array_equal(self._trace_token_indices, token_indices):
-                        raise RuntimeError(
-                            "Self-Forcing trace token samples do not match"
-                        )
                     self._trace_layers.setdefault(layer_index, {})[kind] = sampled
 
             return record
@@ -316,107 +244,52 @@ def install(runtime_root: str | Path) -> type:
             del module, args, kwargs
             if not self._trace_enabled:
                 return
-            if output is None:
-                self._trace_enabled = False
-                self._trace_layers = {}
-                self._trace_token_indices = None
-                return
             try:
-                self._append_trace_block()
+                if output is not None:
+                    self._append_trace_block()
             finally:
                 self._trace_enabled = False
                 self._trace_layers = {}
                 self._trace_token_indices = None
 
         def _append_trace_block(self) -> None:
-            if sorted(self._trace_layers) != list(range(_LAYERS)):
-                raise RuntimeError(
-                    "clean Self-Forcing pass did not capture all 30 attention layers"
-                )
-            token_indices = self._trace_token_indices
-            if token_indices is None:
-                raise RuntimeError("clean Self-Forcing pass did not capture token indices")
-
-            first = self._trace_layers[0]
-            if set(first) != set(_TRACE_KINDS):
-                raise RuntimeError(
-                    "clean Self-Forcing pass captured "
-                    f"{sorted(first)} instead of {list(_TRACE_KINDS)}"
-                )
-            frames = first["k_pre_rope"].shape[1]
-            block_end = self._trace_start + frames * _FRAME_SEQ_LENGTH
+            frames = self._trace_layers[0]["k_pre_rope"].shape[1]
             if self._trace_sequence_start is None:
                 self._trace_sequence_start = self._trace_start
                 self._trace_sequence_end = self._trace_start
-                self._trace_sequence_token_indices = token_indices
+                self._trace_sequence_token_indices = self._trace_token_indices
+            # A gap would splice two separate moments into one trace sequence.
             if self._trace_start != self._trace_sequence_end:
                 raise RuntimeError(
                     "clean Self-Forcing trace blocks are not temporally contiguous"
                 )
-            if not np.array_equal(
-                self._trace_sequence_token_indices, token_indices
-            ):
-                raise RuntimeError(
-                    "clean Self-Forcing trace blocks use different token samples"
-                )
-
             for layer_index in range(_LAYERS):
-                arrays = self._trace_layers[layer_index]
-                if set(arrays) != set(_TRACE_KINDS):
-                    raise RuntimeError(
-                        f"layer {layer_index} captured {sorted(arrays)} instead "
-                        f"of {list(_TRACE_KINDS)}"
-                    )
-                shapes = {arrays[kind].shape for kind in _TRACE_KINDS}
-                if len(shapes) != 1:
-                    raise ValueError(
-                        f"layer {layer_index} captured mismatched shapes: {shapes}"
-                    )
                 sequence = self._trace_sequence_layers.setdefault(
                     layer_index, {kind: [] for kind in _TRACE_KINDS}
                 )
                 for kind in _TRACE_KINDS:
-                    sequence[kind].append(arrays[kind])
-            self._trace_sequence_end = block_end
+                    sequence[kind].append(self._trace_layers[layer_index][kind])
+            self._trace_sequence_end = (
+                self._trace_start + frames * _FRAME_SEQ_LENGTH
+            )
 
         def _write_trace_event(self) -> None:
             if self._trace_sequence_start is None or self._trace_sequence_end is None:
                 raise RuntimeError("Self-Forcing inference produced no clean K/V trace")
-            if sorted(self._trace_sequence_layers) != list(range(_LAYERS)):
-                raise RuntimeError(
-                    "Self-Forcing inference did not capture all 30 attention layers"
-                )
             token_indices = self._trace_sequence_token_indices
-            if token_indices is None:
-                raise RuntimeError("Self-Forcing inference did not capture token indices")
 
             sequence_start = self._trace_sequence_start
             sequence_end = self._trace_sequence_end
             rank = int(os.environ.get("RANK", "0"))
             rank_dir = output_root / f"rank_{rank:03d}"
-            combined: dict[int, dict[str, np.ndarray]] = {}
-            total_frames: int | None = None
-            for layer_index in range(_LAYERS):
-                arrays = self._trace_sequence_layers[layer_index]
-                merged = {
+            combined = {
+                layer_index: {
                     kind: np.concatenate(arrays[kind], axis=1)
                     for kind in _TRACE_KINDS
                 }
-                shapes = {value.shape for value in merged.values()}
-                if len(shapes) != 1:
-                    raise ValueError(
-                        f"layer {layer_index} captured mismatched shapes: {shapes}"
-                    )
-                frames = int(merged["k_pre_rope"].shape[1])
-                if total_frames is None:
-                    total_frames = frames
-                elif total_frames != frames:
-                    raise ValueError("trace layers contain different frame counts")
-                combined[layer_index] = merged
-            assert total_frames is not None
-            if sequence_end - sequence_start != total_frames * _FRAME_SEQ_LENGTH:
-                raise ValueError("trace token range does not match captured frames")
-
+                for layer_index, arrays in self._trace_sequence_layers.items()
+            }
+            total_frames = (sequence_end - sequence_start) // _FRAME_SEQ_LENGTH
             frames_per_event = event_frames or total_frames
             complete_events = total_frames // frames_per_event
             if complete_events < 1:
@@ -435,8 +308,6 @@ def install(runtime_root: str | Path) -> type:
                 )
                 event_dir = rank_dir / event_name
                 temporary_dir = rank_dir / f".{event_name}.tmp-{os.getpid()}"
-                if event_dir.exists():
-                    raise FileExistsError(f"trace event already exists: {event_dir}")
                 temporary_dir.mkdir(parents=True, exist_ok=False)
                 try:
                     for layer_index in range(_LAYERS):

@@ -115,10 +115,7 @@ def _read_codec_config(
         from tempokv.config import config_from_mapping, is_temporal_v_predictor
 
         config = config_from_mapping(payload)
-        # LongCat CrossKV weights must be layer_head: per-layer V statistics
-        # differ too much for a shared matrix (layer0 V is unfit-able under
-        # layer_shared; see 9.6 hybrid-bits).  Temporal-only V never reads the
-        # CrossKV weights, so its layout is not constrained here.
+        # LongCat CrossKV weights must be layer_head; temporal-only V is unconstrained.
         if (
             not is_temporal_v_predictor(config.v_predictor_mode)
             and config.cross_kv_weight_mode != "layer_head"

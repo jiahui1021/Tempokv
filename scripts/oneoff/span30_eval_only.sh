@@ -3,9 +3,9 @@
 # 适用:L16/48/128(30 条视频已在盘上,等评测)。生成未完成勿用(等 done 或走 --points)。
 set -uo pipefail
 LL="$1"; GPU="$2"
-T=/mnt/cpfs/epic-user/hujiahui-20260612/Tempokv
-QVG=/mnt/cpfs/epic-user/hujiahui-20260612/miniconda3/envs/qvg/bin/python
-VPY=/mnt/cpfs/epic-user/hujiahui-20260612/miniconda3/envs/vbench/bin/python
+T=${WORKSPACE:?set WORKSPACE to the experiment root}/Tempokv
+QVG=${WORKSPACE}/miniconda3/envs/qvg/bin/python
+VPY=${WORKSPACE}/miniconda3/envs/vbench/bin/python
 cd "$T"
 R=$T/results/paper/span-int2/runs; D=$R/span30sweep; RUN=$R/spansweep30_lag18_L${LL}/pixel_717
 V=$R/spansweep30_lag18_L${LL}/vbench_long8
@@ -25,8 +25,8 @@ if [[ -n $RECENT_VB ]]; then echo "[evalonly] L$LL vbench 30分钟内有新产�
 if [[ ! -s $V/evaluation.json && -z $RECENT_VB ]]; then
   mkdir -p "$V"
   echo "[evalonly] L$LL vbench8 开始 $(date '+%T')" >> "$D/evalonly.log"
-  PYTHONPATH="/mnt/cpfs/epic-user/hujiahui-20260612/qvg/forcing/vbench:$T/scripts/evaluation" \
-  VBENCH_CACHE_DIR=/mnt/cpfs/epic-user/hujiahui-20260612/vbench_cache \
+  PYTHONPATH="${WORKSPACE}/qvg/forcing/vbench:$T/scripts/evaluation" \
+  VBENCH_CACHE_DIR=${WORKSPACE}/vbench_cache \
   CUDA_VISIBLE_DEVICES="$GPU" "$VPY" scripts/evaluation/evaluate_vbench.py "$RUN/videos" \
     --output-dir "$V" --name "spansweep30_lag18_L${LL}" --prompt-file "$D/prompts_first30.json" \
     --mode long_custom_input \

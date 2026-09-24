@@ -76,9 +76,7 @@ def _parser() -> argparse.ArgumentParser:
             "1560 for CP=1 or runtime validation for CP>1"
         ),
     )
-    # Bit width, history, stride and the V predictor are overrides rather than
-    # one committed config per combination.  --stride is safe to fold in
-    # because the bridge checks it against the real cache shape.
+    # Bits, history, stride and V predictor are overrides on one config.
     parser.add_argument("--k-bits", type=int, choices=range(1, 9))
     parser.add_argument("--v-bits", type=int, choices=range(1, 9))
     parser.add_argument("--anchor-bits", type=int, choices=range(1, 17))
@@ -229,11 +227,7 @@ def _runtime_arguments(
 
 
 def _require_tempokv_activity(report: dict) -> None:
-    """Fail a TempoKV run that never actually used the codec.
-
-    Without this a hook that stops firing produces a perfectly good video from
-    an untouched BF16 cache and reports it as a TempoKV result.
-    """
+    """Fail a TempoKV run that never exercised the codec."""
     empty = [
         name
         for name in ("encode_key_calls", "encode_value_calls", "decode_tensor_calls")
@@ -335,9 +329,7 @@ def run(argv: Sequence[str] | None = None) -> int:
             "--max-trace-spatial-positions must be at least context_parallel_size"
         )
     if trace_dir is not None:
-        # Every CP rank sees a different spatial shard.  Keep the shards in
-        # separate directories so event creation remains race-free; the trace
-        # preparation script merges them recursively.
+        # One directory per CP rank; prepare_trace merges them.
         trace_dir = trace_dir / f"rank_{rank:05d}"
 
     if known.mode == "tempokv":
@@ -363,9 +355,7 @@ def run(argv: Sequence[str] | None = None) -> int:
         )
         if not known.allow_triton_fallback:
             _enforce_accelerated_codec(bridge)
-            # A user-supplied config may have disabled Triton, in which case
-            # load_codec intentionally skipped cache setup before this launcher
-            # enforced the production path.
+            # The config may have disabled Triton, so set up its cache here.
             from tempokv.runtime import configure_triton_cache
 
             configure_triton_cache(known.triton_cache)

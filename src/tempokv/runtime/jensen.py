@@ -1,35 +1,11 @@
 """Jensen-bias correction for quantized cached keys (arXiv 2605.26266).
 
-Quantization adds approximately zero-mean noise to a cached key, so the
-pre-softmax score ``s_i`` stays unbiased.  The exponential does not: by
-convexity ``E[e^d] >= 1``, so every quantized cached score contributes more to
-the softmax partition sum than its unquantized counterpart, and the cached
-block takes attention mass from the unquantized current chunk.  Subtracting
-
-    b_i = (1 / 24d) * sum_j Delta_{i,j}^2 * ||q_j||^2
-
-from each cached score removes that inflation in expectation.  ``Delta`` is the
-step size TempoKV already stores, so the correction needs no extra state.
-
-Two properties make this cheap to apply here rather than needing a fused
-attention kernel:
-
-**It is a rank-G bilinear form.**  ``b`` pairs a per-query vector
-``(||q_j||^2)_j`` with a per-key vector ``(Delta_{i,j}^2)_j``, both of length
-``G = d/g`` -- two entries at the production ``d=128, g=64``.  So it folds into
-``G`` extra Q/K channels and the ordinary attention call computes it, whatever
-backend that call uses.  :func:`augment` builds those channels; the caller must
-then pass the *original* ``1/sqrt(d)`` softmax scale, since the augmented head
-dimension is no longer the one the scores are normalized by.
-
-**Per-group query norms are RoPE-invariant.**  Wan rotates adjacent channel
-pairs and ``g`` is even, so no rotary pair straddles a group boundary and
-``||q_j||^2`` is the same before and after RoPE.  The correction may therefore
-use the post-RoPE query against pre-RoPE step sizes, which is exactly what a
-pre-RoPE cache has on hand.
-
-Keys that were never quantized -- the current chunk, and any BF16 cache chunk
--- carry a zero step size and so receive a zero correction with no masking.
+By convexity quantization noise inflates exp(score) for cached keys.  Each
+cached score gets ``b_i = (1/24d) * sum_j Delta_{i,j}^2 * ||q_j||^2``
+subtracted, with ``Delta`` the stored step size.  ``b`` is a rank-G bilinear
+form, so :func:`augment` folds it into G extra Q/K channels (pass the original
+``1/sqrt(d)`` scale).  Per-group query norms are RoPE-invariant, and
+unquantized keys have zero step, so they get no correction.
 """
 
 from __future__ import annotations
@@ -67,13 +43,8 @@ def augment(
 ) -> tuple[torch.Tensor, torch.Tensor, float]:
     """Fold the correction into extra channels of ``query`` and ``key``.
 
-    ``query`` and ``key`` are ``[..., S, D]`` with matching leading axes;
-    ``step_sizes`` is ``[..., S_key, D/g]`` and aligns with ``key``.  Returns
-    the augmented pair and the softmax scale the caller must pass through,
-    which stays ``1/sqrt(D)`` of the *original* head dimension.
-
-    ``pad_to`` widens the augmented head dimension with zero channels, for
-    backends that only accept particular head dimensions.
+    ``step_sizes`` is ``[..., S_key, D/g]``.  Returns the augmented pair and the
+    original ``1/sqrt(D)`` scale; ``pad_to`` zero-pads the head dimension.
     """
     dim = int(query.shape[-1])
     groups = dim // group_size
@@ -94,12 +65,7 @@ def augment(
 
 
 def bias(query: torch.Tensor, step_sizes: torch.Tensor, group_size: int) -> torch.Tensor:
-    """Materialize ``b`` as ``[..., Q, K]``.  A reference, not the fast path.
-
-    Attention never needs this tensor -- :func:`augment` lets the attention
-    kernel compute the same values without materializing a score-sized buffer.
-    It exists so tests can check the folded form against the definition.
-    """
+    """Materialize ``b`` as ``[..., Q, K]``; a test reference, not the fast path."""
     dim = int(query.shape[-1])
     work = _work_dtype(query)
     norms = query.to(work).pow(2).reshape(*query.shape[:-1], -1, group_size).sum(-1)

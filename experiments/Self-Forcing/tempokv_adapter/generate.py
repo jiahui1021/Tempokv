@@ -197,9 +197,8 @@ def _validate_parameters(
         if temporal_v
         else CrossKVParameters.load(v_path)
     )
-    # The codec itself refuses a stamped set fitted under another config or
-    # split across two fitting runs; a production run additionally refuses
-    # unstamped sets and parameters fitted in another coordinate system.
+    # The codec refuses mismatched stamped sets; production also refuses unstamped
+    # sets and other coordinate systems.
     if temporal.codec_signature is None or not temporal.parameter_set_id:
         raise ValueError(
             "Self-Forcing parameters must come from the fitter; refit them"
@@ -365,13 +364,9 @@ _DECODE_SECTIONS = ("decode_k", "decode_v")
 def _efficiency_segments(
     profiles: list[dict[str, object]]
 ) -> tuple[dict[str, float | None], dict[str, str]]:
-    """Reduce per-rank profiles to the four measured latency segments.
+    """Reduce per-rank profiles to the four latency segments.
 
-    Codec sections are absent for a BF16 run by design, so they report ``0.0``
-    with an explicit reason.  A section that should have been patched and was
-    not reports ``None``: the collector treats ``denoising_other`` as a
-    residual, and a missing segment silently folded into it would be a
-    fabricated number.
+    Codec sections of a BF16 run report ``0.0``; an unpatched section reports ``None``.
     """
     totals: dict[str, float] = {}
     for profile in profiles:
@@ -417,14 +412,7 @@ def _efficiency_segments(
 
 
 def _gpu_uuid() -> str:
-    """The device UUID, so the collector can prove one card ran every method.
-
-    Best effort on purpose.  This runs after a generation has already produced
-    its videos, and no provenance lookup is worth losing that work to -- so any
-    failure yields an empty string.  Nothing is hidden by doing so: the
-    collector's consistency gate rejects a record whose ``gpu_uuid`` does not
-    match the manifest, empty included.
-    """
+    """The device UUID, or an empty string if it cannot be read."""
     try:
         return subprocess.check_output(
             ["nvidia-smi", "--query-gpu=uuid", "--format=csv,noheader"],
@@ -466,12 +454,7 @@ def _frozen_run_block(
 def _sampler_from_summary(
     batch_entries: list[dict[str, object]]
 ) -> efficiency.ResidentSampler:
-    """Replay the per-block samples the pipeline recorded into a sampler.
-
-    The pipeline hands the run summary its full observation list rather than a
-    peak, so the peak is still computable after the trip through JSON and the
-    sample count stays auditable.
-    """
+    """Replay the per-block resident-memory samples into a sampler."""
     sampler = efficiency.ResidentSampler()
     for batch in batch_entries:
         for sample in batch.get("efficiency_samples") or []:
@@ -604,12 +587,7 @@ def _write_horizon_record(
 def _load_worker_profiles(
     profile_dir: Path, expected_ranks: int
 ) -> list[dict[str, object]]:
-    """Read the per-rank runtime breakdown written by an instrumented worker.
-
-    A rank that produced no profile is an error rather than an empty entry: the
-    Stage 0 decision gate compares section shares, and a silently missing rank
-    would move every share.
-    """
+    """Read each rank's runtime breakdown; a missing profile is an error."""
     profiles: list[dict[str, object]] = []
     for expected_rank in range(expected_ranks):
         path = profile_dir / f"rank-{expected_rank}.json"
@@ -663,12 +641,7 @@ def _end_to_end_latency(
     batch_entries: list[dict[str, object]],
     video_entries: list[dict[str, object]],
 ) -> float | None:
-    """Average prompt-batch latency, excluding model load.
-
-    New summaries measure one generation and one save interval per prompt. A
-    legacy video-only summary is accepted as a compatibility fallback, with
-    at most one sample counted for each prompt.
-    """
+    """Average prompt-batch latency, excluding model load."""
     candidates: list[float] = []
     for batch in batch_entries:
         if int(batch.get("generated_samples", 0) or 0) <= 0:
@@ -822,10 +795,8 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         parameters = _validate_parameters(
             paths["k_params"], paths["v_params"], config
         )
-        # Predictor parameters are reusable across span lengths.  A fitting
-        # span only partitions calibration samples and is deliberately absent
-        # from the parameter format signature, so generation must not couple
-        # its runtime boundary to fit_report.json.
+        # The fitting span is not part of the parameter signature, so it does not
+        # constrain the runtime span.
 
     generation_command = _generation_command(args, paths)
     report: dict[str, object] = {
@@ -882,21 +853,14 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                 "TEMPOKV_K_PARAMS_PATH": str(paths["k_params"]),
                 "TEMPOKV_V_PARAMS_PATH": str(paths["v_params"]),
                 "TEMPOKV_NUM_FRAMES": str(latent_frames_for(args.frames)),
-                # The rollout length, which is what the incremental encoder
-                # sizes its spans against.  It is exported separately because
-                # TEMPOKV_NUM_FRAMES doubles as the attention window and the
-                # ablation below narrows that window without shortening the
-                # rollout.
+                # Rollout length; TEMPOKV_NUM_FRAMES is the attention window.
                 "TEMPOKV_HORIZON_FRAMES": str(latent_frames_for(args.frames)),
             }
         )
         if args.span_frames is not None:
             environment["TEMPOKV_SPAN_FRAMES"] = str(args.span_frames)
-        # The attention window normally spans every generated frame, because
-        # TempoKV compresses the whole cache and no longer needs the model's
-        # 21-frame default.  Overriding it back to a smaller window is what
-        # makes a run comparable against a baseline that kept that default,
-        # since the window decides how many quantized frames reach the output.
+        # The window defaults to every generated frame; narrowing it matches a
+        # baseline that kept the 21-frame default.
         attention_frames = os.environ.get("TEMPOKV_ATTENTION_FRAMES")
         if attention_frames:
             environment["TEMPOKV_NUM_FRAMES"] = str(int(attention_frames))
@@ -913,9 +877,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             ):
                 environment.pop(name)
         if args.mode == "trace" and args.config is not None:
-            # Reuse the TempoKV bounded-cache runtime while trace_bridge captures
-            # the clean (pre-quant) K/V.  Without this the model falls back to a
-            # full unbounded bf16 KV cache, which OOMs on long sequences.
+            # Use the bounded TempoKV cache runtime while tracing clean K/V.
             _cfg = json.loads(Path(args.config).read_text())
             if isinstance(_cfg, dict) and "codec" in _cfg:
                 _cfg = _cfg["codec"]
@@ -1042,9 +1004,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                 "TempoKV direct persistent Triton decode was not used: "
                 + ", ".join(missing_routes)
             )
-        # "declined:" entries are not routes; each names the gate that sent a
-        # span to the Torch decoder, so report them as the reason alongside
-        # whichever fallback route actually ran.
+        # "declined:" entries name the gate that sent a span to the Torch decoder.
         declines = {
             name.split(":", 1)[1]: int(count)
             for name, count in performance["decode_routes"].items()

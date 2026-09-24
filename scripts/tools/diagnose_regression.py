@@ -1,20 +1,11 @@
 """Localize a TempoKV quality regression to one stage boundary.
 
-Runs the real codec on a real trace and reports, per layer:
+Reports per layer: predictor residual energy, encoder closed-loop error,
+decoder parity and error attribution.  The first stage that looks wrong is
+where the bug is.
 
-  A. predictor residual energy   -- are the fitted parameters any good?
-  B. encoder closed-loop error   -- the codec's intrinsic quality
-  C. decoder parity              -- does decode() reproduce the encoder exactly?
-  D. error attribution           -- quantization vs decoder mismatch
-
-Read the stages in order.  The first one that looks wrong is where the bug is;
-later stages inherit the earlier stage's damage and are not independent evidence.
-
-    python scripts/tools/diagnose_regression.py \
-        --trace runs/.../self_forcing_trace.npz \
-        --config configs/legacy.json \
-        --k-params <params>/k_temporal.npz \
-        --v-params <params>/v_cross_kv.npz
+    python scripts/tools/diagnose_regression.py --trace TRACE.npz \\
+        --config configs/legacy.json --k-params K.npz --v-params V.npz
 """
 
 from __future__ import annotations
@@ -44,13 +35,7 @@ def _relative_mse(estimate: torch.Tensor, target: torch.Tensor) -> float:
 
 
 def _restride(parameters, stride):
-    """Rebuild parameters for the trace's tokens-per-frame stride.
-
-    The trace subsamples tokens per frame, so a faithful replay uses one unit
-    per sampled frame rather than the production 1560-token stride.  Identity
-    stamps are dropped with it: they describe the production config, and
-    keeping them would only make the codec reject its own parameters.
-    """
+    """Rebuild parameters for the trace's sampled-token stride (identity stamps dropped)."""
     if isinstance(parameters, TemporalParameters):
         return TemporalParameters(
             parameters.history_weights,
@@ -116,13 +101,8 @@ def main() -> None:
     print(f"  coordinate_system   : {temporal.coordinate_system}")
     print(f"  codec_signature     : {temporal.codec_signature}")
 
-    # The fitter caps each channel's L1 gain across lags at --max-gain. A cap
-    # of 1.0 forbids extrapolation (lag-1 above 1 against negative higher
-    # lags), which is exactly what a smoothly drifting cache wants. When the
-    # cap binds, adding history makes prediction *worse* rather than better.
-    # Independent weights are [P,P,D], [P,P,H,D] or [L,P,P,H,D]; the lag axis is
-    # -3 whenever a head axis is present and -2 otherwise.  `per_head` cannot be
-    # used here because it only reads correctly after a layer is selected.
+    # The L1 gain cap forbids extrapolation; when it binds, more history hurts.
+    # The lag axis is -3 with a head axis and -2 without.
     weights = temporal.history_weights
     gains = weights.abs().sum(dim=-3 if weights.ndim >= 4 else -2)
     for threshold in (1.0,):

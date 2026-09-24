@@ -6,11 +6,11 @@
 #       生成完 watcher 收尾全部 30 条后进下一组。幂等: summary complete 或 30 eval 齐则跳过。
 set -uo pipefail
 GPU="${1:-GPU-801636c6-7759-36df-3ee7-ad18e0d5cde9}"
-TEMPOKV=/mnt/cpfs/epic-user/hujiahui-20260612/Tempokv
-QB=/mnt/cpfs/epic-user/hujiahui-20260612/miniconda3/envs/qvg/bin; QVG="$QB/python"
-CKPT=/mnt/cpfs/epic-user/hujiahui-20260612/checkpoints/self_forcing_dmd.pt
-WAN=/mnt/cpfs/epic-user/hujiahui-20260612/models--Wan-AI--Wan2.1-T2V-1.3B
-REF=/mnt/cpfs/epic-user/hujiahui-20260612/kv-quant-result/experiments/self-forcing/Self-Forcing/bf16
+TEMPOKV=${WORKSPACE:?set WORKSPACE to the experiment root}/Tempokv
+QB=${WORKSPACE}/miniconda3/envs/qvg/bin; QVG="$QB/python"
+CKPT=${WORKSPACE}/checkpoints/self_forcing_dmd.pt
+WAN=${WORKSPACE}/models--Wan-AI--Wan2.1-T2V-1.3B
+REF=${WORKSPACE}/kv-quant-result/experiments/self-forcing/Self-Forcing/bf16
 export PYTHON_BIN="$QVG"
 cd "$TEMPOKV"; mkdir -p logs
 log(){ printf '[%s] %s\n' "$(date '+%F %T')" "$*" >>"$TEMPOKV/logs/mirror_serial.log"; }

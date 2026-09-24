@@ -1,11 +1,5 @@
 #!/usr/bin/env python3
-"""Compare temporal-only and CrossKV+V-history predictors on a held-out trace.
-
-The comparison replays each independently fitted parameter set through the
-production closed loop.  It reports clean-target prediction residuals before
-quantization, reconstructed-V error after quantization, and recorded-Q
-attention-output error, with pooled, prompt, layer, and head breakdowns.
-"""
+"""Compare temporal-only and CrossKV+V-history predictors on a held-out trace."""
 
 from __future__ import annotations
 

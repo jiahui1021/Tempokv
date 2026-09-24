@@ -2,11 +2,11 @@
 # CrossKV weight-sharing 717-frame generation comparison, 3-GPU variant parallelism.
 set -euo pipefail
 
-ROOT=/mnt/cpfs/epic-user/hujiahui-20260612/Tempokv
-PY=/mnt/cpfs/epic-user/hujiahui-20260612/miniconda3/envs/qvg/bin/python
+ROOT=${WORKSPACE:?set WORKSPACE to the experiment root}/Tempokv
+PY=${WORKSPACE}/miniconda3/envs/qvg/bin/python
 GEN=$ROOT/experiments/Self-Forcing/tempokv_adapter/generate.py
-CKPT=/mnt/cpfs/epic-user/hujiahui-20260612/checkpoints/self_forcing_dmd.pt
-WAN_DIR=/mnt/cpfs/epic-user/hujiahui-20260612/models--Wan-AI--Wan2.1-T2V-1.3B
+CKPT=${WORKSPACE}/checkpoints/self_forcing_dmd.pt
+WAN_DIR=${WORKSPACE}/models--Wan-AI--Wan2.1-T2V-1.3B
 PROMPTS=$ROOT/assets/moviegen128.txt
 SMOKE=$ROOT/results/paper/cross_kv_sharing_smoke
 OUT=$ROOT/results/paper/cross_kv_sharing_717f

@@ -1,9 +1,7 @@
 """Runtime adapter between LongCat's KV cache and TempoKV.
 
-LongCat owns attention, RoPE, and cache lifetime.  This module only changes the
-cache boundary: clean pre-RoPE K/V are encoded with TempoKV, then K is decoded
-before V so the CrossKV predictor receives the same closed-loop K used during
-encoding.
+Clean pre-RoPE K/V are encoded at the cache boundary; the primary tensor is
+decoded first so the cross predictor sees the same reconstruction as the encoder.
 """
 
 from __future__ import annotations
@@ -56,19 +54,12 @@ class LongCatRuntimeSpec:
 
 @dataclass(frozen=True, slots=True)
 class PackedTensorSpanSet:
-    """Independent TempoKV spans concatenated at the LongCat cache boundary.
-
-    Attention-sink caches contain a historical sink span followed by a recent
-    conditioning span.  Each span has its own anchor so predictor history never
-    crosses the semantic time gap.
-    """
+    """Independent TempoKV spans (e.g. sink + recent) concatenated at the cache boundary."""
 
     shape: tuple[int, int, int, int]
     predictor_kind: str
     spans: tuple[PackedTensor, ...]
-    # The newest conditioning latents kept exact, after every packed span.
-    # This is the LongCat form of the Self-Forcing BF16 lag: the frames the
-    # new segment attends to most are not approximated.
+    # Newest conditioning latents kept exact, after the packed spans.
     tail: torch.Tensor | None = None
 
     def storage_bytes(self) -> int:
@@ -86,11 +77,7 @@ def _move_tensor(value: torch.Tensor | None, device: torch.device) -> torch.Tens
 
 
 def move_packed_tensor(packed: PackedState, device: torch.device | str) -> PackedState:
-    """Move PackedTensor storage while retaining shared predictor parameters.
-
-    Predictor parameters are owned and cached by ``TempoKVCodec``.  Only the
-    quantized storage travels between CPU and GPU with the LongCat cache.
-    """
+    """Move PackedTensor storage between devices; predictor parameters stay with the codec."""
     if isinstance(packed, PackedTensorSpanSet):
         return replace(
             packed,
@@ -148,9 +135,7 @@ def decode_kv_cache(
             value_output.copy_(v_cache)
             v_cache = value_output
         return k_cache, v_cache
-    # Exactly one side is predicted temporally and supplies the projection
-    # source for the other: forward is K temporal / V cross, mirrored is
-    # V temporal / K cross.
+    # Forward: K temporal / V cross; mirrored: V temporal / K cross.
     if isinstance(k_cache, PackedTensorSpanSet):
         output_dtype = _RECONSTRUCTION_DTYPE[
             k_cache.spans[0].reconstruction_dtype
@@ -332,10 +317,7 @@ def encode_kv_cache(
                 value = value.to(target_device)
             key = key.contiguous()
             value = value.contiguous()
-            # Encode by codec role: the primary tensor is predicted from its
-            # own temporal history and the secondary one from the primary's
-            # reconstruction.  Forward is K then V; the mirrored direction is
-            # V then K through this same call pair.
+            # Encode by role: primary first, then secondary from its reconstruction.
             mirrored = codec.config.mirrored
             primary, secondary = (value, key) if mirrored else (key, value)
             packed_primary, reconstructed_primary = codec.encode_primary(
@@ -401,13 +383,9 @@ def encode_kv_cache(
 
 
 def _env_span_splits(temporal_units: int) -> tuple[int, ...] | None:
-    """Parse ``TEMPOKV_SPAN_SPLITS="first+step"`` into span unit sizes.
+    """Parse ``TEMPOKV_SPAN_SPLITS="first+step"`` (e.g. ``"19+5"``) into span sizes.
 
-    ``"19+5"`` cuts the cumulative LongCat window into a 19-unit span followed
-    by 5-unit spans, i.e. one anchor per generation segment even though the
-    cache itself starts at frame 0 every call.  Unset (or a window too short to
-    split) returns ``None`` so the batched single-span path — one anchor for
-    the whole video — runs unchanged.
+    Returns ``None`` when unset or too short, keeping one anchor for the video.
     """
     raw = os.environ.get("TEMPOKV_SPAN_SPLITS", "").strip()
     if not raw:
@@ -503,10 +481,7 @@ def encode_kv_cache_spans(
                     sum(item.shape[2] for item in key_spans),
                     key_spans[0].shape[3],
                 ),
-                # Take the kind from the spans themselves.  Re-deriving it
-                # from the codec assumed K is always the temporal side, which
-                # the mirrored direction reverses, and a label that disagrees
-                # with the packed state routes the decode wrongly.
+                # Take the kind from the spans, which the mirrored direction reverses.
                 predictor_kind=key_spans[0].predictor_kind,
                 spans=key_spans,
             ),
@@ -569,12 +544,7 @@ _ACTIVE_BRIDGE: ContextVar["LongCatTempoKVBridge | None"] = ContextVar(
 
 
 def _unwrap_compiled_module(value: Any) -> Any:
-    """Return the original module hidden by torch.compile wrappers.
-
-    The bundled runtime may compile LongCat before returning the model. The
-    wrapper still executes the original block, so bridge state must be attached
-    to that original module and its attention.
-    """
+    """Return the original module behind torch.compile wrappers."""
     current = value
     seen: set[int] = set()
     for _ in range(8):
@@ -884,13 +854,7 @@ class LongCatTempoKVBridge:
         encode_device: torch.device | None,
         storage_device: torch.device | None,
     ) -> Any:
-        """Pack all but the newest ``lag_units`` conditioning latents.
-
-        LongCat rebuilds the whole conditioning cache each segment and drops it
-        at the end, so it has no incremental schedule and nothing to flush.
-        Only the lag carries over from Self-Forcing, and it is taken from the
-        most recent span so an attention sink is never cut.
-        """
+        """Pack all but the newest ``lag_units`` conditioning latents (taken from the last span)."""
         assert self.codec is not None
         spans = (
             tuple(int(item) for item in span_units)
@@ -987,10 +951,7 @@ class LongCatTempoKVBridge:
         key_output: torch.Tensor | None = None,
         value_output: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        # Synchronizing around every layer decode serializes the entire GPU
-        # pipeline.  Production runs keep aggregate counters only.  Optional
-        # profiling measures host enqueue time and deliberately never waits for
-        # CUDA work to finish.
+        # No per-layer synchronization; profiling measures host enqueue time only.
         started = time.perf_counter() if self.profile_decode else None
         result = decode_kv_cache(
             k_cache,
@@ -1334,11 +1295,7 @@ def install_longcat_bridge(
     profile_decode: bool = False,
     **modules: Any,
 ) -> LongCatTempoKVBridge:
-    """Create and install a LongCat bridge.
-
-    A codec can be supplied directly for embedding applications.  The path
-    form mirrors the command-line workflow and keeps model dependencies lazy.
-    """
+    """Create and install a LongCat bridge from a codec or config/parameter paths."""
     if codec is None and mode == "tempokv":
         paths = (config_path, k_parameters_path, v_parameters_path)
         if any(path is None for path in paths):

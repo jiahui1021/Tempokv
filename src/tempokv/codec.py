@@ -55,23 +55,10 @@ class PackedTensor:
     channel_mean: torch.Tensor | None = None
 
     def step_sizes(self) -> torch.Tensor:
-        """Per-token per-group quantizer step size, shaped ``[B, H, S, D/g]``.
+        """Per-token per-group quantizer step ``[B, H, S, D/g]`` for the Jensen correction.
 
-        This is the ``Delta`` a Jensen-bias correction needs (arXiv 2605.26266):
-        the reconstruction error of a cached key is bounded by ``Delta/2``,
-        because the residual loop is closed and every unit after the anchor
-        stores only the quantization error of its own residual.
-
-        The step size is the stored scale itself at every width but one, so
-        reading it costs nothing and adds nothing to the cache.  The exception
-        is 1-bit symmetric quantization, which has no zero code and places its
-        two levels at -scale and +scale: the distance between adjacent levels
-        is then 2*scale, not scale.  Reporting the scale there would understate
-        the step by 2x and the bias, which is quadratic in it, by 4x.
-
-        An unquantized anchor reports zero, which is correct rather than merely
-        convenient: a key stored at bf16 carries no quantization noise and must
-        receive no correction.
+        This is the stored scale, except 1-bit symmetric (step ``2*scale``); a raw
+        anchor reports zero.
         """
         batch, heads, sequence, width = self.shape
         groups = width // self.group_size
@@ -97,12 +84,7 @@ class PackedTensor:
         return self.anchor_bits == RAW_ANCHOR_BITS
 
     def storage_bytes(self) -> int:
-        """On-device bytes actually stored for this packed tensor.
-
-        Counts every quantized component (anchor quant/scale and, when present,
-        residual quant/scale/zero-point).  Predictor parameters are shared and
-        not replicated per span, so they are excluded.
-        """
+        """On-device bytes of the quantized components (predictor parameters excluded)."""
         total = self.anchor_quant.numel() * self.anchor_quant.element_size()
         total += self.anchor_scale.numel() * self.anchor_scale.element_size()
         if self.channel_mean is not None:
@@ -117,12 +99,7 @@ class PackedTensor:
         return total
 
     def logical_storage_bytes(self) -> int:
-        """Bytes initialized for the logical prefix of an open packed span.
-
-        ``storage_bytes`` is the allocator-facing figure and includes unused
-        geometric-growth capacity.  This method exists only for codec-format
-        analysis; resident-memory reports must continue to use allocated bytes.
-        """
+        """Bytes of the logical prefix of an open span, excluding growth capacity."""
         total = self.anchor_quant.numel() * self.anchor_quant.element_size()
         total += self.anchor_scale.numel() * self.anchor_scale.element_size()
         if self.channel_mean is not None:
@@ -202,12 +179,7 @@ def reconstructed_key_innovation(
     *,
     legacy: bool = True,
 ) -> torch.Tensor:
-    """Return the decoder-visible K innovation for one reconstructed span.
-
-    The anchor has no preceding temporal prediction and is defined as zero.
-    Every later unit subtracts the same prediction the K decoder can reproduce,
-    then rounds the innovation to reconstructed K's dtype before V projects it.
-    """
+    """Return the decoder-visible K innovation of a span (zero at the anchor)."""
     innovation = torch.zeros_like(reconstructed_key)
     anchor_length = unit_lengths[0]
     history = [reconstructed_key[:, :, :anchor_length]]
@@ -236,14 +208,9 @@ def cross_projection(
     *,
     matmul_precision: str = "ieee",
 ) -> torch.Tensor:
-    """Project a whole reconstructed-K span through Cross(K) in one GEMM.
+    """Project a reconstructed-K span through Cross(K) in one GEMM.
 
-    The projection depends only on K, so every unit's prediction is known
-    before the V recurrence starts.  Computing them per unit issues one small
-    matmul per unit inside the sequential loop and recomputes the projection of
-    a unit that the history term needs again; one batched call over the span
-    replaces both.  Encoder and decoder must call this the same way, otherwise
-    the residual is quantized against a prediction the decoder cannot rebuild.
+    Encoder and decoder must both use it so their predictions match.
     """
     weight = parameters.weight.to(source.device)
     bias = parameters.bias.to(source.device)
@@ -274,11 +241,7 @@ def predict_cross_kv(
     legacy: bool = False,
     projection: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Predict V from current reconstructed K and newest-to-oldest V history.
-
-    ``projection`` supplies ``Cross(K)+bias`` computed for this unit ahead of
-    time by :func:`cross_projection`; the recurrence then costs no GEMM at all.
-    """
+    """Predict V from a precomputed ``Cross(K)+bias`` and newest-to-oldest V history."""
     resolved_history = () if history is None else tuple(history)
     order = min(len(resolved_history), parameters.history_length)
     weight = parameters.weight.to(source.device)
@@ -328,16 +291,8 @@ def _cuda_matmul_precision(device: torch.device, precision: str):
 def anchor_roundtrip(value: torch.Tensor, config: CodecConfig) -> torch.Tensor:
     """Replay what the encoder stores for one anchor unit.
 
-    Fitting, attention refinement and the analysis tools all rebuild the anchor
-    outside the codec, and each of them has to round exactly where
-    :func:`_encode` rounds.  The unquantized anchor keeps its value, so handing
-    ``config.anchor_bits`` to a quantizer there would optimize and report
-    against an anchor the codec never produces.
-
-    Every out-of-codec anchor replay goes through this function instead of
-    calling a quantizer with ``config.anchor_bits``; the quantized branch
-    returns float32 exactly as ``roundtrip`` does, so existing callers keep
-    their own reconstruction-dtype rounding.
+    Out-of-codec anchor replays (fitting, refinement, analysis) go through here so
+    the raw anchor is handled exactly as the codec handles it.
     """
     if config.raw_anchor:
         return value.to(_dtype(config.reconstruction_dtype))
@@ -439,15 +394,9 @@ def _encode(
 
     anchor = value[:, :, :stride]
     if config.raw_anchor:
-        # No quantizer: the anchor is the stored value.  ``copy=True`` matters
-        # because ``to`` returns the input itself when the dtype already
-        # matches, and an in-place reconstruction would then write through the
-        # tensor the packed state is supposed to own.  It also keeps this to a
-        # single copy when the dtype does differ.
+        # Raw anchor: copy so the packed state owns its storage.
         anchor_quant = anchor.to(reconstruction_dtype, copy=True)
-        # No codes means no group scale.  Keeping the field a real tensor
-        # rather than None spares every reader an optional, and an empty one
-        # contributes nothing to storage_bytes().
+        # An empty scale keeps the field a tensor.
         anchor_scale = anchor_quant.new_empty((0,), dtype=scale_dtype)
         anchor_rebuilt = anchor_quant
     else:
@@ -468,10 +417,7 @@ def _encode(
         else torch.empty(value.shape, device=value.device, dtype=reconstruction_dtype)
     )
     reconstruction[:, :, :stride] = anchor_rebuilt
-    # The legacy predictor keeps every encoder history unit as the standalone
-    # result returned by QDQ.  Native TempoKV keeps cheaper views into the
-    # reconstruction buffer.  The distinction affects CUDA dispatch and exact
-    # accumulation.
+    # Legacy keeps standalone QDQ results as history; native keeps views.
     history = (
         [anchor_rebuilt]
         if config.fit_mode == "legacy"
@@ -525,9 +471,7 @@ def _encode(
             residual_sequence,
             scale_width,
             device=value.device,
-            # A zero point is a code, so it needs the same room a code does.
-            # Residual widths stop at 8 today, which keeps this uint8; asking
-            # the packer means a wider residual could never truncate here.
+            # A zero point is a code, so it takes the code dtype.
             dtype=code_dtype(bits),
         )
         if residual_sequence and config.residual_mode == "asymmetric"
@@ -542,9 +486,7 @@ def _encode(
         current = value[:, :, offset : offset + unit_length]
         if predictor_kind == "temporal":
             if temporal.history_length == 0:
-                # Zero-order K is the direct-quantization ablation. Keep the
-                # temporal packed-state contract while spending all residual
-                # bits on the current unit.
+                # Zero-order K: direct quantization within the temporal state layout.
                 prediction = torch.zeros_like(current, dtype=torch.float32)
             else:
                 prediction = predict_temporal(
@@ -634,14 +576,10 @@ def _encode(
 
 
 class IncrementalTensorEncoder:
-    """Append finalized units to one predictor-continuous packed span.
+    """Append finalized units to an open packed span.
 
-    Starts from a batch-encoded prefix and applies the same closed-loop
-    predictor/quantizer arithmetic to newly finalized units, so the packed
-    bytes match a batch encode of the whole span.  ``shape`` and
-    ``unit_lengths`` describe the logical prefix; the residual buffers behind
-    them may be longer.  Only reconstructed predictor history is kept in BF16,
-    bounded by the history order and released when the span closes.
+    The arithmetic matches a batch encode of the whole span; only the predictor
+    history is kept in BF16 until the span closes.
     """
 
     def __init__(
@@ -882,11 +820,7 @@ def encode_temporal(
     history_length: int | None = None,
     channel_mean: bool = False,
 ) -> tuple[PackedTensor, torch.Tensor]:
-    """Encode a temporally predicted tensor with its closed-loop reconstruction.
-
-    ``bits`` and ``history_length`` default to the K settings.  A temporal V
-    predictor passes the V settings instead; the predictor itself is identical.
-    """
+    """Encode a temporally predicted tensor and return its reconstruction."""
     resolved = config or CodecConfig()
     return _encode(
         key,
@@ -957,12 +891,9 @@ def decode_tensor(
     use_triton: bool = True,
     strict_triton: bool = False,
 ) -> torch.Tensor:
-    """Decode a packed cache, using Triton when its CUDA path is available.
+    """Decode a packed cache, using Triton when available.
 
-    ``output_tensor`` may be a strided BHSD or BSHD view with non-overlapping
-    positive strides; ``output_layout`` names its layout.  The returned tensor
-    is always BHSD, so a reconstructed K can be passed straight on as the
-    CrossKV ``source``.
+    ``output_tensor`` may be a strided BHSD/BSHD view; the result is always BHSD.
     """
     # Decoding replays the closed loop, so it always produces the dtype the
     # encoder reconstructed in.
@@ -1128,13 +1059,7 @@ def check_parameters_match_config(
     cross_kv: CrossKVParameters | TemporalParameters,
     config: CodecConfig,
 ) -> None:
-    """Refuse parameters fitted for a different codec configuration.
-
-    Every fitted file carries the signature of the config it was fitted under,
-    so running INT2-fitted predictors against an INT4 config -- the mix-up an
-    overwritten parameter directory produces -- fails here instead of quietly
-    producing wrong numbers.  Hand-built parameters carry no stamp.
-    """
+    """Refuse stamped parameters fitted for a different codec configuration."""
     expected = config.format_signature()
     for name, parameters in (("K", temporal), ("V", cross_kv)):
         signature = parameters.codec_signature
@@ -1249,12 +1174,7 @@ class TempoKVCodec:
         layer: int = 0,
         reuse_input: bool = False,
     ) -> tuple[PackedTensor, torch.Tensor]:
-        """Encode the temporally predicted tensor and return its reconstruction.
-
-        Callers address the cache by role rather than by name so a runtime does
-        not have to know which direction it is running; ``primary_role`` says
-        which slot to read.
-        """
+        """Encode the temporally predicted tensor and return its reconstruction."""
         return self.encode_key(tensor, layer=layer, reuse_input=reuse_input)
 
     def begin_incremental_primary(
@@ -1349,11 +1269,7 @@ class TempoKVCodec:
         layer: int = 0,
         reuse_input: bool = False,
     ) -> PackedTensor:
-        """Encode one V cache without retaining the decoded V output.
-
-        ``reconstructed_key`` is required only when V is predicted from K; the
-        temporal V predictor reads its own reconstructed history instead.
-        """
+        """Encode one V cache; ``reconstructed_key`` is needed only for Cross(K) V."""
         packed, _ = self._encode_value_with_reconstruction(
             value,
             reconstructed_key,
@@ -1403,9 +1319,7 @@ class TempoKVCodec:
     def encode(
         self, key: torch.Tensor, value: torch.Tensor, *, layer: int = 0
     ) -> PackedKV:
-        # Under the mirrored direction V leads and K is projected from it, so
-        # address the pair by role and put the results back under their own
-        # names.
+        # Address the pair by role so the mirrored direction works too.
         primary, secondary = (
             (value, key) if self.config.mirrored else (key, value)
         )
@@ -1420,13 +1334,7 @@ class TempoKVCodec:
     def decode(
         self, packed: PackedKV, *, output_dtype: torch.dtype | None = None
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Decode a packed pair, mirroring the order ``encode`` used.
-
-        The dependent tensor is decoded from the reconstruction of the tensor
-        it was projected from, so the order follows the codec direction rather
-        than the K/V names: forward decodes K then V, and the mirrored
-        direction decodes V then K.
-        """
+        """Decode a packed pair in encode order (K then V, or V then K when mirrored)."""
         mirrored = self.config.mirrored
         packed_primary, packed_secondary = (
             (packed.value, packed.key) if mirrored else (packed.key, packed.value)

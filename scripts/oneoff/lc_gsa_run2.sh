@@ -2,7 +2,7 @@
 # global_single_anchor 第二批:k2v2 AB×idx1-3, k4v2 AB×idx2-3, k6v4 AB×idx1-3(16 条,拼成 3tag×2arm×idx0-3=24)
 # 每张卡一个 worker,等卡空闲(<15GB)再接活;与 lc_gsa_run.sh 的在跑队列共享卡,不冲突。
 set -u
-W=/mnt/cpfs/epic-user/hujiahui-20260612
+W=${WORKSPACE:?set WORKSPACE to the experiment root}
 T=$W/Tempokv
 OUT=$W/kv-quant-result/LongCat/global_single_anchor
 CKPT=$W/checkpoints/LongCat-Video

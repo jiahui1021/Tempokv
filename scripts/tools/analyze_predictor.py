@@ -1,19 +1,9 @@
 #!/usr/bin/env python3
 """Analyze the TempoKV predictor on a clean trace.
 
-Reproduces the codec's closed-loop K/V reconstruction (matching
-fitting._reconstruct_*_trace) while capturing per-frame prediction,
-residual, and rebuilt tensors, then reports per-layer:
-
-  * prediction energy ratio     ||pred||^2 / ||orig||^2      (frame >= 1)
-  * residual energy ratio       ||orig - pred||^2 / ||orig||^2
-  * prediction-explained share  1 - residual_ratio
-  * reconstruction error        ||rebuilt - orig||^2 / ||orig||^2  (all frames)
-  * attention output difference (causal softmax, clean K used as query proxy)
-
-The trace carries no queries, so attention uses the clean K as the query
-stand-in; Q is therefore unaffected by reconstruction and only K/V errors
-propagate into the output, which is the quantity of interest.
+Replays the closed-loop K/V reconstruction and reports per layer the prediction
+and residual energy ratios, reconstruction error and attention-output error
+(clean K stands in for the query).
 """
 
 from __future__ import annotations
@@ -184,15 +174,9 @@ def reconstruct_v(
     use_cross: bool = True,
     use_history: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Closed-loop V reconstruction.
+    """Closed-loop V reconstruction: ``(pred, residual, rebuilt, cross_term, history_term)``.
 
-    Returns ``(pred, residual, rebuilt, cross_term, history_term)``.  The two
-    prediction terms are kept apart so a sweep can ask what the V history adds
-    on top of the CrossKV term alone.
-
-    ``use_cross`` / ``use_history`` zero out the respective term so an ablation
-    can run the full quantization round-trip on a reduced predictor (e.g. V
-    history alone) and report its *reconstruction* error, not just the residual.
+    ``use_cross`` / ``use_history`` zero one term for ablations.
     """
     L, S, T, H, D = values.shape
     vh = cross.history_length
@@ -262,12 +246,7 @@ def attention_output_diff(
     L, S, T, H, D = clean_keys.shape
 
     def flat(tensor: torch.Tensor) -> torch.Tensor:
-        """[L, S, T, H, D] -> [L*S*H, T, D], one row per (layer, sample, head).
-
-        The time axis has to stay the second one. Transposing L*S with H
-        instead of permuting would interleave different samples and layers
-        into what attention then reads as a single causal sequence.
-        """
+        """[L, S, T, H, D] -> [L*S*H, T, D], keeping time as the sequence axis."""
         return (
             tensor.float()
             .reshape(-1, T, H, D)

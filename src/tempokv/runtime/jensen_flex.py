@@ -1,10 +1,4 @@
-"""Opt-in fused Jensen scores without widening the attention head.
-
-Inputs use the Self-Forcing BSHD layout. Squared steps must already have the
-legacy cache rounding: cast Delta to the cache dtype, then square. Query
-coefficients likewise round to the query dtype before FP32 score arithmetic.
-No score-sized bias is materialized. Compilation is lazy and CUDA-only.
-"""
+"""Opt-in fused Jensen scores via FlexAttention (BSHD, CUDA only)."""
 
 from __future__ import annotations
 
@@ -55,21 +49,14 @@ def make_score_mod(query_terms, key_terms, scale):
 def _compiled_attention():
     from torch.nn.attention.flex_attention import flex_attention
 
-    # Dynamic sequence lengths avoid deliberate per-length specialization;
-    # Inductor may still guard/recompile, so growing-cache runs must measure it.
-    # No CUDA graphs: scale tensors are refreshed on every cache read.
+    # Dynamic lengths; no CUDA graphs since scales change every read.
     return torch.compile(
         flex_attention, dynamic=True, mode="max-autotune-no-cudagraphs"
     )
 
 
 def corrected_attention(query, key, value, step_squared, *, group_size):
-    """Unmasked attention over an already selected sink/recent window.
-
-    Matches the cached Self-Forcing call (causal=False, dropout=0, equal heads).
-    This is not a general replacement for masked training attention. Failure
-    is explicit: no silent fallback to a dense score matrix or widened head.
-    """
+    """Unmasked attention over a selected cache window (no dense-score fallback)."""
     if query.device.type != "cuda":
         raise RuntimeError("fused Jensen attention requires CUDA and torch.compile")
     q_terms, k_terms = score_terms(query, step_squared, group_size)

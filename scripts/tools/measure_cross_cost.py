@@ -1,19 +1,9 @@
 #!/usr/bin/env python3
 """Measure the Torch Cross(K) projection cost at production shapes.
 
-The temporal V predictor reads only its own history, so its decode is pure
-elementwise work.  Cross + temporal V adds one 128x128 projection per decoded
-span.  That arithmetic is real and unavoidable; what this script answers is how
-much wall-clock it buys back or costs once the projection is issued as a single
-batched GEMM instead of one small matmul per unit.
-
-Run it on the target GPU before committing to a full generation:
-
     python scripts/tools/measure_cross_cost.py --reads 7200
 
-This script does not launch the Triton ``tl.dot`` decoder and therefore cannot
-identify its lowering.  Use ``benchmark_tempokv_kernels.py --route v`` to
-compare the production Triton route and its tile configurations.
+Use ``benchmark_tempokv_kernels.py --route v`` for the Triton route.
 """
 
 from __future__ import annotations

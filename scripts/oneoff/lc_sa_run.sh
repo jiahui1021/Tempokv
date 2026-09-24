@@ -1,9 +1,9 @@
 #!/bin/bash
-T=/mnt/cpfs/epic-user/hujiahui-20260612/Tempokv
-OUT=/mnt/cpfs/epic-user/hujiahui-20260612/kv-quant-result/LongCat/single_anchor
-CKPT=/mnt/cpfs/epic-user/hujiahui-20260612/checkpoints/LongCat-Video
-Q=/mnt/cpfs/epic-user/hujiahui-20260612/miniconda3/envs/qvg/bin
-PROMPT="$(head -1 /mnt/cpfs/epic-user/hujiahui-20260612/kv-quant-result/shared/prompts/moviegen_128.txt)"
+T=${WORKSPACE:?set WORKSPACE to the experiment root}/Tempokv
+OUT=${WORKSPACE}/kv-quant-result/LongCat/single_anchor
+CKPT=${WORKSPACE}/checkpoints/LongCat-Video
+Q=${WORKSPACE}/miniconda3/envs/qvg/bin
+PROMPT="$(head -1 ${WORKSPACE}/kv-quant-result/shared/prompts/moviegen_128.txt)"
 # 等 tkint2 补测完全收工(或最多 4h)
 for i in $(seq 240); do [ -e /tmp/tkint2_fill.done ] && break; sleep 60; done
 run_job(){

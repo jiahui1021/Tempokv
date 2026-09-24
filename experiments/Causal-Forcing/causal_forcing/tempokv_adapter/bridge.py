@@ -1,14 +1,8 @@
 """Install TempoKV into the bundled Causal Forcing inference pipeline.
 
-The pipeline already owns the cache write-mode state machine: it announces
-ephemeral denoising writes, announces exactly one finalize per block after the
-clean/context refresh, and announces resets.  This bridge subclasses it and
-gives those announcements their TempoKV meaning — the finalize hook feeds the
-streaming span encoder, and every packed span is decoded back through the
-codec when attention reads the cache.
-
-Nothing here inspects a timestep.  If this file is not installed, the pipeline
-runs BF16 and the hooks are inert.
+The pipeline announces denoising writes, one finalize per block after the clean
+refresh, and resets; this bridge feeds finalized blocks to the streaming
+encoder and decodes packed spans on cache reads.
 """
 
 from __future__ import annotations
@@ -29,19 +23,13 @@ from tempokv.runtime.streaming import StreamingTempoKVEncoder
 
 _TEMPOKV_STATE_KEY = "_tempokv_packed"
 
-# Frames per span; one anchor each, so a larger span compresses better.  Only a
-# fallback: generate.py always sets TEMPOKV_SPAN_FRAMES, to the whole rollout,
-# so a normal run spends one anchor.
+# Fallback span length; generate.py sets TEMPOKV_SPAN_FRAMES to the rollout.
 DEFAULT_SPAN_FRAMES = 12
-# Finalized frames kept exact before they are packed, as on Self-Forcing.  It is
-# sized for the default 180-latent-frame rollout; a short rollout needs a
-# smaller lag, or nothing is packed before the terminal block is discarded.
+# Finalized frames kept exact before packing (sized for 180 latent frames).
 DEFAULT_BF16_LAG_FRAMES = 18
 DECODE_TIMING_ENV = "TEMPOKV_DECODE_TIMING"
-# Diagnostic: compare what attention reads back from the packed cache with the
-# clean K/V it replaced (layer 0, a few tokens per frame) and print the NMSE.
-# A readback error that does not move with k_bits/v_bits means the bit widths
-# never reach the cache; one that does move puts the problem downstream.
+# Diagnostic: print the NMSE between layer-0 cache reads and the clean K/V
+# they replaced, to check that bit widths reach the cache.
 READBACK_PROBE_ENV = "TEMPOKV_READBACK_PROBE"
 _PROBE_TOKENS_PER_FRAME = 16
 
@@ -182,9 +170,7 @@ def install(runtime_root: str | Path | None = None) -> type:
     class TempoKVCausalInferencePipeline(base):
         def __init__(self, *args: Any, **kwargs: Any) -> None:
             super().__init__(*args, **kwargs)
-            # TempoKV intentionally keeps the pre-RoPE, frame-addressable
-            # cache so finalized spans can be predicted and re-rotated at
-            # absolute positions during reads.
+            # TempoKV needs the pre-RoPE frame-addressable cache.
             self._uses_pre_rope_cache = True
             self.tempokv_codec = load_codec_from_env()
             config = self.tempokv_codec.config
@@ -221,10 +207,8 @@ def install(runtime_root: str | Path | None = None) -> type:
             self.tempokv_report.decode_timing_enabled = _decode_timing_enabled()
             self._readback_probe = os.environ.get(READBACK_PROBE_ENV, "0") == "1"
             self._probe_clean: dict[str, list[torch.Tensor]] = {"k": [], "v": []}
-            # Same schedule as the Self-Forcing bridge: pack each finalized
-            # block into the open span once it is TEMPOKV_BF16_LAG_FRAMES
-            # behind the newest one.  Span-mean K and innovation V have no
-            # incremental state, so they keep the batch schedule.
+            # Incremental schedule as on Self-Forcing; span-mean K and innovation V
+            # have no incremental state.
             incremental = (
                 os.environ.get("TEMPOKV_INCREMENTAL", "1") != "0"
                 and not self.tempokv_codec.k_channel_mean
@@ -373,14 +357,9 @@ def install(runtime_root: str | Path | None = None) -> type:
             )
 
         def flush_kv_cache(self) -> None:
-            # Formal long-video benchmarks keep the incomplete final span as a
-            # BF16 tail. Preserve the historical force-flush behavior for
-            # interactive callers and unit tests unless the benchmark launcher
-            # explicitly disables it.
+            # Benchmarks may keep the final partial span as a BF16 tail.
             if self.tempokv_stream.incremental:
-                # The partial span is already packed; what is left is the BF16
-                # lag tail.  Flush it by default, as Self-Forcing does, unless
-                # TEMPOKV_FLUSH_TAIL=0.
+                # Pack the lag tail unless TEMPOKV_FLUSH_TAIL=0.
                 force = os.environ.get("TEMPOKV_FLUSH_TAIL", "1") != "0"
             else:
                 force_partial = os.environ.get("TEMPOKV_FORCE_PARTIAL_SPAN", "1")

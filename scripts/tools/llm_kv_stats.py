@@ -1,17 +1,12 @@
-"""Capture KV-cache activations of a small LLM (Qwen3.6-27B) and reuse the
-video-side statistics to compare the two cache families.
+"""Capture an LLM's KV-cache activations and compute the video-side statistics.
 
-Usage (single GPU): python llm_kv_stats.py OUT_JSON [MODEL_PATH]
-
-Qwen3.6-27B is hybrid: only the full_attention layers keep a K/V cache
-(linear_attention layers do not), and those cached layers are what we measure.
-
-Long-context arm: concatenated local markdown corpus in 8k-token prefills.
-Short-prompt arm: moviegen prompts (~60 tokens each), like text "frames".
+Usage: WORKSPACE=... python llm_kv_stats.py OUT_JSON [MODEL_PATH]
+Only the full-attention layers keep a cache and are measured.
 """
 from __future__ import annotations
 
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -22,8 +17,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from kv_activation_stats import (aggregate, frame_stats, head_vector_dissim,
                                  profile_dissim, token_stats)
 
-W = Path("/mnt/cpfs/epic-user/hujiahui-20260612")
-MODEL = Path(sys.argv[2]) if len(sys.argv) > 2 else Path("/mnt/cpfs/public_data/public_model/Qwen/Qwen3.6-27B")
+W = Path(os.environ["WORKSPACE"])
+MODEL = Path(sys.argv[2]) if len(sys.argv) > 2 else W / "models/Qwen3.6-27B"
 CHUNK = 8192
 N_CHUNKS = 3
 

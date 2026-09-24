@@ -2,7 +2,6 @@ import importlib.util
 from pathlib import Path
 
 import numpy as np
-import pytest
 
 
 MODULE_PATH = Path(__file__).with_name("prepare_trace.py")
@@ -77,34 +76,10 @@ def test_convert_trace_keeps_legacy_kv_only_compatibility(tmp_path: Path) -> Non
         assert "k_post_rope" not in trace.files
 
 
-def test_event_rejects_partial_attention_pair(tmp_path: Path) -> None:
-    raw = tmp_path / "raw"
-    _write_event(raw, 0, partial_attention=True)
-    event = raw / "rank_000" / "event_000000_frames_0_2"
-
-    with pytest.raises(ValueError, match="must contain both"):
-        MODULE._event(event)
 
 
-def test_event_rejects_attention_shape_mismatch(tmp_path: Path) -> None:
-    raw = tmp_path / "raw"
-    _write_event(raw, 0, q_shape=(1, 1, 2, 2, 4))
-    event = raw / "rank_000" / "event_000000_frames_0_2"
-
-    with pytest.raises(ValueError, match="q_post_rope shape"):
-        MODULE._event(event)
 
 
-def test_convert_trace_rejects_attention_presence_mismatch(
-    tmp_path: Path,
-) -> None:
-    raw = tmp_path / "raw"
-    output = tmp_path / "trace.npz"
-    _write_event(raw, 0, attention=False)
-    _write_event(raw, 1, attention=True)
-
-    with pytest.raises(ValueError, match="same rotated Q/K arrays"):
-        MODULE.convert_trace_root(raw, output)
 
 
 def test_legacy_event_preserves_rotated_attention_layout(tmp_path: Path) -> None:
@@ -126,9 +101,8 @@ def test_legacy_event_preserves_rotated_attention_layout(tmp_path: Path) -> None
             frame_seq_length=np.asarray(1560, dtype=np.int32),
         )
 
-    keys, values, rotated, _ = MODULE._event(event, legacy_protocol=True)
+    arrays, _ = MODULE._event(event, legacy_protocol=True)
 
-    assert keys.shape == (30, 1, 1, 1, 12, 128)
-    assert values.shape == keys.shape
-    assert rotated["q_post_rope"].shape == keys.shape
-    assert rotated["k_post_rope"].shape == keys.shape
+    assert arrays["keys"].shape == (30, 1, 1, 1, 12, 128)
+    for name in ("values", "q_post_rope", "k_post_rope"):
+        assert arrays[name].shape == arrays["keys"].shape

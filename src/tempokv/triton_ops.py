@@ -29,21 +29,14 @@ def _record(route: str) -> None:
 
 
 def _decline(reason: str) -> None:
-    """Name why a span fell back, so a slow run says which gate rejected it.
-
-    A silent ``return None`` is indistinguishable from a kernel that never
-    existed: the caller only sees the Torch decoder running, or, under strict
-    Triton, a bare "not supported" with nothing to act on.
-    """
+    """Record why a span fell back to the Torch decoder."""
     _record(f"declined:{reason}")
 
 
 def _route_name(route: str, direct_output_layout: str | None) -> str:
     if direct_output_layout is None:
         return route
-    # Preserve the established BSHD route name used by the Self-Forcing
-    # benchmark contract.  BHSD is named explicitly so reports still
-    # distinguish the two direct-output layouts.
+    # BSHD keeps the historical route name; BHSD is suffixed.
     if direct_output_layout == "BSHD":
         return f"{route}_direct"
     return f"{route}_direct_bhsd"
@@ -109,9 +102,7 @@ def _load_packed_unsigned(
             mask=valid & (packed_channel[None, :] + 1 < packed_width),
             other=0,
         ).to(tl.int32)
-        # ``_window_bytes`` in quantization.py: a code plus a 7-bit offset fits
-        # in two bytes up to INT8 and needs a third from INT9 upward.  The two
-        # sides must agree on the window, so keep this split in step with it.
+        # Must match ``_window_bytes`` in quantization.py: 2 bytes up to INT8, 3 above.
         if bits <= 8:
             word = (first << 8) | second
             shift = 16 - bit_offset - bits
@@ -433,9 +424,7 @@ def _cross_kv_persistent_decode_kernel(
         mask=channel < width,
         other=0.0,
     ).to(tl.float32)
-    # Cross(K)'s projection matrix is invariant across every unit owned by
-    # this program.  Load the tile once instead of issuing the same load from
-    # each unrolled iteration.
+    # Load the Cross(K) tile once per program.
     weight_offset = (
         head * width * width
         + input_channel[:, None] * width
@@ -549,14 +538,8 @@ def _cross_kv_history_persistent_decode_kernel(
 ):
     """Stream Cross(K) and the V recurrence without a span-sized FP32 buffer.
 
-    The projection is issued as a ``tl.dot`` over the tile this program owns
-    and consumed on the spot.  Precomputing it into a tensor instead reads and
-    writes a buffer the size of the whole V span once each, and that traffic
-    costs far more than the projection arithmetic it was meant to amortize.
-
-    Only diagonal history reaches this kernel: a per-lag dense matrix mixes
-    output channels, which would force one program to own all of them and
-    collapse the parallelism the ``block_d`` tiling exists to provide.
+    The projection is a per-tile ``tl.dot`` consumed on the spot; only diagonal
+    V history is supported, since dense history would mix output channels.
     """
     batch_head = tl.program_id(0)
     head = batch_head % heads
@@ -568,9 +551,7 @@ def _cross_kv_history_persistent_decode_kernel(
         mask=channel < width,
         other=0.0,
     ).to(tl.float32)
-    # The Cross(K) matrix tile is shared by all recurrent units in this
-    # program.  Keeping the load outside the unrolled loop avoids redundant
-    # memory instructions while preserving the FP32 projection exactly.
+    # Load the Cross(K) tile once per program.
     weight_offset = (
         head * width * width
         + input_channel[:, None] * width
@@ -581,10 +562,8 @@ def _cross_kv_history_persistent_decode_kernel(
         mask=(input_channel[:, None] < width) & (channel[None, :] < width),
         other=0.0,
     ).to(tl.float32)
-    # V history length one is the production route.  Seed its recurrence from
-    # the unit immediately before this launch and then carry the BF16-rounded
-    # value in registers.  The explicit round preserves the old store/load
-    # semantics while avoiding a dependent global-memory read on every unit.
+    # History length 1 (production): carry the BF16-rounded previous unit in
+    # registers instead of reloading it.
     if history_length == 1:
         previous_coefficient = tl.load(
             history_weight_ptr + head * width + channel,
@@ -729,9 +708,7 @@ def _uniform_layout(packed: "PackedTensor") -> bool:
 def _supported(packed: "PackedTensor", source: torch.Tensor | None) -> bool:
     if not packed.anchor_quant.is_cuda:
         return False
-    # Residual widths stop at 8 by configuration.  The anchor covers INT1-INT15
-    # through the loader above, plus the unquantized width the caller copies
-    # instead of decoding.
+    # Residuals stop at 8 bits; anchors cover INT1-INT15 (raw anchors are copied).
     if not 1 <= packed.bits <= 8 or not 1 <= packed.anchor_bits <= MAX_BITS:
         return False
     if packed.predictor_kind in {"cross_kv", "innovation"}:
@@ -837,13 +814,7 @@ def decode(
         output_sequence_dim = 2
     anchor_length = packed.unit_lengths[0]
     if packed.raw_anchor:
-        # There is nothing to unpack: the stored anchor already holds values.
-        # The recurrent kernels below read their first history unit out of
-        # ``output``, not out of ``anchor_quant``, so writing it here with a
-        # plain copy leaves the rest of the pipeline untouched.  Going through
-        # the logical BHSD view keeps this correct for a BSHD destination.
-        # No ``.to(output.dtype)``: the slice assignment casts as it copies,
-        # so converting first would allocate and copy a whole anchor span twice.
+        # Raw anchor: copy through the logical BHSD view; the slice cast converts dtype.
         _logical_bhsd_output(output, direct_output_layout)[
             :, :, :anchor_length
         ] = packed.anchor_quant
@@ -950,9 +921,7 @@ def decode(
                 )
             _record(_route_name("direct_persistent", direct_output_layout))
             return _logical_bhsd_output(output, direct_output_layout)
-        # Only the persistent route remains.  A span that misses this gate is
-        # handed back to the Torch decoder by name instead of falling to a
-        # second, per-unit kernel that production never reached.
+        # Only the persistent route exists; anything else falls back to Torch by name.
         if output_dtype != torch.bfloat16:
             _decline("temporal_output_dtype")
             return None
@@ -1017,17 +986,13 @@ def decode(
         _decline("layered_parameters")
         return None
     if parameters.history_length and not parameters.history_diagonal:
-        # A dense per-lag matrix mixes output channels, so one program would
-        # have to own all of them and the block_d tiling would buy nothing.
-        # The Torch decoder applies every lag.
+        # Dense per-lag history mixes channels; the Torch decoder handles it.
         _decline("dense_v_history")
         return None
     source_stride_b, source_stride_h, source_stride_s, source_stride_d = (
         source.stride()
     )
-    # CrossKVParameters normalizes every tensor to contiguous storage when it
-    # is constructed (including per-layer selections).  Avoid repeating the
-    # contiguous dispatch on every cache read.
+    # CrossKVParameters tensors are already contiguous.
     weight = parameters.weight
     history_weight = (
         parameters.history_weights
@@ -1053,10 +1018,7 @@ def decode(
         _ceil_div(packed.stride, block_s),
         _ceil_div(width, cross_block_d),
     )
-    # Both Cross routes unroll a K projection per unit, so a launch batch
-    # holds one source and one weight tile per unrolled unit.  Cap it where
-    # the reference implementation does rather than at the temporal route's
-    # larger default, which only has to keep elementwise state alive.
+    # Cross routes keep a source and weight tile per unrolled unit, so cap the batch.
     persistent_units = min(persistent_units_per_launch(), 8)
     for shift_units, start_unit, chunk_units in persistent_launch_plan(
         len(packed.unit_lengths),

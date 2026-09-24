@@ -14,9 +14,7 @@ from tempokv.integration import load_codec_from_env
 from tempokv.runtime.metrics import TempoKVRuntimeReport
 from tempokv.runtime.streaming import StreamingTempoKVEncoder
 
-# This module is loaded both as ``bridge`` off the adapter directory and by
-# file path from the test suite, so it puts its own directory on the path
-# rather than relying on whoever imported it having done so.
+# Loaded both as ``bridge`` and by file path, so add this directory itself.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import efficiency_record as efficiency
 import pruning
@@ -66,9 +64,7 @@ def decode_cache_state(
         if output_layout != "BSHD":
             fallback_kwargs["output_layout"] = output_layout
         return fallback(state, **fallback_kwargs)
-    # Every route decodes straight into the caller's cache buffer.  Forcing a
-    # standalone BHSD result here made the cache copy the whole span back, and
-    # forcing a contiguous K source copied it forward, on top of the decode.
+    # Decode straight into the caller's cache buffer.
     decode_kwargs = {
         "source": source_tensor,
         "output_tensor": output_tensor,
@@ -95,17 +91,12 @@ def install(runtime_root: str | Path) -> type:
     class TempoKVCausalInferencePipeline(base):
         def __init__(self, *args: Any, **kwargs: Any) -> None:
             super().__init__(*args, **kwargs)
-            # TempoKV intentionally keeps the pre-RoPE, frame-addressable
-            # cache so finalized spans can be predicted and re-rotated at
-            # absolute positions during reads.  The BF16 baseline gets the
-            # dense window-sized cache instead.
+            # TempoKV needs the pre-RoPE frame-addressable cache; BF16 keeps the dense one.
             self._uses_pre_rope_cache = True
             self.tempokv_codec = load_codec_from_env()
             config = self.tempokv_codec.config
             self._tempokv_rope_precision = "complex64"
-            # The rollout length, not the attention window: they coincide by
-            # default, but the TEMPOKV_ATTENTION_FRAMES ablation narrows
-            # TEMPOKV_NUM_FRAMES while the rollout still runs to the horizon.
+            # Rollout length (the attention-window ablation narrows TEMPOKV_NUM_FRAMES).
             self._tempokv_total_frames = int(
                 os.environ.get(
                     "TEMPOKV_HORIZON_FRAMES",
@@ -114,9 +105,7 @@ def install(runtime_root: str | Path) -> type:
             )
             if self._tempokv_total_frames < 1:
                 raise ValueError("TEMPOKV_HORIZON_FRAMES must be positive")
-            # One anchor for the whole rollout by default: the incremental
-            # schedule reads a span back while it is still open, so a span that
-            # never closes never spends a second anchor.
+            # Default: one anchor for the whole rollout.
             self._tempokv_span_frames = int(
                 os.environ.get(
                     "TEMPOKV_SPAN_FRAMES", str(self._tempokv_total_frames)
@@ -124,20 +113,14 @@ def install(runtime_root: str | Path) -> type:
             )
             if self._tempokv_span_frames < 2:
                 raise ValueError("TEMPOKV_SPAN_FRAMES must be at least 2")
-            # Span-mean K needs the final mean before the first residual, and
-            # innovation V needs a continuation-aware source; neither has
-            # incremental state, so both keep the batch schedule.
+            # Span-mean K and innovation V have no incremental state.
             self._incremental_tempokv = (
                 os.environ.get("TEMPOKV_INCREMENTAL", "1") != "0"
                 and not self.tempokv_codec.k_channel_mean
                 and config.v_predictor_mode != "innovation"
             )
-            # A frame is encoded only once it is this far behind the newest
-            # finalized one, so the frames the model attends to most are still
-            # exact.  Packing each block the moment it is finalized instead
-            # makes every key a reconstruction from the second block on, and in
-            # a self-forcing rollout that error compounds.  18 frames is the lag
-            # that matched the batch schedule's quality at 24-frame spans.
+            # Frames stay exact until this far behind the newest finalized one; 18
+            # matched the batch schedule's quality at 24-frame spans.
             self._tempokv_bf16_lag_frames = int(
                 os.environ.get(
                     "TEMPOKV_BF16_LAG_FRAMES", str(DEFAULT_BF16_LAG_FRAMES)
@@ -226,13 +209,7 @@ def install(runtime_root: str | Path) -> type:
             cache_module.set_quantized_decoder(decode_with_codec)
 
         def _apply_tempokv_cache_settings(self) -> None:
-            """Stamp the settings the attention layer has to read back.
-
-            The attention code decides which cache slot to decode first, and it
-            only has the cache entries to go on, so the direction travels with
-            them.  It is stamped on both slots because either one can be the
-            tensor that leads.
-            """
+            """Stamp the codec direction and Jensen settings on both cache slots."""
             if self.kv_cache1 is None:
                 return
             config = self.tempokv_codec.config
@@ -242,9 +219,7 @@ def install(runtime_root: str | Path) -> type:
                 # slot needs to carry it.
                 layer["k"].tempokv_jensen_correction = config.jensen_correction
                 layer["k"].tempokv_group_size = config.group_size
-                # Ablation switch, read from the environment rather than the
-                # codec config: it changes no stored value and exists to tell
-                # the exact correction apart from the cheap approximation.
+                # Ablation switch; changes no stored value.
                 layer["k"].tempokv_jensen_cache_mean = (
                     os.environ.get("TEMPOKV_JENSEN_CACHE_MEAN") == "1"
                 )
@@ -270,12 +245,7 @@ def install(runtime_root: str | Path) -> type:
             return result
 
         def _patch_attention_windows(self) -> None:
-            # TempoKV compresses the whole cache, so the model keeps the full
-            # sequence readable instead of capping attention at its 21-frame
-            # default.  The frame count arrives through TEMPOKV_NUM_FRAMES
-            # because omegaconf args lack num_output_frames.  A bounded local
-            # window stays legitimate: the causal model reads the full resident
-            # cache and slices afterwards, so spans are never cut.
+            # Keep the whole compressed sequence readable instead of the 21-frame default.
             frames = int(os.environ.get("TEMPOKV_NUM_FRAMES", "0"))
             if frames <= 0:
                 raise ValueError("TEMPOKV_NUM_FRAMES must be set for TempoKV runs")
@@ -313,15 +283,7 @@ def install(runtime_root: str | Path) -> type:
             )
 
         def flush_incremental_tail(self) -> None:
-            """Pack the BF16 tail the incremental schedule still owes.
-
-            During generation the newest ``lag`` frames must stay exact for
-            attention; once the rollout is over that tail is dead weight, and
-            leaving it unpacked keeps the lag frames dense in the finished
-            cache.  The batch schedule never packs its trailing partial span,
-            so its finished cache is not the reference here.
-            ``TEMPOKV_FLUSH_TAIL=0`` restores the unpacked-tail behavior.
-            """
+            """Pack the BF16 lag tail once no later block reads it (``TEMPOKV_FLUSH_TAIL=0`` keeps it)."""
             if not getattr(self, "_incremental_tempokv", False):
                 return
             if os.environ.get("TEMPOKV_FLUSH_TAIL", "1") == "0":
@@ -388,12 +350,7 @@ def install(runtime_root: str | Path) -> type:
             self._record_kv_cache_memory()
 
         def _resident_kv_bytes(self) -> tuple[int, int]:
-            """Packed spans plus dense chunks, per ``resident_analytic.v1``.
-
-            Predictor parameters live inside every ``PackedTensor`` but are
-            shared across spans, so they are skipped here and reported once as
-            ``predictor_parameter_bytes``.
-            """
+            """Packed spans plus dense chunks per ``resident_analytic.v1`` (parameters excluded)."""
             if not self.kv_cache1:
                 return 0, 0
             resident = 0
@@ -419,20 +376,10 @@ def install(runtime_root: str | Path) -> type:
             return resident, equivalent
 
         def _record_kv_cache_memory(self) -> None:
-            """Aggregate resident K/V bytes across every layer.
+            """Aggregate resident K/V bytes into ``summary["last_kv_cache_memory"]``.
 
-            Fills ``self.summary["last_kv_cache_memory"]`` (consumed by the
-            Self-Forcing runtime as ``summary.json -> memory.kv_cache``) with a
-            per-layer breakdown, totals, and the achieved compression rate
-            versus the equivalent BF16 cache.  Predictor parameters are shared
-            across spans and already excluded from ``storage_bytes``.
-
-            Frames that have not been packed yet are still dense on the device,
-            so they are counted separately rather than omitted: a peak-memory
-            figure built only from packed spans understates what the run
-            actually needed.  ``compression_rate`` deliberately compares only
-            the packed part against its own BF16 equivalent, so it stays a
-            property of one cache state.
+            Unpacked dense frames are counted separately; ``compression_rate`` compares
+            only the packed part with its BF16 equivalent.
             """
             per_layer: dict[str, dict[str, object]] = {}
             total_kv_bytes = 0
@@ -454,9 +401,6 @@ def install(runtime_root: str | Path) -> type:
                             continue
                         bytes_per_cache += packed.storage_bytes()
                         logical_bytes_per_cache += packed.logical_storage_bytes()
-                        # Plain Python arithmetic: this runs once per span per
-                        # role per layer, and the incremental schedule reaches
-                        # it once per model block instead of once per span.
                         total_bf16_bytes += (
                             math.prod(packed.shape) * bf16_per_value
                         )

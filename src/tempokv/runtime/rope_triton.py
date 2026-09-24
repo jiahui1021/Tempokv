@@ -1,15 +1,7 @@
 """One-pass float64 read-time RoPE for a pre-RoPE K cache read.
 
-The reference in :mod:`tempokv.runtime.rope` rotates in complex128 to match
-upstream ``causal_rope_apply`` bit for bit, but it does so with separate
-PyTorch kernels per model block: widen to float64, multiply, narrow to BF16,
-copy into the result.  Every one of those passes streams the whole float64
-intermediate through HBM, so a cache read of ``N`` elements moves roughly 40N
-bytes, and the full cache is rotated on every attention call.
-
-This kernel reads each BF16 pair once, rotates it in float64 registers with the
-same expression and the same float64 -> float32 -> BF16 rounding as the
-reference, and writes it back once (4N bytes).  It may write in place.
+Same expression and float64 -> float32 -> BF16 rounding as the reference in
+:mod:`tempokv.runtime.rope`, but one read and one write per element.
 """
 
 from __future__ import annotations
@@ -47,9 +39,7 @@ def _rope_native_kernel(
     token = tl.program_id(0) * block_t + tl.arange(0, block_t)
     pair = tl.arange(0, block_p)
     mask = (token[:, None] < num_tokens) & (pair[None, :] < pairs)
-    # The multiplier of pair j comes from the temporal, height or width table
-    # according to j, indexed by the token's absolute frame, row or column --
-    # the same concatenation the reference builds per model block.
+    # Pair j takes its multiplier from the temporal, height or width table.
     frame = start_frame + token // tokens_per_frame
     within_frame = token % tokens_per_frame
     row = within_frame // grid_width

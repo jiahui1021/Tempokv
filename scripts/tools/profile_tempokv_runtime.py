@@ -1,24 +1,10 @@
 #!/usr/bin/env python3
-"""Report the Self-Forcing runtime breakdown and the Stage 0 decision gates.
+"""Report the Self-Forcing runtime breakdown and the decode/encode share gates.
 
-Stage 0 of the acceleration plan will not let a kernel be rewritten until the
-profile shows that kernel owns a meaningful share of the generation.  This script
-reads the per-rank breakdown an instrumented run wrote and answers the two gates
-directly: does TempoKV *decode* reach the share that justifies Stages 1 to 3, and
-does TempoKV *encode* reach the share that justifies Stage 4.
-
-Record a profile by asking the normal entry point for one:
-
-    PROFILE=1 CHECKPOINT=... WAN_MODEL_DIR=... PROMPTS=... CONFIG=... \\
-      bash scripts/Self-Forcing/run_tempokv.sh
-
-then report it:
-
+    PROFILE=1 ... bash scripts/Self-Forcing/run_tempokv.sh
     python scripts/tools/profile_tempokv_runtime.py results/self_forcing/<label>
 
-Pass ``--baseline`` to compare two runs; later stages need the comparison more
-than the absolute numbers, because their stopping conditions are written as
-end-to-end speedup against the run they started from.
+``--baseline`` compares two runs.
 """
 
 from __future__ import annotations
@@ -42,8 +28,7 @@ from tempokv.profiling import (  # noqa: E402
     format_report,
 )
 
-# Stage 0.3 in the plan: below this share, a faster kernel cannot move the
-# generation enough to be worth the maintenance it costs.
+# Below this share of the generation, a faster kernel is not worth pursuing.
 STAGE_GATE_SHARE = 0.10
 
 

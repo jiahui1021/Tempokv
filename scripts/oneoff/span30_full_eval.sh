@@ -4,24 +4,25 @@
 # 断点续:per-point done_L{L};vbench 见 evaluation.json 即跳;生成 skip-existing;idx0 复用旧扫描。
 # 用法:主入口直接跑(内部起两卡链并 wait);单卡链:bash 本文件 --chain1|--chain2
 set -uo pipefail
-T=/mnt/cpfs/epic-user/hujiahui-20260612/Tempokv
-QVG=/mnt/cpfs/epic-user/hujiahui-20260612/miniconda3/envs/qvg/bin/python
-VPY=/mnt/cpfs/epic-user/hujiahui-20260612/miniconda3/envs/vbench/bin/python
-VBENCH_ROOT=/mnt/cpfs/epic-user/hujiahui-20260612/qvg/forcing/vbench
-export VBENCH_CACHE_DIR=/mnt/cpfs/epic-user/hujiahui-20260612/vbench_cache
+T=${WORKSPACE:?set WORKSPACE to the experiment root}/Tempokv
+QVG=${WORKSPACE}/miniconda3/envs/qvg/bin/python
+VPY=${WORKSPACE}/miniconda3/envs/vbench/bin/python
+VBENCH_ROOT=${WORKSPACE}/qvg/forcing/vbench
+export VBENCH_CACHE_DIR=${WORKSPACE}/vbench_cache
 cd "$T"
 R=$T/results/paper/span-int2/runs
 D=$R/span30sweep; mkdir -p "$D"
 REFS30=$D/refs30; PROV=$D/prompts_first30.json
-BF16SRC=/mnt/cpfs/epic-user/hujiahui-20260612/kv-quant-result/experiments/self-forcing/Self-Forcing/bf16
+BF16SRC=${WORKSPACE}/kv-quant-result/experiments/self-forcing/Self-Forcing/bf16
 # ---- 公共准备(幂等)----
 mkdir -p "$REFS30"
 for i in $(seq 0 29); do [[ -e $BF16SRC/${i}_0.mp4 ]] && ln -sf $BF16SRC/${i}_0.mp4 $REFS30/${i}_0.mp4; done
 [[ -s $PROV ]] || $QVG - <<'PY'
-import json
+import json, os
 from pathlib import Path
-pl=Path('/mnt/cpfs/epic-user/hujiahui-20260612/Tempokv/assets/moviegen128_first30.txt').read_text().splitlines()
-Path('/mnt/cpfs/epic-user/hujiahui-20260612/Tempokv/results/paper/span-int2/runs/span30sweep/prompts_first30.json').write_text(
+W=Path(os.environ['WORKSPACE'])
+pl=(W/'Tempokv/assets/moviegen128_first30.txt').read_text().splitlines()
+(W/'Tempokv/results/paper/span-int2/runs/span30sweep/prompts_first30.json').write_text(
     json.dumps({f'{i}_0.mp4': pl[i] for i in range(30)}, ensure_ascii=False, indent=1))
 PY
 log(){ printf '[%s] %s\n' "$(date '+%F %T')" "$*" >>"$D/driver.log"; }

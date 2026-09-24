@@ -1,9 +1,4 @@
-"""Inference-only Jensen attention with no widened heads or score buffers.
-
-The CUDA implementation is imported lazily so CPU users need not have Triton.
-Inputs are BSHD, steps are BSHG and already squared in the cache dtype. This
-entry point only supports the unmasked, equal-head Self-Forcing cache window.
-"""
+"""Inference-only Jensen attention without widened heads or score buffers."""
 
 from __future__ import annotations
 
@@ -11,17 +6,10 @@ import torch
 
 
 def corrected_attention(query, key, value, step_squared, *, group_size):
-    """Apply the existing rounded Jensen correction in a single warmed GPU launch.
+    """Apply the Jensen correction in one GPU launch (forward only).
 
-    Supported head dimensions: 64/128; group sizes: 32/64/128 dividing D.
-    Arbitrary positive input strides are accepted, including sliced windows.
-    This is forward-only; callers requesting gradients receive an error.
-    The default auto configuration benchmarks candidate tiles on a new length
-    bucket; use TEMPOKV_JENSEN_TRITON_CONFIG for a measured fixed configuration.
-    TEMPOKV_JENSEN_TRITON_CORRECTION=mma opts into the small Tensor Core
-    correction; scalar remains the user-measured default.
-    TEMPOKV_JENSEN_TRITON_IMPL=pipeline is retained for experimental comparisons,
-    not recommended for generation. Baseline stays the default.
+    Head dim 64/128, group size 32/64/128.  ``TEMPOKV_JENSEN_TRITON_CONFIG``,
+    ``..._CORRECTION`` and ``..._IMPL`` select tiles, correction and schedule.
     """
     dim = query.shape[-1]
     if dim not in (64, 128):

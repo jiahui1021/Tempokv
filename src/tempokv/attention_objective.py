@@ -1,13 +1,6 @@
 """Differentiable closed-loop rollout and the attention-output objective.
 
-Least squares fits a predictor to reproduce K and V.  What the model actually
-needs is the attention output those tensors produce, and the two are not the
-same target: an error the attention softmax ignores costs nothing, while a
-small error in a high-attention token costs a lot.  This module supplies the
-pieces to optimize the second target directly.
-
-Everything here is shape-generic over leading batch axes and expects the
-temporal layout ``[..., F, H, D]`` used by the fitting traces.
+Tensors use the ``[..., F, H, D]`` trace layout.
 """
 
 from __future__ import annotations
@@ -26,13 +19,7 @@ EPS = 1e-12
 
 
 def _reconstruction_dtype(config: CodecConfig) -> torch.dtype:
-    """The dtype the codec actually stores reconstructions in.
-
-    The rollout has to round exactly where the encoder rounds, so this follows
-    the config instead of assuming bfloat16; a float32 codec was otherwise
-    simulated at a precision it never uses, and the refinement objective was
-    optimizing against a slightly different codec from the deployed one.
-    """
+    """The dtype the codec stores reconstructions in."""
     return _dtype(config.reconstruction_dtype)
 
 
@@ -58,21 +45,16 @@ def temporal_rollout(
     config: CodecConfig,
     detach_residual: bool = True,
 ) -> torch.Tensor:
-    """Replay the codec's closed loop while staying differentiable in the parameters.
+    """Replay the temporal codec loop, differentiable in the parameters.
 
-    Parameters may be shared ``[P,P,D]``, per-head ``[P,P,H,D]``, or layered
-    per-layer/per-head ``[L,P,P,H,D]``.  ``detach_residual`` blocks gradients
-    through the quantized residual, which is the straight-through proxy the
-    refinement relies on: the residual is refreshed from the current
-    prediction each step, but only the prediction path carries gradient.
+    Weights are ``[P,P,D]``, ``[P,P,H,D]`` or ``[L,P,P,H,D]``.
+    ``detach_residual`` makes the quantized residual a straight-through constant.
     """
     layered = weight.ndim == 5
     history_length = int(weight.shape[1 if layered else 0])
     frames = int(target.shape[-3])
     if history_length == 0:
-        # Direct K is represented by an empty temporal map.  It still follows
-        # the same anchor/residual quantization protocol as the production
-        # codec, but every later unit is quantized without a prediction.
+        # Direct: an empty map, so every unit is quantized without prediction.
         reconstructed = [
             anchor_roundtrip(target[..., 0, :, :], config)
             .to(_reconstruction_dtype(config))
@@ -163,14 +145,7 @@ def cross_kv_rollout(
     config: CodecConfig,
     detach_residual: bool = True,
 ) -> torch.Tensor:
-    """Replay a CrossKV + reconstructed-V-history codec differentiably.
-
-    ``source`` is the decoder-visible reconstructed K trace and ``target`` is
-    clean V.  Layered parameters use ``[L,H,D,D]``, ``[L,H,D]``, and either
-    diagonal ``[L,P,H,D]`` or dense ``[L,P,H,D,D]`` history weights.  The
-    unlayered equivalents omit ``L``.  As in :func:`temporal_rollout`, the
-    quantized residual is refreshed at every frame but detached by default.
-    """
+    """Replay the CrossKV + V-history codec loop differentiably (K source, V target)."""
     layered = weight.ndim == 4
     diagonal_history_ndim = 4 if layered else 3
     history_length = int(history_weights.shape[1 if layered else 0])
@@ -247,12 +222,7 @@ def cross_kv_rollout(
 def recover_rotation(
     pre_rope: torch.Tensor, post_rope: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Recover the RoPE rotation the runtime applied, from a clean K pair.
-
-    Solving for the rotation instead of recomputing it keeps the objective
-    independent of every RoPE implementation detail: table dtype, frame
-    offsets, and block sizes are already baked into the recorded pair.
-    """
+    """Recover the RoPE rotation applied at runtime from a pre/post-RoPE K pair."""
     x = pre_rope[..., 0::2].float()
     y = pre_rope[..., 1::2].float()
     u = post_rope[..., 0::2].float()
@@ -316,11 +286,7 @@ def objective_terms(
     query_post_rope: torch.Tensor,
     key_post_rope: torch.Tensor,
 ) -> ObjectiveTerms:
-    """Reconstruction and attention-output error, both against the clean pass.
-
-    The anchor frame is excluded: it is quantized directly and no predictor
-    influences it, so including it would dilute every ratio by a constant.
-    """
+    """Reconstruction and attention-output errors, excluding the anchor frame."""
     key_target = clean_key[..., 1:, :, :]
     value_target = clean_value[..., 1:, :, :]
     key_error = (rebuilt_key[..., 1:, :, :] - key_target).square().sum()
@@ -365,12 +331,7 @@ def phase_score(
     reconstruction_weight: float = 0.5,
     attention_weight: float = 0.5,
 ) -> float:
-    """Score a candidate against the least-squares baseline.
-
-    The configured normalized weights match the training objective, so
-    reconstruction-only and joint-objective ablations use coherent candidate
-    selection rather than sharing a hidden fixed scoring rule.
-    """
+    """Score a candidate against the least-squares baseline with the objective weights."""
     metric = f"{tensor}_nmse"
     return reconstruction_weight * errors[metric] / max(
         baseline[metric], EPS

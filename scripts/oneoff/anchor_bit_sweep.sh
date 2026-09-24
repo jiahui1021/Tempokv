@@ -6,13 +6,13 @@
 #   bash anchor_bit_sweep.sh --anchors "2 5" GPU-xxxx   # 任意机器/卡跑指定档(断点续)
 # 前提:anchor{b} 档自动用 fit_params.sh 在 trace_legacy 上重拟合(签名含 anchor_bits)。
 set -uo pipefail
-T=/mnt/cpfs/epic-user/hujiahui-20260612/Tempokv
-QVG=/mnt/cpfs/epic-user/hujiahui-20260612/miniconda3/envs/qvg/bin/python
-VPY=/mnt/cpfs/epic-user/hujiahui-20260612/miniconda3/envs/vbench/bin/python
+T=${WORKSPACE:?set WORKSPACE to the experiment root}/Tempokv
+QVG=${WORKSPACE}/miniconda3/envs/qvg/bin/python
+VPY=${WORKSPACE}/miniconda3/envs/vbench/bin/python
 cd "$T"
 R=$T/results/paper/span-int2/runs; D=$R/anchorsweep; mkdir -p "$D/configs"
 REFS30=$R/span30sweep/refs30; PROV=$R/span30sweep/prompts_first30.json
-export VBENCH_CACHE_DIR=/mnt/cpfs/epic-user/hujiahui-20260612/vbench_cache
+export VBENCH_CACHE_DIR=${WORKSPACE}/vbench_cache
 G1=GPU-2ff1acd3-71e7-4032-9632-3880ba5ee31c
 G2=GPU-c8e19653-0138-0223-68fe-5b7236baf470
 DIMS=subject_consistency,background_consistency,motion_smoothness,dynamic_degree,aesthetic_quality,imaging_quality,overall_consistency,clip_score
@@ -48,7 +48,7 @@ run_anchor(){
   local V=$R/$LAB/vbench_long8
   if [[ ! -s $V/evaluation.json ]] && [[ $(ls $RUN/videos/*_0.mp4 2>/dev/null|wc -l) -ge 30 ]]; then
     mkdir -p "$V"
-    PYTHONPATH="/mnt/cpfs/epic-user/hujiahui-20260612/qvg/forcing/vbench:$T/scripts/evaluation" \
+    PYTHONPATH="${WORKSPACE}/qvg/forcing/vbench:$T/scripts/evaluation" \
     CUDA_VISIBLE_DEVICES="$GPU" "$VPY" scripts/evaluation/evaluate_vbench.py "$RUN/videos" \
       --output-dir "$V" --name "$LAB" --prompt-file "$PROV" --mode long_custom_input \
       --dimensions "$DIMS" --device cuda --local-checkpoints --reuse-complete --config-out "$V/evaluation.json" >>"$D/a${B}.log" 2>&1

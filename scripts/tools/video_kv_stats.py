@@ -1,14 +1,11 @@
 """Compute KV activation stats from the stored clean video traces (CPU).
 
-Usage: python video_kv_stats.py OUT_JSON
-
-Reads Tempokv/data/{self-forcing/trace_legacy,longcat/trace}/clean_trace.npz.
-Spatial positions are subsampled during tracing (32 of 1560 for LongCat) —
-the stats below treat those subsamples as the frame's token set.
+Usage: WORKSPACE=... python video_kv_stats.py OUT_JSON
 """
 from __future__ import annotations
 
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -18,7 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from kv_activation_stats import (aggregate, frame_stats, head_vector_dissim,
                                  profile_dissim, token_stats)
 
-ROOT = Path("/mnt/cpfs/epic-user/hujiahui-20260612/Tempokv/data")
+ROOT = Path(os.environ["WORKSPACE"]) / "Tempokv/data"
 
 
 def per_layer_head(arr: np.ndarray, model: str):

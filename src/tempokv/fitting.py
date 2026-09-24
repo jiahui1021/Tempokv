@@ -1,9 +1,4 @@
-"""Fit the small linear predictors consumed by :mod:`tempokv.codec`.
-
-The routines in this module deliberately operate on reconstructed history.
-That keeps fitting consistent with decoding, where clean past frames are not
-available.
-"""
+"""Fit the linear predictors used by :mod:`tempokv.codec` on reconstructed history."""
 
 from __future__ import annotations
 
@@ -54,20 +49,11 @@ def build_fixed_temporal_parameters(
     layer_ids: tuple[int, ...] | None = None,
     head_count: int | None = None,
 ) -> TemporalParameters:
-    """Build deterministic temporal coefficients for predictor ablations.
+    """Build fixed temporal coefficients (newest-to-oldest history).
 
-    The history is ordered newest-to-oldest.  ``identity`` is a zero-order
-    hold, while ``taylor`` and ``taylor2`` use one- and two-step backward finite
-    differences respectively:
-
-    ``x[t+1] = x[t]``;
-    ``x[t+1] = 2*x[t] - x[t-1]``; and
-    ``x[t+1] = 3*x[t] - 3*x[t-1] + x[t-2]``.
-
-    Warm-up rows use the highest order supported by the history available at
-    that point.  The returned object has the same layout as fitted temporal
-    parameters, so the encoder, decoder, Triton path, and parameter checks all
-    exercise the identical recurrence.
+    ``identity``: x[t+1] = x[t]; ``taylor``: 2x[t] - x[t-1];
+    ``taylor2``: 3x[t] - 3x[t-1] + x[t-2].  Warm-up rows use the highest order
+    the available history allows.
     """
     degree = _FIXED_TEMPORAL_DEGREES[predictor_mode]
     if history_length < degree + 1:
@@ -120,13 +106,7 @@ def _attach_fixed_cross_kv_history(
     *,
     history_length: int,
 ) -> CrossKVParameters:
-    """Attach fixed diagonal V-history coefficients to a fitted CrossKV map.
-
-    ``CrossKVParameters`` stores one coefficient vector per available lag rather
-    than warm-up rows.  The final fixed temporal row is therefore used here;
-    missing warm-up lags are zero-padded by the runtime, matching the existing
-    CrossKV recurrence contract.
-    """
+    """Attach fixed diagonal V-history coefficients (the final fixed row) to CrossKV."""
     fixed = build_fixed_temporal_parameters(
         fixed_temporal_predictor_mode(predictor_mode),
         history_length=history_length,
@@ -273,14 +253,10 @@ def _pinv_rtol(dtype: torch.dtype) -> float:
 
 
 def _legacy_layer_records(tensor: torch.Tensor, layer: int) -> list[torch.Tensor]:
-    """Return legacy-protocol records as ``[B,F,P,H,D]`` in capture order.
+    """Return one layer's records as ``[B,F,P,H,D]`` in capture order.
 
-    The legacy trace schema is ``[L,E,B,P,F,H,D]`` so ``F`` remains
-    TempoKV's conventional ``-3`` temporal axis on disk.  The legacy fitter
-    evaluates one event at a time in ``[B,F,P,H,D]``; restore that layout to
-    preserve its reduction and FP64 accumulation order.  Smaller synthetic
-    traces keep the established ``[L,...,F,H,D]`` layout and count as one
-    record.
+    Legacy traces are ``[L,E,B,P,F,H,D]`` and are replayed per event to keep the
+    reference FP64 accumulation order; other traces count as one record.
     """
     selected = tensor[layer]
     if tensor.ndim == 7:
@@ -329,11 +305,10 @@ def _objective_sums(
     reconstruction_weight: float = 0.5,
     attention_weight: float = 0.5,
 ) -> torch.Tensor:
-    """Accumulate the six objective sums over the trace, one layer chunk at a time.
+    """Accumulate the six objective sums one layer chunk at a time.
 
-    Chunking bounds the rollout activations kept for backward.  Native temporal
-    and CrossKV parameters are sliced with the trace; shared parameters are
-    reused.  Summing chunk gradients is the gradient of the whole trace.
+    Chunking bounds the activations kept for backward; the chunk gradients sum to
+    the whole-trace gradient.
     """
     totals = torch.zeros(6, dtype=torch.float64, device=keys.device)
     layer_count = int(keys.shape[0])
@@ -476,12 +451,10 @@ def refine_attention(
     TemporalParameters | CrossKVParameters,
     dict[str, object],
 ]:
-    """Refine least-squares predictors under an explicit ablation protocol.
+    """Refine least-squares predictors against the attention objective.
 
-    K and V are optimized in selected, separate phases.  Adam is the primary
-    optimizer; ``sign_gradient`` reproduces the historical one-direction scan
-    inside the same rollout and parameter protocol.  Candidate selection and
-    guardrails use the same normalized objective weights as training.
+    K and V are optimized in separate phases with Adam, or with a one-step
+    ``sign_gradient`` scan; a phase is kept only if no guarded metric regresses.
     """
     if config.v_predictor_mode == "innovation":
         raise ValueError("attention refinement does not support innovation V")
@@ -777,18 +750,11 @@ def fit_temporal(
     max_gain: float = 1.0,
     stride: int | None = None,
 ) -> TemporalParameters:
-    """Fit a diagonal autoregressive predictor from decoder-visible history.
+    """Fit a diagonal autoregressive predictor on ``[..., T, H, D]`` history.
 
-    ``reconstructed`` and ``target`` use ``[..., T, H, D]`` layout.  Leading
-    dimensions are independent samples, ``T`` is frame order, ``H`` is the
-    number of heads and ``D`` is the per-head dimension.  Shared fitting pools
-    heads and returns ``[P,P,D]`` weights; per-head fitting returns
-    ``[P,P,H,D]``.  Row ``q-1`` contains the order-``q`` warm-up parameters,
-    with unused lag positions kept at zero.
-
-    Ridge is scaled by the average centered feature energy and shrinks toward
-    persistence (lag 1 has coefficient 1).  The L1 gain across lags is capped
-    independently for every head/channel.
+    Returns ``[P,P,D]`` (shared) or ``[P,P,H,D]`` weights; row ``q-1`` holds the
+    order-``q`` warm-up coefficients.  Ridge shrinks toward persistence and the
+    L1 gain over lags is capped per channel.
     """
     frame_count, head_count, dim = map(int, reconstructed.shape[-3:])
     work_device, compute_dtype = _compute_device_and_dtype(reconstructed)
@@ -876,13 +842,7 @@ def fit_legacy_shared_temporal(
     max_gain: float = 1.0,
     stride: int | None = None,
 ) -> TemporalParameters:
-    """Fit the legacy single shared K predictor across every layer and head.
-
-    It accumulates the normal-equation statistics in FP64 even on CUDA.  The
-    warm-up row for order ``q < P`` uses only frame ``q``; the final row uses
-    every remaining frame.  Ridge shrinks each channel toward persistence and
-    the sum of absolute history gains is capped per channel.
-    """
+    """Fit the legacy K predictor shared across all layers and heads (FP64 stats)."""
     frame_count = int(target.shape[-3])
     dim = int(target.shape[-1])
     work_device = (
@@ -1002,13 +962,7 @@ def fit_legacy_layer_head_temporal(
     stride: int | None = None,
     layer_ids: tuple[int, ...] | None = None,
 ) -> TemporalParameters:
-    """Fit the legacy K predictor independently for every layer and head.
-
-    The statistics, FP64 accumulation, warm-up rows, ridge toward persistence
-    and per-channel gain cap are those of :func:`fit_legacy_shared_temporal`;
-    only the normal equations are kept per ``(layer, head)`` instead of pooled.
-    Returns ``[L,P,P,H,D]`` weights and ``[L,P,H,D]`` bias.
-    """
+    """Fit the legacy K predictor per layer and head; returns ``[L,P,P,H,D]``."""
     layer_count = int(target.shape[0])
     frame_count = int(target.shape[-3])
     heads = int(target.shape[-2])
@@ -1130,17 +1084,11 @@ def fit_cross_kv(
     stride: int | None = None,
     layer_ids: tuple[int, ...] | None = None,
 ) -> CrossKVParameters:
-    """Fit current-K and reconstructed-V-history maps per layer/head.
+    """Fit ``V_t = K_t W_K + sum_i V_hat_(t-i) W_Vi + b`` per layer and head.
 
-    With ``history_length=0``, inputs use ``[L,...,H,D]`` and retain the legacy
-    ``V = K @ W_K + b`` behavior.  With one or two history terms, inputs use
-    ``[L,...,T,H,D]``; frame zero is an anchor and later frames are fitted as
-    ``V_t = K_t @ W_K + sum(V_hat_(t-i) @ W_Vi) + b``.  Missing warm-up lags
-    are zero.  ``reconstructed_values`` must supply decoder-visible history;
-    callers that intentionally want teacher forcing can pass ``values``.
-    ``history_mode="dense"`` fits a full ``D x D`` map per lag and preserves
-    the legacy API.  ``history_mode="diagonal"`` jointly fits the dense K map
-    with one history coefficient per lag and output channel.
+    With ``history_length=0`` this is ``V = K W_K + b`` on ``[L,...,H,D]``.
+    Otherwise inputs are ``[L,...,T,H,D]``, frame 0 is the anchor, and
+    ``history_mode`` picks a dense ``D x D`` or a diagonal map per lag.
     """
     # A zero-history fit is exactly the legacy K-only regression.  Keep that
     # fast path even when callers preselect diagonal mode for a later fit.
@@ -1221,9 +1169,7 @@ def fit_cross_kv(
             biases.append(bias)
             continue
 
-        # Every output channel sees all current-K channels, but only the same
-        # channel from each V-history lag.  Form the small normal-equation
-        # blocks directly to avoid materializing D copies of the K features.
+        # Each output channel sees all K channels but only its own V-history lags.
         key_x = layer_keys.reshape(-1, head_count, dim).permute(1, 0, 2)
         observation_count = int(key_x.shape[1])
         if history_parts:
@@ -1253,10 +1199,7 @@ def fit_cross_kv(
             "honp,hon->hop", history_centered, y_centered
         )
 
-        # Use one common relative ridge scale per head so the D x D K block
-        # can be factored once and reused for every output channel.  History
-        # energy is averaged over output channels because each channel sees
-        # only its own P history features.
+        # One ridge scale per head so the K block is factored once.
         key_energy = key_gram.diagonal(dim1=-2, dim2=-1).sum(dim=-1)
         history_energy = history_gram.diagonal(
             dim1=-2, dim2=-1
@@ -1269,9 +1212,7 @@ def fit_cross_kv(
             * identity[:history_length, :history_length]
         )
 
-        # Schur complement: solve the large K block once per head with all
-        # output/history right-hand sides, then solve only P x P systems per
-        # output channel and back-substitute the K weights.
+        # Schur complement: solve the K block once, then P x P systems per channel.
         key_block_rhs = torch.cat(
             (
                 key_rhs.permute(0, 2, 1),
@@ -1343,13 +1284,10 @@ def fit_legacy_cross_kv(
     weight_mode: str = "layer_shared",
     projection_source: str = "cross_kv",
 ) -> CrossKVParameters:
-    """Fit the legacy source-to-V projection backbone in FP64.
+    """Fit the legacy source-to-V projection in FP64.
 
-    ``weight_mode="layer_head"`` preserves the reference fit.  The other modes
-    pool across layers (``layer_shared``), heads (``head_shared``), or both
-    (``shared``), then broadcast W and bias to the deployed tensor shapes.
-    ``projection_source`` records whether the supplied source is reconstructed
-    K or its decoder-visible temporal innovation.
+    ``weight_mode`` pools across layers (layer_shared), heads (head_shared),
+    both (shared) or neither (layer_head) and broadcasts to the deployed shape.
     """
     work_device = (
         torch.device("cpu")
@@ -1529,13 +1467,7 @@ def fit_temporal_layers(
     stride: int | None = None,
     layer_ids: tuple[int, ...] | None = None,
 ) -> TemporalParameters:
-    """Fit independent per-head temporal parameters for every layer.
-
-    Inputs use ``[L, ..., T, H, D]`` layout.  The returned weights and bias
-    have shapes ``[L,P,P,H,D]`` and ``[L,P,H,D]``.  Each layer is fitted with
-    :func:`fit_temporal`, so warm-up, ridge and gain behavior are identical to
-    the non-layered path.
-    """
+    """Fit :func:`fit_temporal` per layer; returns ``[L,P,P,H,D]`` weights."""
     layer_fits = [
         fit_temporal(
             reconstructed[layer],
@@ -1650,11 +1582,7 @@ def _reconstruct_temporal_trace(
     bits: int | None = None,
     residual_roundtrip: Callable[[torch.Tensor], torch.Tensor] | None = None,
 ) -> torch.Tensor:
-    """Apply the codec's closed-loop anchor/residual rules to a trace.
-
-    ``bits`` defaults to the K residual width.  A temporal V predictor runs the
-    identical loop over V and passes ``config.v_bits``.
-    """
+    """Replay the codec's closed-loop anchor/residual rules over a trace."""
     residual_bits = config.k_bits if bits is None else bits
     frame_count = int(clean_keys.shape[-3])
     if parameters.history_length == 0:
@@ -1917,12 +1845,9 @@ def fit_legacy_temporal_v_alpha(
     gain_limit: float = 1.0,
     fit_history_source: str = "reconstructed",
 ) -> CrossKVParameters:
-    """Fit the legacy diagonal ``Cross(K_t) + sum_lag alpha_lag * Vhat_(t-lag)``.
+    """Fit the legacy diagonal V history ``Cross(K_t) + sum_lag alpha_lag V_hat_(t-lag)``.
 
-    One coefficient per lag, head and channel.  With several lags the
-    coefficients are coupled, so they are solved together over the frames where
-    every lag is available; a single lag keeps its closed-form ratio so the
-    validated VH1 fit is untouched.
+    One coefficient per lag, head and channel; one lag keeps the closed-form ratio.
     """
     history_length = int(config.v_history_length)
     layer_count = int(clean_values.shape[0])
@@ -2119,12 +2044,7 @@ def _initial_temporal_parameters(
     head_count: int | None = None,
     layer_ids: tuple[int, ...] | None = None,
 ) -> TemporalParameters:
-    """Lag-1 persistence, where the closed-loop temporal fit starts.
-
-    ``history_length=0`` gives the empty map a direct predictor deploys.
-    Passing ``layer_count`` and ``head_count`` gives the ``[L,P,P,H,D]`` layout;
-    otherwise the map is the shared ``[P,P,D]`` one.
-    """
+    """Lag-1 persistence start point; ``history_length=0`` gives the empty map."""
     lead = () if layer_count is None else (layer_count,)
     tail = (dim,) if head_count is None else (head_count, dim)
     weights = torch.zeros(
@@ -2179,27 +2099,11 @@ def fit_predictors(
     coordinate_system: str | None = None,
     fit_history_source: str = "reconstructed",
 ) -> tuple[TemporalParameters, CrossKVParameters | TemporalParameters]:
-    """Fit deployable K and V predictors from reconstructed or clean history.
+    """Fit deployable K and V predictors from a ``[L, ..., T, H, D]`` trace.
 
-    Clean traces use ``[L, ..., T, H, D]`` layout.  ``fit_history_source`` is a
-    fitting-only ablation: ``"reconstructed"`` runs the deployable closed loop,
-    while ``"clean"`` teacher-forces K/V history and the current K used by
-    CrossKV.  Prediction targets remain the current clean K/V in both modes.
-
-    ``v_history_mode`` selects the native V-history map: ``"dense"`` fits a
-    full ``D x D`` matrix per lag, so the V history can mix channels the way
-    the reference joint predictor does; ``"diagonal"`` fits one coefficient
-    per output channel instead.
-
-    Under ``predictor_direction="v_to_k"`` the two tensors exchange roles: V is
-    predicted from its own temporal history and K is projected from the
-    reconstructed V.  The codec equations do not mention K or V anywhere, so
-    the mirror is applied by handing the fitter the pair in the other order
-    rather than by maintaining a second set of equations.  The returned
-    ``TemporalParameters`` therefore always describe the primary tensor and the
-    returned ``CrossKVParameters`` the secondary one; the direction is stamped
-    into the codec signature, so a mirrored set cannot load into a forward
-    runtime.
+    ``fit_history_source="clean"`` teacher-forces history (ablation only).
+    Under ``v_to_k`` the pair is fitted in swapped order, so the temporal
+    parameters always describe the primary tensor.
     """
     # A NaN in the trace would otherwise surface as NaN parameters.
     if not (torch.isfinite(keys).all() and torch.isfinite(values).all()):
@@ -2370,9 +2274,7 @@ def fit_predictors(
             **native_layout,
         )
     elif is_fixed_temporal_predictor(v_mode):
-        # The fixed family deliberately never reads the calibration trace for
-        # its coefficients.  It still emits a normal TemporalParameters archive
-        # so deployment and the learned temporal baseline use the same decoder.
+        # Fixed coefficients never read the trace.
         cross = build_fixed_temporal_parameters(
             v_mode,
             history_length=config.v_history_length,
@@ -2394,9 +2296,7 @@ def fit_predictors(
             fit_history_source=fit_history_source,
         )
     elif v_mode == "temporal":
-        # Temporal V reads its own reconstructed history, so it needs neither
-        # the reconstructed K nor a Cross(K) map: it is the K loop with V's
-        # history length and residual width.
+        # Temporal V is the K loop run on V with V's history and width.
         cross = closed_loop(
             values,
             config.v_history_length,

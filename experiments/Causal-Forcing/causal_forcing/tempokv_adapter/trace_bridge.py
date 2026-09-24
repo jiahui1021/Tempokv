@@ -1,17 +1,8 @@
 """Collect Causal Forcing clean traces for TempoKV parameter fitting.
 
-Only the state TempoKV will actually compress is sampled: the normalized
-**pre-RoPE** K and the raw V left behind by the clean/context refresh pass.
-The post-RoPE Q and reconstructed post-RoPE K used by attention are sampled at
-the same positions for optional attention-objective refinement.
-The four noisy denoising passes per block are never traced — fitting on them
-would match the predictor to a distribution the long-term cache never holds.
-
-Which pass counts as clean is not inferred from a timestep: the pipeline
-announces it with ``note_clean_refresh`` before the forward, and confirms the
-frame range with ``finalize_kv_cache`` afterwards.  Sampling only that pass also
-avoids four fifths of the device-to-host traffic, since the four noisy
-denoising passes per block would otherwise be copied out and thrown away.
+Only the clean refresh pass is sampled (pre-RoPE K, V, and the post-RoPE Q/K
+for the attention objective); noisy denoising passes never enter the cache.
+The pipeline announces that pass with ``note_clean_refresh``.
 """
 
 from __future__ import annotations
@@ -31,28 +22,6 @@ DEFAULT_TOKENS_PER_FRAME = 8
 _TRACE_KINDS = ("k_pre_rope", "v", "q_post_rope", "k_post_rope")
 
 
-def _positive_env(name: str, default: int) -> int:
-    value = os.environ.get(name, str(default))
-    try:
-        parsed = int(value)
-    except ValueError as error:
-        raise ValueError(f"{name} must be an integer, got {value!r}") from error
-    if parsed < 1:
-        raise ValueError(f"{name} must be positive, got {parsed}")
-    return parsed
-
-
-def _nonnegative_env(name: str, default: int) -> int:
-    value = os.environ.get(name, str(default))
-    try:
-        parsed = int(value)
-    except ValueError as error:
-        raise ValueError(f"{name} must be an integer, got {value!r}") from error
-    if parsed < 0:
-        raise ValueError(f"{name} must not be negative, got {parsed}")
-    return parsed
-
-
 def _sample_projection(
     tensor: torch.Tensor,
     *,
@@ -62,37 +31,11 @@ def _sample_projection(
     tokens_per_frame: int,
     legacy: bool = False,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Take the same spatial positions from every frame of one projection.
-
-    Sampling different positions per frame would destroy the temporal
-    correlation the predictor is fitted on, so the token indices are a fixed
-    stride and are recorded alongside the samples.
-    """
-    if tensor.ndim != 3:
-        raise ValueError(
-            f"Causal Forcing projection must use [B,S,C], got {tuple(tensor.shape)}"
-        )
-    batch, sequence, channels = tensor.shape
-    if channels != num_heads * head_dim:
-        raise ValueError(
-            f"Causal Forcing trace expects {num_heads} heads of dimension "
-            f"{head_dim}, got projection width {channels}"
-        )
-    if sequence % frame_seq_length:
-        raise ValueError(
-            f"projection sequence {sequence} is not divisible by frame size "
-            f"{frame_seq_length}"
-        )
-    if tokens_per_frame > frame_seq_length:
-        raise ValueError(
-            "TEMPOKV_TRACE_TOKENS_PER_FRAME cannot exceed the frame size "
-            f"{frame_seq_length}"
-        )
+    """Sample the same spatial positions from every frame."""
+    batch, sequence, _ = tensor.shape
     frame_count = sequence // frame_seq_length
     if legacy:
-        # The legacy fitting protocol records a fixed set of spatial positions
-        # spread over both ends of a frame (rounded linspace), matching the
-        # reference sampler in scripts/common/fit_params.py.
+        # Rounded linspace over both frame ends, as the legacy protocol expects.
         token_indices = torch.linspace(
             0,
             frame_seq_length - 1,
@@ -126,10 +69,10 @@ def install(runtime_root: str | Path | None = None) -> type:
     if not output_value:
         raise ValueError("TEMPOKV_TRACE_DIR must be set for trace collection")
     output_root = Path(output_value).expanduser().resolve()
-    tokens_per_frame = _positive_env(
-        "TEMPOKV_TRACE_TOKENS_PER_FRAME", DEFAULT_TOKENS_PER_FRAME
+    tokens_per_frame = int(
+        os.environ.get("TEMPOKV_TRACE_TOKENS_PER_FRAME", DEFAULT_TOKENS_PER_FRAME)
     )
-    event_frames = _nonnegative_env("TEMPOKV_TRACE_EVENT_FRAMES", 0)
+    event_frames = int(os.environ.get("TEMPOKV_TRACE_EVENT_FRAMES", "0"))
 
     pipeline_package = importlib.import_module("causal_forcing.pipeline")
     pipeline_module = importlib.import_module(
@@ -167,9 +110,7 @@ def install(runtime_root: str | Path | None = None) -> type:
     class TraceCausalInferencePipeline(base):
         def __init__(self, *args: Any, **kwargs: Any) -> None:
             super().__init__(*args, **kwargs)
-            # Trace collection samples the pre-RoPE K/V representation used by
-            # TempoKV and therefore must retain the chunked read-time-RoPE
-            # cache instead of the native BF16 dense path.
+            # Traces sample the pre-RoPE chunked cache TempoKV compresses.
             self._uses_pre_rope_cache = True
             blocks = self.generator.model.blocks
             output_root.mkdir(parents=True, exist_ok=True)
@@ -203,7 +144,7 @@ def install(runtime_root: str | Path | None = None) -> type:
                 del module, args
                 if not self._capturing:
                     return
-                sampled, token_indices = _sample_projection(
+                sampled, self._latest_token_indices = _sample_projection(
                     output,
                     frame_seq_length=self.frame_seq_length,
                     num_heads=self.num_heads,
@@ -211,10 +152,6 @@ def install(runtime_root: str | Path | None = None) -> type:
                     tokens_per_frame=tokens_per_frame,
                     legacy=event_frames > 0,
                 )
-                if self._latest_token_indices is None:
-                    self._latest_token_indices = token_indices
-                elif not np.array_equal(self._latest_token_indices, token_indices):
-                    raise RuntimeError("Causal Forcing trace token samples do not match")
                 self._latest.setdefault(layer_index, {})[kind] = sampled
 
             return hook
@@ -232,7 +169,7 @@ def install(runtime_root: str | Path | None = None) -> type:
                 ):
                     if tensor.ndim == 4:
                         tensor = tensor.reshape(tensor.shape[0], tensor.shape[1], -1)
-                    sampled, token_indices = _sample_projection(
+                    sampled, _ = _sample_projection(
                         tensor,
                         frame_seq_length=self.frame_seq_length,
                         num_heads=self.num_heads,
@@ -240,14 +177,6 @@ def install(runtime_root: str | Path | None = None) -> type:
                         tokens_per_frame=tokens_per_frame,
                         legacy=event_frames > 0,
                     )
-                    if self._latest_token_indices is None:
-                        self._latest_token_indices = token_indices
-                    elif not np.array_equal(
-                        self._latest_token_indices, token_indices
-                    ):
-                        raise RuntimeError(
-                            "Causal Forcing trace token samples do not match"
-                        )
                     self._latest.setdefault(layer_index, {})[kind] = sampled
 
             return record
@@ -262,18 +191,12 @@ def install(runtime_root: str | Path | None = None) -> type:
 
         def finalize_kv_cache(self, start_frame: int, num_frames: int) -> None:
             super().finalize_kv_cache(start_frame, num_frames)
-            if not self._capturing:
-                raise RuntimeError(
-                    "Causal Forcing finalized a block without announcing a "
-                    "clean refresh first; the trace would be empty"
-                )
             self._capturing = False
             self._commit(start_frame, num_frames)
 
         def inference(self, *args: Any, **kwargs: Any) -> Any:
             self._reset_sequence()
-            # The final clean refresh is trace data, even though ordinary
-            # one-shot generation can discard terminal K/V without creating it.
+            # The terminal clean refresh is trace data too.
             kwargs["retain_final_cache"] = True
             try:
                 result = super().inference(*args, **kwargs)
@@ -286,50 +209,21 @@ def install(runtime_root: str | Path | None = None) -> type:
         # -- accumulation --------------------------------------------------
 
         def _commit(self, start_frame: int, num_frames: int) -> None:
-            layers = self.num_transformer_blocks
-            if sorted(self._latest) != list(range(layers)):
-                raise RuntimeError(
-                    f"clean Causal Forcing pass did not capture all {layers} "
-                    "attention layers"
-                )
-            token_indices = self._latest_token_indices
-            if token_indices is None:
-                raise RuntimeError("clean Causal Forcing pass captured no token indices")
             if self._sequence_start is None:
                 self._sequence_start = start_frame
                 self._sequence_end = start_frame
-                self._sequence_token_indices = token_indices
+                self._sequence_token_indices = self._latest_token_indices
+            # A gap would splice two separate moments into one trace sequence.
             if start_frame != self._sequence_end:
                 raise RuntimeError(
                     "clean Causal Forcing trace blocks are not temporally contiguous"
                 )
-            if not np.array_equal(self._sequence_token_indices, token_indices):
-                raise RuntimeError(
-                    "clean Causal Forcing trace blocks use different token samples"
-                )
-            for layer_index in range(layers):
-                arrays = self._latest[layer_index]
-                if set(arrays) != set(_TRACE_KINDS):
-                    raise RuntimeError(
-                        f"layer {layer_index} captured {sorted(arrays)} instead "
-                        f"of {list(_TRACE_KINDS)}"
-                    )
-                shapes = {arrays[kind].shape for kind in _TRACE_KINDS}
-                if len(shapes) != 1:
-                    raise ValueError(
-                        f"layer {layer_index} captured mismatched shapes: {shapes}"
-                    )
-                keys = arrays["k_pre_rope"]
-                if keys.shape[1] != num_frames:
-                    raise RuntimeError(
-                        f"layer {layer_index} captured {keys.shape[1]} frames but "
-                        f"the pipeline finalized {num_frames}"
-                    )
+            for layer_index in range(self.num_transformer_blocks):
                 bucket = self._sequence.setdefault(
                     layer_index, {kind: [] for kind in _TRACE_KINDS}
                 )
                 for kind in _TRACE_KINDS:
-                    bucket[kind].append(arrays[kind])
+                    bucket[kind].append(self._latest[layer_index][kind])
             self._sequence_end = start_frame + num_frames
             self._latest = {}
             self._latest_token_indices = None
@@ -338,13 +232,7 @@ def install(runtime_root: str | Path | None = None) -> type:
             if self._sequence_start is None or self._sequence_end is None:
                 raise RuntimeError("Causal Forcing inference produced no clean K/V trace")
             layers = self.num_transformer_blocks
-            if sorted(self._sequence) != list(range(layers)):
-                raise RuntimeError(
-                    f"Causal Forcing inference did not capture all {layers} layers"
-                )
             token_indices = self._sequence_token_indices
-            if token_indices is None:
-                raise RuntimeError("Causal Forcing inference captured no token indices")
 
             generation_mode = (
                 "framewise" if self.num_frame_per_block == 1 else "chunkwise"
@@ -352,25 +240,15 @@ def install(runtime_root: str | Path | None = None) -> type:
             rank = int(os.environ.get("RANK", "0"))
             rank_dir = output_root / f"rank_{rank:03d}"
 
-            # Concatenate the whole captured rollout per layer, then slice it
-            # into fixed-size events.  Native collection keeps the rollout as a
-            # single frame-range event; legacy collection
-            # (TEMPOKV_TRACE_EVENT_FRAMES=24) cuts it into 24-frame records
-            # named by their absolute token range.
-            merged: dict[int, dict[str, np.ndarray]] = {}
-            for layer_index in range(layers):
-                arrays = self._sequence[layer_index]
-                combined = {
+            # Native collection writes the rollout as one event; legacy
+            # (TEMPOKV_TRACE_EVENT_FRAMES=24) cuts it into 24-frame records.
+            merged = {
+                layer_index: {
                     kind: np.concatenate(arrays[kind], axis=1)
                     for kind in _TRACE_KINDS
                 }
-                shapes = {array.shape for array in combined.values()}
-                if len(shapes) != 1:
-                    raise ValueError(
-                        f"layer {layer_index} captured mismatched shapes: {shapes}"
-                    )
-                merged[layer_index] = combined
-
+                for layer_index, arrays in self._sequence.items()
+            }
             total_frames = merged[0]["k_pre_rope"].shape[1]
             frames_per_event = event_frames or total_frames
             complete_events = total_frames // frames_per_event
@@ -394,8 +272,6 @@ def install(runtime_root: str | Path | None = None) -> type:
                     )
                 event_dir = rank_dir / event_name
                 temporary_dir = rank_dir / f".{event_name}.tmp-{os.getpid()}"
-                if event_dir.exists():
-                    raise FileExistsError(f"trace event already exists: {event_dir}")
                 temporary_dir.mkdir(parents=True, exist_ok=False)
 
                 try:

@@ -10,9 +10,9 @@ EXP="$1"
 GPU="$2"
 IDLE_MIN="${3:-45}"
 
-TEMPOKV=/mnt/cpfs/epic-user/hujiahui-20260612/Tempokv
-BF16_REF="${BF16_REF:-/mnt/cpfs/epic-user/hujiahui-20260612/kv-quant-result/experiments/self-forcing/Self-Forcing/bf16}"
-QVG_BIN=/mnt/cpfs/epic-user/hujiahui-20260612/miniconda3/envs/qvg/bin
+TEMPOKV=${WORKSPACE:?set WORKSPACE to the experiment root}/Tempokv
+BF16_REF="${BF16_REF:-${WORKSPACE}/kv-quant-result/experiments/self-forcing/Self-Forcing/bf16}"
+QVG_BIN=${WORKSPACE}/miniconda3/envs/qvg/bin
 HB="$TEMPOKV/results/paper_experiments/hybrid-bits/$EXP"
 VDIR="${VDIR:-$HB/videos}"
 OUTDIR="${OUTDIR:-$HB}"

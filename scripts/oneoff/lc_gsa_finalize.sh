@@ -2,7 +2,7 @@
 # GSA 收尾:每个 A 臂 run 收片后自动评 vs BF16 / vs 滑窗基线 / (k2v2) A vs B,最后写 SUMMARY.md
 # 日志与输出全部落在各 run 目录内。setsid nohup 长跑,卡空闲才起评测。
 set -u
-W=/mnt/cpfs/epic-user/hujiahui-20260612
+W=${WORKSPACE:?set WORKSPACE to the experiment root}
 T=$W/Tempokv
 R=$W/kv-quant-result/LongCat
 O=$R/global_single_anchor
@@ -47,9 +47,9 @@ while :; do
 done
 
 $Q - <<'PY'
-import json, time
+import json, os, time
 from pathlib import Path
-O = Path("/mnt/cpfs/epic-user/hujiahui-20260612/kv-quant-result/LongCat/global_single_anchor")
+O = Path(os.environ["WORKSPACE"]) / "kv-quant-result/LongCat/global_single_anchor"
 lines = ["# LongCat 整段全局单 anchor(global_single_anchor)— A 臂每组 1 条",
          "",
          "协议:idx0(seed0,INIT=base/0/0-0.mp4,9段273f,cumulative cond 窗,OFFLOAD);A=单 span(全片 1 anchor),B=[24+5×n] 分段 span(每段 anchor)。",

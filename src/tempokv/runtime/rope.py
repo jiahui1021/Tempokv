@@ -1,21 +1,8 @@
 """Read-time causal RoPE for pre-RoPE KV caches.
 
-The cache stores normalized K *before* the rotary embedding so a TempoKV
-temporal predictor only ever models content change, never the positional
-rotation.  Attention therefore has to rotate the reconstructed K on the way
-out, using each frame's **absolute** position on the model timeline.
-
-When the resident cache is contiguous this is a single call with one start
-frame.  Once eviction leaves a sink/recent gap the resident frames no longer
-form one arithmetic sequence, so each run is rotated with its own absolute
-start and only then concatenated: rotating `[0, 1, 100, 101]` as if it were
-`[0, 1, 2, 3]` would silently corrupt every post-gap key.
-
-The ``native`` (complex128) rotation of a CUDA BF16 read runs as one Triton
-kernel (:mod:`tempokv.runtime.rope_triton`) instead of the per-block PyTorch
-sequence below, which streams a float64 copy of the whole read through memory
-several times.  ``TEMPOKV_ROPE_BACKEND=torch`` keeps the PyTorch sequence for A/B runs; by
-default the kernel is used whenever it applies.
+Reconstructed K is rotated at each frame's absolute position, one contiguous
+span at a time.  On CUDA the native (complex128) rotation runs as one Triton
+kernel; ``TEMPOKV_ROPE_BACKEND=torch`` keeps the PyTorch path for A/B runs.
 """
 
 from __future__ import annotations
@@ -67,9 +54,8 @@ def _rotate_frames(
 ) -> None:
     heads = x.size(2)
     work_dtype = torch.float32 if precision == "complex64" else torch.float64
-    # The native path follows upstream causal_rope_apply in complex128.  The
-    # legacy long cached-K reader intentionally converts each model block to
-    # float32/complex64 instead, so legacy mode reproduces that branch.
+    # native follows upstream causal_rope_apply (complex128); complex64 matches the
+    # legacy cached-K reader.
     for relative_frame in range(0, num_frames, block_frames):
         current_frames = min(block_frames, num_frames - relative_frame)
         block_start = token_start + relative_frame * tokens_per_frame
@@ -112,12 +98,7 @@ def _verify_fused_rotation(
     height_freqs: torch.Tensor,
     width_freqs: torch.Tensor,
 ) -> None:
-    """Compare the fused kernel with the reference once per geometry.
-
-    The kernel exists to change speed, not values, so the first time it meets
-    a geometry it rotates synthetic keys at the first and the last frames of
-    the RoPE table both ways and refuses to continue unless every bit agrees.
-    """
+    """Check the fused kernel bit-for-bit against the reference once per geometry."""
     key = (str(device), heads, head_dim, height, width)
     if key in _VERIFIED_FUSED:
         return
@@ -181,15 +162,9 @@ def apply_rope_by_span(
     precision: str = "native",
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Rotate a pre-RoPE cache read, one absolute-position span at a time.
+    """Rotate a pre-RoPE ``[B, S, H, D]`` cache read span by span.
 
-    ``x`` is ``[B, S, H, D]`` holding the spans back to back in the order
-    given, which is the order :meth:`ChunkedKVCache.spans` returns.
-
-    ``out`` receives the rotated keys instead of a fresh allocation, and may
-    alias ``x``: each block is read in full before its result is written back,
-    so rotating a cache read in place is safe and saves a tensor the size of
-    the whole resident range on every forward.
+    ``out`` may alias ``x`` for an in-place rotation.
     """
     spans = list(spans)
     channels = x.size(3) // 2

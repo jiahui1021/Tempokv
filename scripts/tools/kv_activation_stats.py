@@ -1,17 +1,8 @@
-"""Shared KV-cache activation statistics: video (AR diffusion) vs LLM.
+"""Shared KV-cache activation statistics for video (AR diffusion) and LLM caches.
 
-Same metric family computed from a per-(layer,head) token matrix X [n_tokens, head_dim]:
-
-  heterogeneity : cv_channel_std, outlier_frac, kurtosis_mean,
-                  norm_cv, head_vector_dissim,
-                  layer_profile_dissim, head_profile_dissim
-  redundancy    : adj_sim (temporal/sequential neighbours), same_unit_sim
-                  (spatial within one video frame; skipped for LLM),
-                  far_sim, temporal_diff_energy, rank_{top1,5,10,20}_energy,
-                  participation_ratio, autocorr{1,2,5,10,25}
-
-Video tokens carry (frame, position) grouping so the spatial and temporal
-axes can be separated; LLM tokens only have the sequence axis.
+Computed from a per-(layer, head) token matrix ``[n_tokens, head_dim]``:
+heterogeneity (channel/norm spread, outliers, kurtosis, dissimilarity) and
+redundancy (neighbour similarity, low-rank energy, autocorrelation).
 """
 
 from __future__ import annotations

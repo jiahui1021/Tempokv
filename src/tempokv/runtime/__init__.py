@@ -1,13 +1,4 @@
-"""Runtime pieces shared by the TempoKV model integrations.
-
-``launch`` holds process-level kernel configuration.  ``cache``, ``rope``,
-``streaming`` and ``metrics`` hold the causal video KV runtime that
-Self-Forcing and Causal Forcing share: both run Wan2.1-1.3B as a causal
-autoregressive video diffusion model, so both need the same frame-aligned
-pre-RoPE cache, the same read-time absolute-position RoPE, the same streaming
-span encoder, and the same memory/latency accounting.  ``jensen`` holds the
-quantized-key attention-score correction those integrations can opt into.
-"""
+"""Runtime shared by the Self-Forcing and Causal Forcing integrations."""
 
 from .cache import (
     CacheSpan,

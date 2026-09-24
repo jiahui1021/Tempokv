@@ -1,11 +1,4 @@
-"""Tiled online-softmax attention with an in-register Jensen correction.
-
-Each CTA owns a query tile; each query norm is reduced once before the KV
-loop. Only G step values per key are loaded alongside the original D-wide K/V.
-The online softmax recurrence follows the FlashAttention formulation, also
-documented at https://triton-lang.org/main/getting-started/tutorials/06-fused-attention.html.
-No Q-by-K allocation, Q padding, coefficient preparation or output copy.
-"""
+"""Tiled online-softmax attention with an in-register Jensen correction."""
 
 import os
 
@@ -51,10 +44,7 @@ def _attention_forward(
             coefficient = (-energy / (24.0 * D ** 0.5)).to(q.dtype).to(tl.float32)
             coefficients += (coefficient,)
         if CORRECTION_MMA:
-            # Only the small rank axis is padded, not the D-wide Q/K/V.
-            # Half inputs already match legacy coefficient/step rounding.
-            # Build the Q operand once; its dot-operand layout is reused in
-            # every KV tile rather than broadcasting G vectors over scores.
+            # Pad only the rank axis and build the Q operand once for every KV tile.
             rank = tl.arange(0, 16)
             q_correction = tl.full((BLOCK_M, 16), 0.0, tl.float32)
             for g in tl.static_range(D // GROUP_SIZE):
@@ -114,10 +104,7 @@ def _attention_forward(
     )
 
 
-# (BLOCK_M, BLOCK_N, num_warps, num_stages). User measurements show severe
-# slowdowns for some 4-warp fused tiles. Resource pressure is a hypothesis;
-# register allocation/spills must be checked from the compiled kernel.
-# Keep the measured candidates for reproducible comparison.
+# (BLOCK_M, BLOCK_N, num_warps, num_stages) candidates that measured well.
 _TILES = {
     "64x64": (64, 64, 4, 2),
     "128x64": (128, 64, 4, 2),
@@ -139,13 +126,8 @@ _tuned_forward = triton.autotune(
 def attention_forward(query, key, value, step_squared, group_size, *,
                       config=None, apply_correction=True, correction_mode=None,
                       return_metadata=False, implementation=None):
-    """Production always corrects; plain controls are private benchmark-only.
-
-    ``auto`` tunes candidates per power-of-two sequence bucket. A fixed tile
-    or ``legacy`` bypasses tuning for reproducible comparisons/cold starts.
-    The legacy option retains the previous global FP-fusion disable setting.
-    ``scalar`` preserves the user-measured implementation; ``mma`` is an opt-in
-    small Tensor Core correction with a different accumulation order.
+    """Launch configuration: ``auto`` tunes per sequence bucket; a fixed tile or
+    ``legacy`` skips tuning.  ``scalar`` is the default correction, ``mma`` opt-in.
     """
     config = config or os.environ.get("TEMPOKV_JENSEN_TRITON_CONFIG", "auto")
     correction_mode = correction_mode or os.environ.get("TEMPOKV_JENSEN_TRITON_CORRECTION", "scalar")

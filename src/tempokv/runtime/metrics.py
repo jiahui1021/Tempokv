@@ -1,15 +1,7 @@
 """Runtime accounting shared by the TempoKV model integrations.
 
-Two reporting rules matter for a rolling causal cache and are enforced here.
-
-Memory is reported as *resident* cache state, not as the running total of every
-encode event: a cache that packs a span, then evicts it, never held both at
-once.  ``current_*`` tracks what is resident now, ``peak_*`` the high-water
-mark, and ``total_*`` the cumulative encoded volume — the three are kept apart
-so a compression ratio is never computed by dividing one kind by another.
-
-Compression ratio always compares the compressed and uncompressed bytes *of the
-same cache state*, which is why every span records both together.
+``current_*`` is resident cache state, ``peak_*`` its high-water mark and
+``total_*`` the cumulative encoded volume; ratios compare one kind only.
 """
 
 from __future__ import annotations
@@ -23,10 +15,7 @@ import torch
 
 BF16_BYTES_PER_VALUE = 2
 
-# One drain costs one ``torch.cuda.synchronize``.  ``decode_ms`` is bracketed
-# once per packed span per cache read per layer, so the pool has to hold a
-# comfortable multiple of that before a drain becomes necessary; profiling.py
-# uses the same bound for the same reason.
+# Each drain synchronizes once; hold several reads' worth of events.
 TIMER_EVENT_POOL_SIZE = 8192
 
 
@@ -57,17 +46,8 @@ class TempoKVRuntimeReport:
 
     predictor_parameter_bytes: int = 0
 
-    # Only latencies this runtime actually measures live here. Attention time
-    # is deliberately absent: timing it per layer needs device syncs that
-    # distort the thing being measured, and it is recoverable as
-    # `generation_ms` minus `encode_ms` and `decode_ms`. Per-prompt wall time
-    # lives in the runtime's own `summary.json`.
-    #
-    # All three are GPU intervals measured with CUDA events, not host clocks:
-    # kernel launches are asynchronous, so wall time around an encode or a
-    # decode measures how long it took to *queue* the work. They are only
-    # correct once `drain_timers` has read the events back, which `to_dict`
-    # does; read them through `to_dict` rather than as attributes.
+    # GPU intervals from CUDA events; valid after `drain_timers` (via `to_dict`).
+    # Attention time is `generation_ms` minus these.
     encode_ms: float = 0.0
     decode_ms: float = 0.0
     generation_ms: float = 0.0
@@ -77,9 +57,7 @@ class TempoKVRuntimeReport:
     peak_compressed_cache_bytes: int = 0
     peak_uncompressed_cache_bytes: int = 0
 
-    # Dense frames that are finalized but not packed yet, plus the block being
-    # denoised. Tracked apart from the packed spans because both are resident
-    # at the same time and a peak-memory figure needs their sum.
+    # Finalized-but-unpacked frames plus the block being denoised.
     resident_bf16_bytes: int = 0
     peak_resident_total_bytes: int = 0
 
@@ -106,12 +84,7 @@ class TempoKVRuntimeReport:
     def update_span(
         self, key: Any, *, compressed_bytes: int, uncompressed_bytes: int
     ) -> None:
-        """Grow a span installed earlier by :meth:`record_span`.
-
-        An incrementally encoded span is recorded once when it opens and again
-        after every append.  Only the growth is added to the cumulative totals,
-        so a span that is appended to eight times is not counted eight times.
-        """
+        """Grow an open span recorded earlier; only the growth reaches the totals."""
         previous = self._resident.get(key)
         if previous is None:
             self.record_span(
@@ -130,14 +103,7 @@ class TempoKVRuntimeReport:
         self._refresh_span_peaks()
 
     def observe_resident_bf16_bytes(self, resident_bytes: int) -> None:
-        """Record the dense part of the cache that is currently allocated.
-
-        This is the only thing that moves the resident peak.  Packing a span
-        frees dense chunks and installs compressed bytes in their place, so
-        raising the peak from inside :meth:`record_span` would add the new
-        compressed span on top of a dense figure that the same operation had
-        just invalidated — and a peak, once raised, cannot be corrected down.
-        """
+        """Record the resident dense cache bytes; the only update to the resident peak."""
         self.resident_bf16_bytes = int(resident_bytes)
         self.peak_resident_total_bytes = max(
             self.peak_resident_total_bytes, self.resident_total_bytes
@@ -202,13 +168,7 @@ class TempoKVRuntimeReport:
         )
 
     def drain_timers(self) -> None:
-        """Fold every finished GPU interval into its field, synchronizing once.
-
-        Recording an event does not synchronize, so an instrumented run keeps
-        the launch pattern of an uninstrumented one.  The cost is that the
-        latency fields are stale until this runs; ``to_dict`` calls it, and a
-        caller that reads the attributes directly has to call it itself.
-        """
+        """Fold finished GPU intervals into their fields (one synchronize)."""
         if not self._pending_intervals:
             return
         torch.cuda.synchronize()
@@ -224,11 +184,7 @@ class TempoKVRuntimeReport:
     # -- output ----------------------------------------------------------
 
     def require_tempokv_activity(self) -> None:
-        """Fail a TempoKV run that never actually used the codec.
-
-        Without this a misconfigured run produces a perfectly good video from
-        an untouched BF16 cache and silently reports it as a TempoKV result.
-        """
+        """Fail a TempoKV run that never exercised the codec."""
         if self.kv_mode != "tempokv":
             return
         empty = [
@@ -285,16 +241,7 @@ class TempoKVRuntimeReport:
 
 
 class _Timer:
-    """Accumulate one section's GPU time into a report field.
-
-    On CUDA the bracket is a pair of events rather than a host clock.  The
-    encode and decode paths issue their whole kernel sequence without ever
-    synchronizing, so ``perf_counter`` around them measures launch time, not
-    device time -- and the amount it understates by depends on how much of the
-    launch queue happened to be full, which makes it not merely small but
-    unpredictable.  Off CUDA the host clock stays, so the accounting logic is
-    exercisable without a device.
-    """
+    """Accumulate one section's GPU time (CUDA events; host clock off CUDA)."""
 
     def __init__(self, report: TempoKVRuntimeReport, field_name: str) -> None:
         if not hasattr(report, field_name):

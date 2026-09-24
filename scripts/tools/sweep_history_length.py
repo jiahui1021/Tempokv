@@ -1,43 +1,10 @@
 #!/usr/bin/env python3
 """Sensitivity of TempoKV quality to the predictor history length.
 
-Driven per model by `bash scripts/<model>/sweep_history.sh`, which supplies
-that model's trace, config, and report path. Called directly it falls back to
-Self-Forcing's paths.
-
-Sweeps the number of reconstructed history frames the predictors may use and,
-at each setting, reports the three quantities that decide whether a longer
-history is worth its parameter cost:
-
-  * **reconstruction error** — ``||rebuilt - clean||^2 / ||clean||^2``, the
-    end-to-end closed-loop error of the cache the model will actually read;
-  * **attention output error** — the same reconstruction pushed through causal
-    softmax attention, which is what the error finally does to the model;
-  * **prediction share** — how much of the signal the predictor explains, i.e.
-    ``1 - ||clean - prediction||^2 / ||clean||^2``. Its complement is the
-    residual the quantizer has to spend bits on, so a larger share at the same
-    bit width is exactly what buys quality.
-
-Two sweeps are run:
-
-``K``
-    ``k_history_length`` = N, using N reconstructed K frames. ``N=0`` is the
-    direct-quantization baseline. Dedicated (non shared) parameters are fitted
-    per positive length, so **each N is refitted from the trace** — a parameter
-    file fitted for one length cannot be re-pointed at another, and reusing one
-    would measure the wrong model.
-
-``V``
-    ``v_history_length`` = M *on top of* the CrossKV term. V is always predicted
-    from the current reconstructed K; M adds reconstructed V history to that.
-    The report therefore also breaks the V prediction into its CrossKV term and
-    its history term, so a sweep can show what the history adds rather than
-    only that the total improved. The two terms are correlated, so their
-    energies are reported side by side and do not sum to the total.
-
-Everything is measured on the clean trace with the repo's own fitter and the
-same closed-loop reconstruction the codec performs, so the numbers correspond
-to a deployed run rather than to an open-loop approximation.
+Driven by ``bash scripts/<model>/sweep_history.sh`` (defaults to Self-Forcing).
+Sweeps K history (refitted per length; 0 is direct quantization) and V history
+on top of CrossKV, reporting closed-loop reconstruction error, attention-output
+error and prediction share, with the V prediction split into its terms.
 """
 
 from __future__ import annotations
@@ -200,11 +167,7 @@ def measure(
         v_residual_history_only = v_residual
         v_residual_bias_only = None
     else:
-        # Leave-one-out ablation of the two V prediction terms. Both are dropped
-        # from the *jointly fitted* model rather than refitted without each other,
-        # so these say what each term contributes to this predictor, not what a
-        # predictor trained without it would achieve. The terms are correlated, so
-        # the two residuals do not decompose the full one.
+        # Leave-one-out on the jointly fitted V model (terms are correlated).
         v_without_history = values[:, :, later] - (
             v_pred[:, :, later] - v_hist[:, :, later]
         )
@@ -264,10 +227,7 @@ def measure(
                 if temporal_v
                 else v_residual_cross_only - v_residual
             ),
-            # Closed-loop reconstruction error of the reduced predictors: drop
-            # one V term and rerun the full quantization round-trip. These are
-            # the end-to-end errors the model would actually read under that
-            # ablation, unlike the residuals above.
+            # Closed-loop error with one V term dropped.
             "reconstruction_cross_only": (
                 None
                 if temporal_v

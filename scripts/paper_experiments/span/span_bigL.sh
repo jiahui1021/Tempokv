@@ -4,15 +4,15 @@
 #   generate(k2v2 params, span=L, idx0-29) 与 流式评测 watcher 并发; 完事导 per-video CSV。
 set -uo pipefail
 L="$1"; GPU="$2"
-T=/mnt/cpfs/epic-user/hujiahui-20260612/Tempokv
-QVG=/mnt/cpfs/epic-user/hujiahui-20260612/miniconda3/envs/qvg/bin/python
+T=${WORKSPACE:?set WORKSPACE to the experiment root}/Tempokv
+QVG=${WORKSPACE}/miniconda3/envs/qvg/bin/python
 KV2="${PARAM_DIR:-$T/data/self-forcing/params/legacy-kh2-vh1-k2-v2-layershared}"
 CFG="${CFG:-$T/results/paper/span-int2/configs/residual_int2_anchor_int4.json}"
 PROMPTS="${PROMPTS:-$T/assets/moviegen128.txt}"
 START="${START:-0}"; END="${END:-30}"
-CKPT=/mnt/cpfs/epic-user/hujiahui-20260612/checkpoints/self_forcing_dmd.pt
-WAN=/mnt/cpfs/epic-user/hujiahui-20260612/models--Wan-AI--Wan2.1-T2V-1.3B
-REF="${BF16_REF:-/mnt/cpfs/epic-user/hujiahui-20260612/kv-quant-result/experiments/self-forcing/Self-Forcing/bf16}"
+CKPT=${WORKSPACE}/checkpoints/self_forcing_dmd.pt
+WAN=${WORKSPACE}/models--Wan-AI--Wan2.1-T2V-1.3B
+REF="${BF16_REF:-${WORKSPACE}/kv-quant-result/experiments/self-forcing/Self-Forcing/bf16}"
 LABEL="${LABEL:-int2_anchor4_span${L}}"
 FRAMES="${FRAMES:-717}"   # 像素帧数(须满足 (FRAMES+3)%12==0),默认 717=180 latent
 RUN="$T/results/paper/span-int2/runs/${LABEL}/pixel_${FRAMES}"

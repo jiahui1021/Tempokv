@@ -23,7 +23,7 @@
       "name": "BF16",
       "bit_width": null,
       "command": [
-        "/mnt/cpfs/epic-user/hujiahui-20260612/miniconda3/envs/qvg/bin/python",
+        "/path/to/workspace/miniconda3/envs/qvg/bin/python",
         "scripts/paper_experiments/latency/self_forcing_adapter.py",
         "--phase", "{phase}",
         "--frames", "{frames}"
@@ -33,7 +33,7 @@
       "name": "TempoKV_INT2",
       "bit_width": 2,
       "command": [
-        "/mnt/cpfs/epic-user/hujiahui-20260612/miniconda3/envs/qvg/bin/python",
+        "/path/to/workspace/miniconda3/envs/qvg/bin/python",
         "scripts/paper_experiments/latency/self_forcing_adapter.py",
         "--phase", "{phase}",
         "--frames", "{frames}"
@@ -43,7 +43,7 @@
       "name": "TempoKV_INT4",
       "bit_width": 4,
       "command": [
-        "/mnt/cpfs/epic-user/hujiahui-20260612/miniconda3/envs/qvg/bin/python",
+        "/path/to/workspace/miniconda3/envs/qvg/bin/python",
         "scripts/paper_experiments/latency/self_forcing_adapter.py",
         "--phase", "{phase}",
         "--frames", "{frames}"

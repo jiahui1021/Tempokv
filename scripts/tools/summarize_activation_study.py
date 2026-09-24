@@ -2,12 +2,13 @@
 from __future__ import annotations
 
 import json
+import os
 import time
 from pathlib import Path
 
 import numpy as np
 
-AS = Path("/mnt/cpfs/epic-user/hujiahui-20260612/kv-quant-result/activation_study/video_vs_llm")
+AS = Path(os.environ["WORKSPACE"]) / "kv-quant-result/activation_study/video_vs_llm"
 
 METRICS = [
     ("cv_channel_std", "通道尺度变异系数"),

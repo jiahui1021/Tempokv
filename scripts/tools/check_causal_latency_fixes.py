@@ -1,27 +1,13 @@
 #!/usr/bin/env python3
-"""Check the two Causal Forcing latency fixes on a CUDA device.
+"""Check the Causal Forcing latency fixes on a CUDA device.
 
-``rope``
-    Read-time RoPE of the whole decoded K cache, once per layer per forward.
-    Times the per-block PyTorch float64 reference (out of place, as the
-    attention path used to call it) against the fused Triton kernel (in place),
-    at the production grid, and counts differing BF16 values.  Any nonzero
-    count is a failure.
-
-``decode``
-    Replays the one-anchor rollout schedule: a single packed span read at every
-    length it reaches (3, 6, ..., 159 units for 717 frames with a BF16 lag of
-    18).  Reports how many distinct ``(start_unit, chunk_units)`` launches the
-    persistent kernels see, times a first and a second pass (the difference is
-    Triton compile/load time), and compares every decode bit for bit with the
-    unshifted launch plan.  Run it with a fresh ``TRITON_CACHE_DIR`` to see the
-    cold-cache cost a new container pays.
+``rope``: time the float64 PyTorch RoPE against the fused kernel and count
+differing values (must be zero).  ``decode``: replay the one-anchor read
+schedule, count distinct launches, time cold and warm passes, and compare
+every decode with the unshifted launch plan.
 
     TRITON_CACHE_DIR=$(mktemp -d) PYTHONPATH=src \\
       python scripts/tools/check_causal_latency_fixes.py
-
-A microbenchmark is not the end-to-end result: rerun the 717-frame generation
-and compare ``diffusion_generation_s`` / ``generation_seconds``.
 """
 
 from __future__ import annotations

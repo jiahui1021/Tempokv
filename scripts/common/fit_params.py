@@ -345,13 +345,7 @@ def _load_trace(
 
 
 def _fit_device(name: str) -> torch.device:
-    """Resolve the fitting device, defaulting to the GPU.
-
-    `auto` prefers CUDA and falls back to the CPU, but says so loudly: CPU
-    fitting also runs its equations in float64 rather than float32, so an
-    unnoticed fallback is far slower than it looks, not marginally so.
-    Pass `cuda` to make an unavailable GPU an error instead of a fallback.
-    """
+    """Resolve the fitting device; ``auto`` warns when it falls back to the (float64) CPU."""
     if name == "auto":
         if torch.cuda.is_available():
             return torch.device("cuda")
@@ -550,10 +544,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 )
             expected_layer_ids = tuple(range(30))
         else:
-            # LongCat writes the regular [L,S,T,H,D] fitting layout.  The
-            # legacy equations are shape-independent, so validate the model
-            # dimensions from the archive instead of imposing the 30-layer,
-            # 12-head event protocol used by the two Forcing trace bridges.
+            # LongCat's regular [L,S,T,H,D] layout: take model dimensions from the archive.
             if keys.ndim != 5:
                 raise ValueError(
                     "legacy standard traces must use [L,S,T,H,D] layout, got "
@@ -709,11 +700,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
     output_dir = args.output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
-    # The file names state which tensor each parameter set describes and how
-    # it is predicted, so a mirrored set can never be mistaken on disk for a
-    # production one.  Under v_to_k the temporal parameters describe V and the
-    # projection parameters describe K, which is the reverse of every other
-    # configuration.
+    # File names say which tensor each set describes (reversed under v_to_k).
     temporal_v = is_temporal_v_predictor(config.v_predictor_mode)
     fixed_v_mode = fixed_temporal_predictor_mode(config.v_predictor_mode)
     if config.predictor_direction == "v_to_k":
@@ -757,10 +744,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     logical_parameter_bytes = parameter_bytes
     cross_weight_sharing = None
     if not temporal_v and config.cross_kv_weight_mode != "layer_head":
-        # The experiment deliberately keeps the deployed [L,H,...] tensors so
-        # every existing Torch/Triton generation path stays unchanged.  Report
-        # the actual artifact size and the logical size at the selected sharing
-        # granularity.
+        # Report both the deployed [L,H,...] artifact size and the logical shared size.
         expanded_cross_bytes = (
             cross.weight.numel() * cross.weight.element_size()
             + cross.bias.numel() * cross.bias.element_size()

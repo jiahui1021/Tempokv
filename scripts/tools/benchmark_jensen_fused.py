@@ -1,13 +1,8 @@
 #!/usr/bin/env python3
-"""A100 comparison of actual augmented and opt-in fused Jensen attention.
+"""Compare augmented and fused Jensen attention on an A100.
 
-Run from checkout: PYTHONPATH=src python scripts/tools/benchmark_jensen_fused.py
-Default dimensions match the existing long-window microbenchmark, NOT a claim
-about the caller's run. Set dimensions to the actual slow workload. Cache decode,
-RoPE and scale extraction are excluded from all measurements. Augmented/Flex
-calls include query-term preparation; Flex also includes small-plane layout
-conversion. Triton computes norms inside attention and reads steps directly.
-Large augmented K/V are prepared outside timing as in cache decode.
+Run: PYTHONPATH=src python scripts/tools/benchmark_jensen_fused.py
+Cache decode, RoPE and scale extraction are excluded from timing.
 """
 
 import argparse
@@ -214,7 +209,7 @@ def main():
                         help="same fixed tile: plain vs scalar correction vs Tensor Core correction")
     parser.add_argument("--compare-implementations", action="store_true",
                         help="fixed tile: measured baseline vs pipelined backbone, each with plain/MMA")
-    parser.add_argument("--triton-config", help="fixed tile; compare-correction defaults to user-measured 128x64w8s4")
+    parser.add_argument("--triton-config", help="fixed tile; compare-correction defaults to 128x64w8s4")
     args = parser.parse_args()
     if not torch.cuda.is_available():
         parser.error("requires CUDA, Inductor/Triton and FlashAttention-2")

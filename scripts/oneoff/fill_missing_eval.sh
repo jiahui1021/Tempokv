@@ -2,8 +2,8 @@
 # fill_missing_eval.sh <run_dir_name> <gpu-uuid> — 对 streaming_psnr_ssim.csv 缺的 idx 逐条补
 # evaluate_quality --no-fid 并追加行(按唯一 video 判断,不重复)。
 set -uo pipefail
-T=/mnt/cpfs/epic-user/hujiahui-20260612/Tempokv
-Q=/mnt/cpfs/epic-user/hujiahui-20260612/miniconda3/envs/qvg/bin/python
+T=${WORKSPACE:?set WORKSPACE to the experiment root}/Tempokv
+Q=${WORKSPACE}/miniconda3/envs/qvg/bin/python
 cd "$T"; R=$T/results/paper/span-int2/runs; LAB=$1; GPU=$2
 P=$R/$LAB/pixel_717; CSV=$P/streaming_psnr_ssim.csv; REFS=$R/span30sweep/refs30
 [[ -s $CSV ]] || { echo "$LAB 无CSV"; exit 1; }

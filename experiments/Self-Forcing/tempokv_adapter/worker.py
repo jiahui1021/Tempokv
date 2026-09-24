@@ -75,12 +75,7 @@ def _write_profile(
 
 
 def _install_profile(device_index: int | None):
-    """Bracket the hot path with CUDA-event sections for one worker.
-
-    The targets live in modules that ``inference.py`` imports on its own, so they
-    are imported here first: a BF16 baseline run installs no bridge and would
-    otherwise have nothing to patch yet.
-    """
+    """Install CUDA-event profile sections for one worker."""
     import importlib
 
     import torch

@@ -1,30 +1,9 @@
 """CUDA-event runtime breakdown for the Self-Forcing KV-cache hot path.
 
-Stage 0 of the acceleration plan refuses to rewrite a kernel before the profile
-says that kernel owns the wall clock.  ``torch.profiler`` answers that question
-for individual CUDA kernels, but not for the *sections* the plan is written in
-terms of — "V cache read", "read-time RoPE", "attention" — because each of those
-is many kernels plus the Python, allocator and launch work between them.
-
-This module brackets those sections with CUDA events instead.  Recording an
-event does not synchronize, so an instrumented run keeps the launch pattern of an
-uninstrumented one; the accumulated intervals are read back only when the event
-pool fills or when the report is built.
-
-Sections are keyed by their **call path** rather than by name, so a cache read
-performed inside a quantization event is not confused with one performed inside
-attention, and every interval is attributed to exactly one parent.  That makes
-each section's *self* time exact: total minus the sum of its direct children.
-
-Nothing here is imported by the codec, the cache or the kernels.  Instrumentation
-is installed by :func:`install`, which the Self-Forcing worker calls only when a
-profile output path is requested, and which reports what it could not patch so a
-missing section is never mistaken for a fast one.
-
-One caveat: an event pair measures the stream it was recorded on.  Every section
-on the hot path — attention, cache read, RoPE, decode, encode — runs on the
-current stream, but the TensorRT VAE decoder creates its own, so ``vae_decode``
-is only trustworthy for the default VAE path.
+Sections (cache read, RoPE, decode, attention, ...) are bracketed with CUDA
+events, which do not synchronize, and keyed by call path so self time is exact.
+:func:`install` patches the targets and reports any it could not patch.
+``vae_decode`` is only reliable on the default VAE stream.
 """
 
 from __future__ import annotations
@@ -40,9 +19,7 @@ from typing import Any, Callable, Iterator
 import torch
 
 
-# Sections, in the order the report presents them.  The names are the plan's
-# vocabulary; the tree they form at runtime comes from the call paths, not from
-# this list.
+# Sections, in report order.
 GENERATION = "generation"
 SELF_ATTENTION = "self_attention"
 CACHE_READ_K = "cache_read_k"
@@ -57,23 +34,12 @@ ENCODE_K = "encode_k"
 ENCODE_V = "encode_v"
 VAE_DECODE = "vae_decode"
 
-# One drain costs one ``torch.cuda.synchronize``.  A Self-Forcing block issues
-# roughly 4000 sections (30 layers x 5 generator calls x ~7 sections plus a
-# quantization event), so this bound drains about once every two blocks: rare
-# enough that the added synchronization is far below the noise of a 717-frame
-# generation, while keeping the number of live CUDA events bounded.
+# Each drain synchronizes once; this bound drains about every two blocks.
 DEFAULT_POOL_SIZE = 8192
 
 
 class RuntimeProfile:
-    """Accumulate GPU time per section call path.
-
-    On CUDA the interval between two recorded events is measured on the device,
-    so the figure includes the gaps where the GPU waited for the CPU to queue
-    more work — which is exactly what a launch-bound section looks like.  Off
-    CUDA the class falls back to a host clock so the aggregation and reporting
-    logic stays exercisable without a device.
-    """
+    """Accumulate GPU time per section call path (host clock off CUDA)."""
 
     def __init__(
         self,
@@ -192,14 +158,7 @@ class RuntimeProfile:
 
 
 def aggregate_by_name(report: dict[str, Any]) -> dict[str, dict[str, Any]]:
-    """Collapse the call tree onto section names.
-
-    The tree separates a cache read performed during attention from one
-    performed during a quantization event, which is what makes self time exact.
-    The Stage 0 decision gate asks a coarser question — what fraction of the
-    generation does *decode* own, wherever it ran — so the shares it compares
-    have to be summed back over every path that ends in the same name.
-    """
+    """Sum the call tree back onto section names."""
     generation_ms = report.get("generation_ms")
     collapsed: dict[str, dict[str, Any]] = {}
     for entry in report["sections"]:
@@ -240,12 +199,7 @@ def _percentile(values: list[float], fraction: float) -> float:
 
 
 def _defining_class(cls: type, name: str) -> type | None:
-    """Find the class in ``cls``'s MRO that actually defines ``name``.
-
-    The TempoKV bridge replaces ``CausalInferencePipeline`` with a subclass that
-    overrides some methods and inherits others, so patching a fixed class would
-    silently miss whichever half the bridge did not define.
-    """
+    """Find the class in ``cls``'s MRO that actually defines ``name``."""
     for candidate in cls.__mro__:
         if name in vars(candidate):
             return candidate
@@ -263,11 +217,7 @@ def _wrap_function(module: Any, name: str, profile: RuntimeProfile, section: str
     setattr(module, name, wrapper)
 
 
-# The decode callback runs inside a cache read but is handed only the packed
-# state, which does not say which tensor it is: a temporal V looks exactly like
-# a temporal K, and the mirrored direction swaps which one carries the cross
-# term.  The cache read knows the role, so it publishes it here for the decode
-# wrapper nested inside it.
+# The cache read knows the tensor role; the nested decode wrapper reads it here.
 _ACTIVE_CACHE_ROLE: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "tempokv_active_cache_role", default=None
 )
@@ -296,10 +246,7 @@ def _wrap_method(
 def install(profile: RuntimeProfile) -> dict[str, str]:
     """Bracket the Self-Forcing hot path with profile sections.
 
-    Returns one entry per target: ``"patched"``, or the reason it was skipped.
-    A BF16 baseline run has no codec and no bridge, so its decode and encode
-    targets are legitimately absent; every other absence is a bug in this
-    installer and has to be visible in the report rather than read as zero time.
+    Returns ``"patched"`` or the skip reason per target.
     """
     status: dict[str, str] = {}
 
@@ -341,19 +288,14 @@ def install(profile: RuntimeProfile) -> dict[str, str]:
 
     def patch_decode() -> None:
         bridge = sys.modules["bridge"]
-        # The bridge imported ``decode_tensor`` by value, so the codec module is
-        # the wrong place to patch: only the bridge's own binding is reached by
-        # the cache's decoder callback.
+        # Patch the bridge's own ``decode_tensor`` binding, which the cache calls.
         original = bridge.decode_cache_state
 
         @functools.wraps(original)
         def wrapper(state: Any, **kwargs: Any) -> Any:
             role = _ACTIVE_CACHE_ROLE.get()
             if role is None:
-                # Decoded outside a profiled cache read.  Fall back to the
-                # predictor kind and the codec direction, which is exact
-                # whenever a cross term exists and only ambiguous when both
-                # tensors are predicted temporally.
+                # Outside a profiled read: infer the role from the predictor kind.
                 kind = getattr(state, "predictor_kind", None)
                 if kind is None and isinstance(state, dict):
                     kind = state.get("predictor_kind")

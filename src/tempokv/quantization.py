@@ -3,12 +3,7 @@ from __future__ import annotations
 import torch
 
 
-# The packer's own ceiling.  Residual widths stop at 8 by configuration
-# because a wider residual costs more than the bfloat16 value it replaces, and
-# quantized anchors stop at 15 because at 16 the codes plus their group scale
-# also cost more than bfloat16 -- see RAW_ANCHOR_BITS in config.py.  Nothing
-# currently asks for 16, and the packer is written for the width rather than
-# for its callers, so the bound stays where the layout stops working.
+# The packer's own ceiling; configs stop residuals at 8 and anchors at 15.
 MAX_BITS = 16
 
 
@@ -18,30 +13,18 @@ def code_dtype(bits: int) -> torch.dtype:
 
 
 def _window_bytes(bits: int) -> int:
-    """Bytes one code can touch: its own width plus a 7-bit byte offset.
-
-    A wider window is harmless — the extra bytes receive zeros — so one size
-    per range is enough, and the Triton decoder can mirror the same rule
-    instead of recomputing a per-width span.
-    """
+    """Bytes one code can touch: its own width plus a 7-bit byte offset."""
     return 2 if bits <= 8 else 3
 
 
 def _pack(values: torch.Tensor, bits: int) -> torch.Tensor:
-    """Pack the final dimension into a contiguous MSB-first bit stream.
-
-    Code zero begins at the most-significant bit of byte zero.  A code may
-    cross a byte boundary, and unused low bits in the final byte are zero.
-    This is byte-for-byte compatible with the previous INT2/INT4/INT8 layout.
-    """
+    """Pack the last dimension into an MSB-first bit stream (codes may cross bytes)."""
     width = int(values.shape[-1])
     packed_width = (width * bits + 7) // 8
     if 8 % bits == 0:
         if bits == 8:
             return values.to(torch.uint8)
-        # Preserve the original, allocation-light layout and hot path for
-        # power-of-two bit widths.  Padding is confined to unused low bits of
-        # the final byte, so widths no longer need to be lane-aligned.
+        # Fast path for power-of-two widths.
         lanes = 8 // bits
         padding = (-width) % lanes
         codes = values.to(torch.uint8)
@@ -66,10 +49,8 @@ def _pack(values: torch.Tensor, bits: int) -> torch.Tensor:
     # Left-align each code inside its window, then cut the window into bytes.
     aligned = torch.bitwise_left_shift(codes, window_bits - bit_offset - bits)
 
-    # The scratch columns absorb the window bytes that reach past the payload.
-    # Every code ends inside the payload, so those bytes only ever receive
-    # zeros and the slice below discards nothing.  Distinct codes never share a
-    # bit, so accumulating is the same as OR-ing them together.
+    # Scratch columns absorb window bytes past the payload; they only get zeros.
+    # Codes never share a bit, so accumulating equals OR-ing.
     packed = torch.zeros(
         (rows, packed_width + window - 1), dtype=torch.int64, device=values.device
     )
@@ -131,18 +112,14 @@ def quantize_symmetric(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     groups = value.float().reshape(*value.shape[:-1], -1, group_size)
     if bits == 1:
-        # Binary symmetric quantization has no exact zero code.  Use a stable
-        # sign convention: zero maps to +scale, while code 0/1 represents
-        # -scale/+scale respectively.
+        # 1-bit symmetric has no zero code: zero maps to +scale.
         scale = _checked_scale(
             groups.abs().amax(dim=-1).clamp_min(1e-12), scale_dtype
         )
         unsigned = (groups >= 0).to(torch.uint8).reshape_as(value)
         return _pack(unsigned, bits), scale
     qmax = (1 << (bits - 1)) - 1
-    # Round the scale to its stored precision *before* quantizing against it.
-    # The decoder only ever sees the stored scale, so quantizing against a
-    # higher-precision one leaves a gain error the residual never absorbs.
+    # Quantize against the stored-precision scale the decoder will see.
     scale = _checked_scale(
         groups.abs().amax(dim=-1).clamp_min(1e-12).div(qmax), scale_dtype
     )
@@ -151,21 +128,12 @@ def quantize_symmetric(
     return _pack(unsigned, bits), scale
 
 
-# float16 tops out at 65504, so it is the only supported scale dtype a finite
-# float32 group can overflow; float32 and bfloat16 share float32's exponent
-# range.  Restricting the check to float16 keeps the production bfloat16 path
-# free of an extra reduction on the quantization hot path.
+# Only float16 can overflow a finite float32 group scale.
 _NARROW_SCALE_DTYPES = (torch.float16,)
 
 
 def _checked_scale(scale: "torch.Tensor", scale_dtype: "torch.dtype") -> "torch.Tensor":
-    """Round a scale to its stored dtype, refusing one that does not survive.
-
-    Storing the scale in float16 silently overflows to ``inf`` once the group
-    magnitude is large enough, and every value dequantized against it comes
-    back NaN.  Failing here names the cause; the alternative is a run that
-    produces NaN video and no explanation.
-    """
+    """Round a scale to its stored dtype; a float16 overflow would decode as NaN."""
     stored = scale.to(scale_dtype)
     if scale_dtype in _NARROW_SCALE_DTYPES and not torch.isfinite(stored).all():
         finite = scale[torch.isfinite(scale)]
@@ -242,12 +210,7 @@ def roundtrip(
     scale_dtype: torch.dtype,
     symmetric: bool,
 ) -> torch.Tensor:
-    """Quantize then dequantize an arbitrary ``[..., H, D]`` slice.
-
-    The quantizers take packed ``[B,H,S,D]`` caches; trace and rollout code
-    works on single frames, so reshape around them here instead of in every
-    caller.
-    """
+    """Quantize then dequantize an arbitrary ``[..., H, D]`` slice."""
     original_shape = value.shape
     head_count, dim = map(int, original_shape[-2:])
     packed = value.float().reshape(-1, head_count, 1, dim)

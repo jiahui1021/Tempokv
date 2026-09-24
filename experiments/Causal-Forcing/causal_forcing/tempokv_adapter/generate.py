@@ -1,11 +1,8 @@
 #!/usr/bin/env python3
-"""Generate Causal Forcing videos with TempoKV or native bf16 KV caches.
+"""Generate Causal Forcing videos with TempoKV or native BF16 KV caches.
 
-Validation happens before the model is loaded: a parameter set fitted for a
-different codec config, a different coordinate system, or a different layer
-count is rejected up front rather than producing a plausible-looking video from
-mismatched predictors.  After the run, the TempoKV report is checked for actual
-codec activity so a misconfigured run cannot pass as a TempoKV result.
+Parameters are validated before the model loads, and the TempoKV report is
+checked for codec activity afterwards.
 """
 
 from __future__ import annotations
@@ -45,11 +42,7 @@ from tempokv.config import is_temporal_v_predictor, load_config  # noqa: E402
 
 
 def latent_frames_for(video_frames: int, num_frame_per_block: int) -> int:
-    """Convert a video frame count to whole latent blocks.
-
-    Wan latents cover four video frames each, and the first latent is shared by
-    the first frame only, hence the ``+3``.
-    """
+    """Convert a video frame count to latent frames (``(frames + 3) / 4``) in whole blocks."""
     if video_frames < 1:
         raise ValueError("video frame count must be positive")
     if num_frame_per_block < 1:
@@ -173,9 +166,7 @@ def _validate_parameters(k_path: Path, v_path: Path, config) -> dict[str, object
         if temporal_v
         else CrossKVParameters.load(v_path)
     )
-    # The codec itself refuses a stamped set fitted under another config or
-    # split across two fitting runs; a production run additionally refuses
-    # unstamped sets.
+    # The codec refuses mismatched stamped sets; production also refuses unstamped sets.
     if temporal.codec_signature is None or not temporal.parameter_set_id:
         raise ValueError(
             "Causal Forcing parameters must come from the fitter; refit them"
@@ -328,14 +319,8 @@ def _rank_summaries(videos_dir: Path) -> list[dict[str, object]]:
 def _merge_tempokv_reports(ranks: list[dict[str, object]]) -> dict[str, object]:
     """Combine per-rank reports.
 
-    Every rank holds its own KV cache on its own device, so **all cache-state
-    byte figures are per-device**: they are the worst single rank, which is the
-    number that has to fit on one GPU.  Mixing a summed "current" with a maxed
-    "peak" in the same JSON would produce a report whose current exceeds its
-    peak, and multiplying by the rank count would describe a device that does
-    not exist.  Only genuinely additive quantities are summed: call counts,
-    finalized frames, and the cumulative encoded volume over the whole run.
-    Latency is reported as the slowest rank.
+    Cache-state bytes are per device (worst rank); call counts, frames and
+    cumulative volumes are summed; latency is the slowest rank.
     """
     reports = [rank.get("tempokv_report") for rank in ranks]
     reports = [report for report in reports if isinstance(report, dict)]
@@ -380,10 +365,7 @@ def _merge_tempokv_reports(ranks: list[dict[str, object]]) -> dict[str, object]:
         merged[name] = max(int(report.get(name) or 0) for report in reports)
     for name in slowest:
         merged[name] = max(float(report.get(name) or 0) for report in reports)
-    # Older reports always timed every decoded span and therefore have no
-    # explicit flag.  New production runs skip those thousands of CUDA events
-    # unless TEMPOKV_DECODE_TIMING=1 is set; a missing measurement is ``null``,
-    # never a misleading zero.
+    # Decode timing is opt-in (TEMPOKV_DECODE_TIMING=1); missing means null.
     merged["decode_timing_enabled"] = all(
         bool(report.get("decode_timing_enabled", True)) for report in reports
     )
@@ -401,9 +383,7 @@ def _merge_tempokv_reports(ranks: list[dict[str, object]]) -> dict[str, object]:
     merged["predictor_parameter_bytes"] = max(
         int(report.get("predictor_parameter_bytes") or 0) for report in reports
     )
-    # Each rank's ratio compares one coherent cache state against itself, so
-    # take the worst rather than dividing two independently-maxed figures that
-    # may have come from different ranks.
+    # Worst per-rank ratio, each from one coherent cache state.
     ratios = [
         int(report.get("current_uncompressed_cache_bytes") or 0)
         / int(report["current_compressed_cache_bytes"])
@@ -533,10 +513,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
     if args.local_attn_size == 0 or args.local_attn_size < -1:
         raise ValueError("local-attn-size must be -1 or a positive integer")
     latent_frames = latent_frames_for(args.frames, args.num_frame_per_block)
-    # Keep the ordinary launcher guard for the historical one-shot/demo
-    # workflow.  The explicit benchmark protocol also supports the documented
-    # all-method 51-frame sliding-window ablation, so that mode may opt into a
-    # shorter window through BENCHMARK=1.
+    # A shorter window is allowed only for the BENCHMARK=1 sliding-window ablation.
     if (
         args.local_attn_size != -1
         and args.local_attn_size < latent_frames
@@ -583,9 +560,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         if config.reconstruction_dtype != "bfloat16":
             raise ValueError("Causal Forcing requires reconstruction_dtype=bfloat16")
         if span_frames is None:
-            # One anchor for the whole rollout.  The incremental schedule packs
-            # each finalized block into the open span, so a span that never
-            # closes is still read back, and it spends no second anchor.
+            # Default: one anchor for the whole rollout.
             span_frames = latent_frames
         if span_frames < 2:
             raise ValueError("span-frames must be at least 2")
@@ -594,11 +569,8 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                 f"span-frames ({span_frames}) must be a whole number of "
                 f"{args.num_frame_per_block}-frame blocks"
             )
-        # The batch schedule only packs a span once it is complete, so a span
-        # that closes on the very last block is packed after the last forward
-        # pass and nothing ever decodes it.  The incremental schedule packs
-        # each finalized block as it arrives, so its spans are read back while
-        # they are still open and the span may be as long as the rollout.
+        # The batch schedule packs a span only when complete, so the last span must
+        # close before the final block to be read back.
         if os.environ.get("TEMPOKV_INCREMENTAL", "1") == "0":
             minimum_frames = span_frames + args.num_frame_per_block
             if latent_frames < minimum_frames:
@@ -651,10 +623,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
 
     paths["run"].mkdir(parents=True, exist_ok=True)
     environment = os.environ.copy()
-    # The schedule, kernel, and instrumentation knobs are the caller's choice,
-    # not state left over from another run, so they survive the TEMPOKV_*
-    # cleanup below.  generate.sh exports the validated Cross launch size;
-    # dropping it here silently ran a different decode launch configuration.
+    # Caller-set schedule, kernel and diagnostic knobs survive the TEMPOKV_* cleanup.
     schedule_knobs = {
         name: environment[name]
         for name in (

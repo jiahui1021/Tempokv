@@ -5,16 +5,12 @@ import json
 from pathlib import Path
 from typing import Any, Mapping
 
-# Storing the anchor as INT16 codes costs 16 bits per element *plus* the group
-# scale — more than the bfloat16 value it replaces — and is still lossy, so it
-# is dominated by simply keeping the tensor.  ``anchor_bits=16`` therefore does
-# not mean INT16: it means the anchor skips the quantizer and is stored in
-# ``reconstruction_dtype``, which is exactly 16 bits per element and exact.
+# anchor_bits=16 skips the quantizer and stores the anchor in
+# reconstruction_dtype: INT16 codes plus a scale would cost more and stay lossy.
 RAW_ANCHOR_BITS = 16
 
-# Fixed temporal predictors are used symmetrically for K and V.  CrossKV V
-# variants add the source projection while retaining the selected fixed V
-# history recurrence.
+# Fixed temporal predictors serve both K and V; cross_kv_<fixed> V modes add
+# the CrossKV projection to a fixed V-history recurrence.
 FIXED_TEMPORAL_PREDICTOR_MODES = frozenset({"identity", "taylor", "taylor2"})
 FIXED_TEMPORAL_PREDICTOR_MIN_HISTORY = {"identity": 1, "taylor": 2, "taylor2": 3}
 FIXED_CROSS_KV_V_PREDICTOR_MODES = frozenset(
@@ -64,12 +60,7 @@ def fixed_temporal_predictor_mode(mode: str) -> str | None:
 
 
 def config_from_mapping(payload: Mapping[str, Any]) -> "CodecConfig":
-    """Build a codec config from parsed JSON.
-
-    A config that does not name a fitting family is legacy, because every
-    shipped config and fitted parameter set is; the remaining defaults then
-    follow the family, so writing ``fit_mode`` is enough to pick one.
-    """
+    """Build a codec config from parsed JSON; an unnamed family is legacy."""
     resolved = dict(payload)
     resolved.setdefault("fit_mode", "legacy")
     if resolved["fit_mode"] == "legacy":
@@ -113,62 +104,30 @@ class CodecConfig:
     # None keeps parameter-driven K history selection for predictor modes that
     # support it. Direct K spells out zero explicitly.
     k_history_length: int | None = None
-    # Legacy is the repository-wide fitting family.  ``None`` is retained for
-    # positional compatibility with older programmatic callers; reference
-    # construction resolves it to legacy below.
+    # None keeps positional compatibility; resolved below.
     cross_matmul_precision: str | None = None
-    # ``shared`` pools all layers and heads into [P,P,D]; ``layer_head`` fits
-    # [L,P,P,H,D] (native, and legacy as a K sharing ablation).  The fixed
-    # temporal modes use the shared layout but write analytic coefficients.
-    # ``direct`` is the zero-history baseline: non-anchor K units are quantized
-    # directly and the parameter file contains an empty temporal map.
+    # shared: one [P,P,D] map; layer_head: [L,P,P,H,D]; identity/taylor/taylor2:
+    # analytic coefficients; direct: no temporal prediction (empty map).
     k_predictor_mode: str | None = None
-    # ``temporal`` predicts V from its own reconstructed history with the same
-    # predictor K uses, so V needs no reconstructed K and no CrossKV matrix.
-    # ``identity`` is a fixed one-step hold; ``taylor`` and ``taylor2`` are
-    # fixed first- and second-order backward finite-difference extrapolators.
-    # ``cross_kv`` keeps the learned Cross(K) projection.  The
-    # ``cross_kv_<fixed>`` modes add the same projection to a fixed V-history
-    # predictor. ``innovation`` projects the decoder-visible K temporal
-    # innovation and optionally adds V history.
-    # ``direct`` is the zero-predictor baseline: V units are quantized directly
-    # and the parameter file contains an empty temporal map.
+    # temporal: V from its own history; identity/taylor/taylor2: fixed V history;
+    # cross_kv: learned Cross(K) (+ V history); cross_kv_<fixed>: Cross(K) + fixed
+    # V history; innovation: Cross of the K temporal innovation; direct: no predictor.
     v_predictor_mode: str = "cross_kv"
     # Select the legacy fixed-point/shared-K and direct temporal-V fitting math.
     fit_mode: str | None = None
-    # Production CrossKV always uses layer_shared.  The other values remain
-    # available only to the explicit CrossKV sharing ablation.  ``None`` is
-    # retained for positional compatibility and resolves to layer_shared for
-    # legacy.
+    # Production uses layer_shared; other layouts serve the CrossKV sharing ablation.
     cross_kv_weight_mode: str | None = None
-    # Which tensor carries the cross dependency.  ``k_to_v`` is the production
-    # design: K is predicted from its own temporal history and V is predicted
-    # from the reconstructed K of the same span.  ``v_to_k`` mirrors it so V
-    # leads and K is projected from the reconstructed V, which exists to test
-    # the direction rather than to assume it.  The codec math is identical
-    # under the swap, so the mirror is a role exchange and not a second codec.
+    # k_to_v: V is projected from reconstructed K (production).  v_to_k swaps
+    # the roles to test the direction; the codec math is unchanged.
     predictor_direction: str = "k_to_v"
-    # Subtract the Jensen bias (arXiv 2605.26266) from quantized cached
-    # attention scores.  It reads the step sizes the codec already stores and
-    # changes no stored value, so K_hat, V_hat and every reconstruction metric
-    # are identical either way and fitted parameters stay loadable -- which is
-    # why it is deliberately absent from format_signature().  What it changes
-    # is the attention output, and only for integrations that route their
-    # attention through runtime.jensen.  Off by default: on this repository's
-    # traces the bias at the production INT4 residual width is roughly two
-    # orders of magnitude below the INT2 direct-quantization setting the paper
-    # measures, and the end-to-end effect has not been demonstrated here.
+    # Subtract the Jensen bias (arXiv 2605.26266) from cached attention scores.
+    # Stored values are unchanged, so it stays out of format_signature().
     jensen_correction: bool = False
 
     def __post_init__(self) -> None:
-        # Resolve the remaining legacy defaults after the dataclass has kept
-        # positional compatibility with older callers.  Reference-shaped
-        # construction is the repository default.
         implicit_family = self.fit_mode is None
         if implicit_family:
-            # anchor_bits is deliberately absent: the anchor width is a codec
-            # setting, not a family marker, so raising it must not silently
-            # reinterpret a legacy config as the retired native family.
+            # anchor_bits is a codec setting, not a family marker.
             legacy_shape = (
                 self.group_size == 64
                 and self.residual_mode == "asymmetric"
@@ -252,10 +211,7 @@ class CodecConfig:
         # the other way; every other V mode ignores the source tensor.
         require(self.predictor_direction == "k_to_v" or self.v_predictor_mode == "cross_kv",
                 "predictor_direction=v_to_k requires v_predictor_mode=cross_kv")
-        # A V predictor that reads its own history has nothing to consume when
-        # the history is empty, and a fixed Taylor mode needs enough history for
-        # its finite-difference order; silently falling back would make the
-        # named ablation misleading.
+        # History-reading V modes need history, and Taylor modes need their order.
         require(not is_temporal_v_predictor(self.v_predictor_mode)
                 or self.v_predictor_mode == "direct" or self.v_history_length >= 1,
                 f"v_predictor_mode={self.v_predictor_mode} needs v_history_length >= 1")
@@ -275,9 +231,7 @@ class CodecConfig:
             require(self.v_predictor_mode != "innovation",
                     "v_predictor_mode=innovation requires fit_mode=legacy")
             return
-        # Legacy reproduces the reference implementation, which fixes the
-        # quantizer grouping and dtypes; bit widths, anchor width and stride
-        # stay free.
+        # Legacy reproduces the reference quantizer grouping and dtypes.
         require(self.k_history_length is not None,
                 "legacy fitting requires an explicit k_history_length")
         require(self.group_size == 64, "legacy fitting requires group_size=64")
@@ -341,16 +295,11 @@ class CodecConfig:
         # fitted before this experiment switch existed.
         if self.cross_kv_weight_mode != "layer_head":
             payload["cross_kv_weight_mode"] = self.cross_kv_weight_mode
-        # Same reasoning: the production direction is omitted so every existing
-        # parameter archive keeps its signature, while a mirrored set can never
-        # be loaded into a forward-direction runtime.
+        # The production direction is omitted to keep existing signatures.
         if self.predictor_direction != "k_to_v":
             payload["predictor_direction"] = self.predictor_direction
-        # anchor_bits=16 once meant INT16 codes and now means no quantizer at
-        # all, so the width alone no longer identifies the anchor codec.  This
-        # marker appears only for the raw anchor, which keeps every quantized
-        # parameter set's signature byte-identical while making a set fitted
-        # under the old INT16 reading fail to load instead of loading silently.
+        # Marks the raw anchor so sets fitted under the old INT16 meaning of 16
+        # fail to load; quantized anchors keep their signatures.
         if self.raw_anchor:
             payload["anchor_mode"] = "raw"
         return "tempokv-codec-v5:" + json.dumps(

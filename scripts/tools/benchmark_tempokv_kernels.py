@@ -1,33 +1,13 @@
 #!/usr/bin/env python3
 """Microbenchmark the TempoKV persistent decode kernels at production shape.
 
-Stage 1 of the acceleration plan tunes launch configuration and nothing else, so
-it needs a harness that can vary ``persistent_units``, the tile shape, the warp
-count and the pipeline depth *without* touching the decoder.  Two sweeps are
-provided:
-
-``--sweep production``
-    calls :func:`tempokv.triton_ops.decode` exactly as the runtime does and only
-    varies ``TEMPOKV_PERSISTENT_UNITS_PER_LAUNCH``.  This is the number that
-    predicts an end-to-end change, because it is the real route.
-
-``--sweep tile``
-    launches the persistent kernels directly so ``block_s``, ``block_d``,
-    ``num_warps`` and ``num_stages`` can be varied.  These are not yet runtime
-    settings; the sweep exists to find the winner that Stage 1 then wires in.
-
-Every row is checked against the Torch decoder for the same packed state.  Tile
-rows are also compared bit-for-bit with the current production Triton route, so
-a faster tile can be rejected when it changes the established reconstruction.
-Registers and spills are read from the compiled kernel when the installed Triton
-exposes them; occupancy is deliberately absent rather than guessed — the plan
-reads that from Nsight Compute.
+``--sweep production`` calls the runtime decoder and varies
+``TEMPOKV_PERSISTENT_UNITS_PER_LAUNCH``; ``--sweep tile`` launches the kernels
+directly to vary tile shape, warps and stages.  Every row is checked against
+the Torch decoder (tile rows also bitwise against production).
 
     python scripts/tools/benchmark_tempokv_kernels.py --route v --units 24 \\
       --sweep production --persistent-units 2 4 8
-
-A microbenchmark win is not a result.  The plan requires the 717-frame
-generation to confirm it.
 """
 
 from __future__ import annotations
@@ -99,15 +79,7 @@ def _production_config(
     v_bits: int | None = None,
     anchor_bits: int = 4,
 ) -> CodecConfig:
-    """The legacy production codec settings the plan freezes for this round.
-
-    ``stride`` is threaded through rather than hardcoded so a mismatch between
-    the benchmark geometry and the codec is impossible; ``CodecConfig`` rejects
-    any value legacy fitting does not support.  ``bits``/``v_bits`` and
-    ``anchor_bits`` are separate because the decode kernels read a different
-    packed width for each, and a mixed or wide-anchor run is exactly the case
-    where a per-width regression would otherwise go unmeasured.
-    """
+    """Legacy production codec settings for the benchmark geometry."""
     return CodecConfig(
         k_bits=bits,
         v_bits=bits if v_bits is None else v_bits,
@@ -132,13 +104,7 @@ def _production_config(
 def _synthetic_codec(
     shape: Shape, config: CodecConfig, device: torch.device, generator: torch.Generator
 ) -> TempoKVCodec:
-    """Predictor parameters with production shapes and arbitrary values.
-
-    Decode cost does not depend on what the coefficients are, and a synthetic set
-    keeps the benchmark runnable without a fitted parameter directory.  Values are
-    kept small so the closed-loop recurrence cannot diverge over 24 units and
-    swamp the parity comparison with meaningless magnitudes.
-    """
+    """Synthetic predictor parameters at production shapes (small, so rollouts stay bounded)."""
     history = config.k_history_length
     assert history is not None
     temporal = TemporalParameters(
@@ -244,9 +210,7 @@ def _time(
     samples = sorted(
         start.elapsed_time(end) for start, end in zip(starts, ends)
     )
-    # median and p90, never best-of-N: the plan's stopping conditions compare
-    # runs, and a minimum hides the variance that decides whether a 3% claim is
-    # real.
+    # Median and p90 rather than best-of-N, which hides run-to-run variance.
     return {
         "median_ms": samples[len(samples) // 2],
         "p90_ms": samples[int(round(0.90 * (len(samples) - 1)))],
@@ -538,12 +502,7 @@ def _next_power_of_two(value: int) -> int:
 
 
 def _kernel_metrics(compiled: Any) -> dict[str, int | None]:
-    """Maximum registers and spills across every launch in one decode.
-
-    The last launch is commonly shorter than the others (for example 8/8/7
-    units), so reporting only its compiled variant can hide the resource peak
-    of the main kernel.
-    """
+    """Maximum registers and spills across every launch in one decode."""
     variants = compiled if isinstance(compiled, tuple) else (compiled,)
     registers = [
         value

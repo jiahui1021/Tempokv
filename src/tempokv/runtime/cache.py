@@ -1,26 +1,8 @@
 """Frame-aligned causal KV cache shared by the Wan-based experiments.
 
-Self-Forcing and Causal Forcing both run Wan2.1-1.3B as a causal autoregressive
-video diffusion model, so both store one K or V cache per transformer layer in
-frame-sized chunks.  A chunk holds clean, normalized **pre-RoPE** K (or the
-matching raw V); RoPE is reapplied at read time from absolute frame positions so
-TempoKV predictors never see the positional rotation.
-
-A chunk is in one of three states:
-
-``EMPTY``
-    never written
-``BF16``
-    a dense tensor, used by the BF16 baseline, by trace collection, and by the
-    ephemeral current block during the noisy denoising steps
-``QUANTIZED``
-    covered by a packed TempoKV span, installed once a block is finalized
-
-Physical chunk slots are addressed locally, while every occupied chunk also
-records the absolute frame it represents.  With no eviction the two coincide,
-but keeping them separate is what lets a later rolling/sink cache drop interior
-frames without renumbering RoPE positions or letting a temporal predictor run
-across the resulting gap.
+Each layer keeps K (normalized, pre-RoPE) or V in frame-sized chunks that are
+``EMPTY``, dense ``BF16``, or ``QUANTIZED`` inside a packed TempoKV span.  RoPE
+is applied at read time from each chunk's absolute frame position.
 """
 
 from __future__ import annotations
@@ -40,13 +22,7 @@ class ChunkState(IntEnum):
 
 @dataclass(frozen=True)
 class CacheSpan:
-    """One run of resident chunks with consecutive absolute frame positions.
-
-    ``local_start_chunk`` locates the run in the physical cache, while
-    ``global_start_frame`` is its position on the model's absolute timeline.
-    RoPE must be applied per span, and a TempoKV temporal predictor must never
-    predict across a span boundary.
-    """
+    """A run of resident chunks with consecutive absolute frames (one RoPE span)."""
 
     local_start_chunk: int
     global_start_frame: int
@@ -117,9 +93,7 @@ class ChunkedKVCache:
         self.device = device
         self.layout = layout
         self.cache_role = cache_role
-        # A cache may outlive the pipeline that created the next cache in the
-        # same process.  Keep its decoder on the instance so installing a
-        # second pipeline cannot silently redirect old packed spans.
+        # Per-instance decoder, so a later pipeline cannot redirect old spans.
         self._quantized_decoder = quantized_decoder
         # The TempoKV bridge switches reconstructed K to the legacy complex64
         # cached-key RoPE without changing native/BF16 cache behavior.
@@ -129,19 +103,13 @@ class ChunkedKVCache:
         self.chunk_state: list[ChunkState] = [ChunkState.EMPTY] * max_num_chunks
         self.quantized_spans: list[dict[str, Any]] = []
         self._span_by_chunk: list[dict[str, Any] | None] = [None] * max_num_chunks
-        # Absolute frame position of every occupied chunk. ``None`` means the
-        # slot is free. Without eviction this is the identity mapping, so the
-        # BF16 baseline behaves exactly as it did before spans existed.
+        # Absolute frame of every occupied chunk (None = free).
         self.global_frames: list[int | None] = [None] * max_num_chunks
 
     def set_quantized_decoder(
         self, decoder: Callable[..., torch.Tensor] | None
     ) -> None:
-        """Bind packed-span decoding to this cache instance.
-
-        The module-level setter remains as a compatibility fallback for older
-        integrations and direct callers.
-        """
+        """Bind packed-span decoding to this cache instance."""
         self._quantized_decoder = decoder
 
     @property
@@ -200,12 +168,7 @@ class ChunkedKVCache:
         *,
         global_start_frame: int | None = None,
     ) -> None:
-        """Store BF16 chunks for one token range.
-
-        ``global_start_frame`` records where the range sits on the absolute
-        timeline. It defaults to the local chunk index, which is correct for
-        every cache that never evicts.
-        """
+        """Store BF16 chunks for one token range at ``global_start_frame``."""
         start_chunk = self._token_to_chunk(start_index)
         end_chunk = self._token_to_chunk(end_index)
         expected = list(self._shape())
@@ -241,13 +204,7 @@ class ChunkedKVCache:
             torch._foreach_copy_(destinations, sources)
 
     def spans(self, start_index: int, end_index: int) -> list[CacheSpan]:
-        """Group a token range into runs of consecutive absolute frames.
-
-        A contiguous cache yields exactly one span, so read-time RoPE reduces to
-        a single absolute start frame.  Once eviction leaves a sink/recent gap,
-        each side becomes its own span and must be rotated — and predicted —
-        independently.
-        """
+        """Group a token range into runs of consecutive absolute frames."""
         start_chunk = self._token_to_chunk(start_index)
         end_chunk = self._token_to_chunk(end_index)
         result: list[CacheSpan] = []
@@ -284,12 +241,8 @@ class ChunkedKVCache:
     ) -> torch.Tensor:
         """Decode a token range.
 
-        ``extra_channels`` widens the head dimension of the returned buffer and
-        zero-fills the tail, decoding into the leading ``head_dim`` channels.
-        A caller that needs the decoded tensor inside a wider one -- the Jensen
-        correction folds its per-key term into extra channels, and
-        FlashAttention-2 wants one head dimension for Q, K and V -- gets that
-        for the cost of the padding instead of a second cache-sized copy.
+        ``extra_channels`` zero-pads the head dimension (for the Jensen correction)
+        without a second cache-sized copy.
         """
         return self._read_layout(
             start_index,
@@ -321,12 +274,7 @@ class ChunkedKVCache:
         end_index: int,
         source_tensor: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Return BHSD data that never aliases resident dense cache storage.
-
-        Incremental encoding reconstructs its input in place.  Keeping that
-        ownership requirement explicit prevents a future BHSD/view fast path
-        from silently overwriting the clean cache tensor it is encoding.
-        """
+        """Return BHSD data that never aliases resident cache storage."""
         result = self.read_bhsd(
             start_index,
             end_index,
@@ -375,9 +323,7 @@ class ChunkedKVCache:
             raise ValueError("cache read does not contain the complete K source span")
         if source_layout == "BSHD":
             return source_tensor[:, offset:offset + length].permute(0, 2, 1, 3)
-        # Triton CrossKV consumes explicit source strides, so a BHSD slice of
-        # a larger reconstructed-K buffer can stay a view instead of making a
-        # cache-sized copy for every quantized span.
+        # Triton CrossKV takes explicit strides, so the source can stay a view.
         return source_tensor[:, :, offset:offset + length]
 
     def _read_layout(
@@ -413,10 +359,7 @@ class ChunkedKVCache:
             result = wide[..., : self.head_dim]
         else:
             wide = result = torch.empty(shape, device=self.device, dtype=self.dtype)
-        # Dense tail chunks are separate allocations.  Queueing one ``copy_``
-        # per frame made Causal Forcing launch one tiny copy kernel for every
-        # resident BF16 frame in every K/V read.  Collect the independent
-        # slices and issue them through the foreach path once after decoding.
+        # Batch the dense-chunk copies into one foreach call.
         bf16_destinations: list[torch.Tensor] = []
         bf16_sources: list[torch.Tensor] = []
         chunk_index = start_chunk
@@ -453,9 +396,6 @@ class ChunkedKVCache:
                 span["end_chunk"] - span["start_chunk"]
             ) * self.frame_seq_length
             output_end = output_start + expected_tokens
-            # Decode into the final cache-read buffer.  Its sequence slice can
-            # retain gaps from the surrounding allocation; the codec accepts
-            # these non-overlapping positive strides for both layouts.
             if output_layout == "BSHD":
                 direct_output = result[:, output_start:output_end]
             else:
@@ -489,23 +429,10 @@ class ChunkedKVCache:
         out: torch.Tensor | None = None,
         squared: bool = False,
     ) -> torch.Tensor:
-        """Quantizer step sizes for a read range, aligned with :meth:`read`.
+        """Quantizer step sizes for a read range, aligned token-for-token with :meth:`read`.
 
-        The result is ``[B, S, H, D/g]`` for a BSHD read and ``[B, H, S, D/g]``
-        for BHSD, so it indexes token-for-token with the keys the same range
-        returns.  This is what the Jensen-bias correction needs; the values are
-        the scales the packed spans already store, so nothing is recomputed and
-        nothing extra is kept.
-
-        Chunks still held as BF16 -- the current chunk during denoising, and
-        every chunk of a BF16 baseline run -- report a zero step size, because
-        an unquantized key carries no quantization noise and must receive no
-        correction.
-
-        ``out`` writes into a caller-owned buffer instead of allocating, and
-        ``squared`` returns the squared step size, which is the form the Jensen
-        correction consumes.  Together they let the attention path fill the
-        padding channels of a widened cache read directly.
+        BF16 chunks report zero.  ``out`` fills a caller buffer and ``squared``
+        returns the squared step the Jensen correction uses.
         """
         layout = output_layout or self.layout
         start_chunk = self._token_to_chunk(start_index)
@@ -520,9 +447,6 @@ class ChunkedKVCache:
         if out is None:
             result = torch.zeros(shape, device=self.device, dtype=torch.float32)
         else:
-            # Writing into the caller's buffer -- typically the padding
-            # channels of a widened cache read -- avoids a second tensor the
-            # size of the window on every forward.
             out.zero_()
             result = out
         chunk_index = start_chunk
@@ -574,12 +498,7 @@ class ChunkedKVCache:
             self._span_by_chunk[chunk_index] = span
 
     def extend_quantized(self, start_index: int, end_index: int) -> None:
-        """Extend an existing packed span over newly finalized BF16 chunks.
-
-        The span's quantized state is mutable and has already received the new
-        residual codes.  This method only advances the cache ownership range
-        and releases the dense chunks; it never creates another anchor.
-        """
+        """Extend an open packed span over newly finalized BF16 chunks (no new anchor)."""
         start_chunk = self._token_to_chunk(start_index)
         end_chunk = self._token_to_chunk(end_index)
         span = self._span_by_chunk[start_chunk]
@@ -594,13 +513,7 @@ class ChunkedKVCache:
             self._span_by_chunk[chunk_index] = span
 
     def bf16_resident_bytes(self) -> int:
-        """Bytes held by dense chunks that are not covered by a packed span.
-
-        These are the frames that have been finalized but not yet packed, plus
-        the block currently being denoised.  They occupy real device memory, so
-        a peak-KV-memory figure that only counts packed spans understates what
-        the run actually needed.
-        """
+        """Bytes held by dense chunks not covered by a packed span."""
         total = 0
         for chunk in self.chunks:
             if chunk is not None:

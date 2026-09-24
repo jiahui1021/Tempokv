@@ -21,19 +21,9 @@ def persistent_launch_plan(
 ) -> list[tuple[int, int, int]]:
     """Split units ``1 .. units-1`` of a span into persistent-kernel launches.
 
-    Each entry is ``(shift_units, start_unit, chunk_units)``: the launch decodes
-    absolute units ``shift_units + start_unit`` onward, with every base pointer
-    advanced by ``shift_units`` units and the kernel indexing from
-    ``start_unit``.
-
-    ``start_unit`` and ``chunk_units`` are ``tl.constexpr``, so every distinct
-    pair compiles its own kernel.  A span as long as the rollout reaches a new
-    launch offset every few blocks, and a cold Triton cache then stalls the
-    generation on a compile each time.  Once a unit is at least ``lead_units``
-    into the span it reads a full history and nothing about it depends on its
-    absolute index any more, so every later launch is shifted onto
-    ``start_unit = lead_units`` and reuses that kernel.  The arithmetic each
-    unit performs is unchanged; only the base pointers move.
+    Each entry is ``(shift_units, start_unit, chunk_units)``.  Units past
+    ``lead_units`` are shifted onto one ``start_unit`` so later launches reuse one
+    compiled kernel; the per-unit arithmetic is unchanged.
     """
     plan = []
     for start in range(1, units, units_per_launch):
@@ -50,16 +40,7 @@ def configure_triton_cache(
     *,
     rank: int | None = None,
 ) -> Path:
-    """Give each rank a Triton cache directory that survives across runs.
-
-    Call this before the first accelerated decode in multi-process jobs.
-    Existing ``TRITON_CACHE_DIR`` settings are respected.
-
-    The directory is keyed by rank only.  Keying it by process id as well
-    would give every run a cold cache, so each generation would pay the full
-    kernel compilation cost again; Triton publishes compiled kernels by
-    atomic rename, so concurrent ranks can share one directory safely.
-    """
+    """Give each rank a persistent Triton cache directory (respects ``TRITON_CACHE_DIR``)."""
     existing = os.environ.get("TRITON_CACHE_DIR")
     if existing:
         return Path(existing).expanduser().resolve()

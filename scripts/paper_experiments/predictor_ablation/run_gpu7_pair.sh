@@ -3,21 +3,21 @@
 #   pass 1: identity (resume, GPU-cbea873b) + taylor (free GPU-6f1aaf89)
 #   pass 2: taylor2 on the card identity frees, then quality + summary over all 4 rows
 set -u
-cd /mnt/cpfs/epic-user/hujiahui-20260612/Tempokv
+cd ${WORKSPACE:?set WORKSPACE to the experiment root}/Tempokv
 
-PYTHON_BIN=/mnt/cpfs/epic-user/hujiahui-20260612/miniconda3/envs/qvg/bin/python
+PYTHON_BIN=${WORKSPACE}/miniconda3/envs/qvg/bin/python
 RUN=scripts/paper_experiments/predictor_ablation/run.py
-ROOT=/mnt/cpfs/epic-user/hujiahui-20260612/Tempokv/results/self_forcing/predictor_ablation_v2_60p
+ROOT=${WORKSPACE}/Tempokv/results/self_forcing/predictor_ablation_v2_60p
 CARD_A=GPU-cbea873b-5a71-8923-44ec-109b3b8706c9   # identity resumes here
 CARD_B=GPU-6f1aaf89-db19-84dc-8ce4-28a8bd9bcad4   # empty card, taylor
-export TMPDIR=/mnt/cpfs/epic-user/hujiahui-20260612/.tmp/tempokv
+export TMPDIR=${WORKSPACE}/.tmp/tempokv
 
 common=(
-  --checkpoint /mnt/cpfs/epic-user/hujiahui-20260612/checkpoints/self_forcing_dmd.pt
-  --wan-model-dir /mnt/cpfs/epic-user/hujiahui-20260612/kv-quant-4-videogen/wan_models/Wan2.1-T2V-1.3B
-  --trace /mnt/cpfs/epic-user/hujiahui-20260612/Tempokv/data/self-forcing/trace_legacy/clean_trace.npz
-  --bf16-videos /mnt/cpfs/epic-user/hujiahui-20260612/kv-quant-result/Self-Forcing/bf16_clean
-  --tempokv-videos /mnt/cpfs/epic-user/hujiahui-20260612/Tempokv/results/self_forcing/predictor_ablation_60p/quality/ref_tempokv_flat
+  --checkpoint ${WORKSPACE}/checkpoints/self_forcing_dmd.pt
+  --wan-model-dir ${WORKSPACE}/kv-quant-4-videogen/wan_models/Wan2.1-T2V-1.3B
+  --trace ${WORKSPACE}/Tempokv/data/self-forcing/trace_legacy/clean_trace.npz
+  --bf16-videos ${WORKSPACE}/kv-quant-result/Self-Forcing/bf16_clean
+  --tempokv-videos ${WORKSPACE}/Tempokv/results/self_forcing/predictor_ablation_60p/quality/ref_tempokv_flat
   --output-root "$ROOT"
   --quality-fid
   --resume
