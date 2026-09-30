@@ -86,7 +86,7 @@ def _parser() -> argparse.ArgumentParser:
         type=Path,
         help="Official VBench_full_info.json (required for long_vbench_standard)",
     )
-    parser.add_argument("--device", default="auto", help="auto, cpu, cuda, or cuda:N")
+    parser.add_argument("--device", default="auto", help="auto, cpu, mps, cuda, or cuda:N")
     parser.add_argument("--read-frame", action="store_true")
     parser.add_argument(
         "--local-checkpoints",
@@ -277,8 +277,8 @@ def prepare(args: argparse.Namespace) -> tuple[dict[str, Any], dict[str, str]]:
         raise ValueError("--full-info is required with --mode long_vbench_standard")
     if full_info is not None and not full_info.is_file():
         raise FileNotFoundError(f"VBench full-info file does not exist: {full_info}")
-    if args.device != "auto" and re.fullmatch(r"cpu|cuda(?::\d+)?", args.device) is None:
-        raise ValueError("--device must be auto, cpu, cuda, or cuda:N")
+    if args.device != "auto" and re.fullmatch(r"cpu|mps|cuda(?::\d+)?", args.device) is None:
+        raise ValueError("--device must be auto, cpu, mps, cuda, or cuda:N")
 
     mapping = _staging_mapping(video_paths, prompts, args.mode)
     config = {
@@ -320,11 +320,20 @@ def _device(name: str):
         torch = importlib.import_module("torch")
     except ImportError as error:
         raise RuntimeError("VBench-Long evaluation requires PyTorch") from error
-    selected = "cuda" if name == "auto" and torch.cuda.is_available() else name
+    selected = name
+    if name == "auto":
+        if torch.cuda.is_available():
+            selected = "cuda"
+        elif getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
+            selected = "mps"
     if selected == "auto":
         selected = "cpu"
     if selected.startswith("cuda") and not torch.cuda.is_available():
         raise RuntimeError(f"CUDA device {selected!r} was requested but CUDA is unavailable")
+    if selected == "mps" and (
+        getattr(torch.backends, "mps", None) is None or not torch.backends.mps.is_available()
+    ):
+        raise RuntimeError("MPS was requested but is unavailable")
     return torch.device(selected)
 
 
@@ -358,6 +367,18 @@ def _stage_videos(config: dict[str, Any]) -> Path:
     output_dir = Path(config["output_path"])
     if staging_dir.parent != output_dir:
         raise RuntimeError("VBench-Long staging directory escaped the output directory")
+    # Preserve an existing staging directory so interrupted evaluations can
+    # reuse already encoded split clips. The input fingerprint in evaluation
+    # config guards against accidentally reusing clips from another input.
+    if staging_dir.is_dir() and not staging_dir.is_symlink():
+        source_dir = Path(config["videos_path"])
+        for entry in config["staging_mapping"]:
+            destination = staging_dir / entry["staged_name"]
+            if destination.exists() or destination.is_symlink():
+                continue
+            source = source_dir / entry["source_name"]
+            destination.symlink_to(source)
+        return staging_dir
     if staging_dir.is_symlink() or staging_dir.is_file():
         staging_dir.unlink()
     elif staging_dir.exists():

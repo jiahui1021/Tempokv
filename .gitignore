@@ -21,6 +21,11 @@ tmp/
 /tests/visual-composer/
 .planning/
 
+# Local assistant planning notes
+/task_plan.md
+/findings.md
+/progress.md
+
 supplementary/
 
 # Build and packaging output

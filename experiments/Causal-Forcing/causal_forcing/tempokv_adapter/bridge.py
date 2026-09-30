@@ -341,18 +341,24 @@ def install(runtime_root: str | Path | None = None) -> type:
                 ),
             }
             index = self._probe_tokens(encoded).to(primary.device)
-            errors = {}
+            per_frame = index.numel() // encoded
+            fields = []
             for role in ("k", "v"):
                 clean = torch.cat(self._probe_clean[role], dim=1)[:, : index.numel()]
-                read = decoded[role].index_select(1, index).float().cpu()
-                errors[role] = float(
-                    (read - clean).square().sum() / clean.square().sum().clamp_min(1e-30)
-                )
+                error = decoded[role].index_select(1, index).float().cpu() - clean
+                # Frame 0 is the directly quantized anchor; the rest are predicted.
+                for name, part in (
+                    ("", slice(None)),
+                    ("_anchor", slice(0, per_frame)),
+                    ("_rest", slice(per_frame, None)),
+                ):
+                    energy = clean[:, part].square().sum().clamp_min(1e-30)
+                    nmse = float(error[:, part].square().sum() / energy)
+                    fields.append(f"{role}_nmse{name}={nmse:.3e}")
             config = self.tempokv_codec.config
             print(
-                f"[TempoKVReadback] k{config.k_bits}v{config.v_bits} "
-                f"packed_frames={encoded} "
-                f"k_nmse={errors['k']:.3e} v_nmse={errors['v']:.3e}",
+                f"[TempoKVReadback] k{config.k_bits}v{config.v_bits}"
+                f"a{config.anchor_bits} packed_frames={encoded} " + " ".join(fields),
                 flush=True,
             )
 
