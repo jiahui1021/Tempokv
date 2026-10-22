@@ -139,8 +139,10 @@ class CounterfactualController:
         c=self.config.intervention
         context=self.reference_contexts.get((c.target_layer,c.target_head,c.target_chunk,c.target_step),{})
         first=case.events[0] if case.events else None
-        prefix={**context,"prompt_index":probe.prompt_index,"seed":probe.seed,"sample_id":0,"paired_run_id":case.case_id,
+        event_details=self.details.get(event_key(first),{}) if first else {}
+        prefix={**context,**event_details,"prompt_index":probe.prompt_index,"seed":probe.seed,"sample_id":0,"paired_run_id":case.case_id,
             "strategy":case.kind,"intervention":case.kind,"strength":case.strength,"requested_strength":case.strength,
+            "role":case.role,
             "calibration_protocol":c.calibration,"case_id":case.case_id,"metric_scope":"paired_generation",
             "layer":first.layer if first else c.target_layer,"head":first.head if first else c.target_head,
             "chunk_index":first.chunk if first else c.target_chunk,"denoise_step_index":first.step if first else c.target_step,

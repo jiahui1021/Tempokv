@@ -421,6 +421,18 @@ def _draw(plt, experiment, stem, rows):
     return fig, used
 
 
+def propagation_partitions(rows):
+    """Never pool distinct error doses or unmatched calibration in a heatmap."""
+    groups={}
+    fields=("intervention","role","requested_strength","calibration_protocol","denoise_step_index","head")
+    for row in rows:
+        if row.get("calibration_matched") is False or str(row.get("comparison_cohort","")).startswith("unmatched"):
+            continue
+        key=tuple(row.get(field) for field in fields)
+        groups.setdefault(key,[]).append(row)
+    return [(hashlib.sha256(_canonical(key).encode()).hexdigest()[:10],part) for key,part in sorted(groups.items(),key=lambda item:_canonical(item[0]))]
+
+
 def write_figures(rows, output_dir):
     """Write separate PNG/PDF figures per cohort; report missing plots explicitly."""
     rows = list(rows)
@@ -433,16 +445,28 @@ def write_figures(rows, output_dir):
         cohort = [row for row in rows if row["cohort_id"] == cohort_id]
         for experiment in EXPERIMENTS:
             actual = _measured([row for row in cohort if row["experiment_id"] == experiment])
-            for stem in FIGURES[experiment]:
+            figure_inputs=[(stem,actual) for stem in FIGURES[experiment]]
+            if experiment=="E2" and actual:
+                figure_inputs=[(f"{FIGURES[experiment][0]}-{identity}",part) for identity,part in propagation_partitions(actual)]
+                if not figure_inputs:
+                    results.append({"cohort_id":cohort_id,"experiment_id":experiment,"name":FIGURES[experiment][0],
+                        "status":"not_measured","reason":"no comparable matched calibration cohort"})
+            for stem,plot_rows in figure_inputs:
                 entry = {"cohort_id": cohort_id, "experiment_id": experiment, "name": stem}
+                if experiment=="E2" and plot_rows:
+                    entry["plot_protocol"]={field:plot_rows[0].get(field) for field in
+                        ("intervention","role","requested_strength","calibration_protocol","denoise_step_index","head")}
                 if not actual:
                     results.append({**entry, "status": "not_measured", "reason": "no measured rows"})
                     continue
-                fig, used = _draw(plt, experiment, stem, actual)
+                fig, used = _draw(plt, experiment, stem, plot_rows)
                 try:
                     if used:
                         fig.text(.5, .925, f"{cohort[0]['data_origin']} | source: {cohort[0]['source']} | cohort: {cohort_id}",
                                  ha="center", va="center", fontsize=8, color="dimgray")
+                        if experiment=="E2":
+                            fig.text(.5,.89," | ".join(f"{key}={value}" for key,value in entry["plot_protocol"].items()),
+                                     ha="center",fontsize=6,color="dimgray")
                         folder = destination / "figures" / f"cohort-{cohort_id}"
                         folder.mkdir(parents=True, exist_ok=True)
                         paths = []

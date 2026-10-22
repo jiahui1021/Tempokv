@@ -145,3 +145,16 @@ def test_missing_clean_generation_and_repeat_rebuild_do_not_overwrite(missing_cl
     stat = next(entry for entry in summary["statistics"] if entry["metric"] == "local_attention_relative_error")
     assert stat["mean"] == 0 and stat["independent_prompt_seed_units"] == 1 and stat["ci_low"] is None
     assert "generation outcomes and quality scores remain unmeasured" in (second / "research_summary.md").read_text()
+
+
+def test_propagation_plots_keep_dose_step_head_separate_and_exclude_unmatched():
+    from tempokv.research.analysis import propagation_partitions
+    base={'intervention':'gaussian','role':'v','requested_strength':.1,'calibration_protocol':'local_d_att',
+          'denoise_step_index':0,'head':0,'calibration_matched':True,'comparison_cohort':'matched'}
+    rows=[{**base,'layer':0},{**base,'layer':1},{**base,'requested_strength':.2},
+          {**base,'denoise_step_index':1},{**base,'head':1},
+          {**base,'calibration_matched':False},{**base,'comparison_cohort':'unmatched_dtype_floor'}]
+    groups=propagation_partitions(rows)
+    assert sorted(len(part) for _,part in groups)==[1,1,1,2]
+    assert len({identity for identity,_ in groups})==4
+    assert all(row['calibration_matched'] and row['comparison_cohort']=='matched' for _,part in groups for row in part)

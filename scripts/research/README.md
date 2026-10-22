@@ -12,7 +12,7 @@ This is the `research.v1` suite for **Self-Forcing / Wan**, implemented after th
 | M3 | S3 exact token budgets; frozen E7 2×2; paired single-event E7; bounded full-window snapshot and offline rebuild | passed | not run |
 | M4 | E5 equal-budget causal archives, declared entity/state feature evaluator, four return scenes + static controls, real-evidence gate | passed | real reappearance/quality unmeasured |
 
-The research suite has **586 passing CPU tests**. No model weights were downloaded, no GPU was rented, and no experiment establishes a scientific hypothesis. The [one-page result note](RESULTS.md) distinguishes numerical verification from missing research data.
+The research suite has **587 passing CPU tests**. No model weights were downloaded, no GPU was rented, and no experiment establishes a scientific hypothesis. The [one-page result note](RESULTS.md) distinguishes numerical verification from missing research data.
 
 ## Install and run
 

@@ -39,5 +39,12 @@
   "real_model_results": null,
   "scientific_conclusions": null,
   "production_codec_changes": false,
-  "production_fitting_changes": false
+  "production_fitting_changes": false,
+  "additional_regression": {
+    "analysis_module_passed": 3,
+    "counterfactual_module_passed": 4,
+    "additional_unique_test": "propagation dose/step/head partition and unmatched-calibration exclusion",
+    "research_unique_passed": 587,
+    "full_research_run_before_additional_test": 586
+  }
 }
