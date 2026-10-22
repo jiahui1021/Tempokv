@@ -1,0 +1,357 @@
+{
+  "schema_version": "research.v1",
+  "native_format": "CSV UTF-8 with header",
+  "parquet_logical_types": "Arrow names; strings UTF-8, numeric values nullable",
+  "missing": "empty CSV field or JSON null; never zero imputation",
+  "extensions": "details_json is canonical JSON object, not an unversioned column expansion",
+  "fields": [
+    {
+      "name": "schema_version",
+      "type": "utf8",
+      "nullable": false,
+      "unit": null
+    },
+    {
+      "name": "experiment_id",
+      "type": "utf8",
+      "nullable": false,
+      "unit": null
+    },
+    {
+      "name": "event_id",
+      "type": "utf8",
+      "nullable": false,
+      "unit": null
+    },
+    {
+      "name": "data_origin",
+      "type": "utf8",
+      "nullable": false,
+      "unit": null
+    },
+    {
+      "name": "prompt_index",
+      "type": "utf8",
+      "nullable": true,
+      "unit": null
+    },
+    {
+      "name": "seed",
+      "type": "int64",
+      "nullable": true,
+      "unit": null
+    },
+    {
+      "name": "sample_id",
+      "type": "int64",
+      "nullable": true,
+      "unit": null
+    },
+    {
+      "name": "layer",
+      "type": "int64",
+      "nullable": true,
+      "unit": null
+    },
+    {
+      "name": "head",
+      "type": "int64",
+      "nullable": true,
+      "unit": null
+    },
+    {
+      "name": "chunk_index",
+      "type": "int64",
+      "nullable": true,
+      "unit": null
+    },
+    {
+      "name": "phase",
+      "type": "utf8",
+      "nullable": true,
+      "unit": null
+    },
+    {
+      "name": "denoise_step_index",
+      "type": "int64",
+      "nullable": true,
+      "unit": null
+    },
+    {
+      "name": "denoise_timestep",
+      "type": "int64",
+      "nullable": true,
+      "unit": null
+    },
+    {
+      "name": "current_chunk_start",
+      "type": "int64",
+      "nullable": true,
+      "unit": null
+    },
+    {
+      "name": "grid_t",
+      "type": "int64",
+      "nullable": true,
+      "unit": null
+    },
+    {
+      "name": "grid_h",
+      "type": "int64",
+      "nullable": true,
+      "unit": null
+    },
+    {
+      "name": "grid_w",
+      "type": "int64",
+      "nullable": true,
+      "unit": null
+    },
+    {
+      "name": "query_samples",
+      "type": "int64",
+      "nullable": true,
+      "unit": null
+    },
+    {
+      "name": "key_token_count",
+      "type": "int64",
+      "nullable": true,
+      "unit": null
+    },
+    {
+      "name": "history_token_count",
+      "type": "int64",
+      "nullable": true,
+      "unit": null
+    },
+    {
+      "name": "protected_token_count",
+      "type": "int64",
+      "nullable": true,
+      "unit": null
+    },
+    {
+      "name": "protected_fraction",
+      "type": "float64",
+      "nullable": true,
+      "unit": "dimensionless"
+    },
+    {
+      "name": "block_id",
+      "type": "utf8",
+      "nullable": true,
+      "unit": null
+    },
+    {
+      "name": "score_type",
+      "type": "utf8",
+      "nullable": true,
+      "unit": null
+    },
+    {
+      "name": "score",
+      "type": "float64",
+      "nullable": true,
+      "unit": "dimensionless"
+    },
+    {
+      "name": "local_attention_relative_error",
+      "type": "float64",
+      "nullable": true,
+      "unit": "dimensionless"
+    },
+    {
+      "name": "model_output_relative_error",
+      "type": "float64",
+      "nullable": true,
+      "unit": "dimensionless"
+    },
+    {
+      "name": "clean_latent_relative_error",
+      "type": "float64",
+      "nullable": true,
+      "unit": "dimensionless"
+    },
+    {
+      "name": "horizon_chunks",
+      "type": "int64",
+      "nullable": true,
+      "unit": null
+    },
+    {
+      "name": "nmse_k",
+      "type": "float64",
+      "nullable": true,
+      "unit": "dimensionless"
+    },
+    {
+      "name": "nmse_v",
+      "type": "float64",
+      "nullable": true,
+      "unit": "dimensionless"
+    },
+    {
+      "name": "strategy",
+      "type": "utf8",
+      "nullable": true,
+      "unit": null
+    },
+    {
+      "name": "intervention",
+      "type": "utf8",
+      "nullable": true,
+      "unit": null
+    },
+    {
+      "name": "role",
+      "type": "utf8",
+      "nullable": true,
+      "unit": null
+    },
+    {
+      "name": "strength",
+      "type": "float64",
+      "nullable": true,
+      "unit": "dimensionless"
+    },
+    {
+      "name": "requested_strength",
+      "type": "float64",
+      "nullable": true,
+      "unit": "dimensionless"
+    },
+    {
+      "name": "calibration_protocol",
+      "type": "utf8",
+      "nullable": true,
+      "unit": null
+    },
+    {
+      "name": "retention",
+      "type": "float64",
+      "nullable": true,
+      "unit": "dimensionless"
+    },
+    {
+      "name": "actual_retained_tokens",
+      "type": "int64",
+      "nullable": true,
+      "unit": null
+    },
+    {
+      "name": "actual_retention",
+      "type": "float64",
+      "nullable": true,
+      "unit": "dimensionless"
+    },
+    {
+      "name": "k_bits",
+      "type": "int64",
+      "nullable": true,
+      "unit": null
+    },
+    {
+      "name": "v_bits",
+      "type": "int64",
+      "nullable": true,
+      "unit": null
+    },
+    {
+      "name": "payload_bytes",
+      "type": "int64",
+      "nullable": true,
+      "unit": "bytes"
+    },
+    {
+      "name": "scale_bytes",
+      "type": "int64",
+      "nullable": true,
+      "unit": "bytes"
+    },
+    {
+      "name": "metadata_bytes",
+      "type": "int64",
+      "nullable": true,
+      "unit": "bytes"
+    },
+    {
+      "name": "logical_bytes",
+      "type": "int64",
+      "nullable": true,
+      "unit": "bytes"
+    },
+    {
+      "name": "physical_kv_bytes",
+      "type": "int64",
+      "nullable": true,
+      "unit": "bytes"
+    },
+    {
+      "name": "budget_cohort",
+      "type": "utf8",
+      "nullable": true,
+      "unit": null
+    },
+    {
+      "name": "conditioning_set",
+      "type": "utf8",
+      "nullable": true,
+      "unit": null
+    },
+    {
+      "name": "paired_run_id",
+      "type": "utf8",
+      "nullable": true,
+      "unit": null
+    },
+    {
+      "name": "analysis_ms",
+      "type": "float64",
+      "nullable": true,
+      "unit": "milliseconds"
+    },
+    {
+      "name": "compression_ms",
+      "type": "float64",
+      "nullable": true,
+      "unit": "milliseconds"
+    },
+    {
+      "name": "scoring_ms",
+      "type": "float64",
+      "nullable": true,
+      "unit": "milliseconds"
+    },
+    {
+      "name": "gather_ms",
+      "type": "float64",
+      "nullable": true,
+      "unit": "milliseconds"
+    },
+    {
+      "name": "attention_ms",
+      "type": "float64",
+      "nullable": true,
+      "unit": "milliseconds"
+    },
+    {
+      "name": "status",
+      "type": "utf8",
+      "nullable": false,
+      "unit": null
+    },
+    {
+      "name": "reason",
+      "type": "utf8",
+      "nullable": true,
+      "unit": null
+    },
+    {
+      "name": "details_json",
+      "type": "utf8",
+      "nullable": true,
+      "unit": null
+    }
+  ]
+}

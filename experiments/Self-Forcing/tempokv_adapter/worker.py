@@ -94,7 +94,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         description="Run one distributed Self-Forcing inference worker."
     )
     parser.add_argument(
-        "--mode", choices=("tempokv", "bf16", "trace"), default="tempokv"
+        "--mode", choices=("tempokv", "bf16", "trace", "spectral", "spectral_kv"), default="tempokv"
     )
     parser.add_argument(
         "--profile",
@@ -150,11 +150,21 @@ def main(argv: Sequence[str] | None = None) -> int:
             from bridge import install
 
             install(runtime_root)
+        elif args.mode == "spectral_kv":
+            from tempokv.spectral_kv.bridge import install
+            install(runtime_root, runtime="self_forcing")
         elif args.mode == "trace":
             from trace_bridge import install
 
             install(runtime_root)
             arguments.append("--skip_video_save")
+        elif args.mode == "spectral":
+            from spectral_bridge import install
+
+            install(runtime_root)
+        if os.environ.get("RESEARCH_ENABLE") == "1":
+            from research_bridge import install as install_research
+            install_research(runtime_root)
         if args.profile is not None:
             profile, instrumentation = _install_profile(
                 cuda_device if cuda_available else None

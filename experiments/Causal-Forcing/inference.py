@@ -357,6 +357,9 @@ for batch_data in dataloader:
         )
 
     generation_start = time.perf_counter()
+    spectral_context = getattr(pipeline, "set_spectral_context", None)
+    if spectral_context is not None:
+        spectral_context(prompt_id=int(idx), generation_seed=prompt_seed, model=str(args.checkpoint_path))
     video, latents = pipeline.inference(
         noise=sampled_noise,
         text_prompts=prompts,

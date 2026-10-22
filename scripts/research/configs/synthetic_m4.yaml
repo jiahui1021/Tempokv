@@ -1,0 +1,74 @@
+{
+  "schema_version": "research.v1",
+  "experiments": [
+    "E5"
+  ],
+  "frames": 45,
+  "local_attn_size": -1,
+  "max_events": 2,
+  "selection": {
+    "layers": [
+      0
+    ],
+    "heads": [
+      0
+    ],
+    "chunk_indices": [
+      1,
+      2
+    ],
+    "denoise_step_indices": [
+      0,
+      1
+    ]
+  },
+  "sampling": {
+    "queries_per_head": 4,
+    "max_history_blocks_per_event": 3,
+    "spatial_block_hw": [
+      1,
+      1
+    ],
+    "protect_recent_latent_frames": 0,
+    "max_pairs": 2,
+    "max_capture_mb": 16
+  },
+  "spectral": {
+    "temporal_windows": [
+      2,
+      4
+    ],
+    "temporal_positions": 3
+  },
+  "compression": {
+    "bits": [
+      2,
+      4
+    ],
+    "retention": [
+      0.5
+    ],
+    "mixed_bits": []
+  },
+  "intervention": {
+    "strengths": [
+      0.1
+    ],
+    "paired_rollout": true,
+    "kind": "none",
+    "role": "v",
+    "target_layer": 0,
+    "target_head": 0,
+    "target_chunk": 1,
+    "target_step": 1,
+    "max_branches": 6,
+    "horizon_chunks": [
+      1,
+      2,
+      4
+    ]
+  },
+  "output": {
+    "root": "reports/research/synthetic_m4"
+  }
+}

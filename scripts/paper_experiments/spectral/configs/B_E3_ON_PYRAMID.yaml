@@ -1,0 +1,9 @@
+{
+  "suite_id": "B_SPECTRAL_KV",
+  "profile": "b_e3_on_pyramid",
+  "experiments": [
+    "B_E3_ON_ROLLOUT"
+  ],
+  "online": true,
+  "method": "PYR_dct_b1.0"
+}

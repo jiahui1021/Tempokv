@@ -291,3 +291,18 @@ K 轴 `h_K=0..5` 固定 CrossKV `h_V=1`，V 轴 CrossKV `h_V=0,1,2,4,5` 固定 `
 - [Self-Forcing](scripts/Self-Forcing/README.md)、[Causal Forcing](scripts/Causal-Forcing/README.md)、[LongCat](scripts/LongCat/README.md)
 - [脚本目录](scripts/README.md)
 - 论文实验：[K/V history 消融](scripts/paper_experiments/history_ablation/README.md)、[CrossKV sharing](scripts/paper_experiments/cross_kv_sharing/README.md)、[Predictor replacement](scripts/paper_experiments/predictor_ablation/README.md)、[latency](scripts/paper_experiments/latency/README.md)
+
+## Spectral experiment suites
+
+Two independent spectral experiment suites are available. Their E1/E2/E3 numbers refer to different questions and must not be mixed.
+
+| Suite | Scope | Entry and documentation | Default reports |
+|---|---|---|---|
+| **A_FREQUENCY_ORACLE** | Clean KV spectrum, block-deletion importance and fixed-token-budget selection | [Suite A](scripts/spectral/README.md), `MODE=spectral` | `reports/spectral/` |
+| **B_SPECTRAL_KV** | DC-free/pre/post-RoPE spectrum, chunk-axis/refresh/distance diagnostics, DCT/AVG shadow summaries and explicitly enabled online variants | [Suite B](scripts/paper_experiments/spectral/README.md), separate `run.sh` / `--mode spectral_kv` | `reports/spectral_kv/`, separated by experiment, model, window and profile |
+
+Both suites are disabled by default. CPU synthetic checks are not research evidence. Suite B's online prototype retains native BF16 backing; its reports include this memory and do not claim production memory savings or GPU speedups. Real GPU video-quality and long-rollout results remain unmeasured until explicitly run.
+
+### Independent mechanism research (S1–S3 / E1–E7)
+
+The [research.v1 suite](scripts/research/README.md) adds opt-in Self-Forcing analysis, paired interventions, fair-budget compression comparisons and reappearance checks. It is separate from both earlier spectral suites. See its [source audit](scripts/research/audit/AUDIT.md), [raw data schema](scripts/research/SCHEMA.md) and [one-page evidence note](scripts/research/RESULTS.md). CPU checks are available without checkpoints; real GPU/model results are explicitly unmeasured.

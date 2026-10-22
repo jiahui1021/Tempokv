@@ -1,0 +1,10 @@
+{
+  "suite_id": "B_SPECTRAL_KV",
+  "profile": "b_e2b_calibration",
+  "experiments": [
+    "B_E2B_REFRESH"
+  ],
+  "layers": [],
+  "heads": [],
+  "collect_calibration": true
+}

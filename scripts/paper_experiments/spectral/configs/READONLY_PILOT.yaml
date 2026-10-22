@@ -1,0 +1,11 @@
+{
+  "suite_id": "B_SPECTRAL_KV",
+  "profile": "b_readonly_pilot",
+  "experiments": [
+    "B_E1_SPECTRUM",
+    "B_E2_CHUNK_AXIS",
+    "B_E2B_REFRESH",
+    "B_E3_OFF_SHADOW",
+    "B_E4_DISTANCE"
+  ]
+}

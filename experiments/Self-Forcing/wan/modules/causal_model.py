@@ -352,6 +352,16 @@ class CausalWanSelfAttention(nn.Module):
             return q, k, v
 
         q, k, v = qkv_fn(x)
+        research_probe = getattr(self, "research_probe", None)
+        if research_probe is not None:
+            research_probe.on_projected_native(self.research_layer_idx, q_pre=q, k_pre=k, v=v,
+                grid_sizes=grid_sizes, current_start=current_start, freqs=freqs)
+        spectral_probe = getattr(self, "spectral_probe", None)
+        if spectral_probe is not None:
+            spectral_probe.on_projection(
+                self.spectral_layer_idx, k_pre=k, v=v, grid_sizes=grid_sizes,
+                current_start=current_start, phase=spectral_probe.phase, q_pre=q, freqs=freqs,
+            )
 
         if kv_cache is None:
             # if it is teacher forcing training?
@@ -546,11 +556,51 @@ class CausalWanSelfAttention(nn.Module):
                     attention_start = max(
                         0, local_end_index - self.local_attn_size * frame_seqlen
                     )
-                x = attention(
-                    roped_query,
-                    cache_k[:, attention_start:local_end_index],
-                    cache_v[:, attention_start:local_end_index],
-                )
+                if research_probe is not None:
+                    research_output = research_probe.on_attention_native(
+                        self.research_layer_idx, q_post=roped_query,
+                        k_post=cache_k[:, attention_start:local_end_index], v=cache_v[:, attention_start:local_end_index],
+                        metadata={"grid_sizes": grid_sizes, "current_start": current_start,
+                                  "local_start_index": local_start_index, "local_end_index": local_end_index,
+                                  "attention_start": attention_start, "frame_seqlen": frame_seqlen,
+                                  "sink_frames": self.sink_size, "contiguous": self.sink_size == 0,
+                                  "rope_precision": kv_cache.get("rope_precision", "native"),
+                                  "physical_kv_bytes": (cache_k.numel()+cache_v.numel())*cache_k.element_size(),
+                                  "absolute_positions": [i if i < sink_tokens else current_start-local_start_index+i
+                                      for i in range(attention_start, local_end_index)] if self.sink_size else None},
+                        attention_fn=attention)
+                if spectral_probe is not None:
+                    spectral_output = spectral_probe.on_attention(
+                        self.spectral_layer_idx, q_post=roped_query,
+                        k_post=cache_k[:, attention_start:local_end_index],
+                        v=cache_v[:, attention_start:local_end_index],
+                        metadata={
+                            "grid_sizes": grid_sizes,
+                            "current_start": current_start,
+                            "local_start_index": local_start_index,
+                            "local_end_index": local_end_index,
+                            "attention_start": attention_start,
+                            "frame_seqlen": frame_seqlen,
+                            "sink_frames": self.sink_size,
+                            "contiguous": self.sink_size == 0,
+                            "phase": spectral_probe.phase,
+                            "rope_precision": kv_cache.get("rope_precision", "native"),
+                            "native_cache_allocated_bytes": (cache_k.numel() + cache_v.numel()) * cache_k.element_size(),
+                            "absolute_positions": [i if i < sink_tokens else current_start - local_start_index + i
+                                                   for i in range(attention_start, local_end_index)] if self.sink_size else None,
+                        },
+                        attention_fn=attention,
+                    )
+                if research_probe is not None and research_output is not None:
+                    x = research_output
+                elif spectral_probe is not None and spectral_output is not None:
+                    x = spectral_output
+                else:
+                    x = attention(
+                        roped_query,
+                        cache_k[:, attention_start:local_end_index],
+                        cache_v[:, attention_start:local_end_index],
+                    )
                 _set_cache_index(kv_cache, "global_end_index", current_end)
                 _set_cache_index(kv_cache, "local_end_index", local_end_index)
                 x = x.flatten(2)
@@ -689,7 +739,20 @@ class CausalWanSelfAttention(nn.Module):
                 # actually used.  The newly written tokens are always the tail of
                 # the attention window, so no RoPE is recomputed for the trace.
                 recorder(roped_query, attn_k[:, -num_new_tokens:])
-            if fused_jensen:
+            if research_probe is not None:
+                if pruner is not None or jensen_groups:
+                    raise ValueError("research TempoKV hooks require legacy pruning and Jensen correction disabled")
+                research_output = research_probe.on_attention_native(
+                    self.research_layer_idx, q_post=roped_query, k_post=attn_k, v=attn_v,
+                    metadata={"grid_sizes": grid_sizes, "current_start": current_start,
+                              "local_start_index": local_start_index, "attention_start": 0,
+                              "frame_seqlen": frame_seqlen, "sink_frames": self.sink_size,
+                              "rope_precision": getattr(kv_cache["k"], "rope_precision", "native"),
+                              "absolute_positions": [decode_start_index+i for start,end in window for i in range(start,end)],
+                              "source": "tempokv", "contiguous": False}, attention_fn=attention)
+            if research_probe is not None and research_output is not None:
+                x = research_output
+            elif fused_jensen:
                 fused_attention = (
                     jensen_triton_attention
                     if selected_jensen_backend == "triton"

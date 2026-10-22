@@ -1,0 +1,69 @@
+{
+  "schema_version": "research.v1",
+  "experiments": [
+    "S3",
+    "E7"
+  ],
+  "frames": 33,
+  "local_attn_size": 9,
+  "max_events": 2,
+  "selection": {
+    "layers": [
+      0
+    ],
+    "heads": [
+      0,
+      1
+    ],
+    "chunk_indices": [
+      1,
+      2
+    ],
+    "denoise_step_indices": [
+      0
+    ]
+  },
+  "sampling": {
+    "queries_per_head": 4,
+    "max_history_blocks_per_event": 4,
+    "spatial_block_hw": [
+      1,
+      2
+    ],
+    "protect_recent_latent_frames": 0,
+    "max_pairs": 2,
+    "max_capture_mb": 16
+  },
+  "spectral": {
+    "temporal_windows": [
+      2,
+      4
+    ],
+    "temporal_positions": 3
+  },
+  "compression": {
+    "bits": [
+      2,
+      4
+    ],
+    "mixed_bits": [
+      [
+        4,
+        2
+      ],
+      [
+        2,
+        4
+      ]
+    ]
+  },
+  "intervention": {
+    "strengths": [
+      0.03
+    ]
+  },
+  "output": {
+    "root": "reports/research/synthetic_m3",
+    "save_dense_kv": true
+  }
+}

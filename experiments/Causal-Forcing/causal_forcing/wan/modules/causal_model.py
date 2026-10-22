@@ -141,6 +141,12 @@ class CausalWanSelfAttention(nn.Module):
             return q, k, v
 
         q, k, v = qkv_fn(x)
+        spectral_probe = getattr(self, "spectral_probe", None)
+        if spectral_probe is not None:
+            spectral_probe.on_projection(
+                self.spectral_layer_idx, k_pre=k, v=v, grid_sizes=grid_sizes,
+                current_start=current_start, phase=spectral_probe.phase, q_pre=q, freqs=freqs,
+            )
 
         if kv_cache is None:
             # if it is teacher forcing training?
@@ -290,11 +296,28 @@ class CausalWanSelfAttention(nn.Module):
                     attention_start = max(
                         0, local_end_index - self.local_attn_size * frame_seqlen
                     )
-                x = attention(
-                    roped_query,
-                    cache_k[:, attention_start:local_end_index],
-                    cache_v[:, attention_start:local_end_index],
-                )
+                if spectral_probe is not None:
+                    spectral_output = spectral_probe.on_attention(
+                        self.spectral_layer_idx, q_post=roped_query,
+                        k_post=cache_k[:, attention_start:local_end_index], v=cache_v[:, attention_start:local_end_index],
+                        metadata={"grid_sizes": grid_sizes, "current_start": current_start,
+                                  "local_start_index": local_start_index, "local_end_index": local_end_index,
+                                  "attention_start": attention_start, "frame_seqlen": frame_seqlen,
+                                  "sink_frames": self.sink_size, "contiguous": self.sink_size == 0,
+                                  "phase": spectral_probe.phase, "rope_precision": "float64",
+                                  "native_cache_allocated_bytes": (cache_k.numel() + cache_v.numel()) * cache_k.element_size(),
+                                  "absolute_positions": [i if i < sink_tokens else current_start - local_start_index + i
+                                                         for i in range(attention_start, local_end_index)] if self.sink_size else None},
+                        attention_fn=attention,
+                    )
+                if spectral_probe is not None and spectral_output is not None:
+                    x = spectral_output
+                else:
+                    x = attention(
+                        roped_query,
+                        cache_k[:, attention_start:local_end_index],
+                        cache_v[:, attention_start:local_end_index],
+                    )
             else:
                 if self.sink_size and self.local_attn_size != -1:
                     raise NotImplementedError(

@@ -1,0 +1,36 @@
+{
+  "suite_id": "B_SPECTRAL_KV",
+  "profile": "b_e3_off_shadow",
+  "experiments": [
+    "B_E3_OFF_SHADOW"
+  ],
+  "shadow_methods": [
+    "BF16",
+    "DROP_win6",
+    "DROP_win21",
+    "SPECSUM_dct_R4_B0",
+    "SPECSUM_dct_R4_B0_top8",
+    "SPECSUM_dct_R4_B1",
+    "SPECSUM_dct_R4_B1_top8",
+    "SPECSUM_dct_R16_B0",
+    "SPECSUM_dct_R16_B0_top8",
+    "SPECSUM_dct_R16_B1",
+    "SPECSUM_dct_R16_B1_top8",
+    "SPECSUM_dct_R64_B0",
+    "SPECSUM_dct_R64_B0_top8",
+    "SPECSUM_dct_R64_B1",
+    "SPECSUM_dct_R64_B1_top8",
+    "SPECSUM_avg_R4_B0",
+    "SPECSUM_avg_R4_B0_top8",
+    "SPECSUM_avg_R4_B1",
+    "SPECSUM_avg_R4_B1_top8",
+    "SPECSUM_avg_R16_B0",
+    "SPECSUM_avg_R16_B0_top8",
+    "SPECSUM_avg_R16_B1",
+    "SPECSUM_avg_R16_B1_top8",
+    "SPECSUM_avg_R64_B0",
+    "SPECSUM_avg_R64_B0_top8",
+    "SPECSUM_avg_R64_B1",
+    "SPECSUM_avg_R64_B1_top8"
+  ]
+}

@@ -1,0 +1,37 @@
+{
+  "source": "bf16",
+  "experiments": ["spectrum", "sensitivity", "compression"],
+  "seed": 42,
+  "sampling": {
+    "layers": [0, 15, 29],
+    "heads": [0, 6],
+    "latent_frames": [12, 24, 36],
+    "denoise_calls": [0],
+    "query_tokens_per_head": 32,
+    "max_candidate_blocks": 24,
+    "only_phase": "denoise",
+    "max_oracle_calls_per_layer": 12
+  },
+  "frequency": {
+    "spatial_block_size": [4, 4],
+    "cutoffs": [0.10, 0.25, 0.40],
+    "score_cutoff": 0.25,
+    "temporal_positions_per_frame": 32,
+    "max_clean_frames": 192
+  },
+  "oracle": {
+    "protect_recent_frames": 6,
+    "sink_frames": 0,
+    "key_chunk_size": 1024,
+    "topk_fraction": 0.25
+  },
+  "compression": {
+    "retention_ratios": [0.25, 0.50, 0.75],
+    "policies": ["random", "uniform", "similarity", "attention", "frequency", "frequency_attention"],
+    "random_seeds": [0, 1, 2],
+    "combination_alphas": [0.25, 0.50, 0.75],
+    "snapshot_calls": 0,
+    "max_snapshot_tokens": 100000
+  },
+  "output_dir": "reports/spectral/self_forcing_pilot"
+}

@@ -1,0 +1,13 @@
+{
+  "suite_id": "B_SPECTRAL_KV",
+  "profile": "b_e2_chunk_axis",
+  "experiments": [
+    "B_E2_CHUNK_AXIS"
+  ],
+  "denoise_steps": [
+    0,
+    1,
+    2,
+    -1
+  ]
+}

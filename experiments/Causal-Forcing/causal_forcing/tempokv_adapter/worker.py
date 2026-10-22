@@ -55,7 +55,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Run one Causal Forcing inference worker."
     )
-    parser.add_argument("--mode", choices=("tempokv", "bf16", "trace"), default="tempokv")
+    parser.add_argument("--mode", choices=("tempokv", "bf16", "trace", "spectral_kv"), default="tempokv")
     parser.add_argument("arguments", nargs=argparse.REMAINDER)
     args = parser.parse_args(argv)
     arguments = list(args.arguments)
@@ -94,6 +94,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             from causal_forcing.tempokv_adapter.bridge import install
 
             install()
+        elif args.mode == "spectral_kv":
+            from tempokv.spectral_kv.bridge import install
+            install(RUNTIME_ROOT, runtime="causal_forcing")
         elif args.mode == "trace":
             from causal_forcing.tempokv_adapter.trace_bridge import install
 

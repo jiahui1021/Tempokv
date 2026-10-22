@@ -61,7 +61,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Generate Causal Forcing videos with TempoKV or bf16 KV caches."
     )
-    parser.add_argument("--mode", choices=("tempokv", "bf16", "trace"), default="tempokv")
+    parser.add_argument("--mode", choices=("tempokv", "bf16", "trace", "spectral_kv"), default="tempokv")
     parser.add_argument("--config", type=Path, help="TempoKV codec config JSON")
     parser.add_argument("--k-params", type=Path)
     parser.add_argument("--v-params", type=Path)
@@ -457,6 +457,10 @@ def _require_direct_persistent_routes(
 
 
 def run(args: argparse.Namespace) -> dict[str, object]:
+    suite_b_paths = None
+    if args.mode == "spectral_kv":
+        from tempokv.spectral_kv.config import runtime_environment
+        suite_b_paths = runtime_environment()
     model_config = args.model_config
     if model_config is None:
         model_config = RUNTIME_ROOT / "configs" / "causal_forcing_dmd_chunkwise.yaml"
@@ -617,12 +621,17 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         report["compression_span_frames"] = span_frames
     else:
         report["compression_span_frames"] = None
+    if suite_b_paths is not None:
+        report["spectral_kv"] = {"suite_id": "B_SPECTRAL_KV", **suite_b_paths}
     if args.dry_run:
         print(json.dumps(report, indent=2, ensure_ascii=False))
         return report
 
     paths["run"].mkdir(parents=True, exist_ok=True)
     environment = os.environ.copy()
+    if suite_b_paths is not None:
+        environment.update(suite_b_paths)
+        environment["SPECTRAL_KV_MODEL"] = str(paths["checkpoint"])
     # Caller-set schedule, kernel and diagnostic knobs survive the TEMPOKV_* cleanup.
     schedule_knobs = {
         name: environment[name]

@@ -329,6 +329,13 @@ for i, batch_data in enumerate(dataloader):
     # closes the same device interval.
     torch.cuda.synchronize(device)
     generation_start = time.perf_counter()
+    spectral_context = getattr(pipeline, "set_spectral_context", None)
+    if spectral_context is not None:
+        spectral_context(prompt_id=int(idx), generation_seed=prompt_seed,
+                         model=str(args.checkpoint_path))
+    research_context = getattr(pipeline, "set_research_context", None)
+    if research_context is not None:
+        research_context(prompt_index=int(idx), seed=prompt_seed)
     try:
         video, latents = pipeline.inference(
             noise=sampled_noise,

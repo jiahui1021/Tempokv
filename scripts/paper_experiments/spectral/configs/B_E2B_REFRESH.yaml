@@ -1,0 +1,7 @@
+{
+  "suite_id": "B_SPECTRAL_KV",
+  "profile": "b_e2b_refresh",
+  "experiments": [
+    "B_E2B_REFRESH"
+  ]
+}

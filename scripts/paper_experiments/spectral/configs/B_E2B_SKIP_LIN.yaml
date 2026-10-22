@@ -1,0 +1,8 @@
+{
+  "suite_id": "B_SPECTRAL_KV",
+  "profile": "b_e2b_skip_lin",
+  "experiments": ["B_E2B_REFRESH"],
+  "online": true,
+  "method": "KVSKIP_lin",
+  "calibration_file": "../../../../reports/spectral_kv/calibration/kvskip_lin.npz"
+}

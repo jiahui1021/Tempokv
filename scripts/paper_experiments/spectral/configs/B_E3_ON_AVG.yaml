@@ -1,0 +1,9 @@
+{
+  "suite_id": "B_SPECTRAL_KV",
+  "profile": "b_e3_on_avg",
+  "experiments": [
+    "B_E3_ON_ROLLOUT"
+  ],
+  "online": true,
+  "method": "SPECSUM_avg_R4_B1"
+}

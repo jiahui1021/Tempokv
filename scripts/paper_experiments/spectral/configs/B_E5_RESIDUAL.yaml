@@ -1,0 +1,7 @@
+{
+  "suite_id": "B_SPECTRAL_KV",
+  "profile": "b_e5_residual",
+  "experiments": [
+    "B_E5_RESIDUAL"
+  ]
+}

@@ -1,0 +1,43 @@
+{
+  "schema_version": "research.validation.v1",
+  "date": "2026-10-23",
+  "environment": {
+    "commit_sha": "25558596e49156a5fabef79150c2cf51240969bb",
+    "python": "3.12.13",
+    "platform": "macOS-26.5.1-arm64-arm-64bit",
+    "torch": "2.13.0",
+    "working_tree_dirty": true,
+    "research_source_tree_sha256": "7ddc28ceb64a805c7a2d11d193f935ee614ca33ca04c5c538c4e665a28f9bd8d",
+    "numpy": "2.5.1",
+    "cuda_available": false,
+    "gpu": "not available"
+  },
+  "research_tests": {
+    "command": "python -m pytest scripts/tests/test_research_*.py -q",
+    "passed": 586,
+    "failed": 0,
+    "seconds": 59.1
+  },
+  "legacy_regression": {
+    "command": "python -m pytest scripts/tests/test_spectral*.py scripts/tests/test_fitting_history_source.py scripts/tests/test_script_entry_regressions.py scripts/tests/test_cross_launch_defaults.py -q",
+    "passed": 325,
+    "skipped": 1,
+    "failed": 0,
+    "skip_reason": "optional SciPy missing"
+  },
+  "dry_run_configs": 10,
+  "synthetic_execution": [
+    "M1",
+    "M2",
+    "M3",
+    "E7_paired",
+    "M4"
+  ],
+  "source_compile": "passed",
+  "shell_syntax": "passed",
+  "real_gpu_generation": "not_run",
+  "real_model_results": null,
+  "scientific_conclusions": null,
+  "production_codec_changes": false,
+  "production_fitting_changes": false
+}

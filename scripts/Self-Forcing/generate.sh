@@ -5,9 +5,10 @@
 # 不采集 trace、不重新拟合，只使用 PARAM_DIR 下的参数。更换 PROMPTS /
 # OUTPUT_DIR 后可以重复运行。
 #
-# 两种模式：
+# 生成与分析模式：
 #   MODE=tempokv  使用 TempoKV 量化参数（默认），参数从 PARAM_DIR 读取
 #   MODE=bf16     不量化的对照基线，不需要 CONFIG / PARAM_DIR
+#   MODE=spectral BF16 上的只读频谱分析，需要 SPECTRAL_CONFIG / SPECTRAL_OUTPUT_DIR
 #
 # 用法（所有参数都用环境变量传入）：
 #   CHECKPOINT=/models/self_forcing_dmd.pt \
@@ -83,11 +84,17 @@ mode="${MODE:-tempokv}"
 
 case "$mode" in
   tempokv) ;;
-  bf16) ;;
-  *) die "MODE 必须是 tempokv 或 bf16（当前值：${mode}）" ;;
+  bf16|trace|spectral) ;;
+  *) die "MODE 必须是 tempokv、bf16、trace 或 spectral（当前值：${mode}）" ;;
 esac
 
 require_env CHECKPOINT WAN_MODEL_DIR PROMPTS
+if [[ "$mode" == "spectral" ]]; then
+  require_env SPECTRAL_CONFIG SPECTRAL_OUTPUT_DIR
+  export SPECTRAL_CONFIG="$(resolve_path "$SPECTRAL_CONFIG")"
+  export SPECTRAL_OUTPUT_DIR="$(resolve_path "$SPECTRAL_OUTPUT_DIR")"
+  [[ "${SINK_SIZE:-0}" == "0" ]] || die "spectral 模式要求 SINK_SIZE=0"
+fi
 
 # ---------- 目录 ----------
 
@@ -113,7 +120,7 @@ if [[ "$mode" == "tempokv" ]]; then
   default_units_per_launch "$v_predictor_mode"
 else
   param_dir=""
-  result_label="bf16"
+  result_label="$mode"
 fi
 
 model_type="${MODEL_TYPE:-self_forcing}"

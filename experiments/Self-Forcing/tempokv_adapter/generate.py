@@ -60,7 +60,7 @@ def build_parser() -> argparse.ArgumentParser:
         description="Generate Self-Forcing videos with TempoKV or bf16 KV caches."
     )
     parser.add_argument(
-        "--mode", choices=("tempokv", "bf16", "trace"), default="tempokv"
+        "--mode", choices=("tempokv", "bf16", "trace", "spectral", "spectral_kv"), default="tempokv"
     )
     parser.add_argument("--config", type=Path)
     parser.add_argument("--k-params", type=Path)
@@ -667,6 +667,22 @@ def _end_to_end_latency(
 
 
 def run(args: argparse.Namespace) -> dict[str, object]:
+    suite_b_paths = None
+    if args.mode == "spectral_kv":
+        from tempokv.spectral_kv.config import runtime_environment
+        suite_b_paths = runtime_environment()
+    spectral_paths = None
+    if args.mode == "spectral":
+        from tempokv.spectral.config import load_config as load_spectral_config
+
+        missing = [name for name in ("SPECTRAL_CONFIG", "SPECTRAL_OUTPUT_DIR") if not os.environ.get(name)]
+        if missing:
+            raise ValueError(f"spectral mode requires {', '.join(missing)}")
+        spectral_paths = {name: str(Path(os.environ[name]).expanduser().resolve())
+                          for name in ("SPECTRAL_CONFIG", "SPECTRAL_OUTPUT_DIR")}
+        load_spectral_config(spectral_paths["SPECTRAL_CONFIG"])
+        if args.sink_size != 0:
+            raise ValueError("spectral mode requires sink-size=0; sink/gapped windows need explicit positions")
     inputs = {
         "checkpoint": args.checkpoint.expanduser().resolve(),
         "prompts": args.prompts.expanduser().resolve(),
@@ -806,6 +822,8 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         "generation_command": generation_command,
         "output_dir": str(paths["run"]),
     }
+    if spectral_paths is not None:
+        report["spectral"] = spectral_paths
     if args.mode == "tempokv":
         report["parameters"] = parameters
         report["runtime_config"] = str(paths["runtime_config"])
@@ -832,12 +850,20 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             if args.span_frames is not None
             else latent_frames_for(args.frames)
         )
+    if suite_b_paths is not None:
+        report["spectral_kv"] = {"suite_id": "B_SPECTRAL_KV", **suite_b_paths}
     if args.dry_run:
         print(json.dumps(report, indent=2, ensure_ascii=False))
         return report
 
     paths["run"].mkdir(parents=True, exist_ok=True)
     environment = os.environ.copy()
+    if suite_b_paths is not None:
+        environment.update(suite_b_paths)
+        environment["SPECTRAL_KV_MODEL"] = str(paths["checkpoint"])
+    if spectral_paths is not None:
+        environment.update(spectral_paths)
+        environment["SPECTRAL_MODEL"] = str(paths["checkpoint"])
     if args.mode == "tempokv":
         runtime_payload = asdict(config)
         if not args.allow_triton_fallback and not args.torch_decoder:
@@ -895,7 +921,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             )
             if args.allow_triton_fallback or args.torch_decoder:
                 environment["TEMPOKV_ALLOW_TRITON_FALLBACK"] = "1"
-        if args.mode == "bf16":
+        if args.mode in ("bf16", "spectral", "spectral_kv"):
             # The legacy runtime also rotates dense cached K in complex64.  Keep the
             # BF16 reference on the same arithmetic path as its quantized run.
             environment["SELF_FORCING_CACHE_ROPE_PRECISION"] = "complex64"

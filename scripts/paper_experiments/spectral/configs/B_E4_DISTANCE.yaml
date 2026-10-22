@@ -1,0 +1,9 @@
+{
+  "suite_id": "B_SPECTRAL_KV",
+  "profile": "b_e4_distance",
+  "experiments": [
+    "B_E4_DISTANCE"
+  ],
+  "max_clean_frames": 192,
+  "max_lag": 24
+}

@@ -1,0 +1,162 @@
+{
+  "schema_version": "research.v1",
+  "backend": "self_forcing",
+  "source": "bf16",
+  "experiments": [
+    "E6"
+  ],
+  "seed": 0,
+  "frames": 237,
+  "local_attn_size": 24,
+  "sink_size": 0,
+  "max_events": 8,
+  "max_gpu_memory_gb": null,
+  "selection": {
+    "layers": [
+      0,
+      15,
+      29
+    ],
+    "heads": [
+      0,
+      6
+    ],
+    "chunk_indices": [
+      4
+    ],
+    "denoise_step_indices": [
+      0,
+      1,
+      2,
+      3
+    ]
+  },
+  "sampling": {
+    "queries_per_head": 64,
+    "max_history_blocks_per_event": 64,
+    "spatial_block_hw": [
+      4,
+      4
+    ],
+    "protect_recent_latent_frames": 6,
+    "protect_current_chunk": true,
+    "sink_policy": "preserve",
+    "max_capture_mb": 256,
+    "clean_blocks_per_stream": 256,
+    "max_clean_frames": 192,
+    "max_pairs": 8,
+    "max_pair_frame_distance": 24
+  },
+  "spectral": {
+    "cutoffs": [
+      0.1,
+      0.25,
+      0.4
+    ],
+    "score_cutoff": 0.25,
+    "temporal_windows": [
+      8,
+      16,
+      32
+    ],
+    "temporal_positions": 32
+  },
+  "oracle": {
+    "query_batch_size": 64,
+    "block_batch_size": 4,
+    "reference_dtype": "bf16",
+    "key_chunk_size": 1024
+  },
+  "intervention": {
+    "kind": "none",
+    "role": "kv",
+    "strengths": [
+      0.01,
+      0.03,
+      0.1
+    ],
+    "horizon_chunks": [
+      1,
+      2,
+      4,
+      8
+    ],
+    "calibration": "relative_kv_rmse",
+    "target_layer": 0,
+    "target_head": 0,
+    "target_chunk": 4,
+    "target_step": 0,
+    "target_block_rank": 0,
+    "paired_rollout": true,
+    "max_branches": 8,
+    "e6_step_policies": [
+      [
+        1,
+        1,
+        1,
+        1
+      ],
+      [
+        0.5,
+        0.5,
+        0.5,
+        0.5
+      ],
+      [
+        0.25,
+        0.25,
+        0.75,
+        0.75
+      ]
+    ]
+  },
+  "compression": {
+    "retention": [
+      0.25,
+      0.5,
+      0.75
+    ],
+    "policies": [
+      "random",
+      "uniform",
+      "similarity",
+      "attention",
+      "frequency",
+      "frequency_qk",
+      "oracle"
+    ],
+    "bits": [
+      2,
+      3,
+      4,
+      6,
+      8
+    ],
+    "mixed_bits": [
+      [
+        4,
+        2
+      ],
+      [
+        2,
+        4
+      ],
+      [
+        6,
+        4
+      ],
+      [
+        4,
+        6
+      ]
+    ],
+    "group_size": 64,
+    "allocation_max_states": 4096
+  },
+  "output": {
+    "root": "reports/research/e6_self_forcing",
+    "save_dense_kv": false,
+    "save_videos": false
+  },
+  "eps": 1e-12
+}
