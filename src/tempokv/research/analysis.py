@@ -110,6 +110,19 @@ def _cohort(manifest, row):
     return result
 
 
+def _part_state(folder,part):
+    """Use the completion record for this immutable part, not an older resume."""
+    nonce=part.stem.removeprefix("events-")
+    summary=folder/f"summary-{nonce}.json"
+    if not summary.exists():
+        if any(folder.glob("summary-*.json")):return "unpublished"
+        summary=folder/"summary.json"  # Legacy exports with one completion record.
+    try:
+        value=json.loads(summary.read_text(encoding="utf-8"))
+        return value.get("status","unknown") if isinstance(value,dict) else "unknown"
+    except (OSError,ValueError,TypeError):return "unknown"
+
+
 def _load(input_root):
     root = Path(input_root).expanduser().resolve()
     if not root.exists():
@@ -128,6 +141,10 @@ def _load(input_root):
             continue
         valid_runs.append(str(path))
         for part in sorted(path.parent.glob("*/events-*.csv")):
+            state=_part_state(path.parent,part)
+            if state!="completed":
+                diagnostics["excluded_failed_parts" if state=="failed" else "excluded_incomplete_parts"]+=1
+                continue
             with part.open(newline="", encoding="utf-8") as handle:
                 for raw in csv.DictReader(handle):
                     if raw.get("schema_version") != "research.v1" or raw.get("experiment_id") not in EXPERIMENTS:

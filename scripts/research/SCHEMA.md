@@ -103,3 +103,11 @@ Every row preserves fields not present in the fixed header in a JSON object. Com
 The snapshot stores `q_post`, `k_post`, `v`, optional exact `k_pre`, `pre_valid_mask`, absolute query/key positions and coordinates, protected/eligible/valid masks, optional actual complex `freqs`, and scalar Unicode `metadata_json`. Q is sampled; K/V cover the full effective window of a selected head. BF16 arrays are serialized exactly as float32 with original dtype metadata and restored to BF16 on load. Runtime grid, layout, source, original native callback, rotation definition and later CPU/injected callback are explicit. No pickle or implicit inverse RoPE. ZIP expanded size and NPY declared shape are checked before allocating arrays.
 
 Padding/partial-frame snapshots are rejected; runtime hooks assert the currently supported all-valid dense grid. Gapped whole-frame rolling windows and sinks are supported. Capture is bounded, exclusive and atomic. Snapshot files and raw reports are excluded from Git.
+
+## 2026-10-28 corrected contracts
+
+E5 generation details include `archive_protocol=research.e5.persistent.v2`, `intervention_scope`, `kept_abs_positions`, original/available eligible counts, requested budget, underfill, mask reuse, scoring-query count, actual query×key accesses and a separate clean/denoise cost summary. Evicted tokens cannot return; clean uses the same archive. This protocol is distinct from historical denoise-only outputs.
+
+E5 feature event identity includes sequence/entity, first/disappearance/reappearance/state-anchor frames, event type and feature coordinates. Repeated returns are distinct; resumes do not drop later events. New cumulative summaries are immutable parts; original summaries remain historical artifacts.
+
+Paired video indexes use `research.paired_videos.v1`; per-case manifests use `research.paired_video.v1` and record reference/case identity, prompt/seed context, resolved output, SHA256, frame dimensions/FPS/encoder, inference/decode/encode timing. These nested manifests are deliberately distinct from research.v1 sample manifests.

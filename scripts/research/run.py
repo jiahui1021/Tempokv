@@ -27,7 +27,7 @@ def main(argv=None):
     parser.add_argument("--max-prompts",type=int,default=2)
     parser.add_argument("--seeds",default=None)
     parser.add_argument("--checkpoint",type=Path,default=os.environ.get("CHECKPOINT"))
-    parser.add_argument("--model-root",type=Path,default=os.environ.get("WAN_MODEL_DIR"))
+    parser.add_argument("--model-root",type=Path,default=os.environ.get("FORCING_WAN_MODEL_DIR") or os.environ.get("WAN_MODEL_DIR"))
     parser.add_argument("--prompts",type=Path,default=os.environ.get("PROMPTS"))
     parser.add_argument("--codec-config",type=Path)
     parser.add_argument("--k-params",type=Path);parser.add_argument("--v-params",type=Path)
@@ -57,7 +57,9 @@ def main(argv=None):
           "reference":"native production callback on complete effective K/V window",
           "milestones":{"M0":"audit_and_read_only_identity","M1":"S1_S2_E1_local_E3_E4",
               "M2":"paired_E1_clean_E2_E6","M3":"S3_frozen_and_paired_E7","M4":"E5_causal_archives_and_declared_feature_evaluation"},
-          "runtime_inputs":{key:str(getattr(args,key)) if getattr(args,key) else "not provided" for key in ("checkpoint","model_root","prompts")},
+          "runtime_inputs":{key:str(getattr(args,key).expanduser().resolve()) if getattr(args,key) else "not provided" for key in ("checkpoint","model_root","prompts")},
+          "model_resolution":{"model_root":str(args.model_root.expanduser().resolve()) if args.model_root else None,
+                              "runtime_environment_variable":"FORCING_WAN_MODEL_DIR"},
           "gpu_generation":"not_run"}
     if args.dry_run:
         print(json.dumps(plan,indent=2,ensure_ascii=False));return 0
@@ -93,6 +95,7 @@ def main(argv=None):
         output=root/f"seed-{seed}"
         env={**os.environ,"RESEARCH_ENABLE":"1","RESEARCH_CONFIG_PATH":str(config_path.resolve()),
              "RESEARCH_MODEL":str(args.checkpoint.resolve()),"WAN_MODEL_DIR":str(args.model_root.resolve()),
+             "FORCING_WAN_MODEL_DIR":str(args.model_root.resolve()),
              "SELF_FORCING_CACHE_ROPE_PRECISION":"complex64"}
         mode="bf16"
         if config.source=="tempokv":

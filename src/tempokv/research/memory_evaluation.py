@@ -3,13 +3,13 @@ from .io import RunStore,atomic_json
 from .memory_metrics import evaluate_reappearance,load_reappearance_bundle
 
 
-def evaluate_bundle(config,path):
+def evaluate_bundle(config,path,*,resume=None):
     if set(config.experiments)!={'E5'}:raise ValueError('entity/state feature reports require a separate E5 configuration')
     bundle=load_reappearance_bundle(path)
     result=evaluate_reappearance(**bundle)
     # A supplied feature bundle is its own evidence cohort; it is never promoted
     # to a model-generation run by the file name or a claimed extractor name.
-    store=RunStore(config,origin='supplied_video_features',metadata={'feature_bundle':str(path),'feature_metadata':bundle.get('source_metadata')})
+    store=RunStore(config,origin='supplied_video_features',metadata={'feature_bundle':str(path),'feature_metadata':bundle.get('source_metadata')},resume=resume)
     for row in result['rows']:
         store.write('E5',{**row,'strategy':'supplied_entity_state_features','policy_id':row.get('entity_id'),
             'reappearance_score':row.get('matched_reappearance_identity_cosine')})

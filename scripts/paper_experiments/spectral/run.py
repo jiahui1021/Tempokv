@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import tempfile
 import uuid
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -60,14 +61,31 @@ def main(argv=None):
                    "SPECTRAL_KV_OUTPUT_DIR": str(output)}
     if args.runtime == "self_forcing":
         environment["WAN_MODEL_DIR"] = str(args.model_root.resolve())
+        # Wan's actual model loader reads this name. Keep the historical alias
+        # synchronized so an inherited environment cannot select another model.
+        environment["FORCING_WAN_MODEL_DIR"] = str(args.model_root.resolve())
     elif args.window != -1:
         # This explicitly selected suite-B window is the repository's
         # sliding-window ablation, which its existing launcher requires labeled.
         environment["CAUSAL_FORCING_BENCHMARK"] = "1"
     if args.dry_run:
         command.append("--dry-run")
-    print(json.dumps({"suite_id": config.suite_id, "experiments": config.experiments, "profile": config.profile,
-                      "trajectory_changed": config.online and parse_method(config.method).family != "full", "command": command}, ensure_ascii=False), flush=True)
+    launch={"suite_id": config.suite_id, "experiments": config.experiments, "profile": config.profile,
+                      "trajectory_changed": config.online and parse_method(config.method).family != "full", "command": command,
+                      "model_resolution":{"model_root":str(args.model_root.resolve()),
+                          "contract":"FORCING_WAN_MODEL_DIR" if args.runtime == "self_forcing" else "--model_root"}}
+    if not args.dry_run:
+        folder=output/"launches";folder.mkdir(parents=True,exist_ok=True)
+        manifest=folder/(uuid.uuid4().hex+".json")
+        launch["launch_manifest"]=str(manifest)
+        handle=tempfile.NamedTemporaryFile("w",encoding="utf-8",dir=folder,suffix=".tmp",delete=False)
+        temporary=Path(handle.name)
+        try:
+            with handle:
+                json.dump(launch,handle,indent=2,sort_keys=True);handle.flush();os.fsync(handle.fileno())
+            os.link(temporary,manifest)
+        finally:temporary.unlink(missing_ok=True)
+    print(json.dumps(launch, ensure_ascii=False), flush=True)
     return subprocess.run(command, cwd=ROOT, env=environment, check=False).returncode
 
 

@@ -23,7 +23,96 @@ from tempokv.spectral_kv.stats import fit_distance_decay
 
 
 def finite(value):
-    return isinstance(value, (float, int)) and math.isfinite(value)
+    return isinstance(value, (float, int)) and not isinstance(value, bool) and math.isfinite(value)
+
+
+def _canonical(value):
+    return json.dumps(value, sort_keys=True, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
+
+
+def _cohort_spec(metadata):
+    """Keep replicate identities out, but preserve measurement definitions.
+
+    Seeds and row-retention limits identify repetitions/storage rather than a
+    different measurement. All remaining config fields are conservative cohort
+    boundaries, including sampled layers/heads/steps, band counts, channels,
+    context limits, methods, precision and calibration paths.
+    """
+    config = metadata.get("config", {})
+    config = config if isinstance(config, dict) else {"unparsed_config": config}
+    excluded = {"profile", "seed", "max_stat_rows", "experiments"}
+    spec = {
+        "profile": metadata.get("profile", "offline"),
+        "runtime": metadata.get("runtime", "offline"),
+        "local_attn_size": metadata.get("local_attn_size", "unknown"),
+        "sink_size": metadata.get("sink_size", 0),
+        "trajectory_changed": metadata.get("trajectory_changed", False),
+        "measurement_config": {key: value for key, value in config.items() if key not in excluded},
+    }
+    # Paths/identities are explicit: model and checkpoint must not collapse to
+    # the runtime family. Unknown or absent provenance stays visible as such.
+    for key in ("model", "checkpoint", "checkpoint_path", "model_root", "model_config", "runtime_config",
+                "git_commit", "source", "coordinate_system", "source_contract", "grid", "effective_grids",
+                "heads", "head_dim", "stride", "latent_frames", "k_params", "v_params"):
+        spec[key] = metadata.get(key)
+    terminal = metadata.get("terminal_clean_collection", {})
+    spec["terminal_clean_policy"] = {key: terminal.get(key) for key in
+        ("retain_final_cache_effective", "additional_clean_requested")}
+    return spec
+
+
+def _provenance(root, metadata):
+    cohort = _cohort_spec(metadata)
+    return {
+        "source_run": str(root),
+        "source_id": hashlib.sha256(str(root).encode()).hexdigest()[:16],
+        "cohort_id": hashlib.sha256(_canonical(cohort).encode()).hexdigest()[:16],
+        "profile": metadata.get("profile", "offline"),
+        "model": metadata.get("model"),
+        "checkpoint": metadata.get("checkpoint", metadata.get("checkpoint_path")),
+        "model_root": metadata.get("model_root"),
+        "source": metadata.get("source", "not specified"),
+        "trajectory_changed": metadata.get("trajectory_changed", False),
+    }
+
+
+def _spectrum_observations(rows):
+    """One common metric row per observed frame/window, independent of bands."""
+    identity = ("source_run", "prompt_id", "sample_id", "rank", "layer", "head", "role", "coordinate",
+                "source_kind", "record_kind", "dc_definition", "frame_idx", "frame_idx0", "chunk_idx", "step_idx",
+                "phase", "window_start_frame", "window_end_frame", "window_frames", "window_size", "predictor")
+    metrics = ("dc_ratio", "r95", "r95_excl_dc", "r95_incl_dc", "r95_cycles", "total_power",
+               "non_dc_power", "zero_signal", "zero_non_dc", "valid", "status")
+    provenance = ("source_id", "cohort_id", "profile", "model", "checkpoint", "model_root", "source", "trajectory_changed")
+    observations = {}
+    for source in rows:
+        if not any(key in source for key in metrics):
+            continue
+        row = dict(source)
+        kind = row.get("record_kind", "temporal" if row.get("statistic") == "temporal_spectrum" else "spatial")
+        row["record_kind"] = kind
+        row["dc_definition"] = row.get("dc_definition", "joint_t0_h0_w0" if kind == "temporal" else "spatial_h0_w0")
+        key = _canonical([row.get(field) for field in identity])
+        projected = {field: row.get(field) for field in (*identity, *metrics, *provenance)}
+        if key in observations:
+            previous = observations[key]
+            if any(previous[field] != projected[field] for field in metrics):
+                raise ValueError("inconsistent common spectrum metrics across repeated frequency bands")
+        else:
+            observations[key] = projected
+    return list(observations.values())
+
+
+def _dc_summary(observations):
+    fields = ("record_kind", "dc_definition", "layer", "head", "role", "coordinate", "source_kind",
+              "window_frames", "window_size", "model", "checkpoint", "cohort_id")
+    groups = defaultdict(list)
+    for row in observations:
+        if finite(row.get("dc_ratio")) and row.get("valid", True) is not False:
+            groups[tuple(row.get(field) for field in fields)].append(row)
+    return [{**dict(zip(fields, key)), "dc_ratio": float(np.mean([r["dc_ratio"] for r in values])),
+             "observation_count": len(values), "source_runs": sorted({r["source_run"] for r in values})}
+            for key, values in sorted(groups.items(), key=lambda item: str(item[0]))]
 
 
 def write_csv(path, rows):
@@ -44,20 +133,37 @@ def analyze(input_dir, output_dir, experiment=None, _metadata=None):
             metadata.append((path.parent, item))
     if not metadata:
         raise ValueError("no suite B metadata found; suite A is deliberately excluded")
+    excluded=[];selected=[]
+    for root,item in metadata:
+        state=item.get("status")
+        if state is not None and state!="completed":
+            excluded.append({"source_run":str(root),"status":state})
+        else:selected.append((root,item))
+    metadata=selected
     if output_dir.exists():
         output_dir = output_dir / ("analysis-" + uuid.uuid4().hex[:12])
     output_dir.mkdir(parents=True, exist_ok=False)
+    with (output_dir/"analysis_selection.json").open("x",encoding="utf-8") as handle:
+        json.dump({"excluded_incomplete_or_failed":excluded,"retained_runs":len(metadata),
+                   "legacy_unknown_status_runs":sum(item.get("status") is None for _,item in metadata)},handle,indent=2)
+        handle.write("\n")
     cohorts = defaultdict(list)
     for root, item in metadata:
-        key = (item.get("profile", "offline"), item.get("runtime", "offline"), item.get("local_attn_size", "unknown"),
-               item.get("sink_size", 0), item.get("trajectory_changed", False))
+        key = _canonical(_cohort_spec(item))
         cohorts[key].append((root, item))
+    sources = [{**_provenance(root, item), "cohort": _cohort_spec(item), "metadata": item} for root, item in metadata]
+    with (output_dir / "sources.json").open("x", encoding="utf-8") as handle:
+        json.dump(sources, handle, indent=2, ensure_ascii=False, allow_nan=False)
+        handle.write("\n")
     if len(cohorts) > 1:
-        index = ["# B_SPECTRAL_KV — separate settings", "", "Runtime, window, sink, profile and trajectory mode are never averaged together.", ""]
+        index = ["# B_SPECTRAL_KV — separate settings", "",
+                 "Model/checkpoint, measurement configuration, runtime, window, sink and trajectory mode are never averaged across cohorts.",
+                 "Full source metadata and configuration are preserved in [sources.json](sources.json).", ""]
         for key, group in sorted(cohorts.items(), key=lambda pair: str(pair[0])):
             label = "setting-" + hashlib.sha256(str(key).encode()).hexdigest()[:10]
             analyze(input_dir, output_dir / label, experiment, _metadata=group)
-            index.append(f"- [{key}]({label}/summary.md)")
+            spec = _cohort_spec(group[0][1])
+            index.append(f"- [{label}: model={spec['model']}; checkpoint={spec['checkpoint']}; runtime={spec['runtime']}; profile={spec['profile']}]({label}/summary.md)")
         (output_dir / "summary.md").write_text("\n".join(index) + "\n", encoding="utf-8")
         return output_dir
     os.environ.setdefault("MPLCONFIGDIR", str(Path(tempfile.gettempdir()) / "tempokv-spectral-kv-mpl"))
@@ -68,6 +174,7 @@ def analyze(input_dir, output_dir, experiment=None, _metadata=None):
     index = ["# B_SPECTRAL_KV — separate experiment reports", "",
              "Suite A means frequency / sensitivity / token selection; none of its outputs are merged here.", "",
              "Synthetic inputs, when present, are workflow checks and are not research evidence.", "",
+             "Full source metadata and configuration: [sources.json](sources.json).", "",
              "| Experiment | Rows | Status |", "|---|---:|---|"]
     for exp in selected:
         destination = output_dir / exp
@@ -76,22 +183,25 @@ def analyze(input_dir, output_dir, experiment=None, _metadata=None):
         for root, meta in metadata:
             source = root / exp / "records.jsonl"
             if source.is_file():
+                provenance = _provenance(root, meta)
                 for line in source.read_text(encoding="utf-8").splitlines():
                     row = json.loads(line)
                     if row.get("suite_id", SUITE_ID) != SUITE_ID or row.get("experiment_id", exp) != exp:
                         raise ValueError("conflicting experiment identity in records")
-                    rows.append({**row, "source_run": str(root), "profile": meta.get("profile", "offline"),
-                                 "trajectory_changed": meta.get("trajectory_changed", False)})
+                    rows.append({**row, **provenance})
         write_csv(destination / "records.csv", rows)
         measured = [r for r in rows if r.get("status", "ok") in {"ok", "measured"}]
         status = "measured" if measured else "not measured"
         index.append(f"| [{exp}]({exp}/summary.md) | {len(rows)} | {status} |")
         summary = [f"# {exp}", "", f"Suite: {SUITE_ID}; records: {len(rows)}; status: {status}.", ""]
+        summary += ["Source model/checkpoint and complete measurement settings are preserved in [sources.json](../sources.json).", ""]
         fig, ax = plt.subplots(figsize=(9, 5), constrained_layout=True)
         points = False
         if exp in {"B_E1_SPECTRUM", "B_E5_RESIDUAL"}:
+            observations = _spectrum_observations(rows)
+            write_csv(destination / "spectrum_observations.csv", observations)
             groups = defaultdict(dict)
-            for row in rows:
+            for row in observations:
                 if row.get("record_kind", "spatial") != "spatial" or not finite(row.get("r95")):
                     continue
                 key = (row.get("profile"), row.get("role"), row.get("coordinate"), row.get("head"), row.get("source_kind", "original"))
@@ -102,12 +212,11 @@ def analyze(input_dir, output_dir, experiment=None, _metadata=None):
                 points = True
             ax.set(xlabel="Layer (heads and coordinates separate)", ylabel="r95 after removing DC", ylim=(-.02, 1.02))
             summary += ["r95 uses radial cycles/token divided by sqrt(0.5). DC-free results are undefined when no non-DC energy exists.", ""]
-            dc_groups = defaultdict(list)
-            for row in rows:
-                if finite(row.get("dc_ratio")):
-                    dc_groups[(row.get("layer"), row.get("head"), row.get("role"), row.get("coordinate"), row.get("source_kind"))].append(row["dc_ratio"])
-            write_csv(destination / "dc_summary.csv", [{"layer": k[0], "head": k[1], "role": k[2], "coordinate": k[3],
-                      "source_kind": k[4], "dc_ratio": float(np.mean(v))} for k, v in dc_groups.items()])
+            dc_summary = _dc_summary(observations)
+            write_csv(destination / "dc_summary.csv", dc_summary)
+            write_csv(destination / "spatial_dc_summary.csv", [r for r in dc_summary if r["record_kind"] == "spatial"])
+            write_csv(destination / "joint_dc_summary.csv", [r for r in dc_summary if r["record_kind"] == "temporal"])
+            summary += ["Spatial DC and joint temporal/spatial DC are summarized separately. Common frame/window metrics are counted once, independent of repeated frequency-band rows. Joint-window lengths remain separate during warm-up.", ""]
             temporal = [r for r in rows if r.get("record_kind") == "temporal"]
             write_csv(destination / "joint_temporal_spatial.csv", temporal)
         elif exp == "B_E4_DISTANCE":
@@ -116,8 +225,9 @@ def analyze(input_dir, output_dir, experiment=None, _metadata=None):
                 chosen = [r for r in rows if r["source_run"] == source_run]
                 threshold = next((m.get("config", {}).get("correlation_threshold", .9) for root, m in metadata if str(root) == source_run), .9)
                 rr, ff = fit_distance_decay(chosen, threshold)
-                radius += [{**r, "source_run": source_run} for r in rr]
-                fits += [{**r, "source_run": source_run} for r in ff]
+                provenance = {key: chosen[0][key] for key in _provenance(source_run, {})}
+                radius += [{**r, **provenance} for r in rr]
+                fits += [{**r, **provenance} for r in ff]
             write_csv(destination / "rstar.csv", radius); write_csv(destination / "powerlaw_fits.csv", fits)
             grouped = defaultdict(list)
             for row in radius:

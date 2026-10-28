@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 from collections import defaultdict
 import csv
+import hashlib
 import json
 import math
 import os
@@ -64,20 +65,104 @@ def _empty(ax, label):
     ax.set_title(label)
 
 
-def analyze(input_dir: Path, output_dir: Path) -> Path:
-    roots = []
-    metadata = []
+def _experiment_identity(meta):
+    """Identity of measurements that may share an aggregate, without paths."""
+    config = dict(meta["config"])
+    config.pop("output_dir", None)
+    windows = meta.get("effective_windows", [])
+    runtime = {
+        json.dumps({key: window[key] for key in (
+            "dtype", "attention_backend", "softmax_scale", "mask", "rope_precision"
+        ) if key in window}, sort_keys=True, separators=(",", ":"))
+        for window in windows
+    }
+    identity = {
+        "config": config,
+        "model": {key: meta[key] for key in (
+            "model", "checkpoint_sha256", "model_sha256", "weight_id", "model_config", "git_commit"
+        ) if key in meta},
+        "source": meta.get("source"),
+        "coordinates": meta["coordinates"],
+        "effective_grids": meta.get("effective_grids", {}),
+        "runtime": sorted(runtime),
+    }
+    return json.dumps(identity, sort_keys=True, separators=(",", ":"))
+
+
+def _select_samples(input_dir):
+    """Exclude unfinished attempts and retain one completed retry per identity."""
+    discovered = []
     for path in sorted(input_dir.rglob("metadata.json")):
-        item = json.loads(path.read_text(encoding="utf-8"))
-        if "coordinates" in item and "config" in item and item.get("suite_id", "A_FREQUENCY_ORACLE") == "A_FREQUENCY_ORACLE":
-            roots.append(path.parent)
-            metadata.append(item)
-    if not roots:
+        meta = json.loads(path.read_text(encoding="utf-8"))
+        if "coordinates" in meta and "config" in meta and meta.get("suite_id", "A_FREQUENCY_ORACLE") == "A_FREQUENCY_ORACLE":
+            discovered.append((path, meta))
+    if not discovered:
         raise ValueError(f"no spectral sample metadata found under {input_dir}")
+    selection = {
+        "discovered_samples": len(discovered), "retained_samples": 0,
+        "excluded_failed_samples": 0, "excluded_incomplete_samples": 0,
+        "excluded_retry_samples": 0, "unknown_generation_seed_samples": 0,
+        "excluded": [], "retained_metadata": [],
+    }
+    completed = []
+    for path, meta in discovered:
+        if meta.get("status") != "completed":
+            reason = "failed" if meta.get("status") == "failed" else "incomplete_or_unknown_status"
+            selection["excluded_failed_samples" if reason == "failed" else "excluded_incomplete_samples"] += 1
+            selection["excluded"].append({"metadata": str(path), "reason": reason})
+        else:
+            completed.append((path, meta))
+    signatures = {_experiment_identity(meta) for _, meta in completed}
+    if len(signatures) > 1:
+        raise ValueError(
+            "completed samples have different experiment configurations or model/runtime identities; "
+            "analyze each configuration/model separately (output_dir alone may differ)"
+        )
+    signature = next(iter(signatures)) if signatures else None
+    selection["experiment_identity"] = json.loads(signature) if signature else None
+    selection["experiment_fingerprint"] = hashlib.sha256(signature.encode()).hexdigest()[:16] if signature else None
+    batch_sizes = defaultdict(int)
+    for path, _ in discovered:
+        batch_sizes[path.parent.parent] += 1
+    kept = {}
+    for path, meta in sorted(completed, key=lambda item: (item[0].stat().st_mtime_ns, str(item[0]))):
+        # Rank and output path are assignment details, not independent samples.
+        # Missing generation seeds cannot safely be replaced by the analysis
+        # seed: legacy reports retain their inference identity instead.
+        generation_seed = meta.get("generation_seed")
+        if generation_seed is None:
+            selection["unknown_generation_seed_samples"] += 1
+            sampling = {"inference_id": meta.get("inference_id", str(path.parent.parent))}
+        else:
+            sampling = {"generation_seed": generation_seed}
+        identity = json.dumps({
+            "prompt_id": meta.get("prompt_id"), "sample_id": meta.get("sample_id"),
+            "batch_size": batch_sizes[path.parent.parent], **sampling,
+            "prompt_identity": {key: meta[key] for key in (
+                "prompt", "prompt_text", "prompt_sha256", "prompt_file", "prompts_path", "dataset"
+            ) if key in meta},
+        }, sort_keys=True, separators=(",", ":"))
+        previous = kept.get(identity)
+        if previous is not None:
+            selection["excluded_retry_samples"] += 1
+            selection["excluded"].append({
+                "metadata": str(previous[0]), "reason": "completed_retry",
+                "retained_metadata": str(path),
+            })
+        kept[identity] = (path, meta)
+    retained = sorted(kept.values(), key=lambda item: str(item[0]))
+    selection["retained_samples"] = len(retained)
+    selection["retained_metadata"] = [str(path) for path, _ in retained]
+    return [path.parent for path, _ in retained], [meta for _, meta in retained], selection
+
+
+def analyze(input_dir: Path, output_dir: Path) -> Path:
+    roots, metadata, selection = _select_samples(input_dir)
     # A new analysis never overwrites an earlier report.
     if output_dir.exists():
         output_dir = output_dir / f"analysis-{uuid.uuid4().hex[:12]}"
     output_dir.mkdir(parents=True, exist_ok=False)
+    (output_dir / "analysis_selection.json").write_text(json.dumps(selection, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     spatial = read_rows([r / "spectrum/spatial_energy.csv" for r in roots])
     blocks = read_rows([r / "sensitivity/block_scores.csv" for r in roots])
     correlations = read_rows([r / "sensitivity/correlation.csv" for r in roots])
@@ -165,7 +250,10 @@ def analyze(input_dir: Path, output_dir: Path) -> Path:
     synthetic = any("synthetic" in str(meta.get("source", "")).lower() for meta in metadata)
     lines = ["# Spectral experiment summary", "",
              "Synthetic CPU smoke data; not research evidence." if synthetic else "Results from the supplied spectral report files.", "",
-             f"- Samples: {len(roots)}; failed samples: {sum(m['status'] != 'completed' for m in metadata)}.",
+             f"- Samples retained: {len(roots)} / {selection['discovered_samples']} discovered.",
+             f"- Excluded failed samples: {selection['excluded_failed_samples']}; incomplete/unknown status: {selection['excluded_incomplete_samples']}; completed retries: {selection['excluded_retry_samples']}.",
+             f"- Samples without generation_seed: {selection['unknown_generation_seed_samples']} (kept distinct by inference_id; no seed inferred).",
+             "- Selection and exclusions are recorded in analysis_selection.json. Completed retries use the newest metadata modification time, with the path as a deterministic tie-break.",
              f"- Spatial rows: {len(spatial)} ({'measured' if spatial else 'not measured'}).",
              f"- Temporal ratio rows: {len(temporal)} ({'measured' if temporal else 'not measured'}).",
              f"- Block oracle rows: {len(blocks)} ({'measured' if blocks else 'not measured'}).",

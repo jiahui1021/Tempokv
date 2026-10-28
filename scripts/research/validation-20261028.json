@@ -1,0 +1,86 @@
+{
+  "schema_version": "research.validation.v1",
+  "date": "2026-10-28",
+  "environment": {
+    "commit_sha": "6e1e26e3380b58f91a7bec7780ddbf08e21ede5c",
+    "python": "3.12.13",
+    "platform": "macOS-26.5.1-arm64-arm-64bit",
+    "torch": "2.13.0",
+    "working_tree_dirty": true,
+    "research_source_tree_sha256": "e202407845ed15dd101ed8ca9ea78a152171665c877e71bd27b58a3d276cd511",
+    "numpy": "2.5.1",
+    "cuda_available": false,
+    "gpu": "not available",
+    "resolved_model_root": null
+  },
+  "combined_regression": {
+    "command": "python -m pytest scripts/tests/test_research_*.py scripts/tests/test_spectral*.py -q",
+    "initial_repair_run": {
+      "passed": 957,
+      "skipped": 1,
+      "failed": 0,
+      "seconds": 27.01
+    },
+    "extended_failure_filter_run": {
+      "passed": 959,
+      "skipped": 1,
+      "failed": 0,
+      "seconds": 28.62
+    },
+    "final_full_run": {
+      "passed": 958,
+      "skipped": 1,
+      "failed": 1,
+      "seconds": 53.28,
+      "failure": "a test assumed ordering of random CSV part names; data and legacy IDs were correct"
+    },
+    "resolution": "test now checks preserved event identity independently of filesystem/random-name ordering; no implementation change for this resolution",
+    "post_resolution_targeted": {
+      "passed": 39,
+      "failed": 0,
+      "seconds": 32.24,
+      "files": [
+        "test_research_runtime_fixes.py",
+        "test_research_analysis.py",
+        "test_spectral_kv_review_fixes.py"
+      ]
+    },
+    "unique_cases": 959,
+    "remaining_known_failures": 0,
+    "skip_reason": "optional SciPy comparison",
+    "note": "No unobserved final all-959-passed invocation is claimed; full and targeted evidence are preserved separately."
+  },
+  "suite_counts": {
+    "research": 605,
+    "A": 53,
+    "B": 301
+  },
+  "findings_fixed": [
+    "R1",
+    "R2",
+    "R3",
+    "R4",
+    "R5",
+    "R6",
+    "R7",
+    "R8",
+    "R9"
+  ],
+  "paired_video_verification": "actual system FFmpeg H.264 encode, ffprobe and RGB decode; reference and two branches",
+  "e5_protocol": "research.e5.persistent.v2",
+  "e5_scope_configs": "all runtime layers/heads; selected local scope remains explicit",
+  "cpu_cli_and_saved_data_analysis": [
+    "A smoke + analysis",
+    "B smoke + analysis",
+    "E5 persistent replay + feature controls + analysis"
+  ],
+  "real_gpu_generation": "not_run",
+  "scientific_results": null,
+  "production_codec_fitting_changes": false,
+  "unaffected_legacy_regression": {
+    "passed": 15,
+    "failed": 0,
+    "seconds": 10.21
+  },
+  "additional_integrity_repair": "B explicit failed runs and research immutable failed/incomplete/orphan parts are excluded from analysis"
+}

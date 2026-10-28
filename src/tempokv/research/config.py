@@ -59,6 +59,7 @@ class Intervention:
     paired_rollout: bool = False
     max_branches: int = 4
     e6_step_policies: tuple[tuple[float, ...], ...] = ()
+    e5_scope: str = "selected"
 
 @dataclass(frozen=True)
 class Compression:
@@ -145,6 +146,8 @@ class ResearchConfig:
             raise ValueError("paired target layer/head must be included in clean capture selection")
         if self.intervention.role not in {"k", "v", "kv"} or self.intervention.calibration not in {"relative_kv_rmse", "local_d_att"}:
             raise ValueError("invalid intervention role or calibration protocol")
+        if self.intervention.e5_scope not in {"selected","all"}:
+            raise ValueError("E5 scope must be selected or all runtime layers/heads")
         if any(not math.isfinite(x) or x < 0 for x in self.intervention.strengths): raise ValueError("strengths must be nonnegative")
         if any(type(x) is not int or x < 0 for x in self.intervention.horizon_chunks): raise ValueError("horizons must be nonnegative")
         if any(not 0 <= x <= 1 for x in self.compression.retention): raise ValueError("retention must be in [0,1]")

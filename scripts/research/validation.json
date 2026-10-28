@@ -46,5 +46,7 @@
     "additional_unique_test": "propagation dose/step/head partition and unmatched-calibration exclusion",
     "research_unique_passed": 587,
     "full_research_run_before_additional_test": 586
-  }
+  },
+  "historical_record": true,
+  "current_repair_record": "validation-20261028.json"
 }

@@ -74,19 +74,40 @@ def remove_attention(q, k, v, remove=(), *, attention_fn: Attention = reference_
 
 
 def attention_mass(q, k, blocks: list[Block], *, chunk_size: int = 1024) -> list[float]:
-    """Two-pass FP32 QK, O(B*heads*Q*chunk_size) memory, full-window denominator."""
+    """Two-pass FP32 QK with a separately centered full-window normalizer.
+
+    Keeping the large maximum separate from log(sum(exp(score - maximum)))
+    preserves normalization when a common logit offset would erase the latter
+    in an absolute FP32 logsumexp.  Memory is O(B*heads*Q*chunk_size).
+    """
+    if type(chunk_size) is not int or chunk_size < 1:
+        raise ValueError("chunk_size must be a positive integer")
+    if q.ndim != 4 or k.ndim != 4 or q.shape[0] != k.shape[0] or q.shape[2:] != k.shape[2:]:
+        raise ValueError("expected matching [B,Q/K,heads,D] query and key shapes")
+    if q.shape[1] < 1 or k.shape[1] < 1:
+        raise ValueError("attention_mass requires nonempty query and key sequences")
     scale = q.shape[-1] ** -0.5
     query = q.float().transpose(1, 2)
-    log_z = None
+    maximum = centered_log_z = None
     for start in range(0, k.shape[1], chunk_size):
         scores = (query @ k[:, start:start + chunk_size].float().permute(0, 2, 3, 1)) * scale
-        chunk_z = torch.logsumexp(scores, dim=-1)
-        log_z = chunk_z if log_z is None else torch.logaddexp(log_z, chunk_z)
+        chunk_maximum = scores.amax(dim=-1)
+        chunk_log_z = torch.logsumexp(scores - chunk_maximum[..., None], dim=-1)
+        if maximum is None:
+            maximum, centered_log_z = chunk_maximum, chunk_log_z
+        else:
+            next_maximum = torch.maximum(maximum, chunk_maximum)
+            centered_log_z = torch.logaddexp(
+                centered_log_z + (maximum - next_maximum),
+                chunk_log_z + (chunk_maximum - next_maximum),
+            )
+            maximum = next_maximum
     result = []
     for block in blocks:
         indices = torch.tensor(block.indices, dtype=torch.long, device=k.device)
         scores = (query @ k.index_select(1, indices).float().permute(0, 2, 3, 1)) * scale
-        result.append(float(torch.exp(scores - log_z[..., None]).sum(dim=-1).mean()))
+        centered_scores = scores - maximum[..., None]
+        result.append(float(torch.exp(centered_scores - centered_log_z[..., None]).sum(dim=-1).mean()))
     return result
 
 

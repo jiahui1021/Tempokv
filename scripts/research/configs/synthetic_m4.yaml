@@ -66,7 +66,8 @@
       1,
       2,
       4
-    ]
+    ],
+    "e5_scope": "all"
   },
   "output": {
     "root": "reports/research/synthetic_m4"

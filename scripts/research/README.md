@@ -12,7 +12,7 @@ This is the `research.v1` suite for **Self-Forcing / Wan**, implemented after th
 | M3 | S3 exact token budgets; frozen E7 2×2; paired single-event E7; bounded full-window snapshot and offline rebuild | passed | not run |
 | M4 | E5 equal-budget causal archives, declared entity/state feature evaluator, four return scenes + static controls, real-evidence gate | passed | real reappearance/quality unmeasured |
 
-The research suite has **587 passing CPU tests**. No model weights were downloaded, no GPU was rented, and no experiment establishes a scientific hypothesis. The [one-page result note](RESULTS.md) distinguishes numerical verification from missing research data.
+The research suite has **605 passing CPU tests**. No model weights were downloaded, no GPU was rented, and no experiment establishes a scientific hypothesis. The [one-page result note](RESULTS.md) distinguishes numerical verification from missing research data.
 
 ## Install and run
 
@@ -62,7 +62,7 @@ Use `m2_self_forcing.yaml` for paired E1/E2, `e6_self_forcing.yaml` for E6, `e7_
 - S3 compares the same actual candidate-token budget, including partial last blocks and fixed protection. Its LOO-sorted `oracle` is a diagnostic ranking, not a globally optimal subset solver. E4 enumerates a bounded small allocation set with actual joint attention error and includes packed payload, FP32 scales, group and shape metadata. Controls obey the same upper budget and report their actual spend. Generation error is never approximated by adding local errors.
 - E7 B/D share a BF16-derived frozen selection. A/B retain the original full cache; C/D retain the full quantized logical cache. Gathered attention inputs, logical packed costs and resident tensor backing are separate. `interaction`, `(D-C)` and `(B-A)` are nonlinear error contrasts, not a physical synergy test. Jensen correction stays off.
 - `source=tempokv` is restricted to E7 observation. A decoded TempoKV trajectory by itself does not supply the matched BF16 counterfactual: those rows are explicitly unmeasured. `quant_prune_2x2(..., quantized_pair=...)` accepts a matching snapshot identity/absolute-position map and optional measured storage metadata; missing codec costs remain unknown. The executable paired runner uses separately labeled independent fake quantization. Actual fitted TempoKV paired GPU generation is **not verified**.
-- E5 attention-access selection uses each branch's already generated history. Its labeled Oracle uses a bounded sample of reference future Q; when no future Q is captured it falls back to current Q with an explicit label and the same budget. It is a diagnostic, not an optimum. The full cache remains allocated, so no memory-saving or production-speed claim follows.
+- E5 uses a persistent logical archive on **both denoising and clean refresh**. Once evicted, a position cannot reenter scoring or attention; each chunk's mask remains fixed through all its denoise steps and its clean pass. New generated positions may enter the next decision. `intervention.e5_scope=all` (the shipped E5 configurations) applies the policy to every actual runtime layer/head; `selected` is explicitly a local intervention. Sampling selections remain independent instrumentation limits. Actual query×key accesses include clean refresh, scoring is separate, and a rolling window that cannot fill a budget reports its actual underfill. The protocol is `research.e5.persistent.v2`; it must not be pooled or resumed as an old denoise-only run. The labeled Oracle scores only the available archive using a bounded sample of reference future Q, with a declared current-Q fallback when absent. Full native backing remains allocated solely for diagnostics, so this does not claim resident-memory or production-speed savings.
 
 ## Frozen local replay
 
@@ -100,6 +100,12 @@ python scripts/research/run.py --config scripts/research/configs/e5_self_forcing
 
 A heavier real E5 run additionally needs `--e5-evidence evidence.json`. `heavy_benchmark_gate` requires actual same-cohort paired E1/E2 measurements for at least two prompt/seed units, event-linked criteria, and an explicit `explore_memory` rationale. It accepts zero effects and negative spectral findings when the stated exploration criterion is supported. Synthetic records and an absent rationale do not pass. No such real evidence exists in the delivered CPU runs.
 
+## Repair verification (2026-10-28)
+
+The nine review findings are fixed; see [FIXES.md](FIXES.md). Model loading now receives the actual `FORCING_WAN_MODEL_DIR`; launch/runtime records retain its resolved path. Paired `save_videos=true` saves **reference and every branch**, each with a case manifest, hash and MP4, plus `paired-videos/<session>.json`. System FFmpeg is preferred (imageio backend is a fallback); the CPU regression performs actual encoding and decoding. Inference, VAE decoding and persistence costs are recorded separately. `save_videos=false` performs no VAE/video work. The existing caller still receives the last branch for compatibility; the full paired set is available from the index.
+
+Feature event identity includes sequence/entity/time anchors/feature subsets. Multiple returns and entities are retained. Resume reconstructs seen IDs and cumulative counts from old CSV parts, preserves the old `summary.json`, and publishes the new cumulative `summary-<nonce>.json` (`store.summary_path`). Configuration signatures remain strict: old raw data is readable, but the changed E5/config protocol is not silently mixed with a new run.
+
 ## Files and measurement limits
 
 See [SCHEMA.md](SCHEMA.md) and [schema.json](schema.json) for CSV and equivalent Parquet types, snapshot fields and metric units. `RunStore(..., resume=existing_run)` checks signature/origin, deduplicates deterministic event IDs and adds atomic parts without replacing old files. Repeated CLI invocations create new run directories. The native writer is CSV; Parquet schema is specified, but no Parquet dependency/export is required or claimed here.
@@ -109,3 +115,7 @@ Analysis separates config, origin, model/checkpoint, window, source and metric s
 Instrumentation reports host analysis time, extra oracle callback time, selected real callback time, complete instrumented inference wall time, observed physical KV capacity by layer and process peak allocation separately. Host scoring/gather timings can include GPU scheduling overhead and are not a standalone production throughput benchmark. Capture caps bound each selected tensor/trace subsystem; they do not impose a process-wide allocator cap. A GPU allocation guard can skip analysis events. Run normal generation separately for production timing.
 
 Generated reports, NPZ, checkpoints and videos are ignored by Git. This implementation does not change research conclusions, fit a new predictor, allocate remote GPUs, push branches, or publish results.
+
+Current saved-data analysis excludes failed/incomplete immutable parts using their matching completion records. A failed resume cannot authorize new rows via an old `summary.json`; completed earlier parts remain usable. B records explicit failed-run exclusions; A additionally removes completed retries when their stable generation identity is available.
+
+Concrete, narrowed future research questions and closest-work exclusions are in [RESEARCH_QUESTIONS.md](RESEARCH_QUESTIONS.md). They are proposals only and are not implemented experimental results.

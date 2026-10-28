@@ -42,7 +42,7 @@ python -m pytest -q scripts/tests/test_spectral_*.py
 
 ## E2 / E3 的含义
 
-`oracle_error = ||O - O_without_block|| / (||O|| + eps)` 是单块删除影响，不是可相加的联合误差。Attention Mass 以全部 K 做分母，分块计算 FP32 QK，避免构造完整 Attention Matrix。
+`oracle_error = ||O - O_without_block|| / (||O|| + eps)` 是单块删除影响，不是可相加的联合误差。Attention Mass 以全部 K 做分母，分块计算 FP32 QK，避免构造完整 Attention Matrix。归一化分别保存最大 logit 与中心化的 log-sum-exp，避免极大的公共 logit 偏置吞掉归一化余量。FP32 点积本身已经丢失的差异不在此计算中恢复。
 
 每次调用在同一采样候选集上计算 Spearman、Top-k recall 和保留策略误差。相关性与 recall 使用各分数共同有限的子集，所有比较的有效候选保持一致；表中给出 `finite_candidates,sampled_candidates,excluded_missing_candidates`。Top-k 边界有并列分数时 recall 为 NaN；常量分数的 Spearman 为 NaN。recall 仅针对采样候选，不能称为全局 recall。
 
@@ -76,7 +76,11 @@ SPECTRAL_OUTPUT_DIR/
     compression/window-N.npz          # 仅显式开启 snapshot_calls 后
 ```
 
-汇总脚本递归合并所有 rank/sample；输入目录应该只包含要比较的实验配置。若目标目录已存在，新汇总写入其 `analysis-<unique-id>/` 子目录。生成 `frequency_by_layer.png`、`frequency_vs_importance.png`、`error_vs_retention.png`、四份汇总 CSV 和 `summary.md`。没有数据时图和报告明确显示 `not measured`。
+汇总脚本递归读取所有 rank/sample，默认只统计 `status=completed` 的运行，失败和未完成运行的已保存前缀不进入均值或图表。相同 prompt、generation seed、sample、batch 大小及实验身份的完成重试只保留一份，取 metadata 修改时间最新者；时间相同时按路径确定顺序。rank、inference 目录名和输出路径不代表独立采样。`analysis_selection.json` 保存保留路径、每个排除原因、排除计数和实验身份，`summary.md` 同时显示计数。只有失败运行时仍生成 `not measured` 报告。
+
+一个汇总只接受同一实验配置和模型身份。配置中的 `output_dir` 可以不同；其余配置、已记录的 checkpoint/weight 标识、代码版本、数据来源、坐标、实际网格以及运行时 dtype/backend/缩放不同会直接报错，要求分开汇总，不跨配置计算加权均值。不同 generation seed 和 sample 作为独立观测保留。旧报告没有 `generation_seed` 时按 `inference_id` 保留独立观测，不把分析 seed 当成生成 seed；缺少 prompt 内容或权重内容校验值的旧报告只能使用其已有 prompt ID 和 checkpoint 路径，不能识别同一路径下被替换的内容。不要把不同 prompt 文件的相同编号放入同一输入目录，除非 metadata 带有可区分的 prompt 身份。
+
+若目标目录已存在，新汇总写入其 `analysis-<unique-id>/` 子目录。生成 `frequency_by_layer.png`、`frequency_vs_importance.png`、`error_vs_retention.png`、四份汇总 CSV、`analysis_selection.json` 和 `summary.md`。没有数据时图和报告明确显示 `not measured`。
 
 | 文件 | 列或数组 |
 |---|---|

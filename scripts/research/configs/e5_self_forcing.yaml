@@ -89,7 +89,8 @@
     "target_block_rank": 0,
     "paired_rollout": true,
     "max_branches": 6,
-    "e6_step_policies": []
+    "e6_step_policies": [],
+    "e5_scope": "all"
   },
   "compression": {
     "retention": [

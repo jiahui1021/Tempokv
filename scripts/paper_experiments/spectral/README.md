@@ -47,15 +47,21 @@ python scripts/paper_experiments/spectral/analyze.py \
 
 所有结果进入 `reports/spectral_kv/<profile>/<runtime>/<window-and-sink>/rank-N/inference-<唯一编号>/<B_实验编号>/`，每次 inference 使用新目录。每个样本通过 `sample_id` 标注；所有记录含 `suite_id,experiment_id,prompt_id,rank`。每个实验输出 `records.jsonl`，统计量另存无 pickle 的 NPZ；顶层 `metadata.json` 保存配置、方法、网格、时间、显存与是否改变轨迹。原有 A 组分析工具排除 B 组数据，B 组工具也排除 A 组。
 
+分析会按 model/checkpoint、运行模型、窗口、sink、轨迹模式及测量配置分别输出；频带、采样通道、采样层/头/步、上下文范围、方法、精度和校准路径不同的数据不会平均。seed 作为重复采样信息保留，单纯的标量保留上限不作为测量定义。每份分析新增 `sources.json` 保存完整来源、原始配置和分组依据；记录及汇总保留 `source_id/cohort_id`、模型与 checkpoint 标识。旧记录缺少身份或配置时保持可见的缺失值，不推断其与新配置相同。
+
 随附每个实验独立配置、`READONLY_PILOT.yaml`（多种只读统计一次采集）以及在线 DCT/AVG/DROP/PYRAMID/FULL 变体配置。`SPECTRAL_KV_CONFIG` 可显式指定配置；`SPECTRAL_KV_OUTPUT_DIR` 指定 B 组结果根目录；`OUTPUT_DIR` 指定生成输出。配置使用 JSON-compatible YAML，无 PyYAML 也可读。
 
 ## 各实验口径
 
 **B_E1**：来自完整运行时 H/W 网格，不硬编码 30×52。K 的 pre/post-RoPE 分别记录，V 标为 raw。空间频率半径除以 sqrt(0.5) 归一化，r95 默认指去 DC 后的 95% 能量半径，同时给出含 DC 版本和 DC 比例。无非 DC 能量时不补造 r95。时空统计使用同一空间位置，最多保留 `temporal_window` 帧；跨缺口重置。联合 DC 仅指时间和空间同时为零的频点，不删除整个时间 DC 平面。
 
+E1/E5 的公共帧指标按一次观测计数，不因同一指标出现在多个频带中而重复加权。`spatial_dc_summary.csv` 汇总每帧空间 DC，`joint_dc_summary.csv` 汇总时空窗口的联合 DC，`dc_summary.csv` 保留两者且明确标出 `record_kind/dc_definition`；联合窗口 warm-up 的不同长度分别保留。`spectrum_observations.csv` 可核对去重后的帧/窗口指标，原始频带记录仍完整保存在 `records.csv`。
+
 **B_E2**：在选定 transformer block 输出上，对齐同一去噪步、相邻 chunk，按空间/时间频带比较 cosine、reuse 误差和线性外推误差。只保留两个先前 chunk，并按 `feature_channels` 固定选取每头前若干通道。首块形状不同、chunk 缺口或历史不足时标记未测量。`chunks` 只过滤影子评估，不阻止相邻 chunk 统计。
 
 **B_E2b**：最后去噪步明确由真实日程长度判定。临时保存选定层/头当前块，clean pass 后计算逐频带误差并释放。`KVSKIP_raw` 和 `KVSKIP_lin` 是单独的在线变体，需独立目录和配对长 rollout；跳过后不存在 clean reference，不会生成伪差异谱。
+
+Causal-Forcing 原生生成默认省略末块 clean pass。只读 E1、E2b、E4 或校准采集若仍需要末块数据，B 接入会自动要求保留该末块；超出 `max_clean_frames/max_chunks` 的末块不会因此增加计算。E2、E3-off 和在线变体保持调用方原有的末块选择。新增计算记录在 `terminal_clean_collection` 元数据中，包含请求原因、实际调用及完成次数；`host_section_ms/gpu_section_ms` 的同名计时区间属于 `generator_clean` 的子区间，不能重复相加。带额外末块采集的生成总时长不能直接作为原生生成对照的公平计时；调用方已显式要求保留末块时不计为新增采集。
 
 **B_E3-off**：完整窗口 K/V 保持在 softmax 分母中；只采样 Query。将 Post-RoPE K 逆变换到 pre-RoPE，再做 DCT 或平均池化，摘要位置为原网格的分数 cell center，时间位置为原绝对帧号；重新施加运行时 RoPE。BF16 逆变换存在舍入差异，不能解释成纯压缩误差。DCT 与 AVG 在相同目标网格、同一窗口和 Query 上比较；记录实际 token 数。R 是请求的降采样倍数，非整除网格下以实际数量为准。`B1` 加 `log(count)`，`B0` 为消融。当前块、最近保护历史和在窗口内的 sink 保持完整。Top-k 是采样 Query 的 frame attention mass 诊断，不能声称数学最优上界。
 

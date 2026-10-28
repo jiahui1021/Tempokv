@@ -91,7 +91,8 @@ def _diversity(window: FrozenAttention, eligible: list[int], budget: int) -> lis
 
 
 def select_archive(window: FrozenAttention, *, policy: str, retention: float,
-                   attention_scores=None, oracle_scores=None, online: bool = True) -> dict[str, Any]:
+                   attention_scores=None, oracle_scores=None, online: bool = True,
+                   token_budget: int | None = None) -> dict[str, Any]:
     """Keep an exact half-up fraction of *all* eligible historical K/V pairs.
 
     Sink, configured recent history and current-chunk pairs are mandatory. Keys
@@ -134,6 +135,10 @@ def select_archive(window: FrozenAttention, *, policy: str, retention: float,
     with localcontext() as decimal_context:
         decimal_context.prec = max(28, len(str(len(eligible))) + len(str(retention)) + 8)
         budget = int((Decimal(len(eligible)) * Decimal(str(retention))).to_integral_value(rounding=ROUND_HALF_UP))
+    if token_budget is not None:
+        if type(token_budget) is not int or not 0<=token_budget<=len(eligible):
+            raise ValueError("token_budget must be an integer within the available eligible history")
+        budget=token_budget
     if budget == len(eligible):
         selected = eligible
     elif budget == 0:

@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 from collections import Counter
+from contextlib import nullcontext
 import importlib
+import inspect
 import os
 from pathlib import Path
 import subprocess
@@ -15,6 +17,24 @@ from .probe import SpectralKVProbe
 
 def _arg(args, kwargs, name, index, default=None):
     return kwargs[name] if name in kwargs else args[index] if len(args) > index else default
+
+
+def _terminal_layout(pipeline, frames):
+    """Forecast the final text-to-video block using the native CF layout."""
+    block = int(getattr(pipeline, "num_frame_per_block", 1))
+    independent = bool(getattr(pipeline, "independent_first_frame", False))
+    if frames < 1 or block < 1:
+        return None
+    if independent:
+        if (frames - 1) % block:
+            return None  # Leave validation of invalid input to the native pipeline.
+        chunks = 1 + (frames - 1) // block
+        last_frames = 1 if chunks == 1 else block
+    else:
+        if frames % block:
+            return None
+        chunks, last_frames = frames // block, block
+    return chunks - 1, frames - last_frames
 
 
 def install(runtime_root, runtime="self_forcing"):
@@ -63,6 +83,7 @@ def install(runtime_root, runtime="self_forcing"):
             self._b_clean_pending = False
             self._b_calls, self._b_starts = Counter(), {}
             self._b_step_count = len(self.denoising_step_list)
+            self._b_terminal_clean = {}
             for layer, block in enumerate(blocks):
                 block.self_attn.spectral_layer_idx = layer
                 block.self_attn.spectral_probe = self.spectral_probe
@@ -76,8 +97,20 @@ def install(runtime_root, runtime="self_forcing"):
                     cache = _arg(call_args, call_kwargs, "kv_cache", 3)
                     self.spectral_probe.skip_clean(cache)
                     return None  # The pipeline ignores this announced clean-forward result.
-                with self.spectral_probe.sink.time("generator_clean" if phase == "clean" else "generator_denoise", device):
-                    return original_forward(*call_args, **call_kwargs)
+                extra_clean = (phase == "clean" and self._b_terminal_clean.get("additional_clean_requested", False)
+                               and int(_arg(call_args, call_kwargs, "current_start", 5, 0))
+                               == self._b_terminal_clean.get("terminal_start_token"))
+                if extra_clean:
+                    self._b_terminal_clean["additional_clean_forward_calls"] += 1
+                # The collection interval is a subset of generator_clean, not
+                # another term to add to generation or cache-pass latency.
+                collection_timer = (self.spectral_probe.sink.time("terminal_clean_collection", device)
+                                    if extra_clean else nullcontext())
+                with self.spectral_probe.sink.time("generator_clean" if phase == "clean" else "generator_denoise", device), collection_timer:
+                    result = original_forward(*call_args, **call_kwargs)
+                if extra_clean:
+                    self._b_terminal_clean["additional_clean_forwards_completed"] += 1
+                return result
             self.generator.forward = forward
             original_decode = self.vae.decode_to_pixel
             def decode(*decode_args, **decode_kwargs):
@@ -127,12 +160,39 @@ def install(runtime_root, runtime="self_forcing"):
             self._b_step_count = len(self.denoising_step_list)
             context = dict(self._spectral_context)
             prompt = context.pop("prompt_id", 0)
+            signature = inspect.signature(base.inference)
+            bound = signature.bind_partial(self, *args, **kwargs)
+            supports_terminal = "retain_final_cache" in signature.parameters
+            requested = bool(bound.arguments.get("retain_final_cache", False))
+            layout = _terminal_layout(self, int(noise.shape[1])) if runtime == "causal_forcing" else None
+            clean_experiments = {"B_E1_SPECTRUM", "B_E2B_REFRESH", "B_E4_DISTANCE"}
+            needs_clean = (runtime == "causal_forcing" and not config.online
+                           and (config.collect_calibration or bool(set(config.experiments) & clean_experiments))
+                           and layout is not None and layout[0] < config.max_chunks
+                           and layout[1] < config.max_clean_frames)
+            additional = bool(needs_clean and supports_terminal and not requested)
+            if additional:
+                bound.arguments["retain_final_cache"] = True
+            self._b_terminal_clean = {
+                "required_by_readonly_collection": bool(needs_clean),
+                "runtime_supports_retain_final_cache": supports_terminal,
+                "requested_by_caller": requested,
+                "retain_final_cache_effective": requested or additional,
+                "additional_clean_requested": additional,
+                "additional_clean_forward_calls": 0,
+                "additional_clean_forwards_completed": 0,
+                "terminal_chunk_idx": layout[0] if layout else None,
+                "terminal_frame_idx0": layout[1] if layout else None,
+                "terminal_start_token": layout[1] * int(getattr(self, "frame_seq_length", 1)) if layout else None,
+                "timing_section": "terminal_clean_collection",
+                "timing_contract": "additional terminal clean collection is included in generator_clean; do not add it twice or use the augmented total as a native generation-only benchmark",
+            }
             self.spectral_probe.reset(prompt_id=prompt, batch_size=noise.shape[0], metadata={**context,
                 "local_attn_size": getattr(self.generator.model, "local_attn_size", "unknown"),
                 "sink_size": getattr(self.generator.model.blocks[0].self_attn, "sink_size", 0),
-                "latent_frames": noise.shape[1]})
+                "latent_frames": noise.shape[1], "terminal_clean_collection": self._b_terminal_clean})
             try:
-                result = super().inference(*args, **kwargs)
+                result = super().inference(*bound.args[1:], **bound.kwargs)
             except BaseException as exc:
                 self.spectral_probe.flush(status="failed", error=f"{type(exc).__name__}: {exc}")
                 raise

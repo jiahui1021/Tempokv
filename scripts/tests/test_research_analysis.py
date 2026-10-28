@@ -18,6 +18,7 @@ def write_run(root, name, rows, *, signature="config-a", origin="synthetic_fixtu
                 "prompt_index": prompt, "seed": seed, "model": "fixture-model", "checkpoint": "fixture-checkpoint",
                 "config": {"source": "bf16", "local_attn_size": 24, "sink_size": 0}}
     (folder / "manifest.json").write_text(json.dumps(manifest))
+    (folder / "summary.json").write_text(json.dumps({"status":"completed"}))
     by_experiment = {}
     for row in rows:
         experiment = row["experiment_id"]
@@ -158,3 +159,31 @@ def test_propagation_plots_keep_dose_step_head_separate_and_exclude_unmatched():
     assert sorted(len(part) for _,part in groups)==[1,1,1,2]
     assert len({identity for identity,_ in groups})==4
     assert all(row['calibration_matched'] and row['comparison_cohort']=='matched' for _,part in groups for row in part)
+
+
+def test_failed_and_unpublished_parts_do_not_pollute_resumed_measurements(tmp_path):
+    from tempokv.research.config import ResearchConfig
+    from tempokv.research.io import RunStore
+    config=ResearchConfig.from_dict({'experiments':['E1'],'output':{'root':str(tmp_path)}})
+    store=RunStore(config,origin='synthetic_fixture')
+    store.write('E1',{'block_id':'valid','local_attention_relative_error':.1})
+    run=store.close()
+    resumed=RunStore(config,origin='synthetic_fixture',resume=run)
+    resumed.write('E1',{'block_id':'failed','local_attention_relative_error':100.})
+    resumed.close(status='failed')
+    failed_summary=json.loads(resumed.summary_path.read_text())
+    assert failed_summary['completed_experiments']==failed_summary['synthetic_completed_experiments']==[]
+    # An old completed summary must not authorize a failed resume or an orphan
+    # CSV published before the corresponding completion record was durable.
+    orphan=run/'E1/events-orphan.csv'
+    first=next(path for path in (run/'E1').glob('events-*.csv') if path.name!='events-orphan.csv')
+    orphan.write_bytes(first.read_bytes())
+    (run/'E1/events-invalid.csv').write_bytes(first.read_bytes())
+    (run/'summary-invalid.json').write_text('[]')
+    rows=load_rows(tmp_path)
+    assert len(rows)==1 and rows[0]['block_id']=='valid'
+    assert rows[0]['local_attention_relative_error']==.1
+    from tempokv.research.analysis import _load
+    _,info=_load(tmp_path)
+    assert info['ingestion']['excluded_failed_parts']==1
+    assert info['ingestion']['excluded_incomplete_parts']==2
