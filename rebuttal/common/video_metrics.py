@@ -18,6 +18,7 @@ from typing import Any, Callable, Iterable, Iterator
 
 EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
 IDENTITY_FIELDS = ("model", "prompt_id", "seed", "sample_id", "method", "comparison_id")
+TEXT_FIELDS = {"model", "prompt_id", "method", "comparison_id", "variant", "axis", "role", "head"}
 
 
 def write_json(path: Path, value: Any) -> None:
@@ -40,9 +41,13 @@ def write_csv(path: Path, rows: Iterable[dict[str, Any]], fields: list[str] | No
 
 
 def read_csv(path: Path) -> list[dict[str, Any]]:
-    def value(text: str) -> Any:
+    def value(key: str, text: str) -> Any:
         if text == "":
             return None
+        # IDs such as 0_0 and 0001 are opaque strings. Python's int() accepts
+        # underscores, so inference would silently change or merge identities.
+        if key in TEXT_FIELDS or key.endswith(("_id", "_sha256")) and key not in {"sample_id"}:
+            return text
         if text in {"True", "False"}:
             return text == "True"
         try:
@@ -53,7 +58,27 @@ def read_csv(path: Path) -> list[dict[str, Any]]:
             except ValueError:
                 return text
     with path.open(newline="", encoding="utf-8") as stream:
-        return [{k: value(v) for k, v in row.items()} for row in csv.DictReader(stream)]
+        return [{k: value(k, v) for k, v in row.items()} for row in csv.DictReader(stream)]
+
+
+def video_fingerprint(path: str | Path) -> dict[str, Any]:
+    path = Path(path).resolve()
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return {"path": str(path), "size_bytes": path.stat().st_size, "sha256": digest.hexdigest()}
+
+
+def quality_contract(config: dict[str, Any]) -> dict[str, Any]:
+    """Settings that determine the stored per-frame fidelity observations."""
+    return {"metrics": sorted(config.get("metrics", ["psnr", "ssim", "lpips"])),
+            "lpips_network": config.get("lpips_network", "alex"),
+            "video_decoder": config.get("video_decoder", "pyav"),
+            "require_cfr": config.get("require_cfr", True),
+            "timestamp_tolerance_seconds": config.get("timestamp_tolerance_seconds"),
+            "pixel_contract": "bgr24_uint8_rgb_ssim_lpips_minus_one_to_one",
+            "psnr_contract": "pooled_rgb_pixel_sse_peak_255"}
 
 
 def _video_index(directory: Path, files: dict[Path, Path], manifest: Path | None = None) -> tuple[dict[Path, dict[str, Any]], str | None]:
@@ -151,7 +176,7 @@ def resolve_pairs(config: dict[str, Any]) -> list[dict[str, Any]]:
                           "identity_validation": validation, "reference_identity_source": ref_source, "candidate_identity_source": candidate_source})
     if not pairs:
         raise ValueError("provide nonempty pairs, pairs_manifest, or matching reference_dir/candidate_dir")
-    result, seen = [], set()
+    result, seen, fingerprints = [], set(), {}
     for raw in pairs:
         pair = dict(raw)
         for key in ("reference", "candidate", "prompt_id"):
@@ -178,6 +203,16 @@ def resolve_pairs(config: dict[str, Any]) -> list[dict[str, Any]]:
                 if key not in sidecars[0] or key not in sidecars[1] or sidecars[0][key] != sidecars[1][key]:
                     raise ValueError(f"generation metadata mismatch or missing field: {key}")
         pair["identity_validation"] = "sidecars_matched" if len(sidecars) == 2 else pair.get("identity_validation", "declared_in_pair_manifest")
+        # temporal_window persists resolved pairs before evaluation. Capture
+        # the bytes here, so downstream reuse can verify the original inputs.
+        pair.pop("video_fingerprints", None)
+        for role in ("reference", "candidate"):
+            path = Path(pair[role]).resolve()
+            if path.is_file():
+                if path not in fingerprints:
+                    fingerprints[path] = video_fingerprint(path)
+                pair.setdefault("video_fingerprints", {})[role] = fingerprints[path]
+        pair["quality_contract"] = quality_contract(config)
         result.append(pair)
     return result
 

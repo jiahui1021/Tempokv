@@ -1,0 +1,26 @@
+{
+  "extends": "_base.json",
+  "experiment": "fixed_memory",
+  "seeds": [
+    0
+  ],
+  "span_frames": 12,
+  "methods": [
+    "bf16",
+    "qvg",
+    "tempokv"
+  ],
+  "budget_basis_latent_frames": [
+    48,
+    96,
+    192
+  ],
+  "matched_context_frames": 96,
+  "qvg": {
+    "bits": 4,
+    "stages": 2,
+    "k_centroids": 256,
+    "v_centroids": 256,
+    "block_size": 64
+  }
+}

@@ -105,6 +105,8 @@ PATH_KEYS = frozenset({
     "calibration_identity", "evaluation_identity", "validation_identity", "bf16_reference_dir",
     "frames_csv", "video_index_manifest", "reference_metadata", "candidate_metadata",
     "raw_trace", "trace_output_dir",
+    "bf16_reference_prompts", "quality_output_dir", "motion_groups",
+    "parameter_fit_report",
 })
 
 
@@ -138,6 +140,10 @@ def input_fingerprints(config: dict[str, Any]) -> list[dict[str, Any]]:
                     return
                 records[str(path)] = {"path": str(path), "size_bytes": path.stat().st_size,
                                       "sha256": file_sha256(path)}
+                if key in {"trace", "calibration_trace", "evaluation_trace", "validation_trace", "development_trace"}:
+                    sidecar = path.with_suffix(".identity.json")
+                    if sidecar.is_file():
+                        visit(str(sidecar), "trace_manifest")
                 if key in {"pairs_manifest", "video_index_manifest"}:
                     visit(resolve_paths(read_json(path), path.parent))
     visit(config)
@@ -161,7 +167,8 @@ def prepare_run(output_dir: Path, config: dict[str, Any], *, experiment: str,
                 stage: str, resume: bool) -> dict[str, Any]:
     output_dir.mkdir(parents=True, exist_ok=True)
     path = output_dir / "manifest.json"
-    identity_config = {k: v for k, v in config.items() if not k.startswith("_")}
+    # Resume changes execution control, never the scientific run identity.
+    identity_config = {k: v for k, v in config.items() if not k.startswith("_") and k != "resume"}
     identity = digest(identity_config)
     inputs = input_fingerprints(config)
     code_sha256 = code_fingerprint()
@@ -173,11 +180,16 @@ def prepare_run(output_dir: Path, config: dict[str, Any], *, experiment: str,
         previous = old.get("stages", {}).get(stage)
         if previous and previous.get("status") == "complete" and not resume and stage != "plan":
             raise ValueError(f"stage {stage} already completed; use --resume or a new output directory")
-        if resume and old.get("inputs") != inputs:
+        execution_started = any(name != "plan" for name in old.get("stages", {}))
+        if (resume or execution_started) and old.get("inputs") != inputs:
             raise ValueError("input contents changed; refusing to reuse previous results")
-        if resume and old.get("code_sha256") != code_sha256:
+        if (resume or execution_started) and old.get("code_sha256") != code_sha256:
             raise ValueError("experiment code changed; choose a new run directory")
         payload = old
+        if not execution_started:
+            # Plans can name assets that do not yet exist. Freeze their actual
+            # bytes/code on promotion instead of retaining an empty snapshot.
+            payload.update(inputs=inputs, code_sha256=code_sha256, code_revision=git_revision())
     else:
         payload = {"schema_version": "tempokv.rebuttal.run.v1", "experiment": experiment,
                    "config_sha256": identity, "config": identity_config, "inputs": inputs,

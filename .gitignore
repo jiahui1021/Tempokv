@@ -43,6 +43,7 @@ dist/
 /results/
 /runs/
 /outputs/
+/rebuttal/outputs/
 /traces/
 *.npz
 *.npy

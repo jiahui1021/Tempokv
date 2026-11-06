@@ -1,0 +1,9 @@
+{
+  "extends": "_base.json",
+  "experiment": "architecture",
+  "axis": "temporal",
+  "fit_iterations": 2,
+  "als_steps": 30,
+  "decode_warmup": 2,
+  "decode_repeats": 5
+}

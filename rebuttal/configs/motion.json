@@ -1,0 +1,13 @@
+{
+  "extends": "temporal_window.json",
+  "experiment": "motion",
+  "cache_metric_scope": "bf16_trace_replay",
+  "flow": {
+    "backend": "raft",
+    "device": "cuda",
+    "forward_backward": true
+  },
+  "difficult_cases": {
+    "export_clips": true
+  }
+}

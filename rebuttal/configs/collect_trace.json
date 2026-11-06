@@ -1,0 +1,7 @@
+{
+  "extends": "_base.json",
+  "experiment": "collect_trace",
+  "generation_methods": [
+    "bf16_trace"
+  ]
+}

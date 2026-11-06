@@ -57,12 +57,18 @@ class QVGBackend:
         centroids = c[f"{role}_centroids"]
         if value.shape[-2] < centroids:
             raise ValueError("QVG span has fewer tokens than requested centroids")
-        module = self._load()
-        state = module.triton_prq_quantize_tensor(
-            value.contiguous(), num_stages=c["stages"], num_clusters=centroids,
-            block_size=c["block_size"], max_iters=c["kmeans_iters"],
-            quantize_fn=lambda _: c["bits"],
-        )
+        import torch
+        # PRQ initializes its KMeans centroids with the global CUDA RNG. Keep
+        # those draws out of the generator's denoising-noise stream, including
+        # when importing or running the backend raises. fork_rng also restores
+        # the CPU stream, which a backend may use for initialization.
+        with torch.random.fork_rng(devices=[value.device]):
+            module = self._load()
+            state = module.triton_prq_quantize_tensor(
+                value.contiguous(), num_stages=c["stages"], num_clusters=centroids,
+                block_size=c["block_size"], max_iters=c["kmeans_iters"],
+                quantize_fn=lambda _: c["bits"],
+            )
         required = ("centroids_list", "cluster_ids_list", "residual_quant", "scales")
         if not isinstance(state, dict) or any(key not in state for key in required):
             raise RuntimeError("QVG did not return packed PRQ components")

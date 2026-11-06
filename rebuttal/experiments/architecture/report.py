@@ -5,7 +5,8 @@ from pathlib import Path
 
 def write_table(path: Path, rows):
     fields = ["axis", "variant", "rank", "parameter_bytes", "storage_bytes", "fit_seconds", "replay_seconds",
-              "decoder_backend", "k_prediction_nmse", "v_prediction_nmse", "k_quantization_nmse",
+              "decoder_backend", "decode_seconds_mean", "decode_seconds_median", "decode_warmup", "decode_repeats",
+              "decode_timing_scope", "decode_device", "k_prediction_nmse", "v_prediction_nmse", "k_quantization_nmse",
               "v_quantization_nmse", "k_reconstruction_nmse", "v_reconstruction_nmse", "parameters"]
     with Path(path).open("w", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fields); writer.writeheader()

@@ -1,0 +1,23 @@
+{
+  "model": "self_forcing",
+  "codec_config": "configs/legacy.json",
+  "device": "auto",
+  "calibration_prompts": "assets/calibration/cal_prompts.txt",
+  "evaluation_prompts": "assets/calibration/heldout_prompts.txt",
+  "prompts": "assets/calibration/heldout_prompts.txt",
+  "seed": 0,
+  "frames": 1401,
+  "span_frames": 24,
+  "bf16_lag_frames": 18,
+  "metrics": [
+    "psnr",
+    "ssim",
+    "lpips"
+  ],
+  "window_seconds": 15,
+  "video_decoder": "pyav",
+  "bootstrap_samples": 1000,
+  "bootstrap_seed": 0,
+  "require_prompt_identity": true,
+  "plots": true
+}

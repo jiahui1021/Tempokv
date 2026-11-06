@@ -131,7 +131,7 @@ def test_full_fit_replay_preserves_independent_axis_and_split(tmp_path, axis, va
     out = tmp_path / "out"
     fit_report = run(settings, "fit", out)
     report = run(settings, "replay", out)
-    assert len(report["variants"]) == len(variants)
+    assert len(report["variants"]) == len(variants) + (1 if axis == "cross" else 0)
     models = [ExperimentalCodec.load(x["parameters"]) for x in fit_report["variants"]]
     if axis == "cross":
         for item in models[1:]:

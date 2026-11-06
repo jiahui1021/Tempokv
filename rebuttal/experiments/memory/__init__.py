@@ -26,7 +26,7 @@ def run(config: dict, stage: str, output_dir: Path) -> dict:
         write_capacity(plan["capacity"], output_dir)
         if stage == "generate":
             try:
-                plan = execute_jobs(plan, resume=bool(config.get("resume", False)))
+                plan = execute_jobs(plan, resume=bool(config.get("_resume", config.get("resume", False))))
             finally:
                 (output_dir / "generation_plan.json").write_text(json.dumps(plan, indent=2) + "\n")
         return plan

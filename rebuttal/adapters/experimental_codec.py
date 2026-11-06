@@ -188,6 +188,8 @@ class ResearchPackedTensor(PackedTensor):
     """Actual codes/scales, no dense reconstruction retained in the state."""
     research_predictor: Any = None
     layer: int = 0
+    activity_counts: dict[str, int] | None = None
+    activity_role: str | None = None
 
     def decode(self, *, source: torch.Tensor | None = None,
                output_tensor: torch.Tensor | None = None, output_layout: str = "BSHD", **_: Any) -> torch.Tensor:
@@ -227,6 +229,8 @@ class ResearchPackedTensor(PackedTensor):
             output[:, :, offset:offset + length] = rebuilt
             history = [rebuilt, *history[:max(predictor.history_length - 1, 0)]]
             offset, residual_offset = offset + length, end
+        if self.activity_counts is not None:
+            self.activity_counts[f"decode_{self.activity_role}"] += 1
         return output
 
 
@@ -305,6 +309,7 @@ class ExperimentalCodec:
         self.temporal, self.v_parameters = temporal, cross
         self.config = replace(config, use_triton=False, strict_triton=False)
         self.metadata = dict(metadata or {})
+        self.activity_counts = {"encode_k": 0, "encode_v": 0, "decode_k": 0, "decode_v": 0}
 
     @property
     def cross_kv(self):
@@ -312,6 +317,8 @@ class ExperimentalCodec:
 
     def encode_primary(self, tensor, *, layer=0, reuse_input=False):
         packed, rebuilt = encode_tensor(tensor, self.temporal, self.config, bits=self.config.k_bits, layer=layer)
+        packed.activity_counts, packed.activity_role = self.activity_counts, "k"
+        self.activity_counts["encode_k"] += 1
         if reuse_input:
             tensor.copy_(rebuilt); rebuilt = tensor
         return packed, rebuilt
@@ -321,6 +328,8 @@ class ExperimentalCodec:
     def encode_secondary(self, tensor, reconstructed_primary, *, layer=0, reuse_input=False):
         packed, rebuilt = encode_tensor(tensor, self.v_parameters, self.config, bits=self.config.v_bits,
                                         layer=layer, source=reconstructed_primary)
+        packed.activity_counts, packed.activity_role = self.activity_counts, "v"
+        self.activity_counts["encode_v"] += 1
         if reuse_input:
             tensor.copy_(rebuilt)
         return packed

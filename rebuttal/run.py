@@ -98,7 +98,7 @@ def dispatch(experiment: str, config: dict, stage: str, output_dir: Path) -> dic
 
 
 def execute(experiment: str, config: dict, stage: str, output_dir: Path, *, resume: bool = False) -> dict:
-    config = {**config, "_resume": resume, "resume": resume}
+    config = {**config, "_resume": resume}
     manifest = prepare_run(output_dir, config, experiment=experiment, stage=stage, resume=resume)
     try:
         result = dispatch(experiment, config, stage, output_dir)

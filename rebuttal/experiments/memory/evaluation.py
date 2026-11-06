@@ -7,11 +7,16 @@ import shutil
 import subprocess
 import sys
 
+from .identity import identity_key, job_video_identities, read_prompts, video_identities
+
 ROOT = Path(__file__).resolve().parents[3]
 
 
 def generation_pairs(config: dict, output_dir: Path) -> list[dict]:
-    reference_dir = Path(config.get("bf16_reference_dir") or config.get("reference_dir") or "")
+    reference_root = config.get("bf16_reference_dir") or config.get("reference_dir")
+    if not reference_root:
+        raise ValueError("provide bf16_reference_dir for a complete-history BF16 reference")
+    reference_dir = Path(reference_root)
     if not reference_dir.is_dir():
         raise ValueError("provide bf16_reference_dir for a complete-history BF16 reference")
     path = output_dir / "generation_plan.json"
@@ -19,20 +24,38 @@ def generation_pairs(config: dict, output_dir: Path) -> list[dict]:
         raise FileNotFoundError(f"generation plan is missing: {path}")
     plan = json.loads(path.read_text())
     pairs = []
+    reference_cache = {}
     for job in plan["jobs"]:
-        folder = Path(job["folder"]) / "videos"
-        candidates = sorted(folder.glob("*.mp4"))
-        if len(candidates) != job["expected_video_count"]:
-            raise ValueError(f"incomplete generated video cohort: {folder}")
+        # Multi-seed runs have identical filenames. Select the seed cohort,
+        # then require matching *observed* identity rather than trusting its name.
+        seeded = reference_dir / f"seed_{job['seed']}"
+        selected = seeded if seeded.is_dir() else reference_dir
+        if (selected / "videos").is_dir():
+            selected = selected / "videos"
+        if selected not in reference_cache:
+            prompt_file = config.get("bf16_reference_prompts")
+            records, source = video_identities(selected,
+                prompts_path=Path(prompt_file) if prompt_file else None)
+            reference_cache[selected] = ({identity_key(r): r for r in records}, source)
+        references, reference_source = reference_cache[selected]
+        candidates, candidate_source = job_video_identities(job)
         for candidate in candidates:
-            reference = reference_dir / candidate.name
-            if not reference.is_file():
-                raise FileNotFoundError(f"missing BF16 reference pair: {reference}")
-            pairs.append({"model": "self_forcing", "prompt_id": candidate.stem.split("_")[0],
-                          "seed": job["seed"], "sample_id": 0, "method": job["method"],
-                          "comparison_id": job["name"], "reference": str(reference),
-                          "candidate": str(candidate), "history_frames": job["history_frames"],
-                          "budget_bytes": job["budget_bytes"]})
+            key = identity_key(candidate)
+            reference = references.get(key)
+            if reference is None:
+                raise ValueError(f"missing BF16 reference with matching prompt/noise_seed/sample: {key}")
+            if candidate["prompt"] != reference["prompt"]:
+                raise ValueError(f"BF16 and candidate prompt text differ: {key}")
+            pairs.append({"model": "self_forcing", "prompt_id": candidate["prompt_id"],
+                          "seed": candidate["noise_seed"], "sample_id": candidate["sample_id"],
+                          "generation_seed": job["seed"], "method": job["method"],
+                          "comparison_id": job["name"], "reference": reference["path"],
+                          "candidate": candidate["path"], "history_frames": job["history_frames"],
+                          "budget_bytes": job["budget_bytes"],
+                          "reference_identity_source": reference_source,
+                          "candidate_identity_source": candidate_source,
+                          "identity_validation": "generation_indices_and_prompt_text_matched",
+                          "reference_scope": "complete_history_bf16_declared"})
     return pairs
 
 
@@ -64,7 +87,7 @@ def evaluate_vbench(config: dict, output_dir: Path) -> dict:
     prompts_path = config.get("prompts")
     if not prompts_path or not Path(prompts_path).is_file():
         raise ValueError("VBench evaluation requires the actual generation prompt file")
-    prompts = [line.strip() for line in Path(prompts_path).read_text().splitlines() if line.strip()]
+    prompts = read_prompts(Path(prompts_path))
     settings = config.get("vbench", {})
     settings = settings if isinstance(settings, dict) else {}
     rows = []
@@ -100,7 +123,7 @@ def evaluate_vbench(config: dict, output_dir: Path) -> dict:
                 command += ["--dimensions", ",".join(dimensions) if isinstance(dimensions, list) else str(dimensions)]
             if settings.get("local_checkpoints", True):
                 command.append("--local-checkpoints")
-            if config.get("resume", False):
+            if config.get("_resume", config.get("resume", False)):
                 command.append("--reuse-complete")
             with (folder / "run.log").open("w") as log:
                 result = subprocess.run(command, cwd=ROOT, stdout=log, stderr=subprocess.STDOUT, check=False)

@@ -1,0 +1,7 @@
+{
+  "extends": "_base.json",
+  "experiment": "quant_aware_fit",
+  "optimization_steps": 8,
+  "perturbation_radius": 0.01,
+  "optimizer_seed": 0
+}

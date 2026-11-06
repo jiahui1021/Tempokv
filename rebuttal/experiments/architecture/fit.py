@@ -6,9 +6,7 @@ import hashlib
 import json
 from pathlib import Path
 import time
-from typing import Any
 
-import numpy as np
 import torch
 
 from tempokv.config import load_config
@@ -28,45 +26,66 @@ def digest(path: Path) -> str:
     return h.hexdigest()
 
 
-def load_trace(path: str | Path, device="cpu"):
-    path = Path(path)
-    with np.load(path, allow_pickle=False) as data:
-        if "keys" not in data or "values" not in data:
-            raise ValueError(f"trace missing keys/values: {path}")
-        keys, values = [torch.from_numpy(np.array(data[k], copy=True)).float().to(device) for k in ("keys", "values")]
-        info = {}
-        for key in data.files:
-            if key in {"keys", "values"}:
-                continue
-            array = data[key]
-            if array.size <= 100000 and ("prompt" in key or "seed" in key or "frame" in key or key in {
-                "metadata", "record_ids", "sample_ids", "token_indices", "layer_ids", "coordinate_system"}):
-                info[key] = array.tolist()
-    if keys.shape != values.shape or keys.ndim < 5:
-        raise ValueError("architecture traces must have matching [L,...,T,H,D] keys/values")
-    if not torch.isfinite(keys).all() or not torch.isfinite(values).all():
-        raise ValueError("non-finite trace")
-    original_shape = list(keys.shape)
-    shape = (keys.shape[0], -1, *keys.shape[-3:])
-    keys, values = keys.reshape(shape), values.reshape(shape)
-    return keys, values, {"path": str(path.resolve()), "sha256": digest(path), "original_shape": original_shape,
-                          "normalized_shape": list(keys.shape), "identity": info}
+def load_trace(path: str | Path, device="cpu", *, identity_path=None, max_records=None):
+    """Use the shared trace reader, including converter-produced identity sidecars."""
+    from rebuttal.common.trace import load_trace as read_trace, device_for
+    trace = read_trace(path, device=device_for(str(device)), identity_path=identity_path, max_records=max_records)
+    info = dict(trace.metadata)
+    if "split_identity" not in info and any(trace.records):
+        complete = all(r.get("prompt_id") is not None for r in trace.records)
+        hashes_complete = complete and all(r.get("prompt_sha256") for r in trace.records)
+        info["split_identity"] = {
+            "complete": complete, "hashes_complete": hashes_complete, "record_count": len(trace.records),
+            "prompt_ids": sorted({str(r["prompt_id"]) for r in trace.records if r.get("prompt_id") is not None}),
+            "prompt_hashes": sorted({str(r["prompt_sha256"]) for r in trace.records if r.get("prompt_sha256")}),
+        }
+    source = {"path": str(trace.path), "sha256": digest(trace.path),
+              "original_shape": info["original_shape"], "normalized_shape": list(trace.shape),
+              "identity": info}
+    identity_path = info.get("identity_path")
+    if identity_path:
+        source["identity_sha256"] = digest(Path(identity_path))
+    return trace.keys, trace.values, source
 
 
 def _prompt_set(info):
+    summary = info["identity"].get("split_identity")
+    if summary is not None:
+        if not summary.get("complete", False):
+            return None, None
+        if summary.get("hashes_complete", False):
+            return {str(x) for x in summary["prompt_hashes"]}, "prompt_sha256"
+        return {str(x) for x in summary["prompt_ids"]}, "prompt_id"
+    records = info.get("records", [])
+    if records and all(r.get("prompt_sha256") is not None for r in records):
+        return {str(r["prompt_sha256"]) for r in records}, "prompt_sha256"
+    if records and all(r.get("prompt_id") is not None for r in records):
+        return {str(r["prompt_id"]) for r in records}, "prompt_id"
+    # Legacy archives embed one complete list in the NPZ instead of a sidecar.
+    # A partially populated sidecar must never be upgraded to verified identity.
+    if any(records):
+        return None, None
     identity = info["identity"]
-    for key in ("prompts", "prompt_texts", "prompt_hashes", "prompt_ids", "record_prompt_indices"):
+    for key in ("prompt_sha256", "prompt_hashes", "prompts", "prompt_texts", "prompt_ids",
+                "prompt_id", "record_prompt_indices"):
         if key not in identity:
             continue
         value = identity[key]
-        if isinstance(value, list):
-            return {json.dumps(x, sort_keys=True) for x in value}, key
+        values = value if isinstance(value, list) else [value]
+        if not values or any(x is None or x == "" for x in values):
+            return None, None
+        kind = ("prompt_sha256" if key in {"prompt_sha256", "prompt_hashes"} else
+                "prompt_text" if key in {"prompts", "prompt_texts"} else "prompt_id")
+        return {str(x) for x in values}, kind
     return None, None
 
 
 def validate_split(calibration, evaluation, *, allow_in_sample=False, require_prompt_identity=False):
     if calibration["sha256"] == evaluation["sha256"] and not allow_in_sample:
         raise ValueError("calibration and evaluation traces are identical; provide held-out trace or explicit allow_in_sample")
+    summaries = [source["identity"].get("split_identity", {}) for source in (calibration, evaluation)]
+    if set(summaries[0].get("prompt_hashes", [])) & set(summaries[1].get("prompt_hashes", [])) and not allow_in_sample:
+        raise ValueError("calibration/evaluation prompt hashes overlap")
     cal, ck = _prompt_set(calibration); eva, ek = _prompt_set(evaluation)
     overlap = sorted(cal & eva) if cal is not None and eva is not None and ck == ek else None
     if overlap and not allow_in_sample:
@@ -121,7 +140,7 @@ def _settings(config):
     variants = config.get("variants", ["identity", "scalar_linear", "channel_linear", "dense_linear"] if axis == "temporal"
                           else ["diagonal", "low_rank", "dense"])
     allowed = {"identity", "scalar_linear", "channel_linear", "dense_linear"} if axis == "temporal" else {
-        "diagonal", "low_rank", "low_rank_1_8", "low_rank_1_4", "low_rank_1_2", "dense"}
+        "diagonal", "low_rank", "low_rank_1_8", "low_rank_1_4", "low_rank_1_2", "dense", "production"}
     if not variants or len(set(variants)) != len(variants) or set(variants) - allowed:
         raise ValueError(f"invalid architecture variants for {axis}: {variants}")
     # A production control through the same reference codec is always retained.
@@ -129,6 +148,8 @@ def _settings(config):
     variants = list(variants)
     if control not in variants:
         variants.append(control)
+    if axis == "cross" and "production" not in variants:
+        variants.append("production")
     return axis, variants
 
 
@@ -138,7 +159,8 @@ def fit(config: dict, output_dir: Path):
     device = config.get("device", "cpu")
     if device == "auto":
         device = "cuda" if torch.cuda.is_available() else "cpu"
-    keys, values, source = load_trace(config["calibration_trace"], device)
+    keys, values, source = load_trace(config["calibration_trace"], device,
+        identity_path=config.get("calibration_identity"), max_records=config.get("max_records"))
     codec_config = load_config(config.get("codec_config", "configs/legacy.json"), config.get("codec_overrides"))
     if codec_config.mirrored or codec_config.v_predictor_mode != "cross_kv":
         raise ValueError("architecture studies require production k_to_v cross_kv")
@@ -194,7 +216,7 @@ def fit(config: dict, output_dir: Path):
                 changed_keys = reconstruct_keys(keys, temporal, codec_config)
                 refit_v = refit_production_cross(changed_keys, values, production_v, codec_config)
                 cross = ResearchCross.from_production(refit_v, codec_config.cross_kv_weight_mode, layers, heads)
-            elif axis == "cross" and variant != "dense":
+            elif axis == "cross" and variant != "production":
                 cross, log = fit_cross_architecture(reconstructed_k, values, baseline_v, codec_config,
                     kind="low_rank" if rank is not None else variant, rank=rank,
                     rounds=int(config.get("fit_iterations", 2)), ridge=float(config.get("ridge", 0.1)),
@@ -203,6 +225,7 @@ def fit(config: dict, output_dir: Path):
                         "history_source": "reconstructed", "fit_controls": {k: config[k] for k in (
                             "fit_iterations", "als_steps", "ridge", "temporal_ridge", "cross_ridge", "max_gain") if k in config},
                         "cross_history_policy": "production_refit_for_changed_k" if axis == "temporal" else "fixed_production_coefficients",
+                        "cross_ridge_center": "zero" if axis == "cross" else None,
                         "optimization": log}
             codec = ExperimentalCodec(temporal, cross, codec_config, metadata)
             path = output_dir / "params" / axis / f"{name}.npz"
@@ -211,7 +234,7 @@ def fit(config: dict, output_dir: Path):
             row = {"axis": axis, "variant": name, "rank": rank, "parameters": str(path.resolve()),
                    "parameter_bytes": codec.parameter_bytes(), "fit_seconds": baseline_fit_seconds + additional_fit_seconds,
                    "baseline_preparation_seconds": baseline_fit_seconds, "additional_fit_seconds": additional_fit_seconds,
-                   "production_reference_control": variant == ("channel_linear" if axis == "temporal" else "dense"),
+                   "production_reference_control": variant == ("channel_linear" if axis == "temporal" else "production"),
                    "decoder_backend": codec.backend, "temporal_sharing": temporal.sharing, "cross_sharing": cross.sharing,
                    "generation": {"codec_factory": "rebuttal.adapters.experimental_codec:load_codec_factory",
                                   "architecture_params": str(path.resolve()), "incremental": False,
@@ -243,8 +266,10 @@ def generation_plan(config: dict, output_dir: Path):
     jobs = []
     for row in rows:
         path = str(Path(row["parameters"]).resolve())
+        from rebuttal.adapters.worker import research_span_frames
         cfg = {**config, "research_params": path, "torch_decoder": True,
                "decoder_backend": "pytorch_research_reference", "incremental": False}
+        cfg["span_frames"] = research_span_frames(cfg)
         try:
             job = build_job(cfg, output_dir / "runs" / axis / row["variant"],
                             mode="tempokv", name=f"architecture_{axis}_{row['variant']}")
@@ -256,7 +281,7 @@ def generation_plan(config: dict, output_dir: Path):
     result = {"schema": "tempokv.rebuttal.architecture.generation.v1", "axis": axis,
               "status": "needs_inputs" if missing else "planned", "fit_report": str(fit_report_path.resolve()),
               "variants": [x["variant"] for x in rows] if rows else variants,
-              "production_reference_control": "channel_linear" if axis == "temporal" else "dense",
+              "production_reference_control": "channel_linear" if axis == "temporal" else "production",
               "jobs": [job.record() for job in jobs], "missing": list(dict.fromkeys(missing)),
               "decoder_backend": "pytorch_research_reference", "incremental": False}
     _write(output_dir / "generation_plan.json", result)
@@ -300,12 +325,56 @@ def replay_codec(codec: ExperimentalCodec, keys: torch.Tensor, values: torch.Ten
             "normalized_stream_count": keys.shape[1]}, events
 
 
+@torch.no_grad()
+def benchmark_decode(codec: ExperimentalCodec, keys: torch.Tensor, values: torch.Tensor,
+                     *, warmup: int = 1, repeats: int = 5) -> dict:
+    """Time K-then-V decoding only; encode and diagnostics stay outside the timer.
+
+    Per-repeat durations are summed across layers to bound resident packed data
+    to one layer. This measures trace replay, not end-to-end generator latency.
+    """
+    import statistics
+    if warmup < 1 or repeats < 1:
+        raise ValueError("decode_warmup and decode_repeats must be positive")
+    cfg = replace(codec.config, stride=1)
+    durations = [0.0] * repeats
+    device = keys.device
+
+    def synchronize():
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        elif device.type == "mps":
+            torch.mps.synchronize()
+
+    for layer in range(keys.shape[0]):
+        kinput, vinput = [x[layer].permute(0, 2, 1, 3) for x in (keys, values)]
+        packed_k, rebuilt_k = encode_tensor(kinput, codec.temporal, cfg, bits=cfg.k_bits, layer=layer)
+        packed_v, _ = encode_tensor(vinput, codec.v_parameters, cfg, bits=cfg.v_bits,
+                                    layer=layer, source=rebuilt_k)
+        del rebuilt_k
+        for index in range(warmup + repeats):
+            synchronize()
+            start = time.perf_counter()
+            decoded_k = packed_k.decode()
+            decoded_v = packed_v.decode(source=decoded_k)
+            synchronize()
+            elapsed = time.perf_counter() - start
+            if index >= warmup:
+                durations[index - warmup] += elapsed
+            del decoded_k, decoded_v
+    return {"decode_seconds_mean": statistics.mean(durations),
+            "decode_seconds_median": statistics.median(durations),
+            "decode_seconds_samples": durations, "decode_warmup": warmup, "decode_repeats": repeats,
+            "decode_timing_scope": "K_then_V_decode_only_per_layer_sum_including_output_allocations",
+            "decode_timing_backend": codec.backend, "decode_device": str(device)}
+
+
 def run(config: dict, stage: str, output_dir: Path) -> dict:
     output_dir = Path(output_dir); output_dir.mkdir(parents=True, exist_ok=True)
     axis, variants = _settings(config)
     if stage == "plan":
-        report = {"schema": "tempokv.rebuttal.architecture.plan.v1", "axis": axis, "variants": variants,
-                  "ranks": config.get("ranks", "D/8,D/4,D/2"), "stages": ["plan", "fit", "replay", "generate", "evaluate", "summarize"],
+        report = {"schema": "tempokv.rebuttal.architecture.plan.v1", "status": "planned", "axis": axis, "variants": variants,
+                  "ranks": config.get("ranks", "D/8,D/4,D/2"), "stages": ["plan", "fit", "replay", "generate", "evaluate", "quality", "summarize"],
                   "required_fit_inputs": ["calibration_trace", "codec_config"],
                   "required_evaluation_inputs": ["evaluation_trace", "architecture_parameters_or_fit_report"],
                   "generation_interface": "ExperimentalCodec.load(path); ResearchPackedTensor.decode(source=...)",
@@ -332,7 +401,8 @@ def run(config: dict, stage: str, output_dir: Path) -> dict:
     source = config.get("evaluation_trace", config.get("trace"))
     if not source:
         raise ValueError("evaluation_trace is required for architecture replay")
-    keys, values, evaluation = load_trace(source, config.get("device", "cpu"))
+    keys, values, evaluation = load_trace(source, config.get("device", "cpu"),
+        identity_path=config.get("evaluation_identity"), max_records=config.get("max_records"))
     parameters = config.get("architecture_parameters", config.get("parameters"))
     if parameters:
         if isinstance(parameters, str):
@@ -356,9 +426,12 @@ def run(config: dict, stage: str, output_dir: Path) -> dict:
         if (codec.temporal.layers, codec.temporal.heads, codec.temporal.bias.shape[-1]) != (keys.shape[0], keys.shape[-2], keys.shape[-1]):
             raise ValueError("evaluation model shape differs from fitted model")
         start = time.perf_counter(); metrics, records = replay_codec(codec, keys, values)
+        replay_seconds = time.perf_counter() - start
+        decoding = benchmark_decode(codec, keys, values, warmup=int(config.get("decode_warmup", 1)),
+                                    repeats=int(config.get("decode_repeats", 5)))
         identity = {"variant": codec.metadata["variant"], "axis": axis}
         results.append({**row, **identity, **metrics, "split_validation": split,
-                        "replay_seconds": time.perf_counter() - start, "metric_scope": "bf16_trace_replay"})
+                        "replay_seconds": replay_seconds, **decoding, "metric_scope": "bf16_trace_replay"})
         events.extend({**identity, **x} for x in records)
     report = {"schema": "tempokv.rebuttal.architecture.reconstruction.v1", "status": "complete", "axis": axis,
               "evaluation": evaluation, "variants": results}

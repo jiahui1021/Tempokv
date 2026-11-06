@@ -10,9 +10,9 @@ from rebuttal.adapters.experimental_codec import ResearchCross, group_count, gro
 @torch.no_grad()
 def fit_low_rank_regression(xx: torch.Tensor, xy: torch.Tensor, *, rank: int,
                             ridge: float = 0.1, steps: int = 30):
-    """Fit A B against sufficient statistics with a dense-map ridge prior.
+    """Fit A B against sufficient statistics with the same zero-centered ridge as the dense control.
 
-    The objective is tr(W' XX W)-2 tr(W' XY)+lambda||W-I||².
+    The objective is tr(W' XX W)-2 tr(W' XY)+lambda||W||².
     Unlike truncating W, alternating updates account for the calibration input
     covariance. The objective log omits the target-energy constant.
     """
@@ -21,7 +21,7 @@ def fit_low_rank_regression(xx: torch.Tensor, xy: torch.Tensor, *, rank: int,
         raise ValueError("invalid low-rank regression controls")
     penalty = ridge * xx.diagonal().mean().clamp_min(1e-20)
     system = xx + torch.eye(dimension, device=xx.device, dtype=xx.dtype) * penalty
-    target = xy + torch.eye(dimension, device=xx.device, dtype=xx.dtype) * penalty
+    target = xy
     dense = torch.linalg.lstsq(system, target).solution
     u, singular, vh = torch.linalg.svd(dense, full_matrices=False)
     a = u[:, :rank] * singular[:rank].sqrt()[None]
@@ -106,11 +106,11 @@ def fit_cross_architecture(reconstructed_keys: torch.Tensor, target: torch.Tenso
                 w = a.double() @ b.double()
                 logs.append({"round": round_index + 1, "group": group, "rank": rank, "optimization": log})
             elif kind == "diagonal":
-                diagonal = (cross.diagonal() + penalty) / (covariance.diagonal() + penalty).clamp_min(1e-20)
+                diagonal = cross.diagonal() / (covariance.diagonal() + penalty).clamp_min(1e-20)
                 weights.append(diagonal.float()); w = torch.diag(diagonal)
             else:
                 w = torch.linalg.lstsq(covariance + torch.eye(dimension, device=target.device) * penalty,
-                                      cross + torch.eye(dimension, device=target.device) * penalty).solution
+                                      cross).solution
                 weights.append(w.float())
             biases.append((sy[group] / n - sx[group] / n @ w).float())
         current = ResearchCross(kind, baseline.sharing, torch.stack(biases), baseline.history_weights.clone(), layers, heads,

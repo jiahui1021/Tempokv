@@ -8,8 +8,23 @@ from typing import Any
 from rebuttal.common.statistics import grouped_summary
 from rebuttal.common.video_metrics import (
     aggregate_frames, iter_pair_metrics, make_quality_backend, pair_key, read_csv,
-    resolve_pairs, write_csv, write_json,
+    resolve_pairs, video_fingerprint, write_csv, write_json,
 )
+
+
+QUALITY_COMPLETION_FILE = "quality_completion.json"
+QUALITY_COMPLETION_SCHEMA = "tempokv.rebuttal.quality_completion.v1"
+QUALITY_OUTPUT_FILES = ("video_pairs.json", "frames.csv", "windows.csv", "videos.csv")
+
+
+def quality_output_fingerprints(output_dir: Path) -> dict[str, dict[str, Any]]:
+    """Bind the input declaration and all reusable score tables to one run."""
+    result = {}
+    for name in QUALITY_OUTPUT_FILES:
+        fingerprint = video_fingerprint(output_dir / name)
+        # Output directories can be relocated together without changing scores.
+        result[name] = {key: fingerprint[key] for key in ("size_bytes", "sha256")}
+    return result
 
 
 def summarize(output_dir: Path, config: dict[str, Any]) -> dict[str, Any]:
@@ -100,6 +115,9 @@ def run(config: dict[str, Any], stage: str, output_dir: Path) -> dict[str, Any]:
         return summarize(output_dir, config)
     if stage != "evaluate":
         raise ValueError("temporal_window supports plan/evaluate/summarize; generation uses the model adapter")
+    # A failed rerun must not authenticate partially overwritten or old scores.
+    completion_path = output_dir / QUALITY_COMPLETION_FILE
+    completion_path.unlink(missing_ok=True)
     pairs = resolve_pairs(config)
     backend = make_quality_backend(config)
     windows, videos = [], []
@@ -123,4 +141,7 @@ def run(config: dict[str, Any], stage: str, output_dir: Path) -> dict[str, Any]:
             videos.extend(aggregate_frames(rows, group_by_window=False))
             write_csv(output_dir / "windows.csv", windows)
             write_csv(output_dir / "videos.csv", videos)
-    return summarize(output_dir, config)
+    result = summarize(output_dir, config)
+    write_json(completion_path, {"schema_version": QUALITY_COMPLETION_SCHEMA, "status": "complete",
+                                 "outputs": quality_output_fingerprints(output_dir)})
+    return result

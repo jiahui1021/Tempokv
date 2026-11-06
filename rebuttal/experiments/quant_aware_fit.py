@@ -11,7 +11,7 @@ from pathlib import Path
 import time
 from typing import Any
 
-from rebuttal.common.manifest import write_json
+from rebuttal.common.manifest import write_json, file_sha256
 
 
 def run(config: dict[str, Any], stage: str, output_dir: Path) -> dict[str, Any]:
@@ -39,6 +39,8 @@ def run(config: dict[str, Any], stage: str, output_dir: Path) -> dict[str, Any]:
     validation = load_trace(config["validation_trace"], device=device,
                             identity_path=config.get("validation_identity"), max_records=config.get("max_records"))
     split = check_trace_split(calibration, validation, allow_in_sample=False)
+    if config.get("require_prompt_identity", False) and not split["prompt_identity_verified"]:
+        raise ValueError("complete calibration/validation prompt identity is required")
     k, v = load_pair(config["k_params"], config["v_params"], codec, device)
     tensors = [k.history_weights, k.history_bias]
     tensors += [v.history_weights, v.history_bias] if isinstance(v, TemporalParameters) else [v.weight, v.history_weights, v.bias]
@@ -99,6 +101,10 @@ def run(config: dict[str, Any], stage: str, output_dir: Path) -> dict[str, Any]:
               "baseline_calibration_loss": baseline_cal, "selected_validation_loss": best_val,
               "history": history, "fit_seconds": time.perf_counter()-started,
               "codec_config": str(output_dir / "codec.json"), "k_params": str(k_path), "v_params": str(v_path),
-              "parameter_set_id": k.parameter_set_id}
+              "parameter_set_id": k.parameter_set_id,
+              "k_sha256": file_sha256(k_path), "v_sha256": file_sha256(v_path),
+              "selection_sources": [{"role": role, "path": str(trace.path), "sha256": file_sha256(trace.path),
+                                     "split_identity": trace.metadata["split_identity"]}
+                                    for role, trace in (("calibration", calibration), ("validation", validation))]}
     write_json(output_dir / "fit_report.json", result)
     return result

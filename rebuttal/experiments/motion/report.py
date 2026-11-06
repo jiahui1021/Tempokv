@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from rebuttal.common.statistics import correlation, finite, grouped_summary
-from rebuttal.common.video_metrics import IDENTITY_FIELDS, VideoReader, read_csv, resolve_pairs, write_csv, write_json
+from rebuttal.common.video_metrics import IDENTITY_FIELDS, VideoReader, quality_contract, read_csv, resolve_pairs, write_csv, write_json
 from rebuttal.experiments import temporal_window
 from .camera import camera_proxy, forward_backward_proxy
 from .cases import export_paired_clip, select_candidates
@@ -37,17 +37,19 @@ def analyze_reference(pair: dict[str, Any], config: dict[str, Any], backend: Any
                 raise ValueError("BF16 reference changes frame shape")
             if frame.timestamp <= previous.timestamp:
                 raise ValueError("BF16 reference has nonmonotonic PTS")
-            flow = backend(previous.image, frame.image)
-            if flow.shape != (*previous.image.shape[:2], 2) or not np.isfinite(flow).all():
-                raise ValueError("flow backend returned invalid original-resolution vectors")
-            magnitude = float(np.linalg.norm(flow, axis=-1).mean())
             score = float(np.abs(frame.image.astype(np.float32) - previous.image.astype(np.float32)).mean())
             cut = score >= threshold
+            magnitude = None
+            if not cut:
+                flow = backend(previous.image, frame.image)
+                if flow.shape != (*previous.image.shape[:2], 2) or not np.isfinite(flow).all():
+                    raise ValueError("flow backend returned invalid original-resolution vectors")
+                magnitude = float(np.linalg.norm(flow, axis=-1).mean())
             row = {k: pair.get(k) for k in ("model", "prompt_id", "seed", "sample_id")}
             row.update(frame_index=previous.index, next_frame_index=frame.index, timestamp=previous.timestamp,
                        end_timestamp=frame.timestamp, motion_magnitude=magnitude,
-                       motion_diagonal_per_second=magnitude * reader.fps / math.hypot(reader.width, reader.height),
-                       is_cut=cut, cut_score=score, flow_valid=True, global_motion=None, residual_motion=None,
+                       motion_diagonal_per_second=magnitude * reader.fps / math.hypot(reader.width, reader.height) if magnitude is not None else None,
+                       is_cut=cut, cut_score=score, flow_valid=not cut, global_motion=None, residual_motion=None,
                        camera_valid=False, camera_failure="scene_cut" if cut else None,
                        fb_inconsistent_fraction=None, fb_valid_fraction=None)
             if not cut:
@@ -73,7 +75,8 @@ def analyze_reference(pair: dict[str, Any], config: dict[str, Any], backend: Any
     summary = {k: pair.get(k) for k in ("model", "prompt_id", "seed", "sample_id")}
     summary.update(reference=pair["reference"], frames=total_frames, flow_pairs=len(rows), fps=reader.fps,
                    duration_seconds=previous.timestamp + 1 / reader.fps, width=reader.width, height=reader.height,
-                   motion_magnitude=average(rows, "motion_magnitude"), motion_diagonal_per_second=average(rows, "motion_diagonal_per_second"),
+                   motion_magnitude=average(continuous, "motion_magnitude"), motion_diagonal_per_second=average(continuous, "motion_diagonal_per_second"),
+                   motion_basis="non_cut_adjacent_frames", motion_missing_reason=None if continuous else "no_non_cut_frame_pairs",
                    motion_continuous=average(continuous, "motion_magnitude"), cut_pairs=len(rows)-len(continuous),
                    cut_fraction=(len(rows)-len(continuous))/len(rows), global_motion=average(camera_valid, "global_motion"),
                    residual_motion=average(camera_valid, "residual_motion"), camera_valid_pairs=len(camera_valid),
@@ -101,6 +104,28 @@ def _interval(event: dict[str, Any]) -> tuple[int, int] | None:
     return int(start), int(end)
 
 
+def _cache_records(pair: dict[str, Any], events: list[dict[str, Any]], scope: str) -> tuple[list[dict[str, Any]], str | None]:
+    """Resolve experiment identity as well as video identity before summing."""
+    candidates = [r for r in events if _identity(r) == _identity(pair) and r.get("metric_scope") == scope]
+    if not candidates:
+        return [], "no_matching_identity_and_scope"
+    selectors = {"method": pair.get("cache_method", pair.get("method")),
+                 "variant": pair.get("cache_variant", pair.get("variant", pair.get("method"))),
+                 "comparison_id": pair.get("cache_comparison_id", pair.get("comparison_id", "default"))}
+    for field, expected in selectors.items():
+        present = [r.get(field) is not None for r in candidates]
+        # Legacy observer files have no experiment fields: their explicitly
+        # declared per-pair file binds the configuration. Do not combine such
+        # unlabelled rows with labelled configurations in one event stream.
+        if any(present) and not all(present):
+            return [], f"incomplete_cache_{field}_identity"
+        if any(present):
+            candidates = [r for r in candidates if str(r[field]) == str(expected)]
+            if not candidates:
+                return [], f"no_matching_cache_{field}"
+    return candidates, None
+
+
 def join_cache(pair: dict[str, Any], start_frame: int, end_frame: int, scope: str = "bf16_trace_replay", *, events: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     """No guessed latent→pixel mapping; no mean-of-NMSE reconstruction."""
     result = {"k_reconstruction_nmse": None, "v_reconstruction_nmse": None,
@@ -110,10 +135,11 @@ def join_cache(pair: dict[str, Any], start_frame: int, end_frame: int, scope: st
     if not filename:
         return result
     rows = _load_events(Path(filename)) if events is None else events
-    matched = [r for r in rows if _identity(r) == _identity(pair) and r.get("metric_scope") == scope]
-    if not matched:
-        result["cache_missing_reason"] = "no_matching_identity_and_scope"
+    matched, reason = _cache_records(pair, rows, scope)
+    if reason:
+        result["cache_missing_reason"] = reason
         return result
+    result["cache_identity_validation"] = "event_fields_and_declared_file" if any(any(r.get(k) is not None for k in ("method", "variant", "comparison_id")) for r in matched) else "declared_single_configuration_file"
     if any(_interval(r) is None for r in matched):
         result["cache_missing_reason"] = "pixel_time_mapping_missing"
         return result
@@ -143,7 +169,7 @@ def join_cache(pair: dict[str, Any], start_frame: int, end_frame: int, scope: st
 
 def cache_motion_intervals(pair: dict[str, Any], flow_rows: list[dict[str, Any]], scope: str, events: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Aggregate flow into the explicit cache pixel intervals, never vice versa."""
-    relevant = [r for r in events if _identity(r) == _identity(pair) and r.get("metric_scope") == scope]
+    relevant, _ = _cache_records(pair, events, scope)
     intervals = sorted({_interval(r) for r in relevant if _interval(r) is not None})
     result = []
     for start, end in intervals:
@@ -154,12 +180,77 @@ def cache_motion_intervals(pair: dict[str, Any], flow_rows: list[dict[str, Any]]
         row = {k: pair.get(k) for k in (*IDENTITY_FIELDS,)}
         row.update(pixel_start_frame=start, pixel_end_frame=end, timestamp=members[0]["timestamp"], end_timestamp=members[-1]["end_timestamp"],
                    is_cut=any(r["is_cut"] for r in members), camera_valid=valid_camera,
-                   motion_magnitude=sum(r["motion_magnitude"] for r in members) / len(members),
+                   motion_magnitude=sum(r["motion_magnitude"] for r in members) / len(members) if not any(r["is_cut"] for r in members) else None,
                    global_motion=sum(r["global_motion"] for r in members) / len(members) if valid_camera else None,
                    residual_motion=sum(r["residual_motion"] for r in members) / len(members) if valid_camera else None)
         row.update(join_cache(pair, start, end, scope, events=events))
         result.append(row)
     return result
+
+
+def validate_quality_reuse(directory: Path, pairs: list[dict[str, Any]], config: dict[str, Any]) -> None:
+    completion_path = directory / temporal_window.QUALITY_COMPLETION_FILE
+    if not completion_path.is_file():
+        raise ValueError("quality reuse requires a successful completion record; recompute quality")
+    completion = json.loads(completion_path.read_text(encoding="utf-8"))
+    if (completion.get("schema_version") != temporal_window.QUALITY_COMPLETION_SCHEMA or
+            completion.get("status") != "complete"):
+        raise ValueError("quality reuse completion record is invalid; recompute quality")
+    try:
+        actual_outputs = temporal_window.quality_output_fingerprints(directory)
+    except FileNotFoundError as exc:
+        raise ValueError("quality reuse completed output file is missing; recompute quality") from exc
+    if completion.get("outputs") != actual_outputs:
+        raise ValueError("quality reuse completed output fingerprint differs; recompute quality")
+    path = directory / "video_pairs.json"
+    if not path.is_file():
+        raise ValueError("quality reuse requires video_pairs.json with captured input fingerprints; recompute quality")
+    saved = json.loads(path.read_text(encoding="utf-8"))
+    expected_contract = quality_contract(config)
+    for pair in pairs:
+        old = [r for r in saved.get("pairs", []) if all(str(r.get(k)) == str(pair.get(k)) for k in IDENTITY_FIELDS)]
+        if len(old) != 1:
+            raise ValueError("quality reuse requires exactly one saved pair for each full identity")
+        if old[0].get("quality_contract") != expected_contract:
+            raise ValueError("quality reuse metric/decoder contract differs or is missing; recompute quality")
+        for role in ("reference", "candidate"):
+            actual = pair.get("video_fingerprints", {}).get(role)
+            previous = old[0].get("video_fingerprints", {}).get(role)
+            if actual is None or previous is None or actual != previous:
+                raise ValueError(f"quality reuse {role} input fingerprint differs or is missing; recompute quality")
+
+
+def case_frames(pair: dict[str, Any], case: dict[str, Any], frame_rows: list[dict[str, Any]],
+                events: list[dict[str, Any]], scope: str) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Use one actual RGB interval for both cache sums and video fidelity."""
+    ordered = sorted(frame_rows, key=lambda r: int(r["frame_index"]))
+    selected = [r for r in ordered if case["start_seconds"] <= float(r["timestamp"]) < case["end_seconds"]]
+    info = {"requested_start_seconds": case["start_seconds"], "requested_end_seconds": case["end_seconds"],
+            "cache_interval_alignment": "no_complete_cache_interval"}
+    if not selected:
+        return [], info
+    start, end = int(selected[0]["frame_index"]), int(selected[-1]["frame_index"]) + 1
+    relevant, reason = _cache_records(pair, events, scope)
+    if reason or any(_interval(r) is None for r in relevant):
+        return selected, info
+    boundaries = []
+    for role in ("k", "v"):
+        intervals = {_interval(r) for r in relevant if str(r.get("role", "")).lower() == role}
+        boundaries.append({point for interval in intervals for point in interval})
+    shared = boundaries[0] & boundaries[1]
+    lower = [point for point in shared if int(ordered[0]["frame_index"]) <= point <= start]
+    upper = [point for point in shared if end <= point <= int(ordered[-1]["frame_index"]) + 1]
+    if not lower or not upper:
+        return selected, info
+    aligned_start, aligned_end = max(lower), min(upper)
+    aligned = [r for r in ordered if aligned_start <= int(r["frame_index"]) < aligned_end]
+    if [int(r["frame_index"]) for r in aligned] != list(range(aligned_start, aligned_end)):
+        return selected, info
+    metrics = join_cache(pair, aligned_start, aligned_end, scope, events=events)
+    if metrics["cache_missing_reason"] is not None:
+        return selected, info
+    info["cache_interval_alignment"] = "expanded_to_shared_explicit_cache_boundaries"
+    return aligned, info
 
 
 def summarize(output_dir: Path, config: dict[str, Any]) -> dict[str, Any]:
@@ -286,6 +377,7 @@ def run(config: dict[str, Any], stage: str, output_dir: Path) -> dict[str, Any]:
     quality_dir = output_dir / "quality"
     if config.get("quality_output_dir"):
         quality_dir = Path(config["quality_output_dir"])
+        validate_quality_reuse(quality_dir, pairs, config)
     else:
         temporal_window.run(config, "evaluate", quality_dir)
     quality = read_csv(quality_dir / "videos.csv")
@@ -327,16 +419,18 @@ def run(config: dict[str, Any], stage: str, output_dir: Path) -> dict[str, Any]:
     case_rows = []
     for case in candidates:
         pair = next(p for p in pairs if _identity(p) == _identity(case) and p["candidate"] == case["candidate"])
-        frames = [r for r in frame_quality if all(str(r.get(k)) == str(pair.get(k)) for k in IDENTITY_FIELDS) and case["start_seconds"] <= float(r["timestamp"]) < case["end_seconds"]]
+        events = loaded_cache[tuple(str(pair.get(k)) for k in IDENTITY_FIELDS)]
+        all_frames = [r for r in frame_quality if all(str(r.get(k)) == str(pair.get(k)) for k in IDENTITY_FIELDS)]
+        frames, alignment = case_frames(pair, case, all_frames, events, config.get("cache_metric_scope", "bf16_trace_replay"))
         if not frames:
             continue
         start, end = int(frames[0]["frame_index"]), int(frames[-1]["frame_index"]) + 1
-        events = loaded_cache[tuple(str(pair.get(k)) for k in IDENTITY_FIELDS)]
         cache = join_cache(pair, start, end, config.get("cache_metric_scope", "bf16_trace_replay"), events=events)
-        result = {**case, **aggregate_case_quality(frames), **cache,
+        result = {**case, **alignment, **aggregate_case_quality(frames), **cache,
+                  "start_seconds": frames[0]["timestamp"], "end_seconds": float(frames[-1]["timestamp"]) + float(frames[-1]["frame_duration"]),
                   "actual_start_seconds": frames[0]["timestamp"], "actual_end_seconds": float(frames[-1]["timestamp"]) + float(frames[-1]["frame_duration"])}
         if config.get("difficult_cases", {}).get("export_clips", True):
-            result["clip"] = export_paired_clip(case, output_dir / "cases" / f"{case['case_id']}.mp4", decoder=config.get("video_decoder", "pyav"))
+            result["clip"] = export_paired_clip(result, output_dir / "cases" / f"{case['case_id']}.mp4", decoder=config.get("video_decoder", "pyav"))
         case_rows.append(result)
     write_json(output_dir / "difficult_cases.json", {"cases": case_rows, "verified_case_count": sum(bool(r["manual_verified"]) for r in case_rows),
                                                      "candidate_only_case_count": sum(not r["manual_verified"] for r in case_rows)})

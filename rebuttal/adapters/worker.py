@@ -25,6 +25,28 @@ def _load_bridge(filename: str):
     return module
 
 
+def research_span_frames(config: dict) -> int:
+    """Require a complete batch span before the final three-frame model block."""
+    frames = int(config.get("frames", 1401))
+    if frames < 1 or (frames + 3) % 12:
+        raise ValueError("Self-Forcing frames must satisfy (frames+3)%12 == 0")
+    latest_finalized = (frames + 3) // 4 - 3
+    span = int(config.get("span_frames", min(24, latest_finalized)))
+    if span < 2 or span > latest_finalized:
+        raise ValueError("research batch codec requires 2 <= span_frames <= latent_frames - 3; "
+                         "otherwise no compressed span is consumed during generation")
+    return span
+
+
+def require_codec_activity(before: dict, after: dict) -> dict:
+    """Reject successful generation that never used both compressed cache roles."""
+    counts = {key: int(after.get(key, 0)) - int(before.get(key, 0))
+              for key in ("encode_k", "encode_v", "decode_k", "decode_v")}
+    if any(value <= 0 for value in counts.values()):
+        raise RuntimeError(f"research codec did not encode and decode both K/V during generation: {counts}")
+    return counts
+
+
 def install(config: dict, runtime_root: Path):
     """Install before importing inference; returns the actual pipeline subclass."""
     import torch
@@ -37,7 +59,8 @@ def install(config: dict, runtime_root: Path):
     mode = config.get("mode", "tempokv")
     os.environ["TEMPOKV_HORIZON_FRAMES"] = str(latent_frames)
     os.environ["TEMPOKV_NUM_FRAMES"] = str(latent_frames)
-    os.environ["TEMPOKV_SPAN_FRAMES"] = str(config.get("span_frames", latent_frames))
+    span_frames = research_span_frames(config) if config.get("research_params") else int(config.get("span_frames", latent_frames))
+    os.environ["TEMPOKV_SPAN_FRAMES"] = str(span_frames)
     os.environ["TEMPOKV_BF16_LAG_FRAMES"] = str(config.get("bf16_lag_frames", 18))
     if mode == "tempokv":
         def factory():
@@ -74,6 +97,21 @@ def install(config: dict, runtime_root: Path):
     hashes = {row["prompt_id"]: row["sha256"] for row in prompt_records(config["prompts"])}
 
     class RebuttalPipeline(base_class):
+        def inference(self, *args, **kwargs):
+            research = bool(config.get("research_params"))
+            before = dict(self.tempokv_codec.activity_counts) if research else None
+            result = super().inference(*args, **kwargs)
+            if research:
+                counts = require_codec_activity(before, self.tempokv_codec.activity_counts)
+                rank = int(os.environ.get("RANK", "0"))
+                path = Path(config["output_dir"]) / f"codec_activity.rank-{rank}.jsonl"
+                path.parent.mkdir(parents=True, exist_ok=True)
+                with path.open("a") as handle:
+                    handle.write(json.dumps({**getattr(self, "_rebuttal_identity", {}),
+                                             "span_frames": span_frames, "counts": counts,
+                                             "status": "verified"}) + "\n")
+            return result
+
         def set_research_context(self, *, prompt_index, seed):
             self._rebuttal_identity = {"prompt_id": int(prompt_index), "seed": int(seed),
                                       "prompt_sha256": hashes.get(int(prompt_index)), "model": "self_forcing"}

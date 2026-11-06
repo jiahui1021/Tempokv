@@ -8,6 +8,7 @@ import subprocess
 import sys
 
 from .capacity import capacity_report
+from .identity import job_video_identities, read_prompts, save_job_identities
 
 ROOT = Path(__file__).resolve().parents[3]
 
@@ -45,7 +46,7 @@ def build_generation_jobs(config: dict, output_dir: Path) -> dict:
                                    "reason": "common context does not fit this budget or schedule"})
     jobs = []
     prompts = config.get("prompts")
-    prompt_lines = ([line.strip() for line in Path(prompts).read_text().splitlines() if line.strip()]
+    prompt_lines = (read_prompts(Path(prompts))
                     if prompts and Path(prompts).is_file() else None)
     input_digests = {}
     for key in ("prompts", "runtime_config", "codec_config", "k_params", "v_params"):
@@ -117,6 +118,7 @@ def execute_jobs(plan: dict, *, resume: bool = False) -> dict:
                 expected = {f"{i}_0.mp4" for i in range(job["expected_video_count"] or 0)}
                 actual = {p.name for p in (folder / "videos").glob("*.mp4")}
                 if expected and actual == expected and (folder / "memory_report.json").is_file():
+                    job_video_identities(job)
                     job["status"] = "reused"
                     continue
         Path(job["config_path"]).write_text(json.dumps(config, indent=2) + "\n")
@@ -130,6 +132,12 @@ def execute_jobs(plan: dict, *, resume: bool = False) -> dict:
             if not expected or actual != expected or not (folder / "memory_report.json").is_file():
                 job["status"] = "failed"
                 job["failure_reason"] = "missing_or_unexpected_videos_or_memory_report"
+            else:
+                try:
+                    save_job_identities(job)
+                except (ValueError, KeyError, OSError) as error:
+                    job["status"] = "failed"
+                    job["failure_reason"] = f"invalid_generation_identity: {error}"
         status_file.write_text(json.dumps(job, indent=2) + "\n")
         if job["status"] == "failed":
             raise RuntimeError(f"fixed-memory generation failed for {job['name']}; see {folder / 'run.log'}")

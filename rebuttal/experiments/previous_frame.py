@@ -16,6 +16,7 @@ def variant_configs(config: dict[str, Any]):
         raise ValueError("previous-frame study requires k_to_v production direction")
     available = {
         "production": base,
+        "k_one_frame": replace(base, k_history_length=1),
         "k_identity": replace(base, k_predictor_mode="identity"),
         "kv_identity_cross": replace(base, k_predictor_mode="identity", v_predictor_mode="cross_kv_identity",
                                        v_history_length=max(base.v_history_length, 1)),
@@ -61,6 +62,10 @@ def fit_variant(trace, codec, *, output_dir: Path, config: dict[str, Any]) -> di
                "parameter_set_id": temporal.parameter_set_id, "fit_seconds": seconds, "controls": controls,
                "k_sha256": file_sha256(k_path), "v_sha256": file_sha256(v_path),
                "production_family": codec.fit_mode}
+    identity_path = trace.metadata.get("identity_path")
+    if identity_path:
+        payload["calibration_identity"] = identity_path
+        payload["calibration_identity_sha256"] = file_sha256(identity_path)
     write_json(output_dir / "fit_report.json", payload)
     return payload
 
@@ -73,6 +78,10 @@ def _fit_record(root: Path, name: str) -> dict[str, Any]:
     for field, hash_key in (("k_params", "k_sha256"), ("v_params", "v_sha256")):
         if file_sha256(result[field]) != result[hash_key]:
             raise ValueError("fitted parameters changed since their fit report")
+    if file_sha256(result["calibration_trace"]) != result["calibration_trace_sha256"]:
+        raise ValueError("calibration trace changed since fitting")
+    if result.get("calibration_identity_sha256") and file_sha256(result["calibration_identity"]) != result["calibration_identity_sha256"]:
+        raise ValueError("calibration identities changed since fitting")
     return result
 
 
@@ -102,21 +111,25 @@ def run(config: dict[str, Any], stage: str, output_dir: Path) -> dict[str, Any]:
                 reports[name] = fit_variant(trace, codec, output_dir=marker.parent, config=config)
         result = {"status": "complete", "variants": reports, "prompt_split": split}
     elif stage in {"replay", "cache"}:
-        from rebuttal.common.trace import load_trace, device_for, check_trace_split
+        from rebuttal.common.trace import load_trace, load_trace_identity, device_for, check_trace_split
         from rebuttal.common.cache_metrics import load_pair, replay
         device = device_for(config.get("device", "auto"))
         trace = load_trace(config.get("evaluation_trace") or config["trace"], device=device,
                            identity_path=config.get("evaluation_identity") or config.get("trace_manifest"),
                            max_records=config.get("max_records"))
         if config.get("calibration_trace"):
-            calibration = load_trace(config["calibration_trace"], max_records=1,
-                                     identity_path=config.get("calibration_identity"))
+            calibration = load_trace_identity(config["calibration_trace"],
+                                              identity_path=config.get("calibration_identity"))
             trace_split = check_trace_split(calibration, trace, allow_in_sample=config.get("allow_in_sample", False))
         else:
             trace_split = {"prompt_identity_verified": False}
+        if config.get("require_prompt_identity", False) and not trace_split["prompt_identity_verified"]:
+            raise ValueError("complete calibration/evaluation prompt identity is required")
         reports = {}
         for name, codec in configs.items():
             fitted = _fit_record(output_dir, name)
+            if config.get("calibration_trace") and Path(config["calibration_trace"]).resolve() != Path(fitted["calibration_trace"]).resolve():
+                raise ValueError("declared calibration_trace differs from the actual fitting source")
             k, v = load_pair(fitted["k_params"], fitted["v_params"], codec, device)
             folder = output_dir / "cache" / name
             report = replay(trace, codec, k, v, span_frames=config.get("span_frames"),
@@ -142,7 +155,7 @@ def run(config: dict[str, Any], stage: str, output_dir: Path) -> dict[str, Any]:
         for name in configs:
             candidate = output_dir / "runs" / name / "videos"
             candidate = Path(config.get("candidate_dirs", {}).get(name, candidate))
-            item = {**config, "candidate_dir": str(candidate), "window_seconds": config.get("window_seconds", 15)}
+            item = {**config, "method": name, "candidate_dir": str(candidate), "window_seconds": config.get("window_seconds", 15)}
             reports[name] = evaluate(item, "evaluate", output_dir / "quality" / name)
         result = {"status": "complete", "variants": reports}
     elif stage == "summarize":

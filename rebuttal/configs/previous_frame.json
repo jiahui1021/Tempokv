@@ -1,0 +1,13 @@
+{
+  "extends": "_base.json",
+  "experiment": "previous_frame",
+  "frames": 717,
+  "variants": [
+    "production",
+    "k_one_frame",
+    "k_identity",
+    "kv_identity_cross",
+    "kv_identity_no_cross"
+  ],
+  "fit_iterations": 2
+}

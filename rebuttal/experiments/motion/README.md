@@ -55,6 +55,12 @@ Cache 记录必须具备以下信息，缺失时 fidelity 和 motion 仍完成�
 
 完整视频的 cache correlation 要求 K/V 各自覆盖完整质量计算范围。Camera/local proxy 关联把连续光流聚合到同一个显式 cache RGB 区间；切镜头或估计失败的区间不混入。多个 layer/head 的 NMSE 通过误差与能量的分子/分母汇总。
 
+Cache join 同时核对事件中已有的 `method`、`variant`、`comparison_id`。默认与 pair 的对应身份匹配；variant 默认采用 pair 的 `variant` 或 `method`。如果视频方法标签是 `tempokv_int4`、replay 事件标签是 `production`，须在 pair 中显式设置 `cache_variant: "production"`。`cache_method`、`cache_comparison_id` 可声明其他命名映射。事件同一身份中混有带标签和不带标签的配置会拒绝关联。旧 online observer 文件没有实验标签时，仍由 pair 的独立 `cache_events` 文件声明配置，输出标记 `declared_single_configuration_file`；这类文件不可拼接不同配置。
+
 `case_candidates.json` 仅为基于 BF16 的自动候选，不能当作已核实遮挡或 scene change。人工标注可使用 `difficult_cases.annotations` 指向 `{"cases": [{"case_id": "...", "manual_verified": true, "category": "...", "notes": "..."}]}`；类别与起止时间可修正。`difficult_cases.json` 区分 verified 与 candidate-only。输出 MP4/PNG 供展示，重新编码片段不参与定量 fidelity。
 
-可选 `quality_output_dir` 复用已生成的 `frames.csv` 与 `videos.csv`，但仍核对每个配对身份和帧范围；可选 `motion_groups` 导入已冻结阈值。缺失模型的阈值会依据该模型 BF16 单独计算；相同 magnitude 的 ties 不为凑齐组数而拆分。
+困难案例若具备完整 K/V 时间映射，会向外扩展到最近的共同显式 cache 边界，并在同一个实际 RGB 区间重新汇总 fidelity 和导出片段。输出同时保留 `requested_*` 与实际起止时间；不按像素长度拆分或估计 cache SSE。缺少完整映射时保留原片段并明确记录 cache 缺测。
+
+可选 `quality_output_dir` 复用已生成的 `frames.csv` 与 `videos.csv`。必须同时存在成功评测后生成的 `quality_completion.json`（绑定输入声明和输出 CSV 指纹）及本版本生成的 `video_pairs.json`，包含原视频路径、字节数、SHA-256 和指标/decoder 合同；换视频、缺视频、换指标配置或缺旧指纹均需重算质量，不能仅凭相同 prompt ID 复用。
+
+主 motion 分数及分位数组仅使用非 cut 帧对；跨 cut 不估计光流。全部帧对均为 cut 的视频标为 `unclassified`，仍保留其质量和困难案例信息。可选 `motion_groups` 导入已冻结阈值，其 `motion_basis` 必须为 `non_cut_adjacent_frames`；旧含 cut 阈值须重算。缺失模型的阈值会依据该模型 BF16 单独计算；相同 magnitude 的 ties 不为凑齐组数而拆分。
