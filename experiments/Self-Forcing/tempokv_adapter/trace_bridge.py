@@ -63,7 +63,7 @@ def _argument(
     return args[index] if len(args) > index else None
 
 
-def install(runtime_root: str | Path) -> type:
+def install(runtime_root: str | Path, *, preserve_video_decoder: bool = False) -> type:
     """Install clean pre-RoPE K/V capture into the bundled Self-Forcing runtime."""
     runtime_root = Path(runtime_root).resolve()
     if str(runtime_root) not in sys.path:
@@ -105,7 +105,8 @@ def install(runtime_root: str | Path) -> type:
         def clear_cache(self) -> None:
             return None
 
-    pipeline_module.WanVAEWrapper = TraceVAEWrapper
+    if not preserve_video_decoder:
+        pipeline_module.WanVAEWrapper = TraceVAEWrapper
 
     class TraceCausalInferencePipeline(base):
         def __init__(self, *args: Any, **kwargs: Any) -> None:

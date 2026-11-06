@@ -64,6 +64,13 @@ def decode_cache_state(
         if output_layout != "BSHD":
             fallback_kwargs["output_layout"] = output_layout
         return fallback(state, **fallback_kwargs)
+    custom_decode = getattr(packed, "decode", None)
+    if callable(custom_decode):
+        return custom_decode(
+            source=source_tensor,
+            output_tensor=output_tensor,
+            output_layout=output_layout,
+        )
     # Decode straight into the caller's cache buffer.
     decode_kwargs = {
         "source": source_tensor,
@@ -76,7 +83,11 @@ def decode_cache_state(
     return decode_tensor(packed, **decode_kwargs)
 
 
-def install(runtime_root: str | Path) -> type:
+def install(
+    runtime_root: str | Path,
+    *,
+    codec_factory: Callable[[], TempoKVCodec] | None = None,
+) -> type:
     """Install TempoKV into the Self-Forcing runtime bundled in this repo."""
     runtime_root = Path(runtime_root).resolve()
     if str(runtime_root) not in sys.path:
@@ -93,7 +104,9 @@ def install(runtime_root: str | Path) -> type:
             super().__init__(*args, **kwargs)
             # TempoKV needs the pre-RoPE frame-addressable cache; BF16 keeps the dense one.
             self._uses_pre_rope_cache = True
-            self.tempokv_codec = load_codec_from_env()
+            self.tempokv_codec = (
+                load_codec_from_env() if codec_factory is None else codec_factory()
+            )
             config = self.tempokv_codec.config
             self._tempokv_rope_precision = "complex64"
             # Rollout length (the attention-window ablation narrows TEMPOKV_NUM_FRAMES).
