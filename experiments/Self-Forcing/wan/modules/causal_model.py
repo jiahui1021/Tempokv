@@ -352,6 +352,12 @@ class CausalWanSelfAttention(nn.Module):
             return q, k, v
 
         q, k, v = qkv_fn(x)
+        # Optional independent cache adapter; default inference is unchanged.
+        cache_handler = kv_cache.get("aquakv_handler") if kv_cache is not None else None
+        if cache_handler is not None:
+            x = cache_handler(q, k, v, current_start=current_start,
+                              grid_sizes=grid_sizes, freqs=freqs, attention=attention)
+            return self.o(x.flatten(2))
         research_probe = getattr(self, "research_probe", None)
         if research_probe is not None:
             research_probe.on_projected_native(self.research_layer_idx, q_pre=q, k_pre=k, v=v,

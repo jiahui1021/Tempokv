@@ -1,0 +1,56 @@
+{
+  "experiment": "aquakv",
+  "model": "self_forcing",
+  "device": "auto",
+  "checkpoint": null,
+  "model_root": null,
+  "model_config": "experiments/Self-Forcing/configs/self_forcing_dmd.yaml",
+  "calibration_prompts": "assets/calibration/cal_prompts.txt",
+  "evaluation_prompts": "assets/calibration/heldout_prompts.txt",
+  "calibration_trace": null,
+  "evaluation_trace": null,
+  "predictor_path": null,
+  "calibration_frames": 81,
+  "calibration_samples": 1,
+  "trace_tokens_per_frame": 8,
+  "frames": 1401,
+  "seed": 0,
+  "samples": 1,
+  "num_gpus": 1,
+  "use_ema": false,
+  "local_attn_size": -1,
+  "sink_size": 0,
+  "rope_precision": "native",
+  "parameter_dtype": "bfloat16",
+  "reg_rate": 0.001,
+  "fit_chunk_size": 4096,
+  "fit_token_stride": 1,
+  "validation_records": 0,
+  "require_prompt_identity": true,
+  "higgs": {
+    "hadamard_groupsize": 1024,
+    "edenn_d": 2,
+    "edenn_n": 16,
+    "first_layer_edenn_d": 2,
+    "first_layer_edenn_n": 256,
+    "quantize_first_layer": true,
+    "chunk_size": 64
+  },
+  "cache": {
+    "prefix_frames": 1,
+    "recent_buffer_frames": 3,
+    "flush_tail": true
+  },
+  "generation_methods": [
+    "bf16",
+    "aquakv"
+  ],
+  "metrics": [
+    "psnr",
+    "ssim",
+    "lpips"
+  ],
+  "video_decoder": "pyav",
+  "window_seconds": 15,
+  "plots": true
+}

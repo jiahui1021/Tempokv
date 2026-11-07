@@ -1,0 +1,2 @@
+# Install into an existing Self-Forcing environment. CPU fitting uses PyTorch.
+fast-hadamard-transform>=1.1.0

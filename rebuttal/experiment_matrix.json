@@ -182,7 +182,8 @@
       "qvg_codec_identity": "prq_not_s2_or_s2pp",
       "qvg_generation_policy": "same_self_forcing_generator_with_real_codec_adapter",
       "priority": "P1_capacity_P3_generation"
-    }
+    },
+    {"id": "aquakv", "status": "code_implemented_not_run", "planned_directory": "rebuttal/experiments/aquakv", "entry": "rebuttal/run.py --experiment aquakv --stage collect|fit|replay|generate|evaluate|summarize|pipeline", "methods": ["bf16", "aquakv"], "reference": "AQUA-KV arXiv 2501.19392, official e744183f2f3a4a90381f20a6975456871fd1ae29", "metrics": ["psnr", "ssim", "lpips", "payload_bits_per_element", "predictor_parameter_bytes", "peak_cache_bytes"], "controls": "independent_aquakv_pipeline_official_higgs_and_calibration_same_eval_prompts_seed_frames", "result_values": []}
   ],
   "implementation_order": [
     "shared_manifest_metrics_and_adapter_plan_mode",

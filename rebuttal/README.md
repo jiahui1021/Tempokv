@@ -64,3 +64,22 @@ python rebuttal/run.py --experiment previous_frame --config rebuttal/outputs/my_
 ## 2026-11-07 修复验证
 
 本轮修复覆盖可运行默认配置、恢复身份、完整 trace 划分、随机流隔离、视频与 cache 方法身份、quality 复用指纹、cut 分组、困难案例区间、架构公平拟合及实际量化验收。具体本地测试计数记录在 [progress.md](progress.md)；没有运行真实模型的 CUDA 长视频实验。
+
+- 1401 帧在 16 fps 下约 87.56 秒，前五个窗口各 15 秒，第六个窗口保留实际剩余时长；不能六等分后都标成 15 秒。
+- Self-Forcing 的完整历史 BF16 参考仅 K/V 数据就约 94 GiB，还需要权重与临时空间；短窗口 BF16 不能替代完整历史参考。
+- 生成时保留的 BF16 尾部、predictor history、量化辅助数据和预分配容量都影响可用历史长度；结束后 flush 的大小不足以回答固定预算问题。
+- 所有缺失飞书表格中的比较行都在主方案中标为“建议补全”，不推定为用户原表内容。
+
+## 实验 7：独立 AQUA-KV
+
+使用固定版本 AquaKV 官方 HIGGS、网格与校准求解器，独立采集、校准自己的参数，并接入 Self-Forcing 视频生成和质量评测。不需要 TempoKV 的配置或参数。现行配置、阶段及运行命令见 [独立 AquaKV 文档](experiments/aquakv/README.md)。
+
+完整入口为 `bash rebuttal/run_aquakv.sh`，等价于 `python rebuttal/run.py --experiment aquakv --stage pipeline`。阶段为 `collect → fit → replay → generate → evaluate → summarize`。没有真实 CUDA 模型实验结果。
+
+## CORAL-style block-DPLR 矩阵重建实验
+
+`block_dplr` 将 CORAL 的 head 内完整矩阵加跨 head 全局低秩项用于当前同层 CrossKV，仅测重建误差。默认 `plan → fit → replay`，`pipeline` 一次完成拟合与测试。入口、比较条件和真实数据来源见 [block-DPLR 文档](experiments/block_dplr/README.md)。现有 per-head dense 已经是全局 block diagonal，因此增加全局低秩项会增加相对该对照的参数大小。
+
+## Per-channel temporal 与 Dense temporal
+
+`temporal_matrix` 单独比较 K temporal（KH2）与 V temporal-only（VH1），两种模型均不使用 CrossKV。两者采用相同数据划分、量化、head/layer 共享方式、正则目标、历史增益上限与 warm-up；详见 [temporal-only 实验说明](experiments/temporal_matrix/README.md)。

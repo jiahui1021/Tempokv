@@ -107,6 +107,8 @@ PATH_KEYS = frozenset({
     "raw_trace", "trace_output_dir",
     "bf16_reference_prompts", "quality_output_dir", "motion_groups",
     "parameter_fit_report",
+    "predictor_path",
+    "previous_report",
 })
 
 
@@ -159,7 +161,11 @@ def git_revision() -> str | None:
 def code_fingerprint() -> str:
     files = sorted((ROOT / "rebuttal").rglob("*.py"))
     files += [ROOT / "experiments/Self-Forcing/tempokv_adapter/bridge.py",
-              ROOT / "experiments/Self-Forcing/tempokv_adapter/trace_bridge.py"]
+              ROOT / "experiments/Self-Forcing/tempokv_adapter/trace_bridge.py",
+              ROOT / "experiments/Self-Forcing/wan/modules/causal_model.py",
+              ROOT / "experiments/Self-Forcing/pipeline/causal_inference.py",
+              ROOT / "experiments/Self-Forcing/inference.py"]
+    files += sorted((ROOT / "rebuttal/experiments/aquakv/upstream/grids").glob("*.pt"))
     return digest({str(path.relative_to(ROOT)): file_sha256(path) for path in files})
 
 

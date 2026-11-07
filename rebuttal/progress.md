@@ -34,3 +34,34 @@
 - 最终验证：`PYTHONPATH=src python -m pytest -q rebuttal/tests` → **87 passed, 1 skipped**（11.90 秒；唯一跳过项需要真实 CUDA）。包括真实 packed codec、拟合/重建、量化目标选择来源、小型 PyAV 视频及失败恢复测试。
 - 六项默认 `--stage plan` 通过；48 个 Python 模块可解析，所有默认 JSON 可解析，`git diff --check` 通过。
 - 补充质量完成记录与输出 CSV 指纹：失败重跑不能认证旧分数；量化感知参数导出保留 calibration/validation 身份，最终测试检查两个来源。
+
+## 2026-11-07：独立 AQUA-KV 全流程替换早期对照
+
+- AquaKV 不读取 TempoKV 配置、拟合器、量化器或预测参数。
+- 固定官方版本 e744183f2f3a4a90381f20a6975456871fd1ae29，包含 HIGGS、网格、回归求解器和 Apache-2.0 LICENSE；保留官方首层独立量化、重建输入与 V 输入顺序。
+- 新增独立 BF16 clean trace 采集、AquaKV 校准、heldout replay、Self-Forcing 压缩缓存生成、视频质量评测和汇总；入口 `rebuttal/run_aquakv.sh` / `rebuttal/run.py --experiment aquakv --stage pipeline`。
+- Self-Forcing 主模型仅增加可选缓存调用；默认路径不启用 AquaKV。测试执行原生 inference loop 的小模型采集与 clean-refresh/reset 行为，并检查不安装 TempoKV 也可独立校准/重放。
+- 最终第三轮验证：`.venv/bin/python -m pytest -q rebuttal/tests tests/test_self_forcing.py tests/test_self_forcing_bf16_cache_window.py tests/test_prepare_self_forcing_trace.py` → **153 passed, 2 skipped**（27.78 秒）。跳过项需要 CUDA。
+- 17 个 Python 文件通过解析，独立默认 JSON 和 6 个官方网格通过检查；脚本语法、统一 plan 入口与 `git diff --check` 通过。
+- 没有执行真实 Self-Forcing checkpoint/CUDA 视频实验，没有产生真实质量或性能结果。未推送远端。
+
+## 2026-11-07：CORAL-style block-DPLR 矩阵真实重建实验
+
+- 按用户要求，将 CORAL 的 head 内完整矩阵加全局跨 head 低秩项用于当前同层 CrossKV。入口 `rebuttal/run.py --experiment block_dplr --stage pipeline`，默认配置 `rebuttal/configs/block_dplr.json`。
+- 旧表原 trace 缺失；使用现有 Self-Forcing `[30,128,24,12,128]` trace，SHA256 `e8f78e349ff297aceaa04b000de5a52e71b91339a7a09419f35df475148804b6`，本轮 103 条拟合 / 25 条测试。明确与旧表分开，重新拟合全部 baseline，未混用旧结果。
+- K4/V4、anchor4、group64、BF16 重建；固定 K temporal、V history/bias。三轮 headwise ridge / exact reduced-rank 更新；矩阵参数 FP32。
+- 本轮 dense V NMSE 0.002428772；DPLR r8/r32/r128 为 0.002221015 / 0.001898709 / 0.001341994，分别降低 8.55% / 21.82% / 44.75%。矩阵大小由 22.5 MiB 增至 25.3125 / 33.75 / 67.5 MiB。
+- 新增相同 ridge 的 block-only 对照 NMSE 0.002429898。校验了生产重放等价性、全部 SSE 比率、矩阵字节数和 120 组拟合目标轨迹。
+- 结果、CSV、参数与汇总位于 `rebuttal/outputs/block_dplr_self_forcing_20261107/`；这是实际 trace 重建结果，尚无视频生成质量或生成速度测量，也不代表完整 CORAL 跨层编解码器复现。
+- 最终验证：160 passed, 2 CUDA skips（39.42 秒）；模块/配置可解析，`git diff --check` 通过。没有推送远端。
+
+## 2026-11-07：Per-channel temporal vs Dense temporal 真实重建比较
+
+- 用户明确只比较 temporal 项。本实验 K KH2、V VH1 各自仅使用自身的量化重建历史，CrossKV 全部关闭，未调用 CrossKV 拟合或重建。
+- 入口 `rebuttal/run.py --experiment temporal_matrix --stage pipeline`，默认配置 `rebuttal/configs/temporal_matrix.json`。
+- 沿用真实 Self-Forcing `[30,128,24,12,128]` trace，103 条校准 / 25 条测试；K4/V4、anchor4、group64、BF16 重建。两类参数均按层/head 独立，两轮拟合，head-level ridge=1.0，incoming gain cap=1.0。
+- K temporal：Per-channel NMSE 0.001124080，Dense 0.001719166，增加 52.94%；实际 FP32 temporal weights+bias 为 1.0546875 / 90.3515625 MiB。
+- V temporal-only：Per-channel NMSE 0.004669325，Dense 0.004968584，增加 6.41%；参数为 0.3515625 / 22.67578125 MiB。
+- Dense 的 K/V 输出分别有 99.9837% / 100% 达到当前增益上限，因此结果限于当前约束下的实现；不据此评价无约束 Dense 的最佳能力。
+- 结果、预测参数、逐层/逐帧误差与增益诊断保存在 `rebuttal/outputs/temporal_channel_dense_self_forcing_20261107/`。只有缓存重建结果，无视频质量或生成速度结果。
+- 最终验证：166 passed, 2 CUDA skips（32.54 秒）。对角特例与生产重放一致、目标/增益控制、因果历史、无 CrossKV 调用、全部 SSE/字节数/比例和来源划分均通过核对。
