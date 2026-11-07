@@ -182,6 +182,20 @@
       "qvg_codec_identity": "prq_not_s2_or_s2pp",
       "qvg_generation_policy": "same_self_forcing_generator_with_real_codec_adapter",
       "priority": "P1_capacity_P3_generation"
+    },
+    {
+      "id": "aquakv",
+      "planned_directory": "rebuttal/experiments/aquakv",
+      "official_repository": "https://github.com/goodevening13/aquakv",
+      "official_commit": "e744183f2f3a4a90381f20a6975456871fd1ae29",
+      "quantizer": "HiggsQuantizer EDEN lattice, not the TempoKV group quantizer",
+      "primary_models": ["self_forcing"],
+      "calibration": "sequential least squares on reconstructed previous-layer KV; internal validation videos are propagated and excluded from the normal equations",
+      "bit_match": "closest official grid is EDEN2-64 with hadamard group 1024; average bits include scales, prefix, recent buffer, first-layer EDEN2-256, and bf16 predictors; gap vs legacy k4/v4 is reported and not forced to zero",
+      "held_fixed": ["evaluation_prompts", "seed", "frame_count", "weights", "quality_script", "memory_accounting_scope"],
+      "quality": "scripts/evaluation/evaluate_quality.py against the BF16 videos; null until those videos exist",
+      "simplified_ablation": "rebuttal/experiments/aquakv_lite",
+      "priority": "rebuttal_comparison"
     }
   ],
   "implementation_order": [

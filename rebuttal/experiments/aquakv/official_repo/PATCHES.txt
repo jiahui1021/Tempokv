@@ -1,0 +1,10 @@
+Snapshot of https://github.com/goodevening13/aquakv @ e744183f2f3a4a90381f20a6975456871fd1ae29
+(Merge pull request #9 from w3rew/grid_generator, 2025-11-05).
+
+Vendored files: aquakv/quantizers.py, edenn.py, linear_utils.py, __init__.py,
+and the EDEN grids. QUIPSHARP8-65536.pt is omitted: the official quantizer stores
+code indices as uint8, which cannot address 65536 centroids.
+
+Patch in quantizers.py: the uint8 index buffer is allocated on the same device
+as the activation. Upstream allocates it on CPU (`torch.empty` without a device),
+so the later CUDA write fails. On CPU the values match the unpatched function.

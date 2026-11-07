@@ -34,3 +34,11 @@
 - 最终验证：`PYTHONPATH=src python -m pytest -q rebuttal/tests` → **87 passed, 1 skipped**（11.90 秒；唯一跳过项需要真实 CUDA）。包括真实 packed codec、拟合/重建、量化目标选择来源、小型 PyAV 视频及失败恢复测试。
 - 六项默认 `--stage plan` 通过；48 个 Python 模块可解析，所有默认 JSON 可解析，`git diff --check` 通过。
 - 补充质量完成记录与输出 CSV 指纹：失败重跑不能认证旧分数；量化感知参数导出保留 calibration/validation 身份，最终测试检查两个来源。
+
+## 2026-11-07：AQUA-KV 移植（不覆盖 main 的 rebuttal 修复）
+
+- 本地 `rebuttal/` 压缩包基于 `0d73cc9`，比 `origin/main`（`ace2b8e`）旧。没有整包覆盖。main 上已有文件保持原样，只在 `run.py`、`experiment_matrix.json`、`README.md`、`progress.md` 上追加 AQUA-KV 入口；Self-Forcing 只增加 `aquakv` 模式和 `aquakv_bridge.py`。
+- 压缩包里的简化版（TempoKV 分组量化 + trace NMSE）改名为 `aquakv_lite`，不作为 AQUA-KV 结果。
+- 正式移植在 `experiments/aquakv/`：vendored HIGGS 与 `fit_linear_regression`（commit `e744183f2f3a4a90381f20a6975456871fd1ae29`），顺序校准，Self-Forcing pre-RoPE cache。`plan` / `generate` / 无视频的 `evaluate` 不产生质量数字。
+- 本机无 GPU，没有跑 Self-Forcing 生成，也没有填写 PSNR/SSIM/LPIPS。
+- `python3 -m pytest -q rebuttal/tests`：108 passed，1 skipped。唯一跳过项仍是 CUDA RNG。`ace2b8e` 原有用例在装上 av、opencv、matplotlib 后为 87 passed、1 skipped；新增 11 个 AQUA-KV 测试和 10 个 `aquakv_lite` 测试。原有用例全部通过。

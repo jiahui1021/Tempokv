@@ -94,7 +94,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         description="Run one distributed Self-Forcing inference worker."
     )
     parser.add_argument(
-        "--mode", choices=("tempokv", "bf16", "trace", "spectral", "spectral_kv"), default="tempokv"
+        "--mode",
+        choices=("tempokv", "bf16", "trace", "spectral", "spectral_kv", "aquakv"),
+        default="tempokv",
     )
     parser.add_argument(
         "--profile",
@@ -158,6 +160,12 @@ def main(argv: Sequence[str] | None = None) -> int:
 
             install(runtime_root)
             arguments.append("--skip_video_save")
+        elif args.mode == "aquakv":
+            from aquakv_bridge import install
+
+            install(runtime_root)
+            if os.environ.get("AQUAKV_COLLECT") == "1":
+                arguments.append("--skip_video_save")
         elif args.mode == "spectral":
             from spectral_bridge import install
 

@@ -64,3 +64,9 @@ python rebuttal/run.py --experiment previous_frame --config rebuttal/outputs/my_
 ## 2026-11-07 修复验证
 
 本轮修复覆盖可运行默认配置、恢复身份、完整 trace 划分、随机流隔离、视频与 cache 方法身份、quality 复用指纹、cut 分组、困难案例区间、架构公平拟合及实际量化验收。具体本地测试计数记录在 [progress.md](progress.md)；没有运行真实模型的 CUDA 长视频实验。
+
+## AQUA-KV（Self-Forcing）
+
+`rebuttal/experiments/aquakv/` 是官方 AQUA-KV（commit `e744183f2f3a4a90381f20a6975456871fd1ae29`）的移植：HIGGS/`HiggsQuantizer`、顺序最小二乘、在重建后的上一层上拟合。它接在 Self-Forcing 的 pre-RoPE cache 上。`python rebuttal/run.py --experiment aquakv --stage plan` 只打印比特表和集群命令，不填写 PSNR/SSIM/LPIPS。适配说明和命令在 [experiments/aquakv/README.md](experiments/aquakv/README.md)。
+
+`aquakv_lite` 是早期消融：复用 TempoKV 分组量化，只在 trace 上算 NMSE。它不是 AQUA-KV，不能写进对照表。

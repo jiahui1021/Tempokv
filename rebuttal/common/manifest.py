@@ -107,6 +107,9 @@ PATH_KEYS = frozenset({
     "raw_trace", "trace_output_dir",
     "bf16_reference_prompts", "quality_output_dir", "motion_groups",
     "parameter_fit_report",
+    "collection_dir", "scratch_dir", "predictors_path",
+    "bf16_video_dir", "tempokv_video_dir", "aquakv_video_dir",
+    "aquakv_spec", "aquakv_trace_dir",
 })
 
 
