@@ -1,0 +1,27 @@
+{
+  "experiment": "temporal_matrix",
+  "device": "cpu",
+  "trace": null,
+  "holdout_step": 5,
+  "fit_rounds": 2,
+  "ridge": 1.0,
+  "max_gain": 1.0,
+  "threads": 4,
+  "codec": {
+    "k_bits": 4,
+    "v_bits": 4,
+    "anchor_bits": 4,
+    "group_size": 64,
+    "stride": 1560,
+    "residual_mode": "asymmetric",
+    "scale_dtype": "bfloat16",
+    "reconstruction_dtype": "bfloat16",
+    "use_triton": false,
+    "strict_triton": false,
+    "k_history_length": 2,
+    "v_history_length": 1,
+    "k_predictor_mode": "layer_head",
+    "v_predictor_mode": "temporal",
+    "fit_mode": "native"
+  }
+}
