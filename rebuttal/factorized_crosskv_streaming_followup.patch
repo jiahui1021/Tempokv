@@ -1,0 +1,464 @@
+diff -ruN a/rebuttal/adapters/experimental_codec.py b/rebuttal/adapters/experimental_codec.py
+--- a/rebuttal/adapters/experimental_codec.py	2026-11-08 13:58:31.974518459 +0000
++++ b/rebuttal/adapters/experimental_codec.py	2026-11-08 13:58:31.978518544 +0000
+@@ -477,6 +477,13 @@
+     Other archives stay on ``ExperimentalCodec`` and keep that loader's CPU default.
+     Factorized K stays the per-channel temporal predictor. Factors are moved to
+     ``device`` once here; later predictions reuse that storage.
++
++    The promoted codec keeps the research PyTorch decoder on every device.
++    Triton temporal K adds the bias before the history sum and rounds through
++    BF16 inside the kernel; ``predict_temporal`` sums the history first and
++    casts once. On the Self-Forcing shape those orders disagree on a handful
++    of BF16 K values, and the V replay reads that K. Dense production loading
++    is a different function and still chooses its own Triton flag.
+     """
+     experimental = ExperimentalCodec.load(path)
+     temporal_state = getattr(experimental, "temporal", None)
+@@ -494,9 +501,7 @@
+     from tempokv.codec import TempoKVCodec
+ 
+     resolved = torch.device(device)
+-    config = replace(
+-        experimental.config,
+-        use_triton=resolved.type == "cuda",
+-        strict_triton=False,
+-    )
++    # Do not key this off ``resolved.type``. CUDA must stay on the same
++    # PyTorch replay the research reference saves into the archive.
++    config = replace(experimental.config, use_triton=False, strict_triton=False)
+     return TempoKVCodec(temporal.to(resolved), cross.to(resolved), config)
+diff -ruN a/rebuttal/tests/test_factorized_cross_streaming.py b/rebuttal/tests/test_factorized_cross_streaming.py
+--- a/rebuttal/tests/test_factorized_cross_streaming.py	2026-11-08 13:58:31.978518544 +0000
++++ b/rebuttal/tests/test_factorized_cross_streaming.py	2026-11-08 13:58:31.978518544 +0000
+@@ -207,6 +207,8 @@
+     experimental.save(path)
+     production = load_generation_codec(path, device="cpu")
+     assert isinstance(production, TempoKVCodec)
++    assert production.config.use_triton is False
++    assert production.config.strict_triton is False
+     assert production.cross_kv.weight is None
+     assert production.temporal.history_weights.ndim == 3  # per-channel shared K, not a dense map
+     for layer in range(layers):
+@@ -306,6 +308,8 @@
+     )
+     pipeline = pipeline_cls()
+     assert isinstance(pipeline.tempokv_codec, TempoKVCodec)
++    assert pipeline.tempokv_codec.config.use_triton is False
++    assert pipeline.tempokv_codec.config.strict_triton is False
+     assert pipeline.tempokv_codec.v_parameters.weight is None
+     assert pipeline.tempokv_codec.v_parameters.factor_a.device.type == "cpu"
+     assert __import__("os").environ["TEMPOKV_INCREMENTAL"] == "1"
+@@ -324,9 +328,9 @@
+ 
+ def test_gpu_factorized_decode_status():
+     status = "RUN" if torch.cuda.is_available() else "NOT_RUN"
+-    # CPU runs cover the PyTorch reference. The fused Triton kernel declines
+-    # factorized spans so CUDA uses that same replay; this process did not
+-    # execute it when CUDA is absent.
++    # Factorized generation keeps use_triton False, so K and V both stay on the
++    # PyTorch replay. The real-shape CUDA measurement lives in
++    # test_factorized_realshape_baseline and is NOT_RUN without a GPU.
+     report = {"gpu_factorized_decode": status, "cuda": torch.cuda.is_available()}
+     print(json.dumps(report))
+     assert status == ("RUN" if torch.cuda.is_available() else "NOT_RUN")
+diff -ruN a/rebuttal/tests/test_factorized_realshape_baseline.py b/rebuttal/tests/test_factorized_realshape_baseline.py
+--- a/rebuttal/tests/test_factorized_realshape_baseline.py	1970-01-01 00:00:00.000000000 +0000
++++ b/rebuttal/tests/test_factorized_realshape_baseline.py	2026-11-08 13:58:31.978518544 +0000
+@@ -0,0 +1,396 @@
++"""Real-shape factorized CrossKV must stay on the research PyTorch decoder.
++
++The Self-Forcing check is input ``[1, 12, 4680, 128]``, stride 1560, seed 0.
++Reported CUDA gaps (47 K elements, max abs 0.00390625 = 2^-8; 5 V elements,
++max abs 0.0078125 = 2^-7) are one BF16 ulp. Codes stayed identical, so the
++quantizer matched and the drift is decode arithmetic.
++
++Triton temporal K adds bias before the history sum and rounds through BF16 in
++the kernel. The research and production PyTorch predictor sums history, then
++adds bias, then casts once. That order is the dense temporal baseline; it is
++not a low-rank defect. V is replayed from the decoded K, so a few V elements
++move with K. This archive therefore keeps ``use_triton=False`` on every
++device. Dense production loading is unchanged.
++
++``python rebuttal/tests/test_factorized_realshape_baseline.py`` runs the CPU
++checks and prints ``NOT_RUN`` for the CUDA measurement when this machine has
++no GPU. On a GPU it measures the dense temporal Triton-vs-PyTorch gap and the
++forced-Triton factorized K gap separately, and still requires the generation
++path to be bit-exact against the reference.
++"""
++from __future__ import annotations
++
++import json
++import tempfile
++from pathlib import Path
++
++import torch
++
++from tempokv.codec import TempoKVCodec, decode_tensor, encode_temporal
++from tempokv.parameters import CrossKVParameters, TemporalParameters
++from rebuttal.adapters.experimental_codec import (
++    ExperimentalCodec,
++    ResearchCross,
++    ResearchTemporal,
++    load_generation_codec,
++)
++from rebuttal.tests.test_factorized_cross_streaming import (
++    _bhsd,
++    _incremental,
++    _legacy_config,
++    _manual_low_rank,
++)
++
++
++REAL_SHAPE = (1, 12, 4680, 128)
++REAL_STRIDE = 1560
++REAL_RANK = 8
++
++
++def _mismatch(actual: torch.Tensor, expected: torch.Tensor) -> dict:
++    if actual.shape != expected.shape or actual.dtype != expected.dtype:
++        raise AssertionError(
++            f"shape/dtype {tuple(actual.shape)} {actual.dtype} vs "
++            f"{tuple(expected.shape)} {expected.dtype}"
++        )
++    differ = actual != expected
++    count = int(differ.sum().item())
++    numel = int(actual.numel())
++    if count == 0:
++        return {"count": 0, "numel": numel, "max_abs": 0.0}
++    max_abs = float((actual.float() - expected.float()).abs().max().item())
++    return {"count": count, "numel": numel, "max_abs": max_abs}
++
++
++def _logical_codes(packed):
++    used = int(packed.shape[2] - packed.unit_lengths[0])
++
++    def take(tensor):
++        if tensor is None:
++            return None
++        return tensor[:, :, :used]
++
++    return (
++        packed.anchor_quant,
++        packed.anchor_scale,
++        take(packed.residual_quant),
++        take(packed.residual_scale),
++        take(packed.residual_zero_point),
++        tuple(int(item) for item in packed.unit_lengths),
++    )
++
++
++def _assert_logical_codes(left, right) -> None:
++    for actual, expected in zip(_logical_codes(left), _logical_codes(right), strict=True):
++        if isinstance(expected, torch.Tensor):
++            assert torch.equal(actual, expected), _mismatch(actual, expected)
++        else:
++            assert actual == expected
++
++
++def _save_real_shape(directory: Path, *, v_history: int) -> tuple[Path, torch.Tensor, torch.Tensor, ExperimentalCodec]:
++    generator = torch.Generator().manual_seed(0)
++    layers, batch, heads, sequence, dim = 1, REAL_SHAPE[0], REAL_SHAPE[1], REAL_SHAPE[2], REAL_SHAPE[3]
++    rank = REAL_RANK
++    k_history = 2
++    temporal = TemporalParameters(
++        torch.randn(k_history, k_history, dim, generator=generator) * 0.2,
++        torch.randn(k_history, dim, generator=generator) * 0.2,
++    )
++    factor_a = torch.randn(heads, dim, rank, generator=generator) * 0.05
++    factor_b = torch.randn(heads, rank, dim, generator=generator) * 0.05
++    bias = torch.randn(heads, dim, generator=generator) * 0.05
++    history = torch.randn(layers, v_history, heads, dim, generator=generator) * 0.1
++    config = _legacy_config(stride=REAL_STRIDE, k_history=k_history, v_history=v_history)
++    research = ExperimentalCodec(
++        ResearchTemporal.from_production(temporal, layers, heads),
++        ResearchCross(
++            "low_rank", "layer_shared", bias, history, layers, heads,
++            factor_a=factor_a, factor_b=factor_b,
++        ),
++        config,
++    )
++    keys = torch.randn(layers, batch, sequence, heads, dim, generator=generator).to(torch.bfloat16)
++    values = (
++        0.8 * keys.float() + 0.1 * torch.randn(keys.shape, generator=generator)
++    ).to(torch.bfloat16)
++    path = directory / f"realshape_vh{v_history}.npz"
++    research.save(path)
++    key, value = _bhsd(keys[0]), _bhsd(values[0])
++    assert tuple(key.shape) == REAL_SHAPE
++    return path, key, value, research
++
++
++def _assert_reference_match(research, production, key, value) -> None:
++    assert production.config.use_triton is False
++    assert production.config.strict_triton is False
++    assert production.v_parameters.weight is None
++    assert production.v_parameters.factor_a is not None
++    ref_k, ref_v = research.decode(research.encode(key, value, layer=0))
++    got_k, got_v = production.decode(production.encode(key, value, layer=0))
++    assert torch.equal(got_k, ref_k), _mismatch(got_k, ref_k)
++    assert torch.equal(got_v, ref_v), _mismatch(got_v, ref_v)
++    ref_packed = research.encode(key, value, layer=0)
++    got_packed = production.encode(key, value, layer=0)
++    _assert_logical_codes(got_packed.key, ref_packed.key)
++    _assert_logical_codes(got_packed.value, ref_packed.value)
++    inc_k, inc_v, inc_key_state, inc_value_state = _incremental(
++        production, key, value, layer=0, capacity=24
++    )
++    assert torch.equal(inc_k, got_k) and torch.equal(inc_v, got_v)
++    assert inc_key_state.residual_quant.shape[2] > key.shape[2] - REAL_STRIDE
++    _assert_logical_codes(inc_key_state, got_packed.key)
++    _assert_logical_codes(inc_value_state, got_packed.value)
++    packed_k, recon_k = production.encode_primary(key, layer=0)
++    assert torch.equal(decode_tensor(packed_k, use_triton=False), recon_k)
++
++
++def _assert_factors_stay_put(production, key, value) -> None:
++    production.encode(key, value, layer=0)
++    cached = production._cross_for_layer(key.device, 0)
++    pointers = (cached.factor_a.data_ptr(), cached.factor_b.data_ptr())
++    factor_shapes = {
++        tuple(cached.factor_a.shape),
++        tuple(cached.factor_b.shape),
++        tuple(production.v_parameters.factor_a.shape),
++        tuple(production.v_parameters.factor_b.shape),
++    }
++    copies = []
++    original = torch.Tensor.to
++
++    def spy(self, *args, **kwargs):
++        result = original(self, *args, **kwargs)
++        if tuple(self.shape) in factor_shapes and (
++            result.device != self.device or result.data_ptr() != self.data_ptr()
++        ):
++            copies.append((tuple(self.shape), str(self.device), str(result.device)))
++        return result
++
++    torch.Tensor.to = spy
++    try:
++        production.encode(key, value, layer=0)
++        again = production._cross_for_layer(key.device, 0)
++        stride = production.config.stride
++        encoder_k, reconstructed = production.begin_incremental_primary(
++            key[:, :, :stride], capacity_units=24, layer=0
++        )
++        encoder_k.append(key[:, :, stride : stride * 2])
++        production.begin_incremental_secondary(
++            value[:, :, :stride], reconstructed, capacity_units=24, layer=0
++        )
++    finally:
++        torch.Tensor.to = original
++    assert again.factor_a.data_ptr() == pointers[0]
++    assert again.factor_b.data_ptr() == pointers[1]
++    assert again.factor_a.device == key.device
++    assert copies == []
++
++
++def test_temporal_accumulation_order_is_not_bit_equivalent():
++    """Bias-first versus history-then-bias is the Triton/PyTorch K gap.
++
++    Seed 4 at 65536 channels is a CPU witness that the two FP32 sums, which
++    differ by one FP32 ulp, round to different BF16 values. This does not run
++    Triton and does not reproduce the private archive's 47-element count.
++    """
++    generator = torch.Generator().manual_seed(4)
++    dim = 1 << 16
++    history = [
++        torch.randn(dim, generator=generator).to(torch.bfloat16),
++        torch.randn(dim, generator=generator).to(torch.bfloat16),
++    ]
++    weights = [torch.randn(dim, generator=generator) * 0.3 for _ in range(2)]
++    bias = torch.randn(dim, generator=generator) * 0.3
++    residual = torch.randn(dim, generator=generator) * 0.05
++    pytorch = history[0].float() * weights[0] + history[1].float() * weights[1] + bias
++    triton_order = bias + history[0].float() * weights[0] + history[1].float() * weights[1]
++    pytorch_bf16 = (pytorch + residual).to(torch.bfloat16)
++    triton_bf16 = (triton_order + residual).to(torch.bfloat16)
++    stats = _mismatch(triton_bf16, pytorch_bf16)
++    fp32_gap = float((pytorch - triton_order).abs().max().item())
++    assert stats["count"] > 0
++    assert fp32_gap < 1e-5
++    assert stats["max_abs"] <= 2 ** -7
++    print(json.dumps({
++        "temporal_order_witness": "PASS",
++        "bf16": stats,
++        "fp32_max_abs": fp32_gap,
++        "triton_executed": False,
++    }))
++
++
++def test_factorized_loader_keeps_pytorch_decoder_for_cuda_device(tmp_path):
++    """The old loader set use_triton from ``device.type == 'cuda'``.
++
++    Parameter ``.to`` is stubbed so the flag can be read without a GPU.
++    A real CUDA move is covered by the diagnostic below when a GPU exists.
++    """
++    _, research, _production, _keys, _values = _manual_low_rank(
++        seed=0, v_history=1, units=2, stride=4
++    )
++    archive = Path(tmp_path) / "tiny.npz"
++    research.save(archive)
++    real_device = torch.device
++
++    class _CudaName:
++        type = "cuda"
++        index = None
++
++    def wrapped(spec="cpu", *args, **kwargs):
++        if spec == "cuda" or getattr(spec, "type", None) == "cuda":
++            return _CudaName()
++        return real_device(spec, *args, **kwargs)
++
++    torch.device = wrapped
++    temporal_to = TemporalParameters.to
++    cross_to = CrossKVParameters.to
++    TemporalParameters.to = lambda self, device: self
++    CrossKVParameters.to = lambda self, device: self
++    try:
++        loaded = load_generation_codec(archive, device="cuda")
++    finally:
++        torch.device = real_device
++        TemporalParameters.to = temporal_to
++        CrossKVParameters.to = cross_to
++    assert isinstance(loaded, TempoKVCodec)
++    assert loaded.config.use_triton is False
++    assert loaded.config.strict_triton is False
++    assert loaded.v_parameters.weight is None
++    assert loaded.v_parameters.factor_a.device.type == "cpu"
++
++
++def test_real_shape_reference_incremental_and_storage(tmp_path):
++    for v_history in (1, 2):
++        path, key, value, research = _save_real_shape(Path(tmp_path), v_history=v_history)
++        production = load_generation_codec(path, device="cpu")
++        assert isinstance(production, TempoKVCodec)
++        _assert_reference_match(research, production, key, value)
++        _assert_factors_stay_put(production, key, value)
++    print(json.dumps({
++        "cpu_realshape": "PASS",
++        "shape": list(REAL_SHAPE),
++        "stride": REAL_STRIDE,
++        "seed": 0,
++        "rank": REAL_RANK,
++        "v_history": [1, 2],
++        "use_triton": False,
++        "reference_equal": True,
++        "incremental_equal": True,
++        "codes_equal": True,
++    }))
++
++
++def _triton_decode(packed, source=None):
++    try:
++        from tempokv.triton_ops import decode as decode_triton
++    except Exception as error:
++        return None, f"NOT_MEASURED:{type(error).__name__}"
++    try:
++        decoded = decode_triton(
++            packed, source=source, output_dtype=torch.bfloat16
++        )
++    except Exception as error:
++        return None, f"NOT_MEASURED:{type(error).__name__}"
++    if decoded is None:
++        return None, "DECLINED"
++    return decoded, "RUN"
++
++
++def test_cuda_realshape_triton_baseline(tmp_path):
++    """Separate the inherited dense temporal Triton gap from this archive.
++
++    Generation equality stays ``torch.equal``. A forced Triton K decode is
++    reported, not treated as the reference. GPU absent -> NOT_RUN.
++    """
++    if not torch.cuda.is_available():
++        print(json.dumps({
++            "cuda_realshape_diagnostic": "NOT_RUN",
++            "cuda": False,
++        }))
++        return
++    device = torch.device("cuda")
++    path, key, value, research = _save_real_shape(Path(tmp_path), v_history=1)
++    research = ExperimentalCodec.load(path, device=device)
++    production = load_generation_codec(path, device=device)
++    key, value = key.to(device), value.to(device)
++    assert isinstance(production, TempoKVCodec)
++    assert production.config.use_triton is False
++    assert production.temporal.history_weights.device.type == "cuda"
++    assert production.v_parameters.factor_a.device.type == "cuda"
++    _assert_reference_match(research, production, key, value)
++    _assert_factors_stay_put(production, key, value)
++
++    temporal = production._temporal_for_layer(device, 0)
++    dense_packed, _dense_recon = encode_temporal(key, temporal, production.config)
++    dense_pytorch = decode_tensor(dense_packed, use_triton=False)
++    dense_triton, dense_status = _triton_decode(dense_packed)
++    factor_packed = production.encode(key, value, layer=0)
++    factor_pytorch_k = decode_tensor(factor_packed.key, use_triton=False)
++    factor_triton_k, factor_status = _triton_decode(factor_packed.key)
++    report = {
++        "cuda_realshape_diagnostic": "RUN",
++        "cuda": True,
++        "shape": list(REAL_SHAPE),
++        "stride": REAL_STRIDE,
++        "generation_use_triton": production.config.use_triton,
++        "reference_equal": True,
++        "dense_temporal_triton": dense_status,
++        "factorized_k_triton": factor_status,
++    }
++    if dense_status == "RUN" and factor_status == "RUN":
++        dense_stats = _mismatch(dense_triton, dense_pytorch)
++        factor_stats = _mismatch(factor_triton_k, factor_pytorch_k)
++        report["dense_temporal_triton_vs_pytorch"] = dense_stats
++        report["factorized_k_triton_vs_pytorch"] = factor_stats
++        if dense_stats["count"] == 0 and factor_stats["count"] != 0:
++            raise AssertionError(
++                "factorized K Triton disagrees with PyTorch while the dense "
++                f"temporal kernel matches: {report}"
++            )
++        v_from_triton_k = decode_tensor(
++            factor_packed.value, source=factor_triton_k, use_triton=False
++        )
++        v_from_pytorch_k = decode_tensor(
++            factor_packed.value, source=factor_pytorch_k, use_triton=False
++        )
++        v_stats = _mismatch(v_from_triton_k, v_from_pytorch_k)
++        report["v_from_triton_k_vs_pytorch_k"] = v_stats
++        if factor_stats["count"] == 0 and v_stats["count"] != 0:
++            raise AssertionError(
++                "V drifted with an unchanged K source; this is not the "
++                f"inherited temporal baseline: {report}"
++            )
++        _inc_k, _inc_v, inc_key_state, _inc_value_state = _incremental(
++            production, key, value, layer=0, capacity=24
++        )
++        inc_triton_k, inc_status = _triton_decode(inc_key_state)
++        report["incremental_k_triton"] = inc_status
++        report["full_residual_length"] = int(factor_packed.key.residual_quant.shape[2])
++        report["incremental_residual_length"] = int(inc_key_state.residual_quant.shape[2])
++        if inc_status == "RUN":
++            report["full_vs_incremental_triton_k"] = _mismatch(inc_triton_k, factor_triton_k)
++    elif dense_status == "DECLINED" or factor_status == "DECLINED":
++        report["note"] = (
++            "temporal Triton declined; generation stays on the PyTorch "
++            "reference, which was checked with torch.equal"
++        )
++    print(json.dumps(report, sort_keys=True))
++
++
++def main() -> None:
++    with tempfile.TemporaryDirectory() as directory:
++        root = Path(directory)
++        test_temporal_accumulation_order_is_not_bit_equivalent()
++        loader = root / "loader"
++        loader.mkdir(parents=True, exist_ok=True)
++        test_factorized_loader_keeps_pytorch_decoder_for_cuda_device(loader)
++        real = root / "real"
++        real.mkdir(parents=True, exist_ok=True)
++        test_real_shape_reference_incremental_and_storage(real)
++        cuda = root / "cuda"
++        cuda.mkdir(parents=True, exist_ok=True)
++        test_cuda_realshape_triton_baseline(cuda)
++
++
++if __name__ == "__main__":
++    main()
