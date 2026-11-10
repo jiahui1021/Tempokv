@@ -200,9 +200,10 @@ generate_command=(
 if [[ "$mode" == "tempokv" ]]; then
   generate_command+=(
     --config "$(resolve_path "$CONFIG")"
-    --k-params "$param_dir/$k_artifact_name"
-    --v-params "$param_dir/$v_artifact_name"
   )
+  if [[ "${PARAMETER_FREE_IDENTITY:-0}" != "1" ]]; then
+    generate_command+=(--k-params "$param_dir/$k_artifact_name" --v-params "$param_dir/$v_artifact_name")
+  fi
   [[ -n "${K_HISTORY_LENGTH:-}" ]] && generate_command+=(--k-history-length "$K_HISTORY_LENGTH")
   [[ -n "${V_HISTORY_LENGTH:-}" ]] && generate_command+=(--v-history-length "$V_HISTORY_LENGTH")
   [[ -n "${K_BITS:-}" ]] && generate_command+=(--k-bits "$K_BITS")

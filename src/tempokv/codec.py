@@ -14,7 +14,7 @@ from .config import (
     is_cross_kv_v_predictor,
     is_temporal_v_predictor,
 )
-from .parameters import CrossKVParameters, TemporalParameters
+from .parameters import CrossKVParameters, PreviousFrameParameters, TemporalParameters
 from .quantization import (
     code_dtype,
     dequantize_asymmetric,
@@ -485,7 +485,9 @@ def _encode(
         unit_length = min(stride, sequence - offset)
         current = value[:, :, offset : offset + unit_length]
         if predictor_kind == "temporal":
-            if temporal.history_length == 0:
+            if isinstance(temporal, PreviousFrameParameters):
+                prediction = history[0][:, :, :unit_length].to(dtype=torch.float32, copy=True)
+            elif temporal.history_length == 0:
                 # Zero-order K: direct quantization within the temporal state layout.
                 prediction = torch.zeros_like(current, dtype=torch.float32)
             else:
@@ -736,7 +738,9 @@ class IncrementalTensorEncoder:
             unit_length = self.packed.stride
             current = value[:, :, output_offset : output_offset + unit_length]
             if self.packed.predictor_kind == "temporal":
-                if self.packed.temporal.history_length == 0:
+                if isinstance(self.packed.temporal, PreviousFrameParameters):
+                    prediction = self._history[0].to(dtype=torch.float32, copy=True)
+                elif self.packed.temporal.history_length == 0:
                     prediction = torch.zeros_like(current, dtype=torch.float32)
                 else:
                     prediction = predict_temporal(
@@ -984,7 +988,9 @@ def decode_tensor(
     residual_offset = 0
     for unit_length in packed.unit_lengths[1:]:
         if packed.predictor_kind == "temporal":
-            if packed.temporal.history_length == 0:
+            if isinstance(packed.temporal, PreviousFrameParameters):
+                prediction = history[0][:, :, :unit_length].to(dtype=torch.float32, copy=True)
+            elif packed.temporal.history_length == 0:
                 prediction = torch.zeros(
                     output.shape[0],
                     output.shape[1],

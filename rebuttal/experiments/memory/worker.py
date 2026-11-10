@@ -39,6 +39,10 @@ def install(runtime_root: str | Path, config: dict) -> type:
     class BudgetCausalInferencePipeline(base):
         def __init__(self, *args, **kwargs):
             super().__init__(*args, **kwargs)
+            # Generation-time KV residency is unchanged. Completed pixels need
+            # no GPU storage and otherwise make long-video concatenation OOM.
+            from rebuttal.experiments.memory.vae_output import install_cpu_video_output
+            install_cpu_video_output(self.vae.model)
             self._budget_method = settings.get("method", "tempokv")
             if self._budget_method == "qvg_prq_real_codec":
                 self._budget_method = "qvg"

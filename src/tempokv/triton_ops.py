@@ -7,6 +7,7 @@ import triton
 import triton.language as tl
 
 from .quantization import MAX_BITS
+from .parameters import PreviousFrameParameters
 from .runtime import persistent_launch_plan, persistent_units_per_launch
 
 if TYPE_CHECKING:
@@ -77,7 +78,7 @@ def _load_packed_unsigned(
         unsigned = tl.load(
             quant_ptr + row_offset + channel[None, :], mask=valid, other=0
         ).to(tl.int32)
-    elif bits == 1 or bits == 2 or bits == 4:
+    elif (bits == 1 or bits == 2) or bits == 4:
         lanes = 8 // bits
         packed_channel = channel // lanes
         lane = channel - packed_channel * lanes
@@ -282,6 +283,7 @@ def _temporal_persistent_decode_kernel(
     asymmetric: tl.constexpr,
     block_s: tl.constexpr,
     block_d: tl.constexpr,
+    previous_frame: tl.constexpr = False,
 ):
     """Decode several recurrent temporal units in one launch."""
     batch_head = tl.program_id(0)
@@ -318,53 +320,38 @@ def _temporal_persistent_decode_kernel(
         else:
             residual = _dequantize_symmetric_code(unsigned, scale, bits)
 
-        order = unit_index
-        if order > history_length:
-            order = history_length
-        if per_head:
-            bias_offset = ((order - 1) * heads + head) * width + channel
-            bias = tl.load(bias_ptr + bias_offset, mask=channel < width, other=0.0)
-            prediction = bias[None, :] + tl.zeros(
-                (block_s, block_d), tl.float32
+        if previous_frame:
+            previous_offset = _strided_bhsd_offsets(
+                batch_head, (unit_index - 1) * stride + token, channel,
+                heads, output_stride_b, output_stride_h, output_stride_s, output_stride_d,
             )
+            prediction = tl.load(output_ptr + previous_offset, mask=valid, other=0.0).to(tl.float32)
         else:
-            bias_offset = (order - 1) * width + channel
-            bias = tl.load(bias_ptr + bias_offset, mask=channel < width, other=0.0)
-            prediction = bias[None, :] + tl.zeros(
-                (block_s, block_d), tl.float32
-            )
-        for lag in tl.static_range(0, history_length):
-            if lag < order:
-                previous_token = (unit_index - lag - 1) * stride + token
-                previous_offset = _strided_bhsd_offsets(
-                    batch_head,
-                    previous_token,
-                    channel,
-                    heads,
-                    output_stride_b,
-                    output_stride_h,
-                    output_stride_s,
-                    output_stride_d,
-                )
-                previous = tl.load(
-                    output_ptr + previous_offset, mask=valid, other=0.0
-                ).to(tl.float32)
-                if per_head:
-                    weight_offset = (
-                        (((order - 1) * history_length + lag) * heads + head)
-                        * width
-                        + channel
+            order = unit_index
+            if order > history_length:
+                order = history_length
+            if per_head:
+                bias_offset = ((order - 1) * heads + head) * width + channel
+                bias = tl.load(bias_ptr + bias_offset, mask=channel < width, other=0.0)
+                prediction = bias[None, :] + tl.zeros((block_s, block_d), tl.float32)
+            else:
+                bias_offset = (order - 1) * width + channel
+                bias = tl.load(bias_ptr + bias_offset, mask=channel < width, other=0.0)
+                prediction = bias[None, :] + tl.zeros((block_s, block_d), tl.float32)
+            for lag in tl.static_range(0, history_length):
+                if lag < order:
+                    previous_token = (unit_index - lag - 1) * stride + token
+                    previous_offset = _strided_bhsd_offsets(
+                        batch_head, previous_token, channel, heads,
+                        output_stride_b, output_stride_h, output_stride_s, output_stride_d,
                     )
-                else:
-                    weight_offset = (
-                        ((order - 1) * history_length + lag) * width + channel
-                    )
-                coefficient = tl.load(
-                    weight_ptr + weight_offset,
-                    mask=channel < width,
-                    other=0.0,
-                )
-                prediction += previous * coefficient[None, :]
+                    previous = tl.load(output_ptr + previous_offset, mask=valid, other=0.0).to(tl.float32)
+                    if per_head:
+                        weight_offset = (((order - 1) * history_length + lag) * heads + head) * width + channel
+                    else:
+                        weight_offset = ((order - 1) * history_length + lag) * width + channel
+                    coefficient = tl.load(weight_ptr + weight_offset, mask=channel < width, other=0.0)
+                    prediction += previous * coefficient[None, :]
         current = (prediction + residual).to(tl.bfloat16).to(tl.float32)
         output_offset = _strided_bhsd_offsets(
             batch_head,
@@ -953,8 +940,8 @@ def decode(
                 _advance(quant, 1, shift),
                 _advance(scale, 1, shift),
                 _advance(zero, 1, shift),
-                parameters.history_weights.contiguous(),
-                parameters.history_bias.contiguous(),
+                None if isinstance(parameters, PreviousFrameParameters) else parameters.history_weights.contiguous(),
+                None if isinstance(parameters, PreviousFrameParameters) else parameters.history_bias.contiguous(),
                 _advance(output, output_sequence_dim, shift),
                 output_stride_b,
                 output_stride_h,
@@ -976,8 +963,12 @@ def decode(
                 asymmetric,
                 block_s,
                 block_d,
+                isinstance(parameters, PreviousFrameParameters),
             )
-        _record(_route_name("temporal_persistent", direct_output_layout))
+        _record(_route_name(
+            "previous_frame_persistent" if isinstance(parameters, PreviousFrameParameters) else "temporal_persistent",
+            direct_output_layout,
+        ))
         return _logical_bhsd_output(output, direct_output_layout)
 
     assert source is not None and packed.cross_kv is not None

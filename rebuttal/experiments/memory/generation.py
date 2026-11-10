@@ -112,6 +112,7 @@ def execute_jobs(plan: dict, *, resume: bool = False) -> dict:
         folder = Path(job["folder"])
         folder.mkdir(parents=True, exist_ok=True)
         status_file = folder / "job.json"
+        previous = None
         if resume and status_file.is_file():
             previous = json.loads(status_file.read_text())
             if previous.get("identity") == job["identity"] and previous.get("status") == "complete":
@@ -121,9 +122,19 @@ def execute_jobs(plan: dict, *, resume: bool = False) -> dict:
                     job_video_identities(job)
                     job["status"] = "reused"
                     continue
+        run_command = list(cmd)
+        if resume:
+            existing_videos = list((folder / "videos").glob("*.mp4"))
+            matching_identity = previous is not None and previous.get("identity") == job["identity"]
+            if existing_videos and not matching_identity:
+                raise RuntimeError(f"Partial videos preserved: matching job identity missing for {job['name']}")
+            if matching_identity:
+                # The generator checks that each existing video decodes before
+                # skipping it. Keep the scientific job identity unchanged.
+                run_command.append("--skip_existing")
         Path(job["config_path"]).write_text(json.dumps(config, indent=2) + "\n")
-        with (folder / "run.log").open("w") as log:
-            completed = subprocess.run(cmd, cwd=ROOT, stdout=log, stderr=subprocess.STDOUT, check=False)
+        with (folder / "run.log").open("a" if resume else "w") as log:
+            completed = subprocess.run(run_command, cwd=ROOT, stdout=log, stderr=subprocess.STDOUT, check=False)
         job["returncode"] = completed.returncode
         job["status"] = "complete" if completed.returncode == 0 else "failed"
         if job["status"] == "complete":

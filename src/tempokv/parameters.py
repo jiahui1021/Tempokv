@@ -172,6 +172,30 @@ class TemporalParameters:
             return cls(data["history_weights"], data["history_bias"], **_metadata(data))
 
 
+class PreviousFrameParameters(TemporalParameters):
+    """Parameter-free rule marker: take the previous reconstructed frame.
+
+    Empty tensors preserve the codec metadata interface without allocating
+    coefficients or biases. Neither tensor may be read by a prediction kernel.
+    """
+
+    __slots__ = ()
+
+    def __init__(self, *, stride: int, codec_signature: str) -> None:
+        super().__init__(
+            torch.empty(1, 1, 0), torch.empty(1, 0), stride,
+            codec_signature=codec_signature,
+            parameter_set_id="previous-frame:" + codec_signature,
+            coordinate_system="pre_rope_normalized",
+        )
+
+    def to(self, device: torch.device | str) -> "PreviousFrameParameters":
+        return self
+
+    def save(self, path: str | Path) -> None:
+        raise ValueError("previous-frame copying has no parameter file to save")
+
+
 @dataclass(frozen=True, slots=True)
 class CrossKVParameters:
     """Per-head source/current-V-history projection parameters."""

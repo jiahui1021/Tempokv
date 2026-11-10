@@ -35,6 +35,7 @@ parser.add_argument("--save_with_index", action="store_true",
                     help="Whether to save the video using the index or prompt as the filename")
 parser.add_argument("--start_index", type=int, default=0)
 parser.add_argument("--end_index", type=int, default=-1)
+parser.add_argument("--prompt_indices", type=str, default=None)
 parser.add_argument("--local_attn_size", type=int, default=-1)
 parser.add_argument("--sink_size", type=int, default=0)
 parser.add_argument("--skip_existing", action="store_true")
@@ -113,6 +114,14 @@ end_index = full_num_prompts if args.end_index < 0 else min(
 if args.start_index < 0 or args.start_index > end_index:
     raise ValueError("invalid prompt range")
 selected_indices = list(range(args.start_index, end_index))
+if args.prompt_indices is not None:
+    requested = json.loads(args.prompt_indices)
+    if (not isinstance(requested, list) or not requested or
+            any(type(index) is not int for index in requested) or
+            len(set(requested)) != len(requested) or
+            any(index < args.start_index or index >= end_index for index in requested)):
+        raise ValueError("prompt_indices must be unique original indices within the selected range")
+    selected_indices = [index for index in selected_indices if index in set(requested)]
 pre_skipped_summaries = []
 pre_skipped_batches = []
 if args.skip_existing and args.save_with_index:

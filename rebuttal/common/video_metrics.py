@@ -358,6 +358,12 @@ def iter_pair_metrics(pair: dict[str, Any], config: dict[str, Any], *, backend: 
         reference.close()
         raise
     frames = 0
+    evaluated_frames = 0
+    ranges = pair.get("evaluation_frame_ranges")
+    if ranges is not None and (not ranges or any(
+            len(interval) != 2 or any(type(x) is not int for x in interval) or
+            interval[0] < 0 or interval[1] <= interval[0] for interval in ranges)):
+        raise ValueError("evaluation_frame_ranges must contain nonempty integer intervals")
     sentinel = object()
     previous_timestamp = None
     try:
@@ -380,6 +386,10 @@ def iter_pair_metrics(pair: dict[str, Any], config: dict[str, Any], *, backend: 
                 if delta <= 0 or (config.get("require_cfr", True) and abs(delta - duration) > tolerance):
                     raise ValueError(f"nonmonotonic or variable-rate timestamps at frame {frames}")
             previous_timestamp = left.timestamp
+            if ranges is not None and not any(start <= frames < end for start, end in ranges):
+                frames += 1
+                continue
+            evaluated_frames += 1
             difference = left.image.astype(np.float64) - right.image.astype(np.float64)
             sse = float(np.square(difference).sum())
             row = {k: pair.get(k) for k in IDENTITY_FIELDS}
@@ -396,6 +406,8 @@ def iter_pair_metrics(pair: dict[str, Any], config: dict[str, Any], *, backend: 
             yield row
         if not frames:
             raise ValueError("paired videos contain no decoded frames")
+        if not evaluated_frames:
+            raise ValueError("no frames fall within the requested evaluation ranges")
         if expected is not None and frames != int(expected):
             raise ValueError(f"expected {expected} frames, decoded {frames}")
         for reader in (reference, candidate):

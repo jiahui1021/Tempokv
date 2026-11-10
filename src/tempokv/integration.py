@@ -7,7 +7,7 @@ from typing import Any, Mapping
 
 from .codec import TempoKVCodec
 from .config import CodecConfig, load_config
-from .parameters import TemporalParameters, load_parameters
+from .parameters import PreviousFrameParameters, TemporalParameters, load_parameters
 from .runtime import configure_triton_cache
 
 
@@ -30,10 +30,26 @@ def check_deployable_cross_kv_layout(config: CodecConfig) -> None:
         )
 
 
+def is_parameter_free_identity(config: CodecConfig) -> bool:
+    return (
+        config.k_predictor_mode == config.v_predictor_mode == "identity"
+        and config.k_history_length == config.v_history_length == 1
+    )
+
+
+def previous_frame_codec(config: CodecConfig) -> TempoKVCodec:
+    if not is_parameter_free_identity(config):
+        raise ValueError("parameter-free identity requires K/V identity and one previous frame")
+    rule = PreviousFrameParameters(
+        stride=config.stride, codec_signature=config.format_signature()
+    )
+    return TempoKVCodec(rule, rule, config)
+
+
 def load_codec(
     config_path: str | Path,
-    k_parameters_path: str | Path,
-    v_parameters_path: str | Path,
+    k_parameters_path: str | Path | None = None,
+    v_parameters_path: str | Path | None = None,
     *,
     triton_cache: str | Path | None = None,
     overrides: Mapping[str, Any] | None = None,
@@ -47,6 +63,10 @@ def load_codec(
     check_deployable_cross_kv_layout(config)
     if config.use_triton:
         configure_triton_cache(triton_cache)
+    if is_parameter_free_identity(config):
+        return previous_frame_codec(config)
+    if k_parameters_path is None or v_parameters_path is None:
+        raise ValueError("this codec requires K and V parameter files")
     temporal = TemporalParameters.load(k_parameters_path)
     cross_kv = load_parameters(v_parameters_path)
     return TempoKVCodec(temporal, cross_kv, config)
@@ -60,6 +80,10 @@ def load_codec_from_env(prefix: str = "TEMPOKV_") -> TempoKVCodec:
         "V_PARAMS_PATH": os.environ.get(f"{prefix}V_PARAMS_PATH"),
     }
     missing = [f"{prefix}{name}" for name, value in required.items() if not value]
+    if required["CONFIG_PATH"] and is_parameter_free_identity(
+        load_config(required["CONFIG_PATH"])
+    ):
+        missing = []
     if missing:
         raise RuntimeError(f"missing environment variables: {', '.join(missing)}")
     return load_codec(

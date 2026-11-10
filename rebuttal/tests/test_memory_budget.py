@@ -133,6 +133,7 @@ def stub_pipeline(monkeypatch, runtime):
             self.num_frame_per_block = 1
             self.kv_cache1 = None
             self.summary = {}
+            self.vae = SimpleNamespace(model=SimpleNamespace())
 
         def inference(self, noise):
             self._initialize_kv_cache(1, torch.bfloat16, torch.device("cpu"), noise.shape[1])

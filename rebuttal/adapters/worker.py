@@ -169,6 +169,10 @@ def main(argv=None) -> int:
                  "--sink_size", str(config.get("sink_size", 0)), "--save_with_index"]
     if config.get("use_ema", False):
         arguments.append("--use_ema")
+    if config.get("skip_existing", False):
+        arguments.append("--skip_existing")
+    if config.get("selected_prompt_ids") is not None:
+        arguments += ["--prompt_indices", json.dumps(config["selected_prompt_ids"])]
     old_argv, old_cwd = sys.argv, Path.cwd()
     try:
         sys.argv = arguments

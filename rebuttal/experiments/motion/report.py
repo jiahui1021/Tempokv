@@ -89,7 +89,8 @@ def _load_events(path: Path) -> list[dict[str, Any]]:
     if path.suffix.lower() == ".csv":
         return read_csv(path)
     if path.suffix.lower() in {".jsonl", ".ndjson"}:
-        return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+        with path.open(encoding="utf-8") as handle:
+            return [json.loads(line) for line in handle if line.strip()]
     payload = json.loads(path.read_text(encoding="utf-8"))
     if isinstance(payload, list):
         return payload
@@ -170,10 +171,24 @@ def join_cache(pair: dict[str, Any], start_frame: int, end_frame: int, scope: st
 def cache_motion_intervals(pair: dict[str, Any], flow_rows: list[dict[str, Any]], scope: str, events: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Aggregate flow into the explicit cache pixel intervals, never vice versa."""
     relevant, _ = _cache_records(pair, events, scope)
-    intervals = sorted({_interval(r) for r in relevant if _interval(r) is not None})
+    by_interval = {}
+    unmapped = []
+    for event in relevant:
+        interval = _interval(event)
+        if interval is not None:
+            by_interval.setdefault(interval, []).append(event)
+        else:
+            unmapped.append(event)
+    by_frame = {}
+    identity = _identity(pair)
+    for position, row in enumerate(flow_rows):
+        if _identity(row) == identity:
+            by_frame.setdefault(row['frame_index'], []).append((position, row))
     result = []
-    for start, end in intervals:
-        members = [r for r in flow_rows if _identity(r) == _identity(pair) and start <= r["frame_index"] and r["next_frame_index"] < end]
+    for start, end in sorted(by_interval):
+        selected = [item for frame in range(start, end) for item in by_frame.get(frame, [])
+                    if item[1]['next_frame_index'] < end]
+        members = [row for _, row in sorted(selected, key=lambda item: item[0])]
         if not members or len(members) != end - start - 1:
             continue
         valid_camera = all(r.get("camera_valid") and not r.get("is_cut") for r in members)
@@ -183,7 +198,12 @@ def cache_motion_intervals(pair: dict[str, Any], flow_rows: list[dict[str, Any]]
                    motion_magnitude=sum(r["motion_magnitude"] for r in members) / len(members) if not any(r["is_cut"] for r in members) else None,
                    global_motion=sum(r["global_motion"] for r in members) / len(members) if valid_camera else None,
                    residual_motion=sum(r["residual_motion"] for r in members) / len(members) if valid_camera else None)
-        row.update(join_cache(pair, start, end, scope, events=events))
+        # Include every contained event, preserving join_cache's interval
+        # semantics even when the input contains nested interval lengths.
+        contained = [event for (a,b), group in by_interval.items()
+                     if a >= start and b <= end for event in group]
+        contained.extend(unmapped)
+        row.update(join_cache(pair, start, end, scope, events=contained))
         result.append(row)
     return result
 
@@ -395,7 +415,7 @@ def run(config: dict[str, Any], stage: str, output_dir: Path) -> dict[str, Any]:
             all_motion[identity] = motion
             all_flow_rows.extend(flow_rows)
             write_csv(output_dir / "motion_pairs.csv", all_flow_rows)
-    joined, pair_cache, loaded_cache = [], [], {}
+    joined, pair_cache, loaded_cache, event_files = [], [], {}, {}
     for pair in pairs:
         motion = all_motion[_identity(pair)]
         matched = [r for r in quality if all(str(r.get(k)) == str(pair.get(k)) for k in IDENTITY_FIELDS)]
@@ -404,7 +424,15 @@ def run(config: dict[str, Any], stage: str, output_dir: Path) -> dict[str, Any]:
         if int(matched[0]["frames"]) != motion["frames"]:
             raise ValueError("flow and quality frame coverage differ")
         cache_filename = pair.get("cache_events") or pair.get("cache_metrics")
-        events = _load_events(Path(cache_filename)) if cache_filename else []
+        events = []
+        if cache_filename:
+            path = Path(cache_filename).resolve()
+            if path not in event_files:
+                indexed = {}
+                for event in _load_events(path):
+                    indexed.setdefault(_identity(event), []).append(event)
+                event_files[path] = indexed
+            events = event_files[path].get(_identity(pair), [])
         loaded_cache[tuple(str(pair.get(k)) for k in IDENTITY_FIELDS)] = events
         scope = config.get("cache_metric_scope", "bf16_trace_replay")
         row = {**motion, **matched[0], **join_cache(pair, 0, motion["frames"], scope, events=events)}

@@ -64,7 +64,13 @@ def build_job(config: dict[str, Any], output_dir: Path, *, mode: str = "tempokv"
                        f"--nproc_per_node={int(config.get('num_gpus', 1))}",
                        str(ROOT / "rebuttal/adapters/worker.py"), "--config", str(path)]
             if mode == "tempokv" and not config.get("research_params"):
-                files.extend([_required(config, k) for k in ("codec_config", "k_params", "v_params")])
+                codec_path = _required(config, "codec_config")
+                files.append(codec_path)
+                from tempokv.config import load_config
+                from tempokv.integration import is_parameter_free_identity
+                fixed = Path(codec_path).is_file() and is_parameter_free_identity(load_config(codec_path))
+                if not fixed:
+                    files.extend([_required(config, k) for k in ("k_params", "v_params")])
             if config.get("research_params"):
                 files.append(str(config["research_params"]))
         else:

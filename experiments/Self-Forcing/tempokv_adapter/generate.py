@@ -25,6 +25,7 @@ from tempokv.config import (  # noqa: E402
     load_config,
     is_temporal_v_predictor,
 )
+from tempokv.integration import is_parameter_free_identity, previous_frame_codec  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import efficiency_record as efficiency  # noqa: E402
@@ -185,18 +186,22 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _validate_parameters(
-    k_path: Path, v_path: Path, config
+    k_path: Path | None, v_path: Path | None, config
 ) -> dict[str, object]:
     from tempokv.codec import TempoKVCodec
     from tempokv.parameters import CrossKVParameters, TemporalParameters
 
-    temporal = TemporalParameters.load(k_path)
     temporal_v = is_temporal_v_predictor(config.v_predictor_mode)
-    cross = (
-        TemporalParameters.load(v_path)
-        if temporal_v
-        else CrossKVParameters.load(v_path)
-    )
+    if is_parameter_free_identity(config):
+        fixed_codec = previous_frame_codec(config)
+        temporal, cross = fixed_codec.temporal, fixed_codec.v_parameters
+    else:
+        temporal = TemporalParameters.load(k_path)
+        cross = (
+            TemporalParameters.load(v_path)
+            if temporal_v
+            else CrossKVParameters.load(v_path)
+        )
     # The codec refuses mismatched stamped sets; production also refuses unstamped
     # sets and other coordinate systems.
     if temporal.codec_signature is None or not temporal.parameter_set_id:
@@ -237,8 +242,9 @@ def _validate_parameters(
         cross.history_weights.numel() * cross.history_weights.element_size()
     )
     return {
-        "k_params": str(k_path),
-        "v_params": str(v_path),
+        "k_params": None if is_parameter_free_identity(config) else str(k_path),
+        "v_params": None if is_parameter_free_identity(config) else str(v_path),
+        "parameter_source": "none_previous_frame_copy" if is_parameter_free_identity(config) else "files",
         "layers": 30,
         "heads": 12,
         "head_dimension": 128,
@@ -667,6 +673,14 @@ def _end_to_end_latency(
 
 
 def run(args: argparse.Namespace) -> dict[str, object]:
+    parameter_free_identity = (
+        args.mode == "tempokv"
+        and args.config is not None
+        and is_parameter_free_identity(load_config(args.config))
+        and args.k_history_length in (None, 1)
+        and args.v_history_length in (None, 1)
+        and args.v_predictor_mode in (None, "identity")
+    )
     suite_b_paths = None
     if args.mode == "spectral_kv":
         from tempokv.spectral_kv.config import runtime_environment
@@ -707,7 +721,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                 ("--k-params", args.k_params),
                 ("--v-params", args.v_params),
             )
-            if value is None
+            if value is None and (name == "--config" or not parameter_free_identity)
         ]
         if missing_arguments:
             raise ValueError(
@@ -716,15 +730,17 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         paths.update(
             {
                 "config": args.config.expanduser().resolve(),
-                "k_params": args.k_params.expanduser().resolve(),
-                "v_params": args.v_params.expanduser().resolve(),
+                "k_params": None if parameter_free_identity else args.k_params.expanduser().resolve(),
+                "v_params": None if parameter_free_identity else args.v_params.expanduser().resolve(),
             }
         )
     if paths["run"] == Path(paths["run"].anchor):
         raise ValueError("output-dir must not be the filesystem root")
     required_files = ["checkpoint", "prompts", "model_config"]
     if args.mode == "tempokv":
-        required_files.extend(("config", "k_params", "v_params"))
+        required_files.append("config")
+        if not parameter_free_identity:
+            required_files.extend(("k_params", "v_params"))
     for name in required_files:
         if not paths[name].is_file():
             raise ValueError(f"{name} file does not exist: {paths[name]}")
@@ -876,13 +892,17 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         environment.update(
             {
                 "TEMPOKV_CONFIG_PATH": str(paths["runtime_config"]),
-                "TEMPOKV_K_PARAMS_PATH": str(paths["k_params"]),
-                "TEMPOKV_V_PARAMS_PATH": str(paths["v_params"]),
                 "TEMPOKV_NUM_FRAMES": str(latent_frames_for(args.frames)),
                 # Rollout length; TEMPOKV_NUM_FRAMES is the attention window.
                 "TEMPOKV_HORIZON_FRAMES": str(latent_frames_for(args.frames)),
             }
         )
+        if parameter_free_identity:
+            environment.pop("TEMPOKV_K_PARAMS_PATH", None)
+            environment.pop("TEMPOKV_V_PARAMS_PATH", None)
+        else:
+            environment["TEMPOKV_K_PARAMS_PATH"] = str(paths["k_params"])
+            environment["TEMPOKV_V_PARAMS_PATH"] = str(paths["v_params"])
         if args.span_frames is not None:
             environment["TEMPOKV_SPAN_FRAMES"] = str(args.span_frames)
         # The window defaults to every generated frame; narrowing it matches a
@@ -1019,6 +1039,8 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             "innovation": "innovation_persistent_direct",
             "direct": "direct_persistent_direct",
         }[config.v_predictor_mode]
+        if parameter_free_identity:
+            k_route = v_route = "previous_frame_persistent_direct"
         required_routes = (k_route,) if k_route == v_route else (k_route, v_route)
         missing_routes = [
             route
