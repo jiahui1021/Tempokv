@@ -76,3 +76,34 @@ the number of prior chunks that already read those values. The zero-exposure
 control requires its prefix, undo-rounding continuation and own-reencode
 continuation to match the native reference bitwise. Intermediate warm start
 positions are supported and the report records the actual exposure count.
+
+## Read precision placement
+
+`--read-precision-study` confines rounding to the final prefix chunk and
+restores the earlier cache to its original values before future generation.
+The reference, all-rounded, writer-only rounded, and clean-protected arms
+form a factorial comparison. Writer-only rounding must preserve the
+denoised prefix and layer-0 K/V exactly. The all-rounded and clean-protected
+arms must have identical denoised prefixes. Trajectory contrasts compare
+these pairs directly and normalize all differences to the BF16 reference.
+
+The four denoise-protected arms and the clean-protected arm read the original
+aged K/V once each. Recent and current positions stay at native precision in
+every arm. The uniform arm divides the same ideal read bytes over all
+passes, with higher-bit positions evenly spaced through the aged region.
+Accounting includes packed coefficient bits and FP32 group scales, and
+excludes headers, alignment and hardware transfer overhead. In the four-step
+Wan 4-bit setup, this gives a fixed 6-bit/7-bit mix with 30% of aged
+positions at 7 bits on every pass. All arms run the same native attention
+and number of calls. Packed storage and selective retrieval are outside the
+probe.
+
+```bash
+python scripts/research/cache_recovery.py --read-precision-study --bits 4 --dry-run
+```
+
+To run on GPU, add `--read-precision-study` to the real invocation above.
+It defaults the first low-bit read to the last prefix chunk. Its immutable
+per-prompt files use `research.cache_read_precision.v1` and record the actual
+call timesteps, one-read cost, layer-by-layer cache errors, per-chunk latent
+errors and the four factorial contrasts.

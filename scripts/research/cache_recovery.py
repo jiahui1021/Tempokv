@@ -16,6 +16,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "src"))
 
 from tempokv.research.cache_recovery import BRANCHES, SCHEMA, RecoverySettings
+from tempokv.research.cache_read_precision import SCHEMA as READ_PRECISION_SCHEMA, UNIFORM, read_schedules
 from tempokv.research.io import atomic_json, environment
 
 
@@ -35,12 +36,19 @@ def main(argv=None):
     parser.add_argument("--protect-chunks", type=int, default=2)
     parser.add_argument("--warm-start-chunk", type=int,
                         help="first low-bit read in the warm prefix, or the fork for a zero-exposure control")
+    parser.add_argument("--read-precision-study", action="store_true",
+                        help="test denoise and clean-write precision on the last prefix chunk")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(argv)
+    warm_start = args.warm_start_chunk
+    if args.read_precision_study:
+        if warm_start not in (None, args.fork_chunk - 1):
+            parser.error("--read-precision-study needs exactly one exposed prefix chunk")
+        warm_start = args.fork_chunk - 1
     try:
         settings = RecoverySettings(
             args.bits, args.group_size, args.fork_chunk, args.future_chunks, args.protect_chunks,
-            args.warm_start_chunk,
+            warm_start,
         )
     except (TypeError, ValueError) as exc:
         parser.error(str(exc))
@@ -54,7 +62,10 @@ def main(argv=None):
     }
     latent_frames = 3 * (settings.fork_chunk + settings.future_chunks)
     plan = {
-        "schema_version": SCHEMA, "settings": asdict(settings), "branches": BRANCHES,
+        "schema_version": READ_PRECISION_SCHEMA if args.read_precision_study else SCHEMA,
+        "settings": asdict(settings),
+        "branches": [*read_schedules(4), UNIFORM] if args.read_precision_study else BRANCHES,
+        "read_precision_study": args.read_precision_study,
         "environment": environment(), "output_dir": str(output) if output else None,
         "prompt_start": args.prompt_start, "prompt_count": args.prompt_count, "base_seed": args.seed,
         "latent_frames": latent_frames, "runtime": paths,

@@ -47,7 +47,7 @@ class Generator(torch.nn.Module):
         return None, generated.reshape_as(x)
 
 
-def native_pipeline():
+def native_pipeline(generator=None):
     path = ROOT / "experiments/Self-Forcing/pipeline/causal_inference.py"
     tree = ast.parse(path.read_text())
     names = {"CausalInferencePipeline", "ready_quantization_spans"}
@@ -63,7 +63,7 @@ def native_pipeline():
         num_frame_per_block=2, independent_first_frame=False, frame_seq_length=1,
     )
     pipeline = scope["CausalInferencePipeline"](
-        config, torch.device("cpu"), generator=Generator(),
+        config, torch.device("cpu"), generator=generator if generator is not None else Generator(),
         text_encoder=lambda **kw: {}, vae=object(),
     )
     pipeline._sample_resident_kv = lambda: None

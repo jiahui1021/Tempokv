@@ -181,7 +181,7 @@ class RecoveryRollout:
                         span.copy_(fake_quantize(span, self.settings.bits, self.settings.group_size).value)
         return max(cutoff, old_end)
 
-    def _run(self, case, noise, prefix=None):
+    def _run(self, case, noise, prefix=None, *, before_forward=None):
         print(f"[cache-recovery] {case}", flush=True)
         pipeline = self.pipeline
         device = noise.device
@@ -226,7 +226,7 @@ class RecoveryRollout:
                     self.fork_rng = capture_rng_state()
                     self.fork_rng_fingerprint = rng_fingerprint()
                     self.reference_cache = ForkCache.capture(pipeline, self.fork_tokens)
-                else:
+                elif prefix is not None:
                     if written_prefix != self.fork_tokens:
                         raise ValueError("incomplete native prefix replay")
                     if started_prefill is not None:
@@ -245,7 +245,8 @@ class RecoveryRollout:
                     _sync(device)
                 started_future = time.perf_counter()
 
-            at_chunk_start = len(calls) % self.calls_per_chunk == 0
+            call_index = len(calls) % self.calls_per_chunk
+            at_chunk_start = call_index == 0
             _validate_cache(cache, start if at_chunk_start else start + self.tokens)
             if at_chunk_start and (
                 case == "continue"
@@ -253,6 +254,8 @@ class RecoveryRollout:
             ):
                 cutoff = max(0, start - self.settings.protect_chunks * self.tokens)
                 quantized_until = self._round_through(cache, case, quantized_until, cutoff)
+            if before_forward is not None:
+                before_forward(start, call_index, kwargs)
             before = rng_fingerprint()
             result = original_forward(**kwargs)
             _validate_cache(cache, start + self.tokens)
