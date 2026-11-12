@@ -13,6 +13,7 @@ from .rollout import capture_rng_state, restore_rng_state
 
 SCHEMA = "research.cache_read_precision.v1"
 UNIFORM = "uniform_equal_payload"
+ROLE_ARMS = {"k_high_equal_bytes": "k", "v_high_equal_bytes": "v"}
 
 
 def read_schedules(denoise_steps):
@@ -56,42 +57,55 @@ def _trajectory_contrast(left, right, reference, frames):
 
 
 class ReadPrecisionRollout(RecoveryRollout):
-    def __init__(self, pipeline, infer, settings, noise, prompts):
+    def __init__(self, pipeline, infer, settings, noise, prompts, *, role_study=False):
         super().__init__(pipeline, infer, settings, noise, prompts)
         if settings.first_round_chunk != settings.fork_chunk - 1:
             raise ValueError("read precision study requires exactly one exposed prefix chunk")
+        if role_study and settings.bits != 4:
+            raise ValueError("K/V allocation uses a 4-bit base")
+        self.role_study = role_study
         self.target_start = self.fork_tokens - self.tokens
         self.aged_end = self.target_start - settings.protect_chunks * self.tokens
 
-    def _uniform_history(self, aged):
+    def _mixed_history(self, aged, favored_role=None):
         if self.settings.bits == 16:
-            return aged, {"lower_bits": 16, "higher_bits": 16, "higher_positions": 0}
-        # The uniform arm reads one additional set of FP32 scales compared to
+            return aged, {"uniform_precision": {"lower_bits": 16, "higher_bits": 16, "higher_positions": 0}}
+        # These arms read one additional set of FP32 scales compared to
         # a single BF16 pass. Deduct that set from the coefficient budget.
         width = aged[0][0].shape[-1]
         scales = math.ceil(width / self.settings.group_size)
         total_bits = width * (16 + (self.calls_per_chunk - 1) * self.settings.bits) - 32 * scales
         denominator = self.calls_per_chunk * width
-        low, remainder = divmod(total_bits, denominator)
-        high = low + int(remainder > 0)
-        count, leftover = divmod(self.aged_end * remainder, denominator)
-        if leftover or not 2 <= low <= high <= 8:
-            raise ValueError("this rollout cannot match the uniform packed payload exactly")
         position = torch.arange(self.aged_end, device=self.noise.device)
-        chosen = position[
-            (position + 1) * count // self.aged_end > position * count // self.aged_end
-        ]
-        uniform = []
+        plans = {}
+        indices = {}
+        for role in ROLES:
+            allocation = total_bits
+            if favored_role is not None:
+                allocation = 8 * denominator if role == favored_role else 2 * total_bits - 8 * denominator
+            low, remainder = divmod(allocation, denominator)
+            high = low + int(remainder > 0)
+            count, leftover = divmod(self.aged_end * remainder, denominator)
+            if leftover or not 2 <= low <= high <= 8:
+                raise ValueError("this rollout cannot match the mixed precision budget exactly")
+            plans[role] = {"lower_bits": low, "higher_bits": high, "higher_positions": count}
+            indices[role] = position[
+                (position + 1) * count // self.aged_end > position * count // self.aged_end
+            ]
+        history = []
         for pair in aged:
             rebuilt = []
-            for value in pair:
-                result = fake_quantize(value, low, self.settings.group_size).value
-                if count:
+            for role, value in zip(ROLES, pair, strict=True):
+                plan, chosen = plans[role], indices[role]
+                result = fake_quantize(value, plan["lower_bits"], self.settings.group_size).value
+                if chosen.numel():
                     original = value.index_select(1, chosen)
-                    result.index_copy_(1, chosen, fake_quantize(original, high, self.settings.group_size).value)
+                    higher = fake_quantize(original, plan["higher_bits"], self.settings.group_size).value
+                    result.index_copy_(1, chosen, higher)
                 rebuilt.append(result)
-            uniform.append(tuple(rebuilt))
-        return tuple(uniform), {"lower_bits": low, "higher_bits": high, "higher_positions": count}
+            history.append(tuple(rebuilt))
+        metadata = {"uniform_precision": plans["k"]} if favored_role is None else {"precision_by_role": plans}
+        return tuple(history), metadata
 
     def _history_states(self):
         device = self.noise.device
@@ -110,10 +124,10 @@ class ReadPrecisionRollout(RecoveryRollout):
         )
         return native, aged, rounded, last_write
 
-    def _scheduled_run(self, name, protected, history, uniform=None):
+    def _scheduled_run(self, name, protected, history, mixed=None):
         native, aged, rounded, last_write = history
-        if uniform is not None:
-            rounded, uniform_precision = uniform
+        if mixed is not None:
+            rounded, precision_metadata = mixed
         read_rows = []
         write_rows = []
         is_native = True
@@ -153,7 +167,7 @@ class ReadPrecisionRollout(RecoveryRollout):
             elements // width * math.ceil(width / self.settings.group_size) * 4
         )
         rounded_bytes = (elements * self.settings.bits + 7) // 8 + scale_bytes
-        extra_reads = 1 if uniform is not None else len(protected)
+        extra_reads = 1 if mixed is not None else len(protected)
         row = {
             "protected_aged_history_calls": len(protected),
             "extra_ideal_cache_read_bytes": extra_reads * (native_bytes - rounded_bytes),
@@ -161,9 +175,27 @@ class ReadPrecisionRollout(RecoveryRollout):
             "target_reads": read_rows,
             "last_write_cache_rows": write_rows,
         }
-        if uniform is not None:
-            row["uniform_precision"] = uniform_precision
+        if mixed is not None:
+            row.update(precision_metadata)
         return latents, calls, end_hash, row
+
+    def _factorial(self, rows, futures, ref_prefix_hash, ref_future):
+        writer = rows["rounded_write_only"]
+        if writer["prefix_sha256"] != ref_prefix_hash or any(
+            r["error_energy"] != 0 for r in writer["last_write_cache_rows"] if r["layer"] == 0
+        ):
+            raise ValueError("writer-only exposure changed its input latent or first-layer K/V")
+        if rows["rounded_all"]["prefix_sha256"] != rows["protect_clean"]["prefix_sha256"]:
+            raise ValueError("protecting only the clean write changed the denoised prefix")
+        both = futures["rounded_all"]
+        write = futures["rounded_write_only"]
+        denoise = futures["protect_clean"]
+        return {
+            "writer_given_native_denoise": _trajectory_contrast(write, ref_future, ref_future, self.frames),
+            "writer_given_rounded_denoise": _trajectory_contrast(both, denoise, ref_future, self.frames),
+            "denoise_given_native_write": _trajectory_contrast(denoise, ref_future, ref_future, self.frames),
+            "denoise_given_rounded_write": _trajectory_contrast(both, write, ref_future, self.frames),
+        }
 
     @torch.no_grad()
     def run(self):
@@ -173,19 +205,21 @@ class ReadPrecisionRollout(RecoveryRollout):
             ref, ref_calls, ref_end, cost = self._run("reference", self.noise)
             reference_end = capture_rng_state()
             history = self._history_states()
-            uniform = self._uniform_history(history[1])
             ref_future = ref[:, self.fork_frames:].cpu().float()
             ref_prefix = ref[:, :self.fork_frames]
             ref_future_hash = _digest(ref[:, self.fork_frames:])
             ref_prefix_hash = _digest(ref_prefix)
             rows, futures = {}, {}
-            schedules = read_schedules(self.calls_per_chunk - 1)
+            schedules = (
+                {"rounded_all": (), **dict.fromkeys(ROLE_ARMS, ())}
+                if self.role_study else read_schedules(self.calls_per_chunk - 1)
+            )
             schedules[UNIFORM] = ()
             for name, protected in schedules.items():
                 restore_rng_state(entry)
-                latents, calls, end, row = self._scheduled_run(
-                    name, protected, history, uniform if name == UNIFORM else None,
-                )
+                mixed = self._mixed_history(history[1], ROLE_ARMS.get(name)) if name in (UNIFORM, *ROLE_ARMS) else None
+                latents, calls, end, row = self._scheduled_run(name, protected, history, mixed)
+                del mixed
                 if calls != ref_calls or end != ref_end:
                     raise ValueError(f"{name}: unpaired RNG or absolute forward schedule")
                 if row["future_query_key_pairs_all_heads_layers"] != cost["future_query_key_pairs_all_heads_layers"]:
@@ -207,23 +241,14 @@ class ReadPrecisionRollout(RecoveryRollout):
                     raise ValueError(f"{name}: non-finite latent comparison")
                 rows[name] = row
 
-            writer = rows["rounded_write_only"]
-            if writer["prefix_sha256"] != ref_prefix_hash or any(
-                r["error_energy"] != 0 for r in writer["last_write_cache_rows"] if r["layer"] == 0
-            ):
-                raise ValueError("writer-only exposure changed its input latent or first-layer K/V")
-            if rows["rounded_all"]["prefix_sha256"] != rows["protect_clean"]["prefix_sha256"]:
-                raise ValueError("protecting only the clean write changed the denoised prefix")
             if self.settings.bits == 16 and any(
                 r["future_sha256"] != ref_future_hash or r["prefix_sha256"] != ref_prefix_hash for r in rows.values()
             ):
                 raise ValueError("native-precision identity control changed a trajectory")
 
-            both = futures["rounded_all"]
-            write = futures["rounded_write_only"]
-            denoise = futures["protect_clean"]
-            return {
+            evidence = {
                 "schema_version": SCHEMA,
+                "study": "roles" if self.role_study else "timing",
                 "settings": asdict(self.settings),
                 "key_coordinate": "native_post_rope",
                 "value_coordinate": "raw",
@@ -235,12 +260,9 @@ class ReadPrecisionRollout(RecoveryRollout):
                 "reference_suffix_sha256": ref_future_hash,
                 "future_rng_fingerprint": ref_end,
                 "branches": rows,
-                "factorial_trajectory_contrasts": {
-                    "writer_given_native_denoise": _trajectory_contrast(write, ref_future, ref_future, self.frames),
-                    "writer_given_rounded_denoise": _trajectory_contrast(both, denoise, ref_future, self.frames),
-                    "denoise_given_native_write": _trajectory_contrast(denoise, ref_future, ref_future, self.frames),
-                    "denoise_given_rounded_write": _trajectory_contrast(both, write, ref_future, self.frames),
-                },
-            }, ref
+            }
+            if not self.role_study:
+                evidence["factorial_trajectory_contrasts"] = self._factorial(rows, futures, ref_prefix_hash, ref_future)
+            return evidence, ref
         finally:
             restore_rng_state(reference_end)

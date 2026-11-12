@@ -107,3 +107,11 @@ It defaults the first low-bit read to the last prefix chunk. Its immutable
 per-prompt files use `research.cache_read_precision.v1` and record the actual
 call timesteps, one-read cost, layer-by-layer cache errors, per-chunk latent
 errors and the four factorial contrasts.
+
+The companion `--read-precision-role-study --bits 4` keeps the precision
+schedule uniform over calls and swaps the allocation between K and V.
+It includes the identical balanced 6/7-bit arm and the all-4-bit anchor.
+With the Wan shape and 64-element groups, the favored role uses 8 bits
+everywhere and the other role uses 4/5 bits with 60% of positions at 5 bits.
+Both directions use exactly the same ideal read bytes including scales as
+the balanced arm. The native coordinate convention is unchanged.

@@ -20,6 +20,7 @@ def install():
     launch = json.loads(Path(os.environ["RESEARCH_CACHE_RECOVERY_LAUNCH"]).read_text())
     settings = RecoverySettings(**launch["settings"])
     rollout_type = ReadPrecisionRollout if launch.get("read_precision_study") else RecoveryRollout
+    rollout_options = {"role_study": True} if launch.get("read_precision_role_study") else {}
     output = Path(launch["output_dir"])
     base = module.CausalInferencePipeline
 
@@ -38,7 +39,7 @@ def install():
             if path.exists():
                 raise FileExistsError(path)
             print(f"[cache-recovery] {path.stem} bits={settings.bits}", flush=True)
-            rollout = rollout_type(self, super().inference, settings, noise, text_prompts)
+            rollout = rollout_type(self, super().inference, settings, noise, text_prompts, **rollout_options)
             evidence, reference = rollout.run()
             atomic_json(path, {
                 **evidence, **context, "status": "completed",

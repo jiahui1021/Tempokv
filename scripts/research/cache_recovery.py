@@ -16,7 +16,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "src"))
 
 from tempokv.research.cache_recovery import BRANCHES, SCHEMA, RecoverySettings
-from tempokv.research.cache_read_precision import SCHEMA as READ_PRECISION_SCHEMA, UNIFORM, read_schedules
+from tempokv.research.cache_read_precision import ROLE_ARMS, SCHEMA as READ_PRECISION_SCHEMA, UNIFORM, read_schedules
 from tempokv.research.io import atomic_json, environment
 
 
@@ -36,14 +36,20 @@ def main(argv=None):
     parser.add_argument("--protect-chunks", type=int, default=2)
     parser.add_argument("--warm-start-chunk", type=int,
                         help="first low-bit read in the warm prefix, or the fork for a zero-exposure control")
-    parser.add_argument("--read-precision-study", action="store_true",
-                        help="test denoise and clean-write precision on the last prefix chunk")
+    studies = parser.add_mutually_exclusive_group()
+    studies.add_argument("--read-precision-study", action="store_true",
+                         help="test denoise and clean-write precision on the last prefix chunk")
+    studies.add_argument("--read-precision-role-study", action="store_true",
+                         help="swap the equal-byte allocation between aged K and V")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(argv)
     warm_start = args.warm_start_chunk
-    if args.read_precision_study:
+    precision_study = args.read_precision_study or args.read_precision_role_study
+    if args.read_precision_role_study and args.bits != 4:
+        parser.error("--read-precision-role-study uses a 4-bit base")
+    if precision_study:
         if warm_start not in (None, args.fork_chunk - 1):
-            parser.error("--read-precision-study needs exactly one exposed prefix chunk")
+            parser.error("read precision studies need exactly one exposed prefix chunk")
         warm_start = args.fork_chunk - 1
     try:
         settings = RecoverySettings(
@@ -61,11 +67,17 @@ def main(argv=None):
         for name, path in (("checkpoint", args.checkpoint), ("model_root", args.model_root), ("prompts", args.prompts))
     }
     latent_frames = 3 * (settings.fork_chunk + settings.future_chunks)
+    branches = BRANCHES
+    if args.read_precision_role_study:
+        branches = ["rounded_all", *ROLE_ARMS, UNIFORM]
+    elif args.read_precision_study:
+        branches = [*read_schedules(4), UNIFORM]
     plan = {
-        "schema_version": READ_PRECISION_SCHEMA if args.read_precision_study else SCHEMA,
+        "schema_version": READ_PRECISION_SCHEMA if precision_study else SCHEMA,
         "settings": asdict(settings),
-        "branches": [*read_schedules(4), UNIFORM] if args.read_precision_study else BRANCHES,
-        "read_precision_study": args.read_precision_study,
+        "branches": branches,
+        "read_precision_study": precision_study,
+        "read_precision_role_study": args.read_precision_role_study,
         "environment": environment(), "output_dir": str(output) if output else None,
         "prompt_start": args.prompt_start, "prompt_count": args.prompt_count, "base_seed": args.seed,
         "latent_frames": latent_frames, "runtime": paths,

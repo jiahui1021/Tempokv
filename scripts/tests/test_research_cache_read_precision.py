@@ -3,7 +3,7 @@
 import pytest
 import torch
 
-from tempokv.research.cache_read_precision import UNIFORM, ReadPrecisionRollout, read_schedules
+from tempokv.research.cache_read_precision import ROLE_ARMS, UNIFORM, ReadPrecisionRollout, read_schedules
 from tempokv.research.cache_recovery import RecoverySettings
 from test_research_cache_recovery import Generator, native_pipeline
 
@@ -77,3 +77,31 @@ def test_study_rejects_more_than_one_exposed_chunk():
             pipeline, pipeline.inference, RecoverySettings(future_chunks=3),
             torch.zeros(1, 18, 4, 1, 1, dtype=torch.bfloat16), ["test"],
         )
+
+
+def test_role_swap_preserves_the_uniform_byte_budget():
+    torch.manual_seed(29)
+    pipeline = native_pipeline(TwoLayerGenerator())
+    settings = RecoverySettings(bits=4, group_size=4, warm_start_chunk=5, future_chunks=3)
+    noise = torch.randn(1, 18, 4, 1, 1, dtype=torch.bfloat16)
+    rollout = ReadPrecisionRollout(pipeline, pipeline.inference, settings, noise, ["test"], role_study=True)
+    evidence, _ = rollout.run()
+    branches = evidence["branches"]
+    assert evidence["study"] == "roles"
+    assert set(branches) == {"rounded_all", UNIFORM, *ROLE_ARMS}
+    assert branches["rounded_all"]["extra_ideal_cache_read_bytes"] == 0
+    uniform = branches[UNIFORM]
+    positions = evidence["aged_positions_per_head"]
+
+    def coefficient_bits(plan):
+        high = plan["higher_positions"]
+        return (positions - high) * plan["lower_bits"] + high * plan["higher_bits"]
+
+    for arm, role in ROLE_ARMS.items():
+        row = branches[arm]
+        plans = row["precision_by_role"]
+        assert plans[role] == {"lower_bits": 8, "higher_bits": 8, "higher_positions": 0}
+        assert sum(map(coefficient_bits, plans.values())) == 2 * coefficient_bits(uniform["uniform_precision"])
+        assert row["extra_ideal_cache_read_bytes"] == uniform["extra_ideal_cache_read_bytes"]
+        assert row["protected_aged_history_calls"] == 0
+    assert branches["k_high_equal_bytes"]["future_sha256"] != branches["v_high_equal_bytes"]["future_sha256"]
