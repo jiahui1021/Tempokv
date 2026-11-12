@@ -64,3 +64,15 @@ the prefix distinguish the observable warm history from the input that was
 used to construct the oracle cache. Compare branches within the same prompt,
 seed, bit width and fork location. Compute prompt-level statistics before
 aggregating repeated chunks.
+
+
+## Matched exposure control
+
+With `--warm-start-chunk 6 --fork-chunk 6`, all six prefix chunks are
+generated and cached in native BF16. At the fork, the runner rounds exactly
+the same old spans as the default three-exposure run. The amount, positions
+and precision of rounded K/V at the fork are thus controlled while changing
+the number of prior chunks that already read those values. The zero-exposure
+control requires its prefix, undo-rounding continuation and own-reencode
+continuation to match the native reference bitwise. Intermediate warm start
+positions are supported and the report records the actual exposure count.

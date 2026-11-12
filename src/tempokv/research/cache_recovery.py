@@ -26,9 +26,14 @@ class RecoverySettings:
     fork_chunk: int = 6
     future_chunks: int = 8
     protect_chunks: int = 2
+    warm_start_chunk: int | None = None
 
     def __post_init__(self):
-        if any(type(value) is not int for value in asdict(self).values()):
+        fields = asdict(self)
+        warm_start = fields.pop("warm_start_chunk")
+        if any(type(value) is not int for value in fields.values()) or (
+            warm_start is not None and type(warm_start) is not int
+        ):
             raise TypeError("recovery settings must be integers")
         if self.bits not in (2, 4, 16) or self.group_size < 1:
             raise ValueError("use 2 or 4 bits, or 16 for identity, and a positive group size")
@@ -36,6 +41,12 @@ class RecoverySettings:
             raise ValueError("the prefix must contain a rounded chunk and protected recent history")
         if self.future_chunks < 1:
             raise ValueError("at least one future chunk is required")
+        if not self.protect_chunks < self.first_round_chunk <= self.fork_chunk:
+            raise ValueError("warm start must be after protection and at or before the fork")
+
+    @property
+    def first_round_chunk(self):
+        return self.protect_chunks + 1 if self.warm_start_chunk is None else self.warm_start_chunk
 
 
 def _validate_cache(cache, end):
@@ -158,10 +169,8 @@ class RecoveryRollout:
         self.unrounded = {}
         self.rounded_prefix_end = 0
 
-    def _round_aged(self, cache, case, start, old_end):
-        cutoff = max(0, start - self.settings.protect_chunks * self.tokens)
+    def _round_through(self, cache, case, old_end, cutoff):
         if cutoff > old_end and self.settings.bits != 16:
-            _validate_cache(cache, start)
             for offset in range(old_end, cutoff, self.tokens):
                 stop = offset + self.tokens
                 if case == "warm":
@@ -238,8 +247,12 @@ class RecoveryRollout:
 
             at_chunk_start = len(calls) % self.calls_per_chunk == 0
             _validate_cache(cache, start if at_chunk_start else start + self.tokens)
-            if at_chunk_start and case in ("warm", "continue"):
-                quantized_until = self._round_aged(cache, case, start, quantized_until)
+            if at_chunk_start and (
+                case == "continue"
+                or (case == "warm" and start >= self.settings.first_round_chunk * self.tokens)
+            ):
+                cutoff = max(0, start - self.settings.protect_chunks * self.tokens)
+                quantized_until = self._round_through(cache, case, quantized_until, cutoff)
             before = rng_fingerprint()
             result = original_forward(**kwargs)
             _validate_cache(cache, start + self.tokens)
@@ -269,8 +282,16 @@ class RecoveryRollout:
         ]:
             raise ValueError("native denoise and clean-refresh call schedule changed")
         if case == "warm":
+            _validate_cache(pipeline.kv_cache1, self.fork_tokens)
+            # Even when no warm forward reads low-bit history, round the
+            # identical old spans before forking. Keep the last warm write
+            # and all of its protected predecessors in native precision.
+            cutoff = self.fork_tokens - (self.settings.protect_chunks + 1) * self.tokens
+            self.rounded_prefix_end = self._round_through(
+                pipeline.kv_cache1, case, quantized_until, cutoff,
+            )
             self.warm_cache = ForkCache.capture(pipeline, self.fork_tokens)
-            self.rounded_prefix_end = quantized_until
+            quantized_until = self.rounded_prefix_end
         accesses = sum((start + self.tokens) * self.tokens for start, _, _ in calls if start >= self.fork_tokens)
         return latents, calls, rng_fingerprint(), {
             "run_seconds": finished - started,
@@ -322,9 +343,17 @@ class RecoveryRollout:
                 raise ValueError("native reference re-encode did not reproduce the reference continuation")
             if self.settings.bits == 16 and any(row["future_sha256"] != reference_hash for row in rows.values()):
                 raise ValueError("native-precision identity control changed a future trajectory")
+            warm_exposure = self.settings.fork_chunk - self.settings.first_round_chunk
+            if warm_exposure == 0:
+                if not torch.equal(warm, reference_prefix):
+                    raise ValueError("no-exposure control changed the prefix before rounding")
+                if any(rows[name]["future_sha256"] != reference_hash for name in ("undo_rounding", "reencode_own")):
+                    raise ValueError("no-exposure control did not recover the native future")
 
             return {
                 "schema_version": SCHEMA, "settings": asdict(self.settings),
+                "warm_first_round_chunk": self.settings.first_round_chunk,
+                "warm_exposed_chunks": warm_exposure,
                 "frame_tokens": self.pipeline.frame_seq_length, "frames_per_chunk": self.frames,
                 "layers": len(self.pipeline.kv_cache1), "heads": self.pipeline.num_heads,
                 "denoise_steps": self.calls_per_chunk - 1, "fork_tokens": self.fork_tokens,

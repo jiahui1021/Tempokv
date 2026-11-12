@@ -115,3 +115,27 @@ def test_unsupported_rolling_cache_and_no_quantization_exposure_rejected():
         )
     with pytest.raises(ValueError, match="rounded chunk"):
         RecoverySettings(fork_chunk=3, protect_chunks=2)
+
+
+def test_delaying_rounding_matches_fork_spans_without_changing_warm_latents():
+    torch.manual_seed(29)
+    noise = torch.randn(1, 18, 4, 1, 1, dtype=torch.bfloat16)
+    entry = torch.get_rng_state()
+    cases = []
+    for warm_start in (None, 6):
+        torch.set_rng_state(entry)
+        settings = RecoverySettings(bits=2, group_size=4, future_chunks=3, warm_start_chunk=warm_start)
+        pipeline = native_pipeline()
+        rollout = RecoveryRollout(pipeline, pipeline.inference, settings, noise, ["fixture"])
+        evidence, _ = rollout.run()
+        cases.append((evidence, rollout))
+    (exposed, a), (unexposed, b) = cases
+    assert exposed["warm_exposed_chunks"] == 3 and unexposed["warm_exposed_chunks"] == 0
+    assert a.rounded_prefix_end == b.rounded_prefix_end == 6
+    for layer_a, layer_b in zip(a.warm_cache.kv, b.warm_cache.kv, strict=True):
+        for values_a, values_b in zip(layer_a, layer_b, strict=True):
+            assert torch.equal(values_a[:, :6], values_b[:, :6])
+    assert unexposed["warm_prefix_relative_l2"] == [0] * 6
+    for branch in ("undo_rounding", "reencode_own"):
+        assert unexposed["branches"][branch]["future_sha256"] == unexposed["reference_suffix_sha256"]
+    assert max(unexposed["branches"]["stop"]["future_chunk_relative_l2"]) > 0

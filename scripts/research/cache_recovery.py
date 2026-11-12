@@ -33,10 +33,15 @@ def main(argv=None):
     parser.add_argument("--fork-chunk", type=int, default=6)
     parser.add_argument("--future-chunks", type=int, default=8)
     parser.add_argument("--protect-chunks", type=int, default=2)
+    parser.add_argument("--warm-start-chunk", type=int,
+                        help="first low-bit read in the warm prefix, or the fork for a zero-exposure control")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(argv)
     try:
-        settings = RecoverySettings(args.bits, args.group_size, args.fork_chunk, args.future_chunks, args.protect_chunks)
+        settings = RecoverySettings(
+            args.bits, args.group_size, args.fork_chunk, args.future_chunks, args.protect_chunks,
+            args.warm_start_chunk,
+        )
     except (TypeError, ValueError) as exc:
         parser.error(str(exc))
     if args.prompt_start < 0 or args.prompt_count < 1 or args.seed < 0:
