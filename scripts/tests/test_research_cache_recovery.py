@@ -47,7 +47,7 @@ class Generator(torch.nn.Module):
         return None, generated.reshape_as(x)
 
 
-def native_pipeline(generator=None):
+def native_pipeline(generator=None, frames_per_block=2):
     path = ROOT / "experiments/Self-Forcing/pipeline/causal_inference.py"
     tree = ast.parse(path.read_text())
     names = {"CausalInferencePipeline", "ready_quantization_spans"}
@@ -60,7 +60,7 @@ def native_pipeline(generator=None):
     exec(compile(ast.Module(body=nodes, type_ignores=[]), str(path), "exec"), scope)
     config = SimpleNamespace(
         denoising_step_list=[9, 4], warp_denoising_step=False, context_noise=0,
-        num_frame_per_block=2, independent_first_frame=False, frame_seq_length=1,
+        num_frame_per_block=frames_per_block, independent_first_frame=False, frame_seq_length=1,
     )
     pipeline = scope["CausalInferencePipeline"](
         config, torch.device("cpu"), generator=generator if generator is not None else Generator(),

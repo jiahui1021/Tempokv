@@ -4,7 +4,9 @@ import pytest
 import torch
 
 from tempokv.research.cache_read_precision import ROLE_ARMS, UNIFORM, ReadPrecisionRollout, read_schedules
+from tempokv.research.cache_persistent_precision import ARMS as PERSISTENT_ARMS, PersistentReadPrecisionRollout
 from tempokv.research.cache_recovery import RecoverySettings
+from tempokv.research.precision import fake_quantize
 from test_research_cache_recovery import Generator, native_pipeline
 
 
@@ -105,3 +107,42 @@ def test_role_swap_preserves_the_uniform_byte_budget():
         assert row["extra_ideal_cache_read_bytes"] == uniform["extra_ideal_cache_read_bytes"]
         assert row["protected_aged_history_calls"] == 0
     assert branches["k_high_equal_bytes"]["future_sha256"] != branches["v_high_equal_bytes"]["future_sha256"]
+
+
+def test_persistent_policies_match_bytes_as_native_spans_age():
+    class RecordingGenerator(TwoLayerGenerator):
+        def __init__(self):
+            super().__init__()
+            self.history = []
+
+        def forward(self, **kwargs):
+            start = kwargs["current_start"]
+            self.history.append(kwargs["kv_cache"][0]["k"][:, :start].clone())
+            return super().forward(**kwargs)
+
+    torch.manual_seed(29)
+    generator = RecordingGenerator()
+    pipeline = native_pipeline(generator, frames_per_block=3)
+    settings = RecoverySettings(bits=4, group_size=4, warm_start_chunk=6, future_chunks=3)
+    noise = torch.randn(1, 27, 4, 1, 1, dtype=torch.bfloat16)
+    evidence, _ = PersistentReadPrecisionRollout(pipeline, pipeline.inference, settings, noise, ["test"]).run()
+    branches = evidence["branches"]
+    assert set(branches) == set(PERSISTENT_ARMS)
+    assert len({branches[arm]["total_ideal_aged_read_bytes"] for arm in PERSISTENT_ARMS[1:]}) == 1
+    assert branches["rounded_all"]["total_ideal_aged_read_bytes"] < branches[UNIFORM]["total_ideal_aged_read_bytes"]
+    for name, rows in branches.items():
+        reads = rows["aged_history_reads"]
+        assert [r["aged_positions_per_head"] for r in reads] == [12] * 3 + [15] * 3 + [18] * 3
+        expected = {"protect_first_denoise": [0] * 3, "protect_last_denoise": [1] * 3}.get(name, [])
+        assert [r["call_index"] for r in reads if r["original_aged_history"]] == expected
+        assert max(rows["future_chunk_relative_l2"]) > 0
+    for arm, protected in (("protect_first_denoise", 0), ("protect_last_denoise", 1)):
+        run_start = (PERSISTENT_ARMS.index(arm) + 1) * 27
+        for chunk in range(6, 9):
+            calls = generator.history[run_start + chunk * 3:run_start + (chunk + 1) * 3]
+            eligible = (chunk - 2) * 3
+            original = calls[protected][:, :eligible]
+            rounded = fake_quantize(original, 4, 4).value
+            for index, cache in enumerate(calls):
+                expected = original if index == protected else rounded
+                assert torch.equal(cache[:, :eligible], expected)

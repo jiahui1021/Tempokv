@@ -17,6 +17,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from tempokv.research.cache_recovery import BRANCHES, SCHEMA, RecoverySettings
 from tempokv.research.cache_read_precision import ROLE_ARMS, SCHEMA as READ_PRECISION_SCHEMA, UNIFORM, read_schedules
+from tempokv.research.cache_persistent_precision import ARMS as PERSISTENT_ARMS, SCHEMA as PERSISTENT_SCHEMA
 from tempokv.research.io import atomic_json, environment
 
 
@@ -41,16 +42,22 @@ def main(argv=None):
                          help="test denoise and clean-write precision on the last prefix chunk")
     studies.add_argument("--read-precision-role-study", action="store_true",
                          help="swap the equal-byte allocation between aged K and V")
+    studies.add_argument("--persistent-read-precision-study", action="store_true",
+                         help="apply the equal-byte policies in each chunk after a clean prefix")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(argv)
     warm_start = args.warm_start_chunk
     precision_study = args.read_precision_study or args.read_precision_role_study
-    if args.read_precision_role_study and args.bits != 4:
-        parser.error("--read-precision-role-study uses a 4-bit base")
+    if (args.read_precision_role_study or args.persistent_read_precision_study) and args.bits != 4:
+        parser.error("the role and persistent studies use a 4-bit base")
     if precision_study:
         if warm_start not in (None, args.fork_chunk - 1):
             parser.error("read precision studies need exactly one exposed prefix chunk")
         warm_start = args.fork_chunk - 1
+    if args.persistent_read_precision_study:
+        if warm_start not in (None, args.fork_chunk):
+            parser.error("persistent read precision uses a clean prefix")
+        warm_start = args.fork_chunk
     try:
         settings = RecoverySettings(
             args.bits, args.group_size, args.fork_chunk, args.future_chunks, args.protect_chunks,
@@ -68,16 +75,20 @@ def main(argv=None):
     }
     latent_frames = 3 * (settings.fork_chunk + settings.future_chunks)
     branches = BRANCHES
+    schema = READ_PRECISION_SCHEMA if precision_study else SCHEMA
     if args.read_precision_role_study:
         branches = ["rounded_all", *ROLE_ARMS, UNIFORM]
     elif args.read_precision_study:
         branches = [*read_schedules(4), UNIFORM]
+    elif args.persistent_read_precision_study:
+        branches, schema = PERSISTENT_ARMS, PERSISTENT_SCHEMA
     plan = {
-        "schema_version": READ_PRECISION_SCHEMA if precision_study else SCHEMA,
+        "schema_version": schema,
         "settings": asdict(settings),
         "branches": branches,
         "read_precision_study": precision_study,
         "read_precision_role_study": args.read_precision_role_study,
+        "persistent_read_precision_study": args.persistent_read_precision_study,
         "environment": environment(), "output_dir": str(output) if output else None,
         "prompt_start": args.prompt_start, "prompt_count": args.prompt_count, "base_seed": args.seed,
         "latent_frames": latent_frames, "runtime": paths,

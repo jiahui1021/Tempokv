@@ -115,3 +115,14 @@ With the Wan shape and 64-element groups, the favored role uses 8 bits
 everywhere and the other role uses 4/5 bits with 60% of positions at 5 bits.
 Both directions use exactly the same ideal read bytes including scales as
 the balanced arm. The native coordinate convention is unchanged.
+
+### Repeated low-precision reads
+
+Use `--persistent-read-precision-study --bits 4` for a clean six-chunk
+prefix followed by low-precision reads on every subsequent chunk.
+The old region grows as new positions age out of the protected two-chunk
+window. Each branch uses its own newly written K/V. The first- and
+last-denoise protection arms spend one native read on every affected
+chunk. The balanced arm spreads the same ideal bytes across all calls.
+The all-4-bit arm is a lower-read-budget anchor. The probe holds native
+backing for the oracle reads and evaluates latent trajectories only.

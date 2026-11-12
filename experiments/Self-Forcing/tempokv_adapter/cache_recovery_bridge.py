@@ -10,6 +10,7 @@ import torch
 
 from tempokv.research.cache_recovery import RecoveryRollout, RecoverySettings
 from tempokv.research.cache_read_precision import ReadPrecisionRollout
+from tempokv.research.cache_persistent_precision import PersistentReadPrecisionRollout
 from tempokv.research.io import atomic_json
 
 
@@ -19,7 +20,12 @@ def install():
 
     launch = json.loads(Path(os.environ["RESEARCH_CACHE_RECOVERY_LAUNCH"]).read_text())
     settings = RecoverySettings(**launch["settings"])
-    rollout_type = ReadPrecisionRollout if launch.get("read_precision_study") else RecoveryRollout
+    if launch.get("persistent_read_precision_study"):
+        rollout_type = PersistentReadPrecisionRollout
+    elif launch.get("read_precision_study"):
+        rollout_type = ReadPrecisionRollout
+    else:
+        rollout_type = RecoveryRollout
     rollout_options = {"role_study": True} if launch.get("read_precision_role_study") else {}
     output = Path(launch["output_dir"])
     base = module.CausalInferencePipeline

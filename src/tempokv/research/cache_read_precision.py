@@ -56,6 +56,48 @@ def _trajectory_contrast(left, right, reference, frames):
     return [float(a.norm() / b.norm().clamp_min(1e-12)) for a, b in zip(error, base, strict=True)]
 
 
+def mixed_history(aged, settings, calls_per_chunk, favored_role=None):
+    aged_end = aged[0][0].shape[1]
+    device = aged[0][0].device
+    if settings.bits == 16:
+        return aged, {"uniform_precision": {"lower_bits": 16, "higher_bits": 16, "higher_positions": 0}}
+    # These arms read one additional set of FP32 scales compared to
+    # a single BF16 pass. Deduct that set from the coefficient budget.
+    width = aged[0][0].shape[-1]
+    scales = math.ceil(width / settings.group_size)
+    total_bits = width * (16 + (calls_per_chunk - 1) * settings.bits) - 32 * scales
+    denominator = calls_per_chunk * width
+    position = torch.arange(aged_end, device=device)
+    plans = {}
+    indices = {}
+    for role in ROLES:
+        allocation = total_bits
+        if favored_role is not None:
+            allocation = 8 * denominator if role == favored_role else 2 * total_bits - 8 * denominator
+        low, remainder = divmod(allocation, denominator)
+        high = low + int(remainder > 0)
+        count, leftover = divmod(aged_end * remainder, denominator)
+        if leftover or not 2 <= low <= high <= 8:
+            raise ValueError("this rollout cannot match the mixed precision budget exactly")
+        plans[role] = {"lower_bits": low, "higher_bits": high, "higher_positions": count}
+        indices[role] = position[
+            (position + 1) * count // aged_end > position * count // aged_end
+        ]
+    history = []
+    for pair in aged:
+        rebuilt = []
+        for role, value in zip(ROLES, pair, strict=True):
+            plan, chosen = plans[role], indices[role]
+            result = fake_quantize(value, plan["lower_bits"], settings.group_size).value
+            if chosen.numel():
+                original = value.index_select(1, chosen)
+                higher = fake_quantize(original, plan["higher_bits"], settings.group_size).value
+                result.index_copy_(1, chosen, higher)
+            rebuilt.append(result)
+        history.append(tuple(rebuilt))
+    metadata = {"uniform_precision": plans["k"]} if favored_role is None else {"precision_by_role": plans}
+    return tuple(history), metadata
+
 class ReadPrecisionRollout(RecoveryRollout):
     def __init__(self, pipeline, infer, settings, noise, prompts, *, role_study=False):
         super().__init__(pipeline, infer, settings, noise, prompts)
@@ -66,46 +108,6 @@ class ReadPrecisionRollout(RecoveryRollout):
         self.role_study = role_study
         self.target_start = self.fork_tokens - self.tokens
         self.aged_end = self.target_start - settings.protect_chunks * self.tokens
-
-    def _mixed_history(self, aged, favored_role=None):
-        if self.settings.bits == 16:
-            return aged, {"uniform_precision": {"lower_bits": 16, "higher_bits": 16, "higher_positions": 0}}
-        # These arms read one additional set of FP32 scales compared to
-        # a single BF16 pass. Deduct that set from the coefficient budget.
-        width = aged[0][0].shape[-1]
-        scales = math.ceil(width / self.settings.group_size)
-        total_bits = width * (16 + (self.calls_per_chunk - 1) * self.settings.bits) - 32 * scales
-        denominator = self.calls_per_chunk * width
-        position = torch.arange(self.aged_end, device=self.noise.device)
-        plans = {}
-        indices = {}
-        for role in ROLES:
-            allocation = total_bits
-            if favored_role is not None:
-                allocation = 8 * denominator if role == favored_role else 2 * total_bits - 8 * denominator
-            low, remainder = divmod(allocation, denominator)
-            high = low + int(remainder > 0)
-            count, leftover = divmod(self.aged_end * remainder, denominator)
-            if leftover or not 2 <= low <= high <= 8:
-                raise ValueError("this rollout cannot match the mixed precision budget exactly")
-            plans[role] = {"lower_bits": low, "higher_bits": high, "higher_positions": count}
-            indices[role] = position[
-                (position + 1) * count // self.aged_end > position * count // self.aged_end
-            ]
-        history = []
-        for pair in aged:
-            rebuilt = []
-            for role, value in zip(ROLES, pair, strict=True):
-                plan, chosen = plans[role], indices[role]
-                result = fake_quantize(value, plan["lower_bits"], self.settings.group_size).value
-                if chosen.numel():
-                    original = value.index_select(1, chosen)
-                    higher = fake_quantize(original, plan["higher_bits"], self.settings.group_size).value
-                    result.index_copy_(1, chosen, higher)
-                rebuilt.append(result)
-            history.append(tuple(rebuilt))
-        metadata = {"uniform_precision": plans["k"]} if favored_role is None else {"precision_by_role": plans}
-        return tuple(history), metadata
 
     def _history_states(self):
         device = self.noise.device
@@ -217,7 +219,7 @@ class ReadPrecisionRollout(RecoveryRollout):
             schedules[UNIFORM] = ()
             for name, protected in schedules.items():
                 restore_rng_state(entry)
-                mixed = self._mixed_history(history[1], ROLE_ARMS.get(name)) if name in (UNIFORM, *ROLE_ARMS) else None
+                mixed = mixed_history(history[1], self.settings, self.calls_per_chunk, ROLE_ARMS.get(name)) if name in (UNIFORM, *ROLE_ARMS) else None
                 latents, calls, end, row = self._scheduled_run(name, protected, history, mixed)
                 del mixed
                 if calls != ref_calls or end != ref_end:
