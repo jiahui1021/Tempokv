@@ -4,7 +4,7 @@ from __future__ import annotations
 import torch
 from torch import nn
 
-from .quantizer import Quantizer
+from .quantizer import Quantizer, TempoKVQuantizer
 from .upstream.linear_utils import fit_linear_regression
 
 SCHEMA = "aquakv.self_forcing.predictors.v1"
@@ -58,10 +58,10 @@ def measure(target, prediction, rebuilt):
 
 def reconstruct_layer(k, v, layer, predictor, quantizer, previous=None, *, direct=False, metrics=True):
     pk = torch.zeros_like(k) if layer == 0 or direct else predictor.predict_key(previous[0], layer)
-    kstate = quantizer.encode(k-pk, layer)
+    kstate = quantizer.encode(k-pk, layer, role="k")
     kh = quantizer.decode(kstate, layer, predictor=pk)
     pv = torch.zeros_like(v) if layer == 0 or direct else predictor.predict_value(kh, previous[1], layer)
-    vstate = quantizer.encode(v-pv, layer)
+    vstate = quantizer.encode(v-pv, layer, role="v")
     vh = quantizer.decode(vstate, layer, predictor=pv)
     row = ({"layer_index": layer, "k": measure(k, pk, kh), "v": measure(v, pv, vh),
             "payload_bytes": kstate.storage_bytes()+vstate.storage_bytes()} if metrics else {})
@@ -69,7 +69,7 @@ def reconstruct_layer(k, v, layer, predictor, quantizer, previous=None, *, direc
 
 
 @torch.no_grad()
-def fit_predictors(keys, values, quantizer: Quantizer, *, parameter_dtype="bfloat16",
+def fit_predictors(keys, values, quantizer: Quantizer | TempoKVQuantizer, *, parameter_dtype="bfloat16",
                    reg_rate=1e-3, fit_token_stride=1, chunk_size=4096, validation_records=0, seed=0):
     validate_trace(keys, values)
     if reg_rate < 0 or fit_token_stride < 1 or chunk_size < 1:
@@ -112,7 +112,7 @@ def fit_predictors(keys, values, quantizer: Quantizer, *, parameter_dtype="bfloa
         if layer:
             training["k"] = fit_module(predictor.keys[str(layer)], previous[0].flatten(-2), k)
         pk = torch.zeros_like(k) if layer == 0 else predictor.predict_key(previous[0], layer)
-        kh = pk + quantizer.roundtrip(k-pk, layer)
+        kh = pk + quantizer.roundtrip(k-pk, layer, role="k")
         if layer:
             x = torch.cat([kh.flatten(-2), previous[1].flatten(-2)], dim=-1)
             training["v"] = fit_module(predictor.values[str(layer)], x, v)

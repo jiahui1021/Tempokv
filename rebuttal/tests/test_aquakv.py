@@ -17,7 +17,9 @@ import torch
 from rebuttal.experiments.aquakv.predictors import (
     AquaKVPredictor, fit_predictors, load_predictor, predictor_state, reconstruct_layer, replay,
 )
-from rebuttal.experiments.aquakv.quantizer import HiggsConfig, Quantizer, pack_indices, unpack_indices
+from rebuttal.experiments.aquakv.quantizer import (
+    HiggsConfig, Quantizer, build_quantizer, pack_indices, unpack_indices,
+)
 from rebuttal.experiments.aquakv.runtime import AquaKVCache, rotate_pre_rope
 from rebuttal.experiments.aquakv.upstream.hadamard import reference_hadamard
 from rebuttal.experiments.aquakv.upstream.linear_utils import fit_linear_regression
@@ -26,6 +28,8 @@ from rebuttal.experiments.aquakv.workflow import run, build_job, verify_videos
 ROOT = Path(__file__).resolve().parents[2]
 RUNTIME = ROOT/'experiments/Self-Forcing'
 HIGGS = dict(hadamard_groupsize=8, edenn_d=2, edenn_n=16, chunk_size=8)
+SCALAR = {"quantizer_backend": "tempokv",
+          "tempokv_quantizer": {"group_size": 4, "k_bits": 5, "v_bits": 3}}
 
 
 def synth(seed=0, records=3, frames=5):
@@ -65,6 +69,45 @@ def test_higgs_decode_matches_upstream_and_counts_real_padding(dtype, layer):
     # 12 channels padded to 16, two groups of four 2D vectors.
     assert state.storage_bytes() == 5*2*(4*bits//8+4)
     assert all(torch.isfinite(q.roundtrip(torch.zeros_like(x), layer)).flatten())
+
+
+@pytest.mark.parametrize("layer,role,bits", [(0, "k", 4), (1, "k", 5), (1, "v", 3)])
+def test_tempokv_quantizer_stores_original_scalar_payload(layer, role, bits):
+    from tempokv.quantization import quantize_asymmetric, quantize_symmetric, roundtrip
+
+    quantizer = build_quantizer(SCALAR, 2, 8)
+    generator = torch.Generator().manual_seed(11)
+    value = torch.randn(2, 3, 2, 8, generator=generator).transpose(0, 1).bfloat16()
+    prediction = torch.ones_like(value)
+    packed = quantizer.encode(value, layer, role=role)
+    asymmetric = layer > 0
+    if asymmetric:
+        expected_tensors = quantize_asymmetric(value, bits, 4, torch.bfloat16)
+    else:
+        expected_tensors = quantize_symmetric(value, bits, 4, torch.bfloat16)
+    assert packed.bits == bits
+    for actual, expected in zip(packed.tensors(), expected_tensors, strict=True):
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    # There are 12 head rows and 24 stored group scales; asymmetric adds a byte per zero point.
+    assert packed.storage_bytes() == 12 * bits + 24 * (2 + asymmetric)
+    rebuilt = roundtrip(value, bits=bits, group_size=4, scale_dtype=torch.bfloat16,
+                        symmetric=not asymmetric).to(value.dtype)
+    torch.testing.assert_close(quantizer.decode(packed, layer, predictor=prediction),
+                               prediction + rebuilt, rtol=0, atol=0)
+
+
+def test_tempokv_quantizer_supports_raw_anchor_and_symmetric_residual():
+    config = {"quantizer_backend": "tempokv",
+              "tempokv_quantizer": {"anchor_bits": 16, "group_size": 4, "residual_mode": "symmetric"}}
+    quantizer = build_quantizer(config, 2, 4)
+    value = torch.randn(3, 2, 4).bfloat16()
+    anchor = quantizer.encode(value, 0)
+    assert anchor.storage_bytes() == value.numel() * value.element_size()
+    assert anchor.codes.data_ptr() != value.data_ptr()
+    assert torch.equal(quantizer.decode(anchor, 0), value)
+    assert quantizer.encode(value, 1, role="v").zero_point is None
+    with pytest.raises(ValueError, match="divide head_dim"):
+        build_quantizer(config, 2, 6)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
@@ -326,6 +369,25 @@ def test_default_plan_is_independent_and_legacy_settings_are_rejected(tmp_path):
         run({**config, 'codec_config': 'configs/legacy.json'}, 'fit', tmp_path)
 
 
+def test_scalar_fit_and_replay_require_matching_quantizer_settings(tmp_path):
+    save_trace(tmp_path/"cal.npz", 0, "cal")
+    save_trace(tmp_path/"ev.npz", 3, "ev")
+    config = {**SCALAR, "higgs": HIGGS, "device": "cpu", "parameter_dtype": "float32",
+              "calibration_trace": str(tmp_path/"cal.npz"), "evaluation_trace": str(tmp_path/"ev.npz")}
+    output = tmp_path/"out"
+    assert run(config, "plan", output)["quantizer"] == "tempokv_scalar"
+    fitted = run(config, "fit", output)
+    state = torch.load(fitted["predictor_path"], weights_only=True)
+    assert state["quantizer"]["backend"] == "tempokv"
+    assert state["quantizer"]["v_bits"] == 3
+    replayed = run(config, "replay", output)
+    assert replayed["tempokv_direct"]["storage"]["payload_bytes"] == replayed["aquakv"]["storage"]["payload_bytes"]
+    with pytest.raises(ValueError, match="quantizer settings differ"):
+        run({**config, "quantizer_backend": "higgs", "tempokv_quantizer": {}}, "replay", output)
+    with pytest.raises(ValueError, match="quantizer settings differ"):
+        run({**config, "_resume": True, "tempokv_quantizer": {"group_size": 4}}, "fit", output)
+
+
 def test_replay_rejects_calibration_prompts_without_needing_calibration_path(tmp_path):
     save_trace(tmp_path/'cal.npz', 0, 'same')
     save_trace(tmp_path/'ev.npz', 5, 'same')
@@ -453,10 +515,14 @@ def native_pipeline_base():
     return Base
 
 
-@pytest.mark.parametrize('mode', ['aquakv', 'bf16_adapter', 'collect'])
-def test_worker_runs_native_clean_refresh_loop_and_resets_per_prompt(tmp_path, monkeypatch, mode):
+@pytest.mark.parametrize('mode,backend', [
+    ('aquakv', 'higgs'), ('aquakv', 'tempokv'), ('bf16_adapter', 'higgs'), ('collect', 'higgs'),
+])
+def test_worker_runs_native_clean_refresh_loop_and_resets_per_prompt(tmp_path, monkeypatch, mode, backend):
     from rebuttal.experiments.aquakv.worker import install
-    p, q = make_predictor('bfloat16')
+    quantization = SCALAR if backend == 'tempokv' else {'higgs': HIGGS}
+    q = build_quantizer(quantization, 2, 4)
+    p, _ = fit_predictors(*synth(frames=20), q, parameter_dtype='bfloat16')
     artifact = {**predictor_state(p), 'quantizer': q.settings(), 'layer_ids': [0, 1, 2]}
     torch.save(artifact, tmp_path/'predictor.pt')
     prompts = tmp_path/'prompts.txt'
@@ -465,7 +531,7 @@ def test_worker_runs_native_clean_refresh_loop_and_resets_per_prompt(tmp_path, m
     module.CausalInferencePipeline = native_pipeline_base()
     monkeypatch.setitem(sys.modules, 'pipeline', package)
     monkeypatch.setitem(sys.modules, 'pipeline.causal_inference', module)
-    config = {'mode': mode, 'predictor_path': str(tmp_path/'predictor.pt'), 'higgs': HIGGS,
+    config = {**quantization, 'mode': mode, 'predictor_path': str(tmp_path/'predictor.pt'),
               'prompts': str(prompts), 'output_dir': str(tmp_path),
               'cache': {'prefix_frames': 0, 'recent_buffer_frames': 0}, 'trace_tokens_per_frame': 2,
               'record_latent_hashes': True}
@@ -479,6 +545,10 @@ def test_worker_runs_native_clean_refresh_loop_and_resets_per_prompt(tmp_path, m
             assert pipeline.aquakv_cache.counts['replacements'] == 4
             assert pipeline.aquakv_cache.counts['decode_k'] > 0
             assert pipeline.aquakv_cache.committed_end == 12
+            if backend == 'tempokv':
+                ks, vs = pipeline.aquakv_cache.chunks[0].layers[1]
+                assert (ks.bits, vs.bits) == (5, 3)
+                assert pipeline.aquakv_cache.report()['quantizer_auxiliary_bytes'] == 0
         elif mode == 'bf16_adapter':
             assert pipeline.aquakv_cache.counts['clean_commits'] == 2
             assert not any(c.packed for c in pipeline.aquakv_cache.chunks)
@@ -493,6 +563,9 @@ def test_worker_runs_native_clean_refresh_loop_and_resets_per_prompt(tmp_path, m
               (tmp_path/'latent_hashes.rank-0.jsonl').read_text().splitlines()]
     assert [row['prompt_id'] for row in hashes] == [0, 1]
     assert all(len(row['sample_block_sha256'][0]) == 2 for row in hashes)
+    if mode == 'aquakv':
+        records = [json.loads(row) for row in (tmp_path/'aquakv_activity.rank-0.jsonl').read_text().splitlines()]
+        assert all(row['quantizer_backend'] == backend and row['quantizer'] == q.settings() for row in records)
 
 
 def test_internal_predictor_mutation_is_rejected(tmp_path):

@@ -1,4 +1,4 @@
-"""Complete independent AquaKV experiment workflow; no TempoKV predictors/codecs."""
+"""Self-Forcing experiment workflow using independently fitted AquaKV predictors."""
 from __future__ import annotations
 
 import os
@@ -16,7 +16,8 @@ def validate_independence(config):
     forbidden = {key for key in ("codec_config", "codec_overrides", "tempokv", "k_params", "v_params", "quantizer", "ridge")
                  if config.get(key) is not None}
     if forbidden:
-        raise ValueError(f"independent AquaKV does not accept TempoKV/legacy settings: {sorted(forbidden)}; use higgs and reg_rate")
+        raise ValueError(f"independent AquaKV does not accept TempoKV/legacy settings: {sorted(forbidden)}; "
+                         "use quantizer_backend with higgs or tempokv_quantizer settings")
     if config.get("model", "self_forcing") != "self_forcing":
         raise ValueError("AquaKV video generation currently supports Self-Forcing")
 
@@ -79,16 +80,14 @@ def _predictor_path(config, output):
 def load_artifact(config, output, device="cpu"):
     import torch
     from .predictors import load_predictor
-    from .quantizer import HiggsConfig, Quantizer
+    from .quantizer import build_quantizer
     path = _predictor_path(config, output)
     report_path = output/"fit.json"
     if not config.get("predictor_path") and report_path.is_file():
         if read_json(report_path)["predictor_sha256"] != file_sha256(path):
             raise ValueError("AquaKV predictor changed after calibration")
     state = torch.load(path, map_location=device, weights_only=True)
-    quantizer = Quantizer(state["heads"]*state["dim"], HiggsConfig(**config.get("higgs", {})))
-    if state["quantizer"] != quantizer.settings():
-        raise ValueError("AquaKV HIGGS configuration differs from fitted artifact")
+    quantizer = build_quantizer(config, state["heads"], state["dim"], fitted_settings=state["quantizer"])
     return load_predictor(state, device), quantizer, state
 
 
@@ -143,12 +142,18 @@ def verify_videos(job, config, prompts, *, collection=False):
 
 
 def run(config, stage, output_dir):
+    from .quantizer import quantizer_config
+
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
     validate_independence(config)
+    settings = quantizer_config(config)
+    backend = config.get("quantizer_backend", "higgs")
     if stage == "plan":
         result = {"status": "planned", "experiment": "aquakv", "independent": True,
-                  "upstream_commit": UPSTREAM_COMMIT, "quantizer": "official_HIGGS",
+                  "upstream_commit": UPSTREAM_COMMIT,
+                  "quantizer": "official_HIGGS" if backend == "higgs" else "tempokv_scalar",
+                  "quantizer_settings": vars(settings),
                   "stages": STAGES, "pipeline_stage": "pipeline",
                   "missing_for_collection": [k for k in ("checkpoint", "model_root", "calibration_prompts", "evaluation_prompts") if not config.get(k)],
                   "calibration_source": str(_source(config, output, "calibration")),
@@ -186,7 +191,7 @@ def run(config, stage, output_dir):
         import torch
         from rebuttal.common.trace import device_for
         from .predictors import fit_predictors, predictor_state
-        from .quantizer import Quantizer, HiggsConfig
+        from .quantizer import build_quantizer
         from .report import summarize
         if config.get("predictor_path"):
             raise ValueError("predictor_path selects an existing independent artifact; omit it when fitting into output_dir")
@@ -194,14 +199,13 @@ def run(config, stage, output_dir):
         if path.exists():
             if config.get("_resume") and (output/"fit.json").is_file():
                 report = read_json(output/"fit.json")
-                if file_sha256(path) != report["predictor_sha256"]:
-                    raise ValueError("AquaKV predictor changed after calibration")
+                load_artifact(config, output)
                 return report
             raise FileExistsError(f"AquaKV predictor already exists: {path}; use a new output directory")
         device = device_for(config.get("device", "auto"))
         k, v, sources = read_traces(_source(config, output, "calibration"), device=device,
                                     require_identity=config.get("require_prompt_identity", True))
-        quantizer = Quantizer(k.shape[-2]*k.shape[-1], HiggsConfig(**config.get("higgs", {})))
+        quantizer = build_quantizer(config, *k.shape[-2:])
         predictor, rows = fit_predictors(k, v, quantizer, parameter_dtype=config.get("parameter_dtype", "bfloat16"),
                 reg_rate=float(config.get("reg_rate", 1e-3)), fit_token_stride=int(config.get("fit_token_stride", 1)),
                 chunk_size=int(config.get("fit_chunk_size", 4096)), validation_records=int(config.get("validation_records", 0)),
@@ -236,7 +240,7 @@ def run(config, stage, output_dir):
         result = {"status": "complete", "split": "heldout" if split["prompt_hashes_verified"] else "unverified_trace_split", "metric_scope": "trace_replay",
                   "split_check": split, "sources": sources,
                   "aquakv": summarize(replay(k, v, predictor, quantizer), predictor.parameter_bytes()),
-                  "higgs_direct": summarize(replay(k, v, predictor, quantizer, direct=True))}
+                  quantizer.direct_report_key: summarize(replay(k, v, predictor, quantizer, direct=True))}
         write_json(output/"replay.json", result)
         return result
     if stage == "generate":
@@ -260,6 +264,7 @@ def run(config, stage, output_dir):
         result = execute_jobs(jobs, resume=config.get("_resume", False))
         result["cohorts"] = {job.name: verify_videos(job, config, prompts) for job in jobs}
         result["predictor_sha256"] = file_sha256(_predictor_path(config, output))
+        result["quantizer"] = quantizer.settings()
         write_json(output/"generate.json", result)
         return result
     if stage == "evaluate":

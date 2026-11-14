@@ -1,4 +1,4 @@
-"""AquaKV metrics computed from actual HIGGS payload and predictor tensors."""
+"""AquaKV metrics computed from actual packed payload and predictor tensors."""
 from __future__ import annotations
 
 
@@ -24,4 +24,4 @@ def summarize(rows, predictor_bytes=0):
                         "total_bytes": payload+predictor_bytes,
                         "payload_bits_per_element": payload*8/numel,
                         "total_bits_per_element": (payload+predictor_bytes)*8/numel,
-                        "note": "actual packed HIGGS indices plus FP32 scales, including Hadamard/grid padding; codebooks and serialization overhead excluded"}}
+                        "note": "actual cache tensors including padding and quantization metadata; codebook and serialization bytes excluded"}}

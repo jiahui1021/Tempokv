@@ -1,12 +1,10 @@
-"""Independent packed HIGGS wrapper around the pinned AQUA-KV implementation."""
+"""Packed quantizers for the AquaKV cross-layer predictor."""
 from __future__ import annotations
 
 from dataclasses import dataclass, asdict
 import math
 
 import torch
-
-from .upstream.quantizers import HiggsQuantizer, QuantizedTensor
 
 
 def _cuda_kernels(device, group_size):
@@ -37,6 +35,52 @@ class HiggsConfig:
         for d, n in ((self.edenn_d, self.edenn_n), (self.first_layer_edenn_d, self.first_layer_edenn_n)):
             if n > 256 or n < 2 or n & (n - 1) or n not in GRIDS.get(d, {}):
                 raise ValueError("choose an upstream grid with power-of-two size <=256 (uint8 indices)")
+
+
+@dataclass(frozen=True)
+class TempoKVQuantizerConfig:
+    k_bits: int = 4
+    v_bits: int = 4
+    anchor_bits: int = 4
+    group_size: int = 64
+    residual_mode: str = "asymmetric"
+    scale_dtype: str = "bfloat16"
+
+    def __post_init__(self):
+        from tempokv.config import DTYPES, RAW_ANCHOR_BITS
+
+        for name, maximum in (("k_bits", 8), ("v_bits", 8), ("anchor_bits", RAW_ANCHOR_BITS)):
+            bits = getattr(self, name)
+            if type(bits) is not int or not 1 <= bits <= maximum:
+                raise ValueError(f"AquaKV TempoKV {name} must be an integer from 1 to {maximum}")
+        if type(self.group_size) is not int or self.group_size < 1:
+            raise ValueError("AquaKV TempoKV group_size must be a positive integer")
+        if self.residual_mode not in {"symmetric", "asymmetric"}:
+            raise ValueError("AquaKV TempoKV residual_mode must be symmetric or asymmetric")
+        if self.scale_dtype not in DTYPES:
+            raise ValueError("AquaKV TempoKV scale_dtype must be float32, float16 or bfloat16")
+
+
+def quantizer_config(config):
+    backend = config.get("quantizer_backend", "higgs")
+    if backend == "higgs":
+        if config.get("tempokv_quantizer"):
+            raise ValueError("AquaKV tempokv_quantizer requires quantizer_backend=tempokv")
+        return HiggsConfig(**config.get("higgs", {}))
+    if backend == "tempokv":
+        return TempoKVQuantizerConfig(**config.get("tempokv_quantizer", {}))
+    raise ValueError("AquaKV quantizer_backend must be higgs or tempokv")
+
+
+def build_quantizer(config, heads, dim, *, fitted_settings=None):
+    settings = quantizer_config(config)
+    if isinstance(settings, HiggsConfig):
+        quantizer = Quantizer(heads * dim, settings)
+    else:
+        quantizer = TempoKVQuantizer(heads, dim, settings)
+    if fitted_settings is not None and fitted_settings != quantizer.settings():
+        raise ValueError("AquaKV quantizer settings differ from calibration; fit a matching predictor")
+    return quantizer
 
 
 def pack_indices(indices: torch.Tensor, bits: int) -> torch.Tensor:
@@ -77,7 +121,12 @@ class HiggsState:
 
 class Quantizer:
     """HIGGS only: no TempoKV configuration, quantization or fitting imports."""
+
+    direct_report_key = "higgs_direct"
+
     def __init__(self, channels: int, config: HiggsConfig | None = None):
+        from .upstream.quantizers import HiggsQuantizer
+
         self.channels, self.config = channels, config or HiggsConfig()
         c = self.config
         kwargs = dict(hadamard_groupsize=c.hadamard_groupsize, channel_size=channels, chunk_size=c.chunk_size)
@@ -91,7 +140,7 @@ class Quantizer:
         return self.first if layer == 0 else self.residual
 
     @torch.no_grad()
-    def encode(self, value: torch.Tensor, layer: int) -> HiggsState:
+    def encode(self, value: torch.Tensor, layer: int, *, role: str = "k") -> HiggsState:
         if value.shape[-2]*value.shape[-1] != self.channels:
             raise ValueError("HIGGS channel size does not match heads * head_dim")
         if layer == 0 and not self.config.quantize_first_layer:
@@ -148,13 +197,87 @@ class Quantizer:
                 residual_dtype=state.dtype,
             )
             return output.reshape(state.shape)
+        from .upstream.quantizers import QuantizedTensor
+
         idx = unpack_indices(state.indices, bits, state.index_shape[-1])
         result = backend.dequantize(QuantizedTensor(idx, state.scales)).reshape(state.shape).to(state.dtype)
         return result if predictor is None else predictor + result
 
-    def roundtrip(self, value, layer):
-        return self.decode(self.encode(value, layer), layer)
+    def roundtrip(self, value, layer, *, role="k"):
+        return self.decode(self.encode(value, layer, role=role), layer)
 
     def auxiliary_tensors(self, device):
         backends = [self.residual] + ([self.first] if self.config.quantize_first_layer else [])
         return [t for q in backends for t in (q.grid(device=device), q.grid_norm(device=device))]
+
+
+@dataclass
+class ScalarState:
+    codes: torch.Tensor
+    scale: torch.Tensor | None
+    zero_point: torch.Tensor | None
+    bits: int
+    dtype: torch.dtype
+
+    def tensors(self):
+        return [tensor for tensor in (self.codes, self.scale, self.zero_point) if tensor is not None]
+
+    def storage_bytes(self):
+        return sum(t.numel() * t.element_size() for t in self.tensors())
+
+
+class TempoKVQuantizer:
+    """TempoKV scalar payloads with AquaKV's cross-layer reconstruction."""
+
+    direct_report_key = "tempokv_direct"
+
+    def __init__(self, heads: int, dim: int, config: TempoKVQuantizerConfig):
+        if dim % config.group_size:
+            raise ValueError("AquaKV TempoKV group_size must divide head_dim")
+        from tempokv import quantization
+        from tempokv.config import RAW_ANCHOR_BITS
+
+        self.heads, self.dim, self.config = heads, dim, config
+        self._ops = quantization
+        self._scale_dtype = getattr(torch, config.scale_dtype)
+        self._raw_anchor = config.anchor_bits == RAW_ANCHOR_BITS
+
+    def settings(self):
+        return {"backend": "tempokv", **asdict(self.config)}
+
+    @torch.no_grad()
+    def encode(self, value: torch.Tensor, layer: int, *, role: str = "k") -> ScalarState:
+        if value.shape[-2:] != (self.heads, self.dim):
+            raise ValueError("AquaKV TempoKV input does not match configured heads and head_dim")
+        config = self.config
+        if layer == 0:
+            bits = config.anchor_bits
+            if self._raw_anchor:
+                return ScalarState(value.detach().clone(), None, None, bits, value.dtype)
+        else:
+            bits = {"k": config.k_bits, "v": config.v_bits}[role]
+        if layer > 0 and config.residual_mode == "asymmetric":
+            codes, scale, zero_point = self._ops.quantize_asymmetric(
+                value, bits, config.group_size, self._scale_dtype,
+            )
+        else:
+            codes, scale = self._ops.quantize_symmetric(value, bits, config.group_size, self._scale_dtype)
+            zero_point = None
+        return ScalarState(codes, scale, zero_point, bits, value.dtype)
+
+    @torch.no_grad()
+    def decode(self, state: ScalarState, layer: int, *, predictor: torch.Tensor | None = None):
+        if state.scale is None:
+            return state.codes.clone() if predictor is None else predictor + state.codes
+        args = (state.bits, self.config.group_size, self.dim, state.dtype)
+        if state.zero_point is None:
+            residual = self._ops.dequantize_symmetric(state.codes, state.scale, *args)
+        else:
+            residual = self._ops.dequantize_asymmetric(state.codes, state.scale, state.zero_point, *args)
+        return residual if predictor is None else predictor + residual
+
+    def roundtrip(self, value, layer, *, role="k"):
+        return self.decode(self.encode(value, layer, role=role), layer)
+
+    def auxiliary_tensors(self, device):
+        return []

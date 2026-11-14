@@ -1,6 +1,6 @@
 # 独立 AQUA-KV → Self-Forcing
 
-当前入口实现独立 AquaKV 的完整流程：**采集 clean KV → 校准 AquaKV 自己的预测器 → 独立 heldout 重放 → BF16/AquaKV 视频生成 → 视频评测 → 汇总**。不读取 TempoKV 的参数、配置、拟合器或量化器。
+当前入口支持采集 clean KV、校准 AquaKV 自己的预测器、heldout 重放、视频生成和评测。默认使用 HIGGS，也可切换到 TempoKV 的分组标量量化。两种模式都使用 AquaKV 自己的预测器和校准流程。
 
 代码验证和真实实验分开记录。当前没有真实 Self-Forcing 视频实验结果；本地检查不能代表生成质量或 GPU 性能。
 
@@ -14,6 +14,20 @@
 - 校准调用官方 `fit_linear_regression`，使用相对 Hessian damping `reg_rate`，逐层用已经重建的输入校准后继预测器。AquaKV 原版需要这一步；这是 AquaKV 自己的校准，与 TempoKV 拟合无关。
 - 校准使用与实际推理一致的参数精度，默认 BF16；保存实际 BF16 权重，避免只按 BF16 估算参数大小、实际却使用高精度权重。
 - 原版的 dense 映射保留跨 head 混合；没有替换成 TempoKV 的时序映射或逐 head 结构。
+
+## 切换到 TempoKV 标量量化
+
+在原运行命令中加入以下选项。示例使用 K5/V3：
+
+```bash
+--set quantizer_backend=tempokv \
+--set tempokv_quantizer.k_bits=5 \
+--set tempokv_quantizer.v_bits=3
+```
+
+选用 `tempokv` 后，第 0 层默认使用对称 4-bit 量化，后续层的 K/V 残差默认使用非对称 4-bit 量化。每个注意力头内按 64 个通道分组，scale 默认用 BF16 存储。在 `tempokv_quantizer` 下可调整 `anchor_bits`、`group_size`、`residual_mode` 和 `scale_dtype`。设置 `tempokv_quantizer.anchor_bits=16` 可保留第 0 层原始值。
+
+在新的输出目录用同一组量化设置运行 `fit`、`replay` 和 `generate`。已有 clean KV trace 可直接复用。切换量化器或位宽后需要重新校准，因为后续层依赖前一层的量化重建。重放报告用 `tempokv_direct` 记录同一量化器下关闭预测的对照。
 
 ## Self-Forcing 适配
 

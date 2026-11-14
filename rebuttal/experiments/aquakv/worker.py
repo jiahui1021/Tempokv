@@ -37,7 +37,7 @@ def install(config, runtime_root):
     from rebuttal.common.manifest import file_sha256, prompt_records
     from .runtime import AquaKVCache, DEFAULT_ROPE_PRECISION, rotate_pre_rope
     from .predictors import load_predictor
-    from .quantizer import Quantizer, HiggsConfig
+    from .quantizer import build_quantizer
     module = importlib.import_module("pipeline.causal_inference")
     package = importlib.import_module("pipeline")
     base = module.CausalInferencePipeline
@@ -57,13 +57,12 @@ def install(config, runtime_root):
                 state = torch.load(config["predictor_path"], map_location="cpu", weights_only=True)
                 if state["parameter_dtype"] != "bfloat16":
                     raise ValueError("Self-Forcing requires AquaKV calibrated in bfloat16")
-                if state["quantizer"] != config.get("higgs", {}):
-                    if state["quantizer"] != Quantizer(self.num_heads*self.head_dim, HiggsConfig(**config.get("higgs", {}))).settings():
-                        raise ValueError("generation HIGGS settings differ from calibration")
+                self.aquakv_quantizer = build_quantizer(
+                    config, self.num_heads, self.head_dim, fitted_settings=state["quantizer"],
+                )
                 if state["layer_ids"] != list(range(self.num_transformer_blocks)):
                     raise ValueError("AquaKV calibration must cover every Self-Forcing layer in order")
                 self.aquakv_predictor = load_predictor(state, next(self.generator.parameters()).device)
-                self.aquakv_quantizer = Quantizer(self.num_heads*self.head_dim, HiggsConfig(**state["quantizer"]))
             if mode == "collect":
                 for layer, block in enumerate(self.generator.model.blocks):
                     block.self_attn.norm_k.register_forward_hook(self._capture(layer, "k"))
@@ -195,7 +194,11 @@ def install(config, runtime_root):
                 require_activity(report)
                 self.summary["last_kv_cache_memory"] = report
                 record = {"status": "verified", **identity, **report,
-                          "predictor_sha256": file_sha256(config["predictor_path"]), "higgs": config.get("higgs", {})}
+                          "predictor_sha256": file_sha256(config["predictor_path"]),
+                          "quantizer_backend": config.get("quantizer_backend", "higgs"),
+                          "quantizer": self.aquakv_quantizer.settings()}
+                if record["quantizer_backend"] == "higgs":
+                    record["higgs"] = config.get("higgs", {})
                 output.mkdir(parents=True, exist_ok=True)
                 with (output / f"aquakv_activity.rank-{rank}.jsonl").open("a") as handle:
                     handle.write(json.dumps(record)+"\n")
