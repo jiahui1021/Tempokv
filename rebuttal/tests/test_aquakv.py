@@ -176,6 +176,70 @@ def test_prefix_buffer_storage_and_partial_layer_rejection():
         run_pass(cache, k[:, :1], v[:, :1], 0)
 
 
+def test_default_bf16_lag_packs_only_the_history_outside_the_retention_window():
+    predictor, quantizer = make_predictor()
+    cache = AquaKVCache(predictor, quantizer, frame_seqlen=1)
+    keys, values = (tensor[:, :1] for tensor in synth(frames=3))
+    for start in range(0, 24, 3):
+        run_pass(cache, keys, values, start)
+        assert bool(cache.counts['decode_k']) == (start == 21)
+        cache.commit_clean(start, start+3)
+        dense = [frame for chunk in cache.chunks if not chunk.prefix and not chunk.packed
+                 for frame in range(chunk.start, chunk.end)]
+        assert dense == list(range(max(1, start+3-18), start+3))
+        assert cache.chunks[0].prefix and not cache.chunks[0].packed
+    cache.flush()
+    assert all(chunk.packed or chunk.prefix for chunk in cache.chunks)
+    assert cache.report()['bf16_lag_frames'] == 18
+
+
+@pytest.mark.parametrize('precision', ['native', 'complex64'])
+def test_bf16_adapter_matches_native_attention_before_and_after_cache_writes(precision):
+    tree = ast.parse((RUNTIME/'wan/modules/causal_model.py').read_text())
+    cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == 'CausalWanSelfAttention')
+    forward = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == 'forward')
+    query_rope = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == 'causal_rope_apply')
+    from tempokv.runtime.rope import causal_rope_apply_long_input
+    from math import prod
+    inputs = []
+
+    def attention(q, k, v):
+        inputs.append((q.clone(), k.clone(), v.clone()))
+        return q
+
+    namespace = dict(torch=torch, math=SimpleNamespace(prod=prod), attention=attention,
+                     causal_rope_apply_long_input=causal_rope_apply_long_input,
+                     _cache_index=lambda cache, name: cache[name], _set_cache_index=dict.__setitem__)
+    exec(compile(ast.Module(body=[query_rope, forward], type_ignores=[]), 'native_attention', 'exec'), namespace)
+    layer = SimpleNamespace(num_heads=2, head_dim=8, local_attn_size=5, sink_size=1)
+    for name in ('q', 'k', 'v', 'o', 'norm_q', 'norm_k'):
+        setattr(layer, name, torch.nn.Identity())
+    predictor = AquaKVPredictor(2, 2, 8)
+    cache = AquaKVCache(predictor, None, frame_seqlen=4, prefix_frames=1,
+                        recent_buffer_frames=0, local_attn_size=5, sink_size=1,
+                        rope_precision=precision, compress=False)
+    bf16 = [{'k': torch.empty(1, 20, 2, 8, dtype=torch.bfloat16),
+             'v': torch.empty(1, 20, 2, 8, dtype=torch.bfloat16),
+             'global_end_index': 0, 'local_end_index': 0, 'rope_precision': precision}
+            for _ in range(2)]
+    adapted = [{'aquakv_handler': lambda q, k, v, i=i, **kw: cache.attend(
+        i, q, k, v, rotate=rotate_pre_rope, **kw)} for i in range(2)]
+    grid = torch.tensor([[3, 2, 2]])
+    rates = torch.tensor([1., .1, .01, .001], dtype=torch.float64)
+    freqs = torch.polar(torch.ones(64, 4, dtype=torch.float64), torch.arange(64)[:, None]*rates)
+    generator = torch.Generator().manual_seed(17)
+    for start in (0, 12, 24):
+        for _ in range(2):
+            for i in range(2):
+                x = torch.randn(1, 12, 16, generator=generator).bfloat16()
+                for state in (bf16[i], adapted[i]):
+                    namespace['forward'](layer, x, None, grid, freqs, None, kv_cache=state, current_start=start)
+                assert all(torch.equal(a, b) for a, b in zip(*inputs, strict=True))
+                inputs.clear()
+        cache.commit_clean(start, start+12)
+    assert cache.counts['encode_k'] == cache.counts['decode_k'] == 0
+
+
 def test_sliding_window_keeps_absolute_rotary_positions_and_sink():
     p, q = make_predictor()
     cache = AquaKVCache(p, q, frame_seqlen=1, prefix_frames=1, recent_buffer_frames=100,
@@ -264,6 +328,9 @@ def test_job_isolated_under_rebuttal_and_uses_no_tempokv_arguments(tmp_path):
     worker = json.loads((tmp_path/'run/worker_config.json').read_text())
     assert not {'codec_config', 'k_params', 'v_params'} & worker.keys()
     assert not any('tempokv_adapter' in arg for arg in job.command)
+    reference = build_job(config, tmp_path/'bf16', mode='bf16', prompts='/data/eval.txt', frames=81)
+    assert job.environment['SELF_FORCING_CACHE_ROPE_PRECISION'] == 'complex64'
+    assert reference.environment['SELF_FORCING_CACHE_ROPE_PRECISION'] == worker['rope_precision']
 
 
 def test_multi_sample_video_identity_uses_actual_batch_seed(tmp_path):
@@ -370,7 +437,7 @@ def native_pipeline_base():
     return Base
 
 
-@pytest.mark.parametrize('mode', ['aquakv', 'collect'])
+@pytest.mark.parametrize('mode', ['aquakv', 'bf16_adapter', 'collect'])
 def test_worker_runs_native_clean_refresh_loop_and_resets_per_prompt(tmp_path, monkeypatch, mode):
     from rebuttal.experiments.aquakv.worker import install
     p, q = make_predictor('bfloat16')
@@ -384,23 +451,32 @@ def test_worker_runs_native_clean_refresh_loop_and_resets_per_prompt(tmp_path, m
     monkeypatch.setitem(sys.modules, 'pipeline.causal_inference', module)
     config = {'mode': mode, 'predictor_path': str(tmp_path/'predictor.pt'), 'higgs': HIGGS,
               'prompts': str(prompts), 'output_dir': str(tmp_path),
-              'cache': {'prefix_frames': 0, 'recent_buffer_frames': 0}, 'trace_tokens_per_frame': 2}
+              'cache': {'prefix_frames': 0, 'recent_buffer_frames': 0}, 'trace_tokens_per_frame': 2,
+              'record_latent_hashes': True}
     pipeline = install(config, RUNTIME)()
     for prompt in range(2):
         pipeline.set_research_context(prompt_index=prompt, seed=prompt+10)
         pipeline.inference(noise=torch.ones(1, 6, 2, 1, 8, dtype=torch.bfloat16),
-                           text_prompts=['scene'], decode_output=False)
+                           text_prompts=['scene'], decode_output=False, return_latents=True)
         if mode == 'aquakv':
             assert pipeline.aquakv_cache.counts['clean_commits'] == 2
             assert pipeline.aquakv_cache.counts['replacements'] == 4
             assert pipeline.aquakv_cache.counts['decode_k'] > 0
             assert pipeline.aquakv_cache.committed_end == 12
+        elif mode == 'bf16_adapter':
+            assert pipeline.aquakv_cache.counts['clean_commits'] == 2
+            assert not any(c.packed for c in pipeline.aquakv_cache.chunks)
+            assert pipeline.aquakv_cache.counts['decode_k'] == 0
         else:
             path = next((tmp_path/'traces').glob(f'prompt_{prompt:06d}*.npz'))
             with np.load(path) as data:
                 assert data['keys'].shape == (3, 2, 6, 2, 4)
                 assert data['coordinate_system'].item() == 'pre_rope_normalized'
                 assert data['seed'].item() == prompt+10
+    hashes = [json.loads(row) for row in
+              (tmp_path/'latent_hashes.rank-0.jsonl').read_text().splitlines()]
+    assert [row['prompt_id'] for row in hashes] == [0, 1]
+    assert all(len(row['sample_block_sha256'][0]) == 2 for row in hashes)
 
 
 def test_internal_predictor_mutation_is_rejected(tmp_path):
@@ -427,3 +503,5 @@ def test_evaluate_does_not_accept_changed_generated_videos(tmp_path):
     (tmp_path/'generate.json').write_text(json.dumps(report))
     with pytest.raises(ValueError, match='video changed'):
         run({}, 'evaluate', tmp_path)
+    with pytest.raises(ValueError, match='video changed'):
+        run({'reference_dir': 'external_bf16'}, 'evaluate', tmp_path)

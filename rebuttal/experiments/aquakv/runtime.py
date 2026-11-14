@@ -7,6 +7,9 @@ import torch
 
 from .predictors import reconstruct_layer
 
+DEFAULT_BF16_LAG_FRAMES = 18
+DEFAULT_ROPE_PRECISION = "complex64"
+
 
 def rotate_pre_rope(x, grid_sizes, freqs, *, start_frame=0, precision="native"):
     """Wan's 3D rotary transform, independent of TempoKV cache/codec helpers."""
@@ -59,17 +62,27 @@ class Chunk:
 
 class AquaKVCache:
     def __init__(self, predictor, quantizer, *, frame_seqlen: int, prefix_frames=1,
-                 recent_buffer_frames=3, local_attn_size=-1, sink_size=0, rope_precision="native"):
-        if frame_seqlen < 1 or min(prefix_frames, recent_buffer_frames, sink_size) < 0:
+                 recent_buffer_frames=None, bf16_lag_frames=None, local_attn_size=-1,
+                 sink_size=0, rope_precision=DEFAULT_ROPE_PRECISION, compress=True):
+        if recent_buffer_frames is not None and bf16_lag_frames is not None:
+            raise ValueError("select either bf16_lag_frames or legacy recent_buffer_frames")
+        if recent_buffer_frames is None and bf16_lag_frames is None:
+            bf16_lag_frames = DEFAULT_BF16_LAG_FRAMES
+        if frame_seqlen < 1 or any(
+            size is not None and (isinstance(size, bool) or not isinstance(size, int) or size < 0)
+            for size in (prefix_frames, recent_buffer_frames, bf16_lag_frames, sink_size)
+        ):
             raise ValueError("invalid AquaKV cache schedule")
         if local_attn_size != -1 and (local_attn_size <= sink_size or local_attn_size < 1):
             raise ValueError("local_attn_size must exceed sink_size, or be -1")
         if rope_precision not in {"native", "complex64"}:
             raise ValueError("unsupported cache RoPE precision")
         self.predictor, self.quantizer = predictor, quantizer
+        self.compress = compress
         self.frame_seqlen = frame_seqlen
         self.prefix_tokens = prefix_frames*frame_seqlen
-        self.buffer_tokens = recent_buffer_frames*frame_seqlen
+        self.recent_buffer_frames = recent_buffer_frames
+        self.bf16_lag_frames = bf16_lag_frames
         self.local_attn_size, self.sink_size, self.rope_precision = local_attn_size, sink_size, rope_precision
         self.reset()
 
@@ -166,11 +179,9 @@ class AquaKVCache:
         chunk = self.active
         # Prefix and suffix own separate storage; a view must not retain both.
         if chunk.start < self.prefix_tokens < chunk.end:
-            offset = self.prefix_tokens-chunk.start
-            first = [(k[:, :offset].clone(), v[:, :offset].clone()) for k, v in chunk.layers]
-            last = [(k[:, offset:].clone(), v[:, offset:].clone()) for k, v in chunk.layers]
-            self.chunks.extend([Chunk(chunk.start, self.prefix_tokens, first, prefix=True),
-                                Chunk(self.prefix_tokens, chunk.end, last)])
+            first, last = self._split_raw(chunk, self.prefix_tokens)
+            first.prefix = True
+            self.chunks.extend([first, last])
         else:
             chunk.prefix = chunk.end <= self.prefix_tokens
             self.chunks.append(chunk)
@@ -178,17 +189,35 @@ class AquaKVCache:
         self.active = None
         self.counts["clean_commits"] += 1
         self._observe()
-        pending = sum(c.end-c.start for c in self.chunks if not c.packed and not c.prefix)
-        if pending >= self.buffer_tokens:
+        if self.bf16_lag_frames is not None:
+            self.flush(through=self.committed_end - self.bf16_lag_frames*self.frame_seqlen)
+        elif sum(c.end-c.start for c in self.chunks if not c.packed and not c.prefix) >= (
+            self.recent_buffer_frames*self.frame_seqlen
+        ):
             self.flush()
         self._evict()
         self._observe()
 
+    @staticmethod
+    def _split_raw(chunk, cutoff):
+        offset = cutoff-chunk.start
+        first = [(k[:, :offset].clone(), v[:, :offset].clone()) for k, v in chunk.layers]
+        last = [(k[:, offset:].clone(), v[:, offset:].clone()) for k, v in chunk.layers]
+        return Chunk(chunk.start, cutoff, first), Chunk(cutoff, chunk.end, last)
+
     @torch.no_grad()
-    def flush(self):
-        for chunk in self.chunks:
+    def flush(self, *, through=None):
+        if not self.compress:
+            return
+        through = self.committed_end if through is None else through
+        for index, chunk in enumerate(self.chunks):
+            if chunk.start >= through:
+                break
             if chunk.prefix or chunk.packed:
                 continue
+            if chunk.end > through:
+                chunk, tail = self._split_raw(chunk, through)
+                self.chunks[index:index+1] = [chunk, tail]
             states, previous = [], None
             for layer, (k, v) in enumerate(chunk.layers):
                 previous, pair, _ = reconstruct_layer(k, v, layer, self.predictor, self.quantizer, previous, metrics=False)
@@ -226,6 +255,7 @@ class AquaKVCache:
                 "peak_attention_working_bytes": self.peak_working_bytes,
                 "persistent_reconstructed_history": False,
                 "prefix_frames": self.prefix_tokens//self.frame_seqlen,
-                "recent_buffer_frames": self.buffer_tokens//self.frame_seqlen,
+                "recent_buffer_frames": self.recent_buffer_frames,
+                "bf16_lag_frames": self.bf16_lag_frames,
                 "compressed_chunks": sum(c.packed for c in self.chunks),
                 "note": "owned cache/predictor/grid bytes; attention scratch is separate; not CUDA allocator peak"}

@@ -94,6 +94,7 @@ def load_artifact(config, output, device="cpu"):
 
 def build_job(config, output, *, mode, prompts, frames, predictor_path=None, trace_role=None):
     from rebuttal.adapters.generation import GenerationJob
+    from .runtime import DEFAULT_ROPE_PRECISION
     if frames < 9 or (frames+3) % 12:
         raise ValueError("Self-Forcing frames must be >=9 and satisfy (frames+3)%12==0")
     missing = [key for key in ("checkpoint", "model_root") if not config.get(key)]
@@ -103,7 +104,9 @@ def build_job(config, output, *, mode, prompts, frames, predictor_path=None, tra
         raise ValueError("AquaKV generation requires " + ", ".join(missing))
     if int(config.get("num_gpus", 1)) < 1 or int(config.get("samples", 1)) < 1:
         raise ValueError("num_gpus and samples must be positive")
-    worker = {**config, "output_dir": str(output), "mode": mode, "prompts": str(prompts), "frames": frames}
+    rope_precision = config.get("rope_precision", DEFAULT_ROPE_PRECISION)
+    worker = {**config, "output_dir": str(output), "mode": mode, "prompts": str(prompts),
+              "frames": frames, "rope_precision": rope_precision}
     if predictor_path is not None:
         worker["predictor_path"] = str(predictor_path)
     if trace_role:
@@ -117,11 +120,10 @@ def build_job(config, output, *, mode, prompts, frames, predictor_path=None, tra
     files = [str(config["checkpoint"]), str(prompts), str(path)]
     if config.get("model_config"):
         files.append(str(config["model_config"]))
-    if mode == "aquakv":
+    if mode in {"aquakv", "bf16_adapter"}:
         files.append(str(predictor_path))
     environment = {"PYTHONPATH": os.pathsep.join([str(ROOT), str(ROOT/"src")]),
-                   "SELF_FORCING_CACHE_ROPE_PRECISION": config.get("rope_precision", "native"),
-                   "TEMPOKV_SPAN_FRAMES": "24"}
+                   "SELF_FORCING_CACHE_ROPE_PRECISION": rope_precision}
     return GenerationJob(mode, command, str(output), environment, files, [str(config["model_root"])], frames)
 
 
@@ -250,8 +252,8 @@ def run(config, stage, output_dir):
         if hashes & calibration_hashes:
             raise ValueError("AquaKV generation prompts overlap predictor calibration prompts")
         methods = config.get("generation_methods", ["bf16", "aquakv"])
-        if not methods or set(methods)-{"bf16", "aquakv"} or len(set(methods)) != len(methods):
-            raise ValueError("independent AquaKV generation_methods must contain bf16 and/or aquakv once each")
+        if not methods or set(methods)-{"bf16", "bf16_adapter", "aquakv"} or len(set(methods)) != len(methods):
+            raise ValueError("AquaKV generation_methods accepts bf16, bf16_adapter and aquakv once each")
         frames = int(config.get("frames", 1401))
         jobs = [build_job(config, output/"runs"/mode, mode=mode, prompts=prompts, frames=frames,
                           predictor_path=_predictor_path(config, output)) for mode in methods]
@@ -262,11 +264,19 @@ def run(config, stage, output_dir):
         return result
     if stage == "evaluate":
         from rebuttal.experiments.temporal_window import run as quality
-        if not config.get("reference_dir") and not config.get("candidate_dir"):
+        local_methods = {
+            method for method, directory in (("bf16", "reference_dir"), ("aquakv", "candidate_dir"))
+            if not config.get(directory)
+        }
+        if local_methods:
             generated = read_json(output/"generate.json")
-            if generated.get("status") != "complete" or {job["name"] for job in generated.get("jobs", [])} != {"bf16", "aquakv"}:
-                raise ValueError("video evaluation requires completed BF16 and AquaKV generation")
+            if generated.get("status") != "complete" or not local_methods.issubset(
+                job["name"] for job in generated.get("jobs", [])
+            ):
+                raise ValueError("video evaluation requires completed generation for " + ", ".join(sorted(local_methods)))
             for job in generated["jobs"]:
+                if job["name"] not in local_methods:
+                    continue
                 for artifact in job["artifacts"]:
                     if file_sha256(artifact["path"]) != artifact["sha256"]:
                         raise ValueError("generated video changed after completed generation")

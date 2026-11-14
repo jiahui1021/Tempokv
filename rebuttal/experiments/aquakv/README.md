@@ -17,11 +17,15 @@
 
 ## Self-Forcing 适配
 
-Self-Forcing 每个块执行多次去噪和一次 clean refresh。当前去噪块保持可覆盖的 BF16 数据，只有 pipeline 明确发出 clean refresh 后才进入历史缓存。历史按 latent frame 划分，保留独立 BF16 prefix 和 recent buffer，达到阈值后逐层压缩。
+Self-Forcing 每个块执行多次去噪和一次 clean refresh。当前去噪块保持可覆盖的 BF16 数据，只有 pipeline 明确发出 clean refresh 后才进入历史缓存。历史按 latent frame 划分，逐层压缩超出 BF16 保留范围的部分。
 
 读取缓存时，跨层预测依次使用**重建后的 pre-RoPE K/V**。每层只暂存解码该层所需的历史，最后一层释放；缓存中不保留完整 BF16 重建镜像。注意力前按绝对位置恢复 Wan 的 3D RoPE；有限窗口按 sink 与 recent 的并集选择，过期完整块释放。
 
-默认 `prefix_frames=1,recent_buffer_frames=3`，单位是 **latent frames**。这是视频适配参数，不等于 LLM 官方示例中的 4/128 tokens。`sink_size` 控制注意力窗口，`prefix_frames` 控制保留哪些未量化数据，两者含义不同。
+默认 `prefix_frames=1,bf16_lag_frames=18`，单位是 **latent frames**。首帧保留 BF16，最近 18 个已定稿帧也保留 BF16，与 TempoKV 的默认保留长度相同。缓存 K 和同次生成的 BF16 参考统一使用 `complex64` RoPE，Q 使用原生精度。`sink_size` 控制注意力窗口。
+
+复现旧实验时，使用旧配置中的 `recent_buffer_frames=3` 与 `rope_precision=native`。旧阈值达到时会压缩所有待压缩历史。若从当前默认配置覆盖，还需设置 `cache.bf16_lag_frames=null`。
+
+评测默认读取同一输出目录中完成并校验过的 BF16 和 AquaKV 视频。需要复用外部视频时，可显式设置 `reference_dir` 或 `candidate_dir`。
 
 `flush_tail=true` 只在生成结束后压缩未满阈值的尾部。报告同时保存生成中的峰值，避免用结束后的大小代替峰值。每条视频必须确实使用过 K/V 压缩和解压，否则生成阶段失败并说明原因。
 
@@ -94,6 +98,14 @@ python rebuttal/run.py --experiment aquakv --config rebuttal/outputs/aquakv_loca
 存储按实际 bit-packed 网格索引、FP32 scales 和 padding 计算，预测器另列。Self-Forcing 的 1536 channels 在默认 1024 Hadamard 分组下需要 padding，因此**名义 2-bit 不代表实际总存储就是 2-bit**。网格字节在生成报告中另列；文件序列化开销不混入 tensor 存储。计时是实际参考实现的计时，不宣称具备融合解码内核的速度。
 
 ## 检查
+
+怀疑生成适配改变了输出时，用同一个 checkpoint、prompt、seed 和 RoPE 精度跑
+`generate`，设置 `generation_methods=["bf16","bf16_adapter","aquakv"]`、
+`record_latent_hashes=true`。可先限制到一条 prompt 和 93 个 RGB 帧。需要已拟合
+的 AquaKV 参数。三路分别走原生 BF16、关闭压缩的 AquaKV 缓存、正常 AquaKV 压缩。
+各自输出的 `latent_hashes.rank-*.jsonl` 按生成块记录 VAE 解码前的 latent 哈希。
+先比较原生 BF16 和关闭压缩的 AquaKV 路径，再检查开启压缩后从哪一块开始分叉。
+使用新输出目录可以排除旧参考视频的生成环境和视频编码差异。
 
 ```bash
 python -m pytest -q rebuttal/tests/test_aquakv.py

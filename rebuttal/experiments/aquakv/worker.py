@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 from functools import partial
+import hashlib
 import importlib
 import json
 import os
@@ -26,32 +27,33 @@ class CacheSlot:
 def require_activity(report):
     counts = report["counts"]
     if any(counts.get(key, 0) <= 0 for key in ("encode_k", "encode_v", "decode_k", "decode_v")):
-        raise RuntimeError(f"AquaKV generation did not consume compressed K/V: {counts}; increase frames or reduce recent_buffer_frames")
+        raise RuntimeError(f"AquaKV generation did not consume compressed K/V: {counts}; increase frames or reduce the BF16 cache retention")
     return counts
 
 
 def install(config, runtime_root):
     import numpy as np
     import torch
-    from rebuttal.common.manifest import file_sha256, prompt_records, write_json
-    from .runtime import AquaKVCache, rotate_pre_rope
+    from rebuttal.common.manifest import file_sha256, prompt_records
+    from .runtime import AquaKVCache, DEFAULT_ROPE_PRECISION, rotate_pre_rope
     from .predictors import load_predictor
     from .quantizer import Quantizer, HiggsConfig
     module = importlib.import_module("pipeline.causal_inference")
     package = importlib.import_module("pipeline")
     base = module.CausalInferencePipeline
     mode = config.get("mode", "aquakv")
-    if mode not in {"aquakv", "bf16", "collect"}:
+    if mode not in {"aquakv", "bf16_adapter", "bf16", "collect"}:
         raise ValueError("unsupported independent AquaKV worker mode")
+    uses_adapter = mode in {"aquakv", "bf16_adapter"}
     hashes = {r["prompt_id"]: r["sha256"] for r in prompt_records(config["prompts"])}
     runtime_settings = config.get("cache", {})
 
     class AquaPipeline(base):
         def __init__(self, *args, **kwargs):
             super().__init__(*args, **kwargs)
-            self._incremental_tempokv = mode in {"aquakv", "collect"}
+            self._incremental_tempokv = uses_adapter or mode == "collect"
             self.aquakv_cache = None
-            if mode == "aquakv":
+            if uses_adapter:
                 state = torch.load(config["predictor_path"], map_location="cpu", weights_only=True)
                 if state["parameter_dtype"] != "bfloat16":
                     raise ValueError("Self-Forcing requires AquaKV calibrated in bfloat16")
@@ -68,14 +70,16 @@ def install(config, runtime_root):
                     block.self_attn.v.register_forward_hook(self._capture(layer, "v"))
 
         def _initialize_kv_cache(self, batch_size, dtype, device, target_frames=None):
-            if mode != "aquakv":
+            if not uses_adapter:
                 return super()._initialize_kv_cache(batch_size=batch_size, dtype=dtype, device=device, target_frames=target_frames)
             self.aquakv_predictor.to(device=device)
             self.aquakv_cache = AquaKVCache(self.aquakv_predictor, self.aquakv_quantizer,
                 frame_seqlen=self.frame_seq_length, prefix_frames=int(runtime_settings.get("prefix_frames", 1)),
-                recent_buffer_frames=int(runtime_settings.get("recent_buffer_frames", 3)),
+                recent_buffer_frames=runtime_settings.get("recent_buffer_frames"),
+                bf16_lag_frames=runtime_settings.get("bf16_lag_frames"),
                 local_attn_size=self.local_attn_size, sink_size=int(config.get("sink_size", 0)),
-                rope_precision=config.get("rope_precision", "native"))
+                rope_precision=config.get("rope_precision", DEFAULT_ROPE_PRECISION),
+                compress=mode == "aquakv")
             self.kv_cache1 = []
             for layer in range(self.num_transformer_blocks):
                 cache = {"k": CacheSlot(), "v": CacheSlot(), "global_end_index": 0, "local_end_index": 0,
@@ -104,7 +108,7 @@ def install(config, runtime_root):
                 return
             if not self._aquakv_clean:
                 raise RuntimeError("AquaKV must commit only the pipeline-announced clean refresh")
-            if mode == "aquakv":
+            if uses_adapter:
                 self.aquakv_cache.commit_clean(start, end)
             else:
                 if len(self._capture_block) != self.num_transformer_blocks:
@@ -154,10 +158,22 @@ def install(config, runtime_root):
         def inference(self, *args, **kwargs):
             noise = kwargs.get("noise", args[0] if args else None)
             self._aquakv_batch = noise.shape[0]
+            if config.get("record_latent_hashes", False) and not kwargs.get("return_latents"):
+                raise ValueError("AquaKV latent hashing requires return_latents=True")
             result = super().inference(*args, **kwargs)
             output = Path(config["output_dir"])
             rank = int(os.environ.get("RANK", "0"))
             identity = self._aquakv_identity
+            if config.get("record_latent_hashes", False):
+                latents = result[1].detach().cpu().contiguous()
+                samples = [
+                    [hashlib.sha256(block.contiguous().view(torch.uint8).numpy().tobytes()).hexdigest()
+                     for block in sample.split(self.num_frame_per_block)]
+                    for sample in latents
+                ]
+                output.mkdir(parents=True, exist_ok=True)
+                with (output / f"latent_hashes.rank-{rank}.jsonl").open("a") as handle:
+                    handle.write(json.dumps({**identity, "mode": mode, "sample_block_sha256": samples}) + "\n")
             if mode == "collect":
                 layers = sorted(self._capture_sequence)
                 keys, values = [], []
@@ -200,7 +216,8 @@ def main(argv=None):
     runtime = ROOT / "experiments/Self-Forcing"
     sys.path.insert(0, str(runtime))
     os.environ["FORCING_WAN_MODEL_DIR"] = str(config["model_root"])
-    os.environ["SELF_FORCING_CACHE_ROPE_PRECISION"] = config.get("rope_precision", "native")
+    from .runtime import DEFAULT_ROPE_PRECISION
+    os.environ["SELF_FORCING_CACHE_ROPE_PRECISION"] = config.get("rope_precision", DEFAULT_ROPE_PRECISION)
     torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", "0")))
     # Run as a module so the vendored AQUA-KV package has a stable import name.
     install(config, runtime)

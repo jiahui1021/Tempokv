@@ -38,7 +38,7 @@
   },
   "cache": {
     "prefix_frames": 1,
-    "recent_buffer_frames": 3,
+    "bf16_lag_frames": 18,
     "flush_tail": true
   },
   "generation_methods": [
