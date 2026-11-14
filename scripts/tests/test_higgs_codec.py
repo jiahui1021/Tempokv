@@ -72,30 +72,32 @@ def test_fused_higgs_packed_state_matches_reference(bits):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("group_size", [512, 1024])
 @pytest.mark.parametrize("quantizer,anchor", [("higgs", False), ("higgs", True), ("scalar", True)])
-def test_higgs_cache_uses_persistent_prediction(quantizer, anchor, monkeypatch):
-    if higgs.for_device(torch.device("cuda"), 256) is None:
+def test_higgs_cache_uses_persistent_prediction(quantizer, anchor, group_size, monkeypatch):
+    if higgs.for_device(torch.device("cuda"), group_size) is None:
         pytest.skip("HIGGS fusion requires Triton 3")
     from tempokv.triton_ops import route_report
 
     monkeypatch.setenv("TEMPOKV_PERSISTENT_UNITS_PER_LAUNCH", "2")
     config = CodecConfig(
         fit_mode="native", stride=3, k_history_length=2, v_history_length=1,
-        residual_quantizer=quantizer, k_bits=3, v_bits=5, anchor_bits=3,
-        higgs_anchor=anchor, higgs_group_size=256, strict_triton=True,
+        residual_quantizer=quantizer, k_bits=5, v_bits=3, anchor_bits=3,
+        higgs_anchor=anchor, higgs_group_size=group_size, strict_triton=True,
     )
     assert config.use_triton
     generator = torch.Generator().manual_seed(45)
-    value = torch.randn(2, 3, 20, 128, generator=generator).to(torch.bfloat16).cuda()
+    value = torch.randn(2, 12, 20, 128, generator=generator).to(torch.bfloat16).cuda()
     key = TemporalParameters(torch.full((2, 2, 128), 0.25), torch.zeros(2, 128))
     cross = CrossKVParameters(
-        torch.eye(128).expand(3, -1, -1) * 0.5, torch.zeros(3, 128),
-        history_weights=torch.full((1, 3, 128), 0.25),
+        torch.eye(128).expand(12, -1, -1) * 0.5, torch.zeros(12, 128),
+        history_weights=torch.full((1, 12, 128), 0.25),
     )
-    packed_k, expected_k = encode_temporal(value, key, config)
-    packed_v, expected_v = encode_cross_kv(value * 0.5, expected_k, cross, config)
+    reference = replace(config, use_triton=False)
+    packed_k, expected_k = encode_temporal(value, key, reference)
+    packed_v, expected_v = encode_cross_kv(value * 0.5, expected_k, cross, reference)
     # Use an offset and gaps in the output storage, as in the attention cache.
-    target = torch.empty((2, 22, 3, 132), device=value.device, dtype=value.dtype)[:, 1:-1, :, :128]
+    target = torch.empty((2, 22, 12, 132), device=value.device, dtype=value.dtype)[:, 1:-1, :, :128]
     before = route_report()
     actual = decode_tensor(packed_k, output_tensor=target, strict_triton=True)
     assert actual.data_ptr() == target.data_ptr()

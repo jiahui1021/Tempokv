@@ -68,29 +68,45 @@ def test_higgs_decode_matches_upstream_and_counts_real_padding(dtype, layer):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("group_size", [256, 512, 1024])
 @pytest.mark.parametrize("grid_size", [16, 64, 256])
-def test_fused_higgs_adds_predictor_with_upstream_rounding(grid_size):
+def test_fused_higgs_matches_reference_at_frame_size(group_size, grid_size, monkeypatch):
+    import rebuttal.experiments.aquakv.quantizer as quantizer_module
     from rebuttal.experiments.aquakv.quantizer import _cuda_kernels
 
-    if _cuda_kernels(torch.device("cuda"), 1024) is None:
+    if _cuda_kernels(torch.device("cuda"), group_size) is None:
         pytest.skip("HIGGS fusion requires Triton 3")
-    quantizer = Quantizer(1536, HiggsConfig(edenn_n=grid_size))
+    pytest.importorskip("fast_hadamard_transform")
+    quantizer = Quantizer(1536, HiggsConfig(hadamard_groupsize=group_size, edenn_n=grid_size))
     generator = torch.Generator().manual_seed(22)
-    value = torch.randn((2, 4, 12, 128), generator=generator).to(torch.bfloat16)
+    value = torch.randn((1, 1560, 12, 128), generator=generator).to(torch.bfloat16).cuda()
     value[:, 0] = 0
-    prediction = torch.randn(value.shape, generator=generator).to(value.dtype)
-    reference = quantizer.encode(value, 1)
-    expected = prediction + quantizer.decode(reference, 1)
-    reference.indices = reference.indices.cuda()
-    reference.scales = reference.scales.cuda()
-    actual = quantizer.decode(reference, 1, predictor=prediction.cuda())
-    torch.testing.assert_close(actual.cpu(), expected, rtol=0, atol=0)
-    packed = quantizer.encode(value.cuda(), 1)
-    torch.testing.assert_close(packed.scales.cpu(), reference.scales.cpu())
+    prediction = torch.randn(value.shape, generator=generator).to(value)
+    # Use the same score precision on both routes.
+    with monkeypatch.context() as reference_path:
+        reference_path.setattr(quantizer_module, "_cuda_kernels", lambda *_: None)
+        reference_path.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
+        reference = quantizer.encode(value, 1)
+        expected = quantizer.decode(reference, 1)
+
+    packed = quantizer.encode(value, 1)
+    with monkeypatch.context() as reference_path:
+        reference_path.setattr(quantizer_module, "_cuda_kernels", lambda *_: None)
+        decoded_by_reference = quantizer.decode(packed, 1)
+    torch.testing.assert_close(packed.scales, reference.scales)
+    # A small number of centroid ties can change when scale reductions round differently.
     assert (packed.indices != reference.indices).float().mean().item() < 0.001
+    torch.testing.assert_close(quantizer.decode(reference, 1), expected, rtol=0, atol=0)
     torch.testing.assert_close(
-        quantizer.decode(packed, 1, predictor=prediction.cuda()),
-        prediction.cuda() + quantizer.decode(packed, 1), rtol=0, atol=0,
+        quantizer.decode(reference, 1, predictor=prediction), prediction + expected, rtol=0, atol=0,
+    )
+    actual = quantizer.decode(packed, 1)
+    torch.testing.assert_close(
+        actual, decoded_by_reference, rtol=0, atol=0,
+    )
+    torch.testing.assert_close(
+        (actual.float() - value).square().mean(),
+        (expected.float() - value).square().mean(), rtol=0.002, atol=1e-6,
     )
 
 

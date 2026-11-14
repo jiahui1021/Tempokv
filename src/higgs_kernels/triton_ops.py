@@ -8,16 +8,18 @@ import triton.language as tl
 
 
 def supports(group_size: int) -> bool:
-    # Split/join require Triton 3.0. Keep the reference path available on 2.2.
     return 0 < group_size <= 4096 and not group_size & (group_size - 1) and hasattr(tl, "split")
 
 
 @triton.jit
 def _hadamard_stage(values, size: tl.constexpr, step: tl.constexpr):
+    # Reduce over the two inputs of each butterfly. The output axis keeps
+    # the original channel order across warps, including at steps 256 and 512.
     pairs = tl.reshape(values, (size // (2 * step), 2, step))
-    left, right = tl.split(tl.permute(pairs, (0, 2, 1)))
-    butterflies = tl.join(left + right, left - right)
-    return tl.reshape(tl.permute(butterflies, (0, 2, 1)), (size,))
+    lane = tl.arange(0, 2)
+    subtract = (lane[:, None] & lane[None, :]) != 0
+    signed = tl.where(subtract[None, :, :, None], -pairs[:, None, :, :], pairs[:, None, :, :])
+    return tl.reshape(tl.sum(signed, axis=2), (size,))
 
 
 @triton.jit
@@ -33,12 +35,12 @@ def _vector_indices(rotated, grid, norms, count: tl.constexpr, dim: tl.constexpr
     tile: tl.constexpr = 16
     lane = tl.arange(0, tile)
     component = tl.reshape(rotated, (count, dim))
-    if dim == 2:
-        x, y = tl.split(component)
-    else:
-        even, odd = tl.split(tl.reshape(component, (count, 2, 2)))
-        x, z = tl.split(even)
-        y, w = tl.split(odd)
+    coordinate = tl.arange(0, dim)
+    x = tl.sum(tl.where(coordinate[None, :] == 0, component, 0.0), axis=1)
+    y = tl.sum(tl.where(coordinate[None, :] == 1, component, 0.0), axis=1)
+    if dim == 4:
+        z = tl.sum(tl.where(coordinate[None, :] == 2, component, 0.0), axis=1)
+        w = tl.sum(tl.where(coordinate[None, :] == 3, component, 0.0), axis=1)
     best_score = tl.full((count,), -float("inf"), tl.float32)
     best_index = tl.full((count,), 0, tl.int32)
     for start in range(tl.cdiv(size, tile)):
@@ -219,7 +221,7 @@ def quantize(
             group_size, group_size.bit_length() - 1, code_dim, code_bits, count, byte_count,
             codes_per_word, bytes_per_word, triton.next_power_of_2(bytes_per_word),
             max(count, codes_per_word), zero_code, check_finite,
-            num_warps=8 if code_dim > 1 and group_size >= 512 else 4, enable_fp_fusion=False,
+            num_warps=4, enable_fp_fusion=False,
             debug=check_finite,
         )
     return codes, scales
