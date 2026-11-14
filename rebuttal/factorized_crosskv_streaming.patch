@@ -1,0 +1,869 @@
+diff -ruN a/rebuttal/adapters/experimental_codec.py b/rebuttal/adapters/experimental_codec.py
+--- a/rebuttal/adapters/experimental_codec.py	2026-11-08 21:29:08.000000000 +0000
++++ b/rebuttal/adapters/experimental_codec.py	2026-11-08 13:39:32.966241081 +0000
+@@ -406,3 +406,97 @@
+ def load_codec_factory(path: str | Path, device: str = "cpu") -> ExperimentalCodec:
+     """Callable suitable for the explicit generation codec_factory hook."""
+     return ExperimentalCodec.load(path, device=device)
++
++
++def _temporal_parameters(temporal: ResearchTemporal) -> TemporalParameters | None:
++    """Invert ``ResearchTemporal.from_production`` for per-channel K only."""
++    if temporal.kind != "channel_linear" or temporal.factor_a is not None or temporal.factor_b is not None:
++        return None
++    weights, bias = temporal.weights, temporal.bias
++    if temporal.sharing == "shared":
++        return TemporalParameters(weights[0].contiguous(), bias[0].contiguous())
++    if temporal.sharing == "layer_shared":
++        return TemporalParameters(
++            weights.permute(1, 2, 0, 3).contiguous(),
++            bias.permute(1, 0, 2).contiguous(),
++        )
++    if temporal.sharing == "layer_head":
++        layers, heads = temporal.layers, temporal.heads
++        order, dim = int(weights.shape[1]), int(weights.shape[-1])
++        return TemporalParameters(
++            weights.view(layers, heads, order, order, dim).permute(0, 2, 3, 1, 4).contiguous(),
++            bias.view(layers, heads, order, dim).permute(0, 2, 1, 3).contiguous(),
++        )
++    return None
++
++
++def _cross_parameters(cross: ResearchCross) -> CrossKVParameters | None:
++    """Broadcast shared factors per layer without forming the dense map ``A @ B``."""
++    if cross.kind != "low_rank" or cross.factor_a is None or cross.factor_b is None or cross.weight is not None:
++        return None
++    layers, heads = cross.layers, cross.heads
++    factor_a, factor_b, bias = cross.factor_a, cross.factor_b, cross.bias
++    rank, dim = int(factor_a.shape[-1]), int(factor_a.shape[-2])
++    if cross.sharing == "layer_shared":
++        if tuple(factor_a.shape) != (heads, dim, rank) or tuple(factor_b.shape) != (heads, rank, dim):
++            return None
++        if tuple(bias.shape) != (heads, dim):
++            return None
++        factor_a = factor_a.unsqueeze(0).expand(layers, -1, -1, -1).contiguous()
++        factor_b = factor_b.unsqueeze(0).expand(layers, -1, -1, -1).contiguous()
++        bias = bias.unsqueeze(0).expand(layers, -1, -1).contiguous()
++    elif cross.sharing == "layer_head":
++        factor_a = factor_a.contiguous().view(layers, heads, dim, rank)
++        factor_b = factor_b.contiguous().view(layers, heads, rank, dim)
++        bias = bias.contiguous().view(layers, heads, dim)
++    elif cross.sharing == "head_shared":
++        if factor_a.shape[0] != layers:
++            return None
++        factor_a = factor_a.unsqueeze(1).expand(-1, heads, -1, -1).contiguous()
++        factor_b = factor_b.unsqueeze(1).expand(-1, heads, -1, -1).contiguous()
++        bias = bias.unsqueeze(1).expand(-1, heads, -1).contiguous()
++    elif cross.sharing == "shared":
++        factor_a = factor_a.reshape(1, 1, dim, rank).expand(layers, heads, -1, -1).contiguous()
++        factor_b = factor_b.reshape(1, 1, rank, dim).expand(layers, heads, -1, -1).contiguous()
++        bias = bias.reshape(1, 1, dim).expand(layers, heads, -1).contiguous()
++    else:
++        return None
++    return CrossKVParameters(
++        None,
++        bias,
++        history_weights=cross.history_weights.contiguous(),
++        projection_source="cross_kv",
++        factor_a=factor_a,
++        factor_b=factor_b,
++    )
++
++
++def load_generation_codec(path: str | Path, device: str | torch.device = "cpu"):
++    """Load a research archive, promoting factorized CrossKV onto the production codec.
++
++    Other archives stay on ``ExperimentalCodec`` and keep that loader's CPU default.
++    Factorized K stays the per-channel temporal predictor. Factors are moved to
++    ``device`` once here; later predictions reuse that storage.
++    """
++    experimental = ExperimentalCodec.load(path)
++    temporal_state = getattr(experimental, "temporal", None)
++    cross_state = getattr(experimental, "v_parameters", None)
++    config = getattr(experimental, "config", None)
++    if temporal_state is None or cross_state is None or config is None:
++        return experimental
++    if config.mirrored or config.v_predictor_mode != "cross_kv":
++        return experimental
++    temporal = _temporal_parameters(temporal_state)
++    cross = _cross_parameters(cross_state)
++    if temporal is None or cross is None:
++        return experimental
++    from dataclasses import replace
++    from tempokv.codec import TempoKVCodec
++
++    resolved = torch.device(device)
++    config = replace(
++        experimental.config,
++        use_triton=resolved.type == "cuda",
++        strict_triton=False,
++    )
++    return TempoKVCodec(temporal.to(resolved), cross.to(resolved), config)
+diff -ruN a/rebuttal/adapters/worker.py b/rebuttal/adapters/worker.py
+--- a/rebuttal/adapters/worker.py	2026-11-08 21:29:08.000000000 +0000
++++ b/rebuttal/adapters/worker.py	2026-11-08 13:38:33.106330906 +0000
+@@ -66,8 +66,14 @@
+         def factory():
+             nonlocal observer
+             if config.get("research_params"):
+-                from rebuttal.adapters.experimental_codec import ExperimentalCodec
+-                base = ExperimentalCodec.load(config["research_params"])
++                from rebuttal.adapters.experimental_codec import load_generation_codec
++                from tempokv.codec import TempoKVCodec
++                device = "cuda" if torch.cuda.is_available() else "cpu"
++                base = load_generation_codec(config["research_params"], device=device)
++                # Factorized archives become the production streaming codec.
++                # Every other research archive keeps the batch reference path.
++                if isinstance(base, TempoKVCodec):
++                    os.environ["TEMPOKV_INCREMENTAL"] = "1"
+             else:
+                 from tempokv.integration import load_codec
+                 base = load_codec(config["codec_config"], config["k_params"], config["v_params"],
+@@ -98,7 +104,7 @@
+ 
+     class RebuttalPipeline(base_class):
+         def inference(self, *args, **kwargs):
+-            research = bool(config.get("research_params"))
++            research = bool(config.get("research_params")) and hasattr(self.tempokv_codec, "activity_counts")
+             before = dict(self.tempokv_codec.activity_counts) if research else None
+             result = super().inference(*args, **kwargs)
+             if research:
+diff -ruN a/rebuttal/tests/test_factorized_cross_streaming.py b/rebuttal/tests/test_factorized_cross_streaming.py
+--- a/rebuttal/tests/test_factorized_cross_streaming.py	1970-01-01 00:00:00.000000000 +0000
++++ b/rebuttal/tests/test_factorized_cross_streaming.py	2026-11-08 13:40:49.919448524 +0000
+@@ -0,0 +1,332 @@
++"""Factorized CrossKV must match the research reference and the production stream."""
++from __future__ import annotations
++
++import json
++from pathlib import Path
++
++import pytest
++import torch
++
++from tempokv.codec import TempoKVCodec, decode_tensor
++from tempokv.config import CodecConfig
++from tempokv.fitting import fit_predictors
++from tempokv.parameters import CrossKVParameters, TemporalParameters
++from rebuttal.adapters.experimental_codec import (
++    ExperimentalCodec,
++    ResearchCross,
++    ResearchTemporal,
++    load_generation_codec,
++)
++from rebuttal.experiments.architecture.cross_low_rank import fit_cross_architecture
++from rebuttal.tests.test_architecture import (
++    baseline,
++    config as architecture_config,
++    test_reference_reproduces_shipped_channel_dense_codec,
++    trace,
++)
++
++
++def _legacy_config(*, stride: int, k_history: int, v_history: int) -> CodecConfig:
++    return CodecConfig(
++        k_bits=2,
++        v_bits=2,
++        anchor_bits=4,
++        group_size=64,
++        stride=stride,
++        k_history_length=k_history,
++        v_history_length=v_history,
++        fit_mode="legacy",
++        use_triton=False,
++        strict_triton=False,
++        residual_mode="asymmetric",
++        scale_dtype="bfloat16",
++        reconstruction_dtype="bfloat16",
++        k_predictor_mode="shared",
++        v_predictor_mode="cross_kv",
++        cross_kv_weight_mode="layer_shared",
++        cross_matmul_precision="ieee",
++    )
++
++
++def _manual_low_rank(*, seed: int, v_history: int, k_history: int = 2, units: int = 4, stride: int = 4):
++    generator = torch.Generator().manual_seed(seed)
++    layers, batch, heads, dim, rank = 2, 1, 2, 64, 8
++    sequence = units * stride
++    temporal = TemporalParameters(
++        torch.randn(k_history, k_history, dim, generator=generator) * 0.2,
++        torch.randn(k_history, dim, generator=generator) * 0.2,
++    )
++    factor_a = torch.randn(heads, dim, rank, generator=generator) * 0.05
++    factor_b = torch.randn(heads, rank, dim, generator=generator) * 0.05
++    bias = torch.randn(heads, dim, generator=generator) * 0.05
++    history = torch.randn(layers, v_history, heads, dim, generator=generator) * 0.1
++    cross = CrossKVParameters(
++        None,
++        bias.unsqueeze(0).expand(layers, -1, -1).contiguous(),
++        history_weights=history,
++        factor_a=factor_a.unsqueeze(0).expand(layers, -1, -1, -1).contiguous(),
++        factor_b=factor_b.unsqueeze(0).expand(layers, -1, -1, -1).contiguous(),
++    )
++    keys = torch.randn(layers, batch, sequence, heads, dim, generator=generator)
++    values = 0.8 * keys + 0.1 * torch.randn(keys.shape, generator=generator)
++    config = _legacy_config(stride=stride, k_history=k_history, v_history=v_history)
++    research = ExperimentalCodec(
++        ResearchTemporal.from_production(temporal, layers, heads),
++        ResearchCross(
++            "low_rank", "layer_shared", bias, history, layers, heads,
++            factor_a=factor_a, factor_b=factor_b,
++        ),
++        config,
++    )
++    production = TempoKVCodec(temporal, cross, config)
++    return config, research, production, keys, values
++
++
++def _bhsd(tensor: torch.Tensor) -> torch.Tensor:
++    return tensor.permute(0, 2, 1, 3).contiguous()
++
++
++def _codes(packed) -> tuple:
++    return (
++        packed.anchor_quant,
++        packed.anchor_scale,
++        packed.residual_quant,
++        packed.residual_scale,
++        packed.residual_zero_point,
++        packed.unit_lengths,
++    )
++
++
++def _assert_same_codes(left, right) -> None:
++    for actual, expected in zip(_codes(left), _codes(right), strict=True):
++        if isinstance(expected, torch.Tensor):
++            assert torch.equal(actual, expected)
++        else:
++            assert actual == expected
++
++
++def _decode(codec: TempoKVCodec, key, value, *, layer: int):
++    return codec.decode(codec.encode(key, value, layer=layer))
++
++
++def _incremental(codec: TempoKVCodec, key, value, *, layer: int, capacity: int):
++    stride = codec.config.stride
++    units = key.shape[2] // stride
++    encoder_k, reconstructed = codec.begin_incremental_primary(
++        key[:, :, :stride], capacity_units=capacity, layer=layer
++    )
++    encoder_v = codec.begin_incremental_secondary(
++        value[:, :, :stride], reconstructed, capacity_units=capacity, layer=layer
++    )
++    for index in range(1, units):
++        start, stop = index * stride, (index + 1) * stride
++        reconstructed = encoder_k.append(key[:, :, start:stop])
++        encoder_v.append(value[:, :, start:stop], source=reconstructed)
++    decoded_k = decode_tensor(encoder_k.packed, use_triton=False)
++    decoded_v = decode_tensor(encoder_v.packed, source=decoded_k, use_triton=False)
++    return decoded_k, decoded_v, encoder_k.packed, encoder_v.packed
++
++
++def test_dense_reference_regression_unchanged():
++    test_reference_reproduces_shipped_channel_dense_codec()
++
++
++def test_factorized_parameters_reject_dense_shortcut_and_roundtrip(tmp_path):
++    factor_a = torch.randn(2, 64, 8)
++    factor_b = torch.randn(2, 8, 64)
++    with pytest.raises(ValueError, match="dense weight"):
++        CrossKVParameters(
++            torch.eye(64).unsqueeze(0).expand(2, -1, -1).contiguous(),
++            torch.zeros(2, 64),
++            factor_a=factor_a,
++            factor_b=factor_b,
++        )
++    factorized = CrossKVParameters(
++        None, torch.randn(2, 64), history_weights=torch.randn(1, 2, 64),
++        factor_a=factor_a, factor_b=factor_b,
++    )
++    assert factorized.weight is None and factorized.factorized
++    path = tmp_path / "factors.npz"
++    factorized.save(path)
++    with path.open("rb") as handle:
++        import numpy as np
++        stored = np.load(handle)
++        assert "weight" not in stored.files
++        assert "factor_a" in stored.files and "factor_b" in stored.files
++    loaded = CrossKVParameters.load(path)
++    assert loaded.weight is None
++    assert torch.equal(loaded.factor_a, factor_a)
++    assert torch.equal(loaded.factor_b, factor_b)
++    dense = CrossKVParameters(torch.randn(2, 64, 64), torch.randn(2, 64), history_weights=torch.randn(1, 2, 64))
++    dense_path = tmp_path / "dense.npz"
++    dense.save(dense_path)
++    restored = CrossKVParameters.load(dense_path)
++    assert restored.factor_a is None and torch.equal(restored.weight, dense.weight)
++
++
++@pytest.mark.parametrize("v_history", [1, 2])
++def test_reference_and_stream_match_across_spans(v_history):
++    _, research, production, keys, values = _manual_low_rank(seed=7, v_history=v_history, units=4, stride=4)
++    assert production.v_parameters.weight is None
++    assert production.v_parameters.factor_a.shape[-1] == 8
++    for layer in range(2):
++        key, value = _bhsd(keys[layer]), _bhsd(values[layer])
++        ref_k, ref_v = research.decode(research.encode(key, value, layer=layer))
++        full_k, full_v = _decode(production, key, value, layer=layer)
++        inc_k, inc_v, packed_k, packed_v = _incremental(production, key, value, layer=layer, capacity=4)
++        assert torch.equal(full_k, ref_k) and torch.equal(full_v, ref_v)
++        assert torch.equal(inc_k, full_k) and torch.equal(inc_v, full_v)
++        ref_packed = research.encode(key, value, layer=layer)
++        got_packed = production.encode(key, value, layer=layer)
++        _assert_same_codes(got_packed.key, ref_packed.key)
++        _assert_same_codes(got_packed.value, ref_packed.value)
++        _assert_same_codes(packed_k, got_packed.key)
++        _assert_same_codes(packed_v, got_packed.value)
++        # A new span re-anchors. It must not carry the previous span's history.
++        for offset in (0, 8):
++            span_k, span_v = key[:, :, offset:offset + 8], value[:, :, offset:offset + 8]
++            span_full = _decode(production, span_k, span_v, layer=layer)
++            span_inc = _incremental(production, span_k, span_v, layer=layer, capacity=2)[:2]
++            assert torch.equal(span_inc[0], span_full[0]) and torch.equal(span_inc[1], span_full[1])
++
++
++def test_short_trace_archive_matches_reference(tmp_path):
++    keys, values = trace(4)
++    cfg = architecture_config()
++    temporal, dense = fit_predictors(
++        keys, values, config=cfg, temporal_ridge=1.0, cross_ridge=0.1, v_history_mode="diagonal"
++    )
++    layers, heads = int(keys.shape[0]), int(keys.shape[-2])
++    baseline = ResearchCross.from_production(dense, "layer_shared", layers, heads)
++    low_rank, _logs = fit_cross_architecture(
++        keys, values, baseline, cfg, kind="low_rank", rank=8, rounds=1, als_steps=2, ridge=0.1
++    )
++    assert low_rank.weight is None and low_rank.factor_a.shape[-1] == 8
++    experimental = ExperimentalCodec(ResearchTemporal.from_production(temporal, layers, heads), low_rank, cfg)
++    path = tmp_path / "low_rank_r8.npz"
++    experimental.save(path)
++    production = load_generation_codec(path, device="cpu")
++    assert isinstance(production, TempoKVCodec)
++    assert production.cross_kv.weight is None
++    assert production.temporal.history_weights.ndim == 3  # per-channel shared K, not a dense map
++    for layer in range(layers):
++        key, value = _bhsd(keys[layer]), _bhsd(values[layer])
++        ref_k, ref_v = experimental.decode(experimental.encode(key, value, layer=layer))
++        got_k, got_v = production.decode(production.encode(key, value, layer=layer))
++        assert torch.equal(got_k, ref_k) and torch.equal(got_v, ref_v)
++        inc_k, inc_v, _, _ = _incremental(production, key, value, layer=layer, capacity=key.shape[2])
++        assert torch.equal(inc_k, got_k) and torch.equal(inc_v, got_v)
++
++
++def test_factors_stay_on_activation_device_without_per_call_copies(monkeypatch):
++    _config, _research, production, keys, values = _manual_low_rank(seed=3, v_history=1)
++    key, value = _bhsd(keys[0]), _bhsd(values[0])
++    for layer in (0, 1):
++        production.encode(key, value, layer=layer)
++    cached = {
++        layer: production._cross_for_layer(key.device, layer) for layer in (0, 1)
++    }
++    pointers = {
++        layer: (item.factor_a.data_ptr(), item.factor_b.data_ptr())
++        for layer, item in cached.items()
++    }
++    factor_shapes = {
++        tuple(item.factor_a.shape) for item in cached.values()
++    } | {tuple(item.factor_b.shape) for item in cached.values()}
++    factor_shapes |= {
++        tuple(production.v_parameters.factor_a.shape),
++        tuple(production.v_parameters.factor_b.shape),
++    }
++    for item in cached.values():
++        assert item.factor_a.device == key.device and item.weight is None
++    seen = []
++    import tempokv.codec as codec_module
++    original = codec_module.cross_projection
++
++    def wrapped(source, parameters, **kwargs):
++        assert parameters.factor_a.device == source.device
++        assert parameters.factor_b.device == source.device
++        assert (parameters.factor_a.data_ptr(), parameters.factor_b.data_ptr()) in pointers.values()
++        seen.append(parameters.factor_a.data_ptr())
++        return original(source, parameters, **kwargs)
++
++    copies = []
++    tensor_to = torch.Tensor.to
++
++    def spy(self, *args, **kwargs):
++        result = tensor_to(self, *args, **kwargs)
++        if tuple(self.shape) in factor_shapes and (
++            result.device != self.device or result.data_ptr() != self.data_ptr()
++        ):
++            copies.append((tuple(self.shape), str(self.device), str(result.device)))
++        return result
++
++    monkeypatch.setattr(codec_module, "cross_projection", wrapped)
++    monkeypatch.setattr(torch.Tensor, "to", spy)
++    for layer in (0, 1):
++        production.encode(key, value, layer=layer)
++        again = production._cross_for_layer(key.device, layer)
++        assert again.factor_a.data_ptr() == pointers[layer][0]
++        assert again.factor_b.data_ptr() == pointers[layer][1]
++    assert seen and copies == []
++    if not torch.cuda.is_available():
++        print("GPU factor-device check: NOT_RUN")
++
++
++def test_dense_archive_stays_on_reference_codec(tmp_path):
++    _cfg, _kp, _vp, research = baseline()
++    path = tmp_path / "dense.npz"
++    research.save(path)
++    loaded = load_generation_codec(path, device="cpu")
++    assert isinstance(loaded, ExperimentalCodec)
++    assert loaded.v_parameters.factor_a is None
++
++
++def test_worker_streams_factorized_codec_and_keeps_reference_batch(tmp_path, monkeypatch):
++    import sys
++    from types import SimpleNamespace
++    from rebuttal.adapters import worker
++
++    _, research, _production, _keys, _values = _manual_low_rank(seed=1, v_history=1, units=2, stride=4)
++    archive = tmp_path / "low_rank_r8.npz"
++    research.save(archive)
++    prompts = tmp_path / "prompts.txt"
++    prompts.write_text("placeholder\n")
++    monkeypatch.setattr(worker, "_load_bridge", lambda name: SimpleNamespace(install=lambda runtime, codec_factory: type(
++        "Base", (), {"__init__": lambda self: setattr(self, "tempokv_codec", codec_factory())}
++    )))
++    monkeypatch.setitem(sys.modules, "pipeline", SimpleNamespace())
++    monkeypatch.setitem(sys.modules, "pipeline.causal_inference", SimpleNamespace())
++    for name in ("TEMPOKV_HORIZON_FRAMES", "TEMPOKV_NUM_FRAMES", "TEMPOKV_SPAN_FRAMES",
++                 "TEMPOKV_BF16_LAG_FRAMES", "TEMPOKV_INCREMENTAL", "RANK"):
++        monkeypatch.setenv(name, "0")
++    pipeline_cls = worker.install(
++        {"frames": 717, "research_params": str(archive), "prompts": str(prompts), "output_dir": str(tmp_path)},
++        tmp_path,
++    )
++    pipeline = pipeline_cls()
++    assert isinstance(pipeline.tempokv_codec, TempoKVCodec)
++    assert pipeline.tempokv_codec.v_parameters.weight is None
++    assert pipeline.tempokv_codec.v_parameters.factor_a.device.type == "cpu"
++    assert __import__("os").environ["TEMPOKV_INCREMENTAL"] == "1"
++
++    dense_path = tmp_path / "dense.npz"
++    baseline()[3].save(dense_path)
++    monkeypatch.setenv("TEMPOKV_INCREMENTAL", "0")
++    dense_cls = worker.install(
++        {"frames": 717, "research_params": str(dense_path), "prompts": str(prompts), "output_dir": str(tmp_path)},
++        tmp_path,
++    )
++    dense_pipeline = dense_cls()
++    assert isinstance(dense_pipeline.tempokv_codec, ExperimentalCodec)
++    assert __import__("os").environ["TEMPOKV_INCREMENTAL"] == "0"
++
++
++def test_gpu_factorized_decode_status():
++    status = "RUN" if torch.cuda.is_available() else "NOT_RUN"
++    # CPU runs cover the PyTorch reference. The fused Triton kernel declines
++    # factorized spans so CUDA uses that same replay; this process did not
++    # execute it when CUDA is absent.
++    report = {"gpu_factorized_decode": status, "cuda": torch.cuda.is_available()}
++    print(json.dumps(report))
++    assert status == ("RUN" if torch.cuda.is_available() else "NOT_RUN")
+diff -ruN a/src/tempokv/codec.py b/src/tempokv/codec.py
+--- a/src/tempokv/codec.py	2026-11-08 21:29:08.000000000 +0000
++++ b/src/tempokv/codec.py	2026-11-08 13:38:17.494571433 +0000
+@@ -202,6 +202,15 @@
+     return innovation
+ 
+ 
++def _factorized_projection(
++    head_major: torch.Tensor,
++    factor_a: torch.Tensor,
++    factor_b: torch.Tensor,
++) -> torch.Tensor:
++    """Head-major ``(X @ A) @ B``. The square map ``A @ B`` is not formed."""
++    return torch.matmul(torch.matmul(head_major, factor_a[:, None]), factor_b[:, None])
++
++
+ def cross_projection(
+     source: torch.Tensor,
+     parameters: CrossKVParameters,
+@@ -211,9 +220,15 @@
+     """Project a reconstructed-K span through Cross(K) in one GEMM.
+ 
+     Encoder and decoder must both use it so their predictions match.
++    Factorized parameters apply ``(X @ A) @ B``; dense parameters apply ``X @ W``.
+     """
+-    weight = parameters.weight.to(source.device)
+     bias = parameters.bias.to(source.device)
++    factorized = parameters.factor_a is not None
++    if factorized:
++        factor_a = parameters.factor_a.to(source.device)
++        factor_b = parameters.factor_b.to(source.device)
++    else:
++        weight = parameters.weight.to(source.device)
+     batch, heads, tokens, dim = source.shape
+     with _cuda_matmul_precision(source.device, matmul_precision):
+         # Head-major and contiguous: the cache read is usually a strided
+@@ -221,7 +236,10 @@
+         head_major = source.permute(1, 0, 2, 3).to(
+             dtype=torch.float32, memory_format=torch.contiguous_format
+         )
+-        prediction = torch.matmul(head_major, weight[:, None, :, :])
++        if factorized:
++            prediction = _factorized_projection(head_major, factor_a, factor_b)
++        else:
++            prediction = torch.matmul(head_major, weight[:, None, :, :])
+         # A span-sized FP32 buffer is large; release the source copy before
+         # the bias pass so two of them never coexist.
+         del head_major
+@@ -244,11 +262,23 @@
+     """Predict V from a precomputed ``Cross(K)+bias`` and newest-to-oldest V history."""
+     resolved_history = () if history is None else tuple(history)
+     order = min(len(resolved_history), parameters.history_length)
+-    weight = parameters.weight.to(source.device)
+     bias = parameters.bias.to(source.device)
++    factorized = parameters.factor_a is not None
++    # Dense keeps the historical eager move even when a projection is supplied.
++    if not factorized:
++        weight = parameters.weight.to(source.device)
+     with _cuda_matmul_precision(source.device, matmul_precision):
+         if projection is not None:
+             prediction = projection if legacy else projection.clone()
++        elif factorized:
++            factor_a = parameters.factor_a.to(source.device)
++            factor_b = parameters.factor_b.to(source.device)
++            prediction = _factorized_projection(
++                source.float().permute(1, 0, 2, 3), factor_a, factor_b
++            ).permute(1, 0, 2, 3)
++            prediction = prediction + bias.view(
++                1, source.shape[1], 1, source.shape[-1]
++            )
+         elif legacy:
+             prediction = torch.matmul(
+                 source.float().permute(1, 0, 2, 3),
+@@ -911,9 +941,14 @@
+         )
+     # Legacy mode picks its decode route deliberately, so a silent PyTorch
+     # fallback would hide both a correctness and a throughput regression.
++    # Factorized CrossKV is the exception: its Triton dot is not the reference
++    # ``(X @ A) @ B`` matmul, so a decline uses this PyTorch replay on purpose.
+     effective_strict_triton = (
+         strict_triton or packed.compatibility_mode == "legacy"
+     )
++    factorized_cross = (
++        packed.cross_kv is not None and packed.cross_kv.factor_a is not None
++    )
+     if use_triton and packed.anchor_quant.is_cuda:
+         try:
+             from .triton_ops import decode as decode_triton
+@@ -929,10 +964,10 @@
+                 if packed.channel_mean is not None:
+                     accelerated.add_(packed.channel_mean.unsqueeze(2))
+                 return accelerated
+-            if effective_strict_triton:
++            if effective_strict_triton and not factorized_cross:
+                 raise RuntimeError("this packed layout is not supported by Triton")
+         except Exception as error:
+-            if effective_strict_triton:
++            if effective_strict_triton and not factorized_cross:
+                 raise
+             warnings.warn(
+                 f"Triton decode failed; using the PyTorch decoder: {error}",
+diff -ruN a/src/tempokv/fitting.py b/src/tempokv/fitting.py
+--- a/src/tempokv/fitting.py	2026-11-08 21:29:08.000000000 +0000
++++ b/src/tempokv/fitting.py	2026-11-08 13:38:19.806528996 +0000
+@@ -1996,7 +1996,11 @@
+     v_tensors = (
+         (cross.history_weights, cross.history_bias)
+         if isinstance(cross, TemporalParameters)
+-        else (cross.weight, cross.history_weights, cross.bias)
++        else (
++            (cross.weight, cross.history_weights, cross.bias)
++            if cross.factor_a is None
++            else (cross.factor_a, cross.factor_b, cross.history_weights, cross.bias)
++        )
+     )
+     for tensor in (temporal.history_weights, temporal.history_bias, *v_tensors):
+         identity.update(tensor.detach().cpu().contiguous().numpy().tobytes())
+@@ -2030,6 +2034,8 @@
+         coordinate_system,
+         cross.history_weights,
+         cross.projection_source,
++        cross.factor_a,
++        cross.factor_b,
+     )
+ 
+ 
+diff -ruN a/src/tempokv/parameters.py b/src/tempokv/parameters.py
+--- a/src/tempokv/parameters.py	2026-11-08 21:29:08.000000000 +0000
++++ b/src/tempokv/parameters.py	2026-11-08 13:38:04.834848847 +0000
+@@ -196,11 +196,100 @@
+         raise ValueError("previous-frame copying has no parameter file to save")
+ 
+ 
++def _finalize_factorized_cross(
++    parameters: "CrossKVParameters",
++    factor_a: torch.Tensor | np.ndarray,
++    factor_b: torch.Tensor | np.ndarray,
++    bias: torch.Tensor | np.ndarray,
++    history_weights: torch.Tensor | np.ndarray | None,
++    layer_ids: tuple[int, ...] | None,
++) -> None:
++    """Store (X @ A) @ B factors. A dense A @ B matrix is never created."""
++    factor_a = _tensor(factor_a)
++    factor_b = _tensor(factor_b)
++    bias = _tensor(bias)
++    if factor_a.ndim == 3:
++        heads, dim, rank = (int(item) for item in factor_a.shape)
++        layers = None
++        if tuple(factor_b.shape) != (heads, rank, dim):
++            raise ValueError(
++                "factor_b must have shape [H,R,D] when factor_a is [H,D,R]"
++            )
++        if tuple(bias.shape) != (heads, dim):
++            raise ValueError(f"bias must have shape {(heads, dim)}")
++    elif factor_a.ndim == 4:
++        layers, heads, dim, rank = (int(item) for item in factor_a.shape)
++        if tuple(factor_b.shape) != (layers, heads, rank, dim):
++            raise ValueError(
++                "factor_b must have shape [L,H,R,D] when factor_a is [L,H,D,R]"
++            )
++        if tuple(bias.shape) != (layers, heads, dim):
++            raise ValueError(f"bias must have shape {(layers, heads, dim)}")
++    else:
++        raise ValueError("factor_a must have shape [H,D,R] or [L,H,D,R]")
++    if not 1 <= rank <= dim:
++        raise ValueError("factorized rank must be in [1, D]")
++    if history_weights is None:
++        if layers is None:
++            history_weights = factor_a.new_empty((0, heads, dim, dim))
++        else:
++            history_weights = factor_a.new_empty((layers, 0, heads, dim, dim))
++    else:
++        history_weights = _tensor(history_weights)
++    if layers is None:
++        valid_dense_history = (
++            history_weights.ndim == 4
++            and tuple(history_weights.shape[1:]) == (heads, dim, dim)
++        )
++        valid_diagonal_history = (
++            history_weights.ndim == 3
++            and tuple(history_weights.shape[1:]) == (heads, dim)
++        )
++        history_axis = 0
++        expected_dense = f"[P,{heads},{dim},{dim}]"
++        expected_diagonal = f"[P,{heads},{dim}]"
++    else:
++        valid_dense_history = (
++            history_weights.ndim == 5
++            and history_weights.shape[0] == layers
++            and tuple(history_weights.shape[2:]) == (heads, dim, dim)
++        )
++        valid_diagonal_history = (
++            history_weights.ndim == 4
++            and history_weights.shape[0] == layers
++            and tuple(history_weights.shape[2:]) == (heads, dim)
++        )
++        history_axis = 1
++        expected_dense = f"[{layers},P,{heads},{dim},{dim}]"
++        expected_diagonal = f"[{layers},P,{heads},{dim}]"
++    if not (valid_dense_history or valid_diagonal_history):
++        raise ValueError(
++            "history_weights must have dense shape "
++            f"{expected_dense} or diagonal shape {expected_diagonal}"
++        )
++    history_length = int(history_weights.shape[history_axis])
++    if not 0 <= history_length <= 5:
++        raise ValueError(
++            "history_weights must contain between 0 and 5 V history maps"
++        )
++    object.__setattr__(parameters, "weight", None)
++    object.__setattr__(parameters, "factor_a", factor_a)
++    object.__setattr__(parameters, "factor_b", factor_b)
++    object.__setattr__(parameters, "bias", bias)
++    object.__setattr__(parameters, "history_weights", history_weights)
++    object.__setattr__(parameters, "layer_ids", _layer_ids(layer_ids, layers))
++
++
+ @dataclass(frozen=True, slots=True)
+ class CrossKVParameters:
+-    """Per-head source/current-V-history projection parameters."""
++    """Per-head source/current-V-history projection parameters.
++
++    Dense archives store a square ``weight``. Factorized archives store
++    ``factor_a`` ``[H,D,R]`` or ``[L,H,D,R]`` and ``factor_b`` ``[H,R,D]`` or
++    ``[L,H,R,D]`` and leave ``weight`` empty so the decoder computes ``(X @ A) @ B``.
++    """
+ 
+-    weight: torch.Tensor
++    weight: torch.Tensor | None
+     bias: torch.Tensor
+     stride: int | None = None
+     layer_ids: tuple[int, ...] | None = None
+@@ -210,8 +299,29 @@
+     history_weights: torch.Tensor | np.ndarray | None = None
+     # Old archives predate this field and always project reconstructed K.
+     projection_source: ProjectionSource = "cross_kv"
++    factor_a: torch.Tensor | np.ndarray | None = None
++    factor_b: torch.Tensor | np.ndarray | None = None
+ 
+     def __post_init__(self) -> None:
++        if self.factor_a is not None or self.factor_b is not None:
++            if self.factor_a is None or self.factor_b is None:
++                raise ValueError("factorized CrossKV requires both factor_a and factor_b")
++            if self.weight is not None:
++                raise ValueError(
++                    "factorized CrossKV must not store a dense weight; "
++                    "projection is (X @ A) @ B"
++                )
++            _finalize_factorized_cross(
++                self,
++                self.factor_a,
++                self.factor_b,
++                self.bias,
++                self.history_weights,
++                self.layer_ids,
++            )
++            return
++        if self.weight is None:
++            raise ValueError("CrossKV weight is required when factors are absent")
+         weight = _tensor(self.weight)
+         bias = _tensor(self.bias)
+         if weight.ndim not in (3, 4) or weight.shape[-1] != weight.shape[-2]:
+@@ -291,8 +401,14 @@
+         )
+ 
+     @property
++    def factorized(self) -> bool:
++        """Whether Cross(K) is the product ``(X @ A) @ B`` rather than ``X @ W``."""
++        return self.factor_a is not None
++
++    @property
+     def layered(self) -> bool:
+-        return self.weight.ndim == 4
++        basis = self.factor_a if self.factor_a is not None else self.weight
++        return basis.ndim == 4
+ 
+     @property
+     def history_length(self) -> int:
+@@ -326,7 +442,7 @@
+             return self
+         index = self.layer_ids.index(int(layer))
+         return CrossKVParameters(
+-            self.weight[index],
++            None if self.weight is None else self.weight[index],
+             self.bias[index],
+             self.stride,
+             codec_signature=self.codec_signature,
+@@ -334,18 +450,25 @@
+             coordinate_system=self.coordinate_system,
+             history_weights=self.history_weights[index],
+             projection_source=self.projection_source,
++            factor_a=None if self.factor_a is None else self.factor_a[index],
++            factor_b=None if self.factor_b is None else self.factor_b[index],
+         )
+ 
++    def _resident_tensors(self) -> tuple[torch.Tensor, ...]:
++        tensors = [self.bias, self.history_weights]
++        if self.weight is not None:
++            tensors.append(self.weight)
++        if self.factor_a is not None:
++            tensors.append(self.factor_a)
++            tensors.append(self.factor_b)
++        return tuple(tensors)
++
+     def to(self, device: torch.device | str) -> "CrossKVParameters":
+         resolved_device = torch.device(device)
+-        if (
+-            self.weight.device == resolved_device
+-            and self.bias.device == resolved_device
+-            and self.history_weights.device == resolved_device
+-        ):
++        if all(tensor.device == resolved_device for tensor in self._resident_tensors()):
+             return self
+         return CrossKVParameters(
+-            self.weight.to(resolved_device),
++            None if self.weight is None else self.weight.to(resolved_device),
+             self.bias.to(resolved_device),
+             self.stride,
+             self.layer_ids,
+@@ -354,35 +477,43 @@
+             self.coordinate_system,
+             self.history_weights.to(resolved_device),
+             self.projection_source,
++            None if self.factor_a is None else self.factor_a.to(resolved_device),
++            None if self.factor_b is None else self.factor_b.to(resolved_device),
+         )
+ 
+     def save(self, path: str | Path) -> None:
+-        np.savez_compressed(
+-            path,
+-            kind=np.asarray("cross_kv"),
+-            weight=self.weight.cpu().numpy(),
+-            bias=self.bias.cpu().numpy(),
+-            history_weights=self.history_weights.cpu().numpy(),
+-            history_length=np.asarray(self.history_length, dtype=np.int32),
++        payload: dict[str, Any] = {
++            "kind": np.asarray("cross_kv"),
++            "bias": self.bias.cpu().numpy(),
++            "history_weights": self.history_weights.cpu().numpy(),
++            "history_length": np.asarray(self.history_length, dtype=np.int32),
+             # dense vs diagonal is a real layout difference the decoder routes
+             # on, so it stays recorded and is checked back on load.
+-            history_mode=np.asarray(self.history_mode),
+-            stride=np.asarray(-1 if self.stride is None else self.stride, dtype=np.int32),
+-            layer_ids=np.asarray(
++            "history_mode": np.asarray(self.history_mode),
++            "stride": np.asarray(-1 if self.stride is None else self.stride, dtype=np.int32),
++            "layer_ids": np.asarray(
+                 [] if self.layer_ids is None else self.layer_ids, dtype=np.int32
+             ),
+-            codec_signature=np.asarray(self.codec_signature or ""),
+-            parameter_set_id=np.asarray(self.parameter_set_id or ""),
+-            coordinate_system=np.asarray(self.coordinate_system or ""),
+-            projection_source=np.asarray(self.projection_source),
+-        )
++            "codec_signature": np.asarray(self.codec_signature or ""),
++            "parameter_set_id": np.asarray(self.parameter_set_id or ""),
++            "coordinate_system": np.asarray(self.coordinate_system or ""),
++            "projection_source": np.asarray(self.projection_source),
++        }
++        if self.factor_a is not None:
++            # Factors only. The square map A @ B is not stored and not applied.
++            payload["factor_a"] = self.factor_a.cpu().numpy()
++            payload["factor_b"] = self.factor_b.cpu().numpy()
++        else:
++            payload["weight"] = self.weight.cpu().numpy()
++        np.savez_compressed(path, **payload)
+ 
+     @classmethod
+     def load(cls, path: str | Path) -> "CrossKVParameters":
+         with np.load(path, allow_pickle=False) as data:
+             _check_kind(data, "cross_kv")
++            factorized = "factor_a" in data or "factor_b" in data
+             return cls(
+-                data["weight"],
++                None if factorized else data["weight"],
+                 data["bias"],
+                 history_weights=(
+                     data["history_weights"] if "history_weights" in data else None
+@@ -393,6 +524,8 @@
+                     if "projection_source" in data
+                     else "cross_kv"
+                 ),
++                factor_a=data["factor_a"] if factorized else None,
++                factor_b=data["factor_b"] if factorized else None,
+                 **_metadata(data),
+             )
+ 
+diff -ruN a/src/tempokv/triton_ops.py b/src/tempokv/triton_ops.py
+--- a/src/tempokv/triton_ops.py	2026-11-08 21:29:08.000000000 +0000
++++ b/src/tempokv/triton_ops.py	2026-11-08 13:38:18.438553816 +0000
+@@ -973,6 +973,11 @@
+ 
+     assert source is not None and packed.cross_kv is not None
+     parameters = packed.cross_kv.to(output.device)
++    if parameters.factor_a is not None:
++        # The fused dot loads a square [D, D] map. Factorized spans stay on the
++        # PyTorch replay, which is the (X @ A) @ B reference, including on GPU.
++        _decline("factorized_cross_kv")
++        return None
+     if parameters.layered:
+         _decline("layered_parameters")
+         return None

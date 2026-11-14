@@ -1,0 +1,128 @@
+# Paired cache recovery
+
+The question is how much departure from the BF16 reference remains reversible
+after low-bit history has already affected later clean latents and cache writes.
+Each prompt/seed has one native reference and one shared low-bit warm prefix.
+After the fork, the branches use the same initial noise and the runtime verifies
+the same RNG state before and after every denoise and clean-write call.
+
+| Branch | History at the fork | Subsequent writes |
+|---|---|---|
+| `continue` | Same low-bit warm state | Keep rounding newly aged chunks |
+| `stop` | Keep existing rounded BF16 values | BF16 |
+| `undo_rounding` | Restore the exact pre-rounding values saved in the warm run | BF16 |
+| `reencode_own` | Replay the warm run's own clean latents in order at native absolute positions | BF16 |
+| `sham` | Replay the same clean latents, then discard that cache and use the stopped state | BF16 |
+| `reencode_reference` | Replay clean latents from the paired BF16 reference | BF16 |
+
+`undo_rounding` and `reencode_reference` are diagnostic controls with
+unavailable information at deployment. Undoing rounding preserves the
+history-dependent hidden state that existed when each entry was first written.
+Re-encoding uses only one clean write per chunk and does not re-denoise the
+prefix. `sham` must match `stop` bitwise, and reference re-encoding must
+match native continuation bitwise. The 16-bit setting tests the same branch
+paths with identity rounding.
+
+The native attention kernel reads the full history. Key rounding is applied in
+post-RoPE coordinates and values use their native coordinates. Current and
+recent chunks are protected during rounding. A span is rounded once when it
+first ages out of protection. Every branch has the same live token positions
+and the same future query–key count. Re-encoding adds separate prefix work.
+The native BF16 backing and CPU diagnostic snapshots remain allocated. These
+experiments report neither packed-cache savings nor perceptual video quality.
+
+The causal fork with a shared low-bit prefix, exact undo-rounding, and sham
+controls addresses reversibility. LongLive re-caches on prompt switching,
+ID-Forcing changes cache-write provenance and conditioning for extrapolation,
+and the 33-method benchmark varies when low-bit quantization is applied.
+
+- [LongLive, §3.1](https://arxiv.org/html/2509.22622v2)
+- [ID-Forcing, §3.1–3.2](https://arxiv.org/html/2610.03120v1)
+- [33-method benchmark, Appendix A](https://arxiv.org/html/2603.27469v1)
+
+## Run
+
+```bash
+python scripts/research/cache_recovery.py --bits 4 --dry-run
+
+CUDA_VISIBLE_DEVICES=0 python scripts/research/cache_recovery.py \
+  --checkpoint "$SELF_FORCING_CHECKPOINT" --model-root "$WAN_MODEL_DIR" \
+  --prompts "$PROMPTS" --prompt-start 2 --prompt-count 2 --seed 0 \
+  --bits 4 --fork-chunk 6 --future-chunks 8 --protect-chunks 2 \
+  --output-dir reports/research/cache-recovery-pilot-4bit
+
+python -m pytest scripts/tests/test_research_cache_recovery.py -q
+```
+
+The CLI requires the repository's native Self-Forcing inference environment.
+The launch manifest and one immutable JSON document per prompt/seed use
+`research.cache_recovery.v1`. A document stores the before-fork clean-latent
+errors, branch-level costs, K and V fork errors for each absolute prefix
+chunk, and an ordered vector of future clean-latent relative L2 values.
+Vector index 0 is the first chunk after the fork. The two branch hashes of
+the prefix distinguish the observable warm history from the input that was
+used to construct the oracle cache. Compare branches within the same prompt,
+seed, bit width and fork location. Compute prompt-level statistics before
+aggregating repeated chunks.
+
+
+## Matched exposure control
+
+With `--warm-start-chunk 6 --fork-chunk 6`, all six prefix chunks are
+generated and cached in native BF16. At the fork, the runner rounds exactly
+the same old spans as the default three-exposure run. The amount, positions
+and precision of rounded K/V at the fork are thus controlled while changing
+the number of prior chunks that already read those values. The zero-exposure
+control requires its prefix, undo-rounding continuation and own-reencode
+continuation to match the native reference bitwise. Intermediate warm start
+positions are supported and the report records the actual exposure count.
+
+## Read precision placement
+
+`--read-precision-study` confines rounding to the final prefix chunk and
+restores the earlier cache to its original values before future generation.
+The reference, all-rounded, writer-only rounded, and clean-protected arms
+form a factorial comparison. Writer-only rounding must preserve the
+denoised prefix and layer-0 K/V exactly. The all-rounded and clean-protected
+arms must have identical denoised prefixes. Trajectory contrasts compare
+these pairs directly and normalize all differences to the BF16 reference.
+
+The four denoise-protected arms and the clean-protected arm read the original
+aged K/V once each. Recent and current positions stay at native precision in
+every arm. The uniform arm divides the same ideal read bytes over all
+passes, with higher-bit positions evenly spaced through the aged region.
+Accounting includes packed coefficient bits and FP32 group scales, and
+excludes headers, alignment and hardware transfer overhead. In the four-step
+Wan 4-bit setup, this gives a fixed 6-bit/7-bit mix with 30% of aged
+positions at 7 bits on every pass. All arms run the same native attention
+and number of calls. Packed storage and selective retrieval are outside the
+probe.
+
+```bash
+python scripts/research/cache_recovery.py --read-precision-study --bits 4 --dry-run
+```
+
+To run on GPU, add `--read-precision-study` to the real invocation above.
+It defaults the first low-bit read to the last prefix chunk. Its immutable
+per-prompt files use `research.cache_read_precision.v1` and record the actual
+call timesteps, one-read cost, layer-by-layer cache errors, per-chunk latent
+errors and the four factorial contrasts.
+
+The companion `--read-precision-role-study --bits 4` keeps the precision
+schedule uniform over calls and swaps the allocation between K and V.
+It includes the identical balanced 6/7-bit arm and the all-4-bit anchor.
+With the Wan shape and 64-element groups, the favored role uses 8 bits
+everywhere and the other role uses 4/5 bits with 60% of positions at 5 bits.
+Both directions use exactly the same ideal read bytes including scales as
+the balanced arm. The native coordinate convention is unchanged.
+
+### Repeated low-precision reads
+
+Use `--persistent-read-precision-study --bits 4` for a clean six-chunk
+prefix followed by low-precision reads on every subsequent chunk.
+The old region grows as new positions age out of the protected two-chunk
+window. Each branch uses its own newly written K/V. The first- and
+last-denoise protection arms spend one native read on every affected
+chunk. The balanced arm spreads the same ideal bytes across all calls.
+The all-4-bit arm is a lower-read-budget anchor. The probe holds native
+backing for the oracle reads and evaluates latent trajectories only.

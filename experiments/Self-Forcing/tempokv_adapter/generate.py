@@ -171,6 +171,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="use the config's Triton flags instead of enforcing strict acceleration",
     )
     parser.add_argument("--skip-existing", action="store_true")
+    parser.add_argument("--save-latents", action="store_true")
     parser.add_argument(
         "--profile",
         action="store_true",
@@ -334,6 +335,8 @@ def _generation_command(
         # Horizon probing only needs the cache lifecycle.  Skipping VAE and
         # video encoding keeps the probe focused on the OOM boundary.
         command.append("--skip_video_save")
+    if args.save_latents:
+        command.append("--save_latents")
     return command
 
 

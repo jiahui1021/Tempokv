@@ -94,7 +94,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         description="Run one distributed Self-Forcing inference worker."
     )
     parser.add_argument(
-        "--mode", choices=("tempokv", "bf16", "trace", "spectral", "spectral_kv"), default="tempokv"
+        "--mode", choices=("tempokv", "bf16", "trace", "spectral", "spectral_kv", "cache_recovery"), default="tempokv"
     )
     parser.add_argument(
         "--profile",
@@ -162,6 +162,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             from spectral_bridge import install
 
             install(runtime_root)
+        elif args.mode == "cache_recovery":
+            if os.environ.get("RESEARCH_ENABLE") == "1":
+                raise ValueError("cache recovery and the core research suite use separate workers")
+            from cache_recovery_bridge import install
+
+            install()
+            arguments.append("--skip_video_save")
         if os.environ.get("RESEARCH_ENABLE") == "1":
             from research_bridge import install as install_research
             install_research(runtime_root)
