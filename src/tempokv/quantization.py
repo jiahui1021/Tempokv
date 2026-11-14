@@ -1,10 +1,27 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
+
 import torch
 
 
 # The packer's own ceiling; configs stop residuals at 8 and anchors at 15.
 MAX_BITS = 16
+
+
+@contextmanager
+def cuda_matmul_precision(device: torch.device, precision: str):
+    """Apply a local policy for CUDA FP32 matrix multiplications."""
+    if device.type != "cuda":
+        yield
+        return
+    backend = torch.backends.cuda.matmul
+    previous = backend.allow_tf32
+    backend.allow_tf32 = precision == "tf32"
+    try:
+        yield
+    finally:
+        backend.allow_tf32 = previous
 
 
 def code_dtype(bits: int) -> torch.dtype:

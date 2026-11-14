@@ -53,6 +53,7 @@ def load_codec(
     *,
     triton_cache: str | Path | None = None,
     overrides: Mapping[str, Any] | None = None,
+    allow_higgs: bool = False,
 ) -> TempoKVCodec:
     """Load a codec from a JSON config (plus overrides) and fitted parameters.
 
@@ -60,6 +61,8 @@ def load_codec(
     projection second, which under ``v_to_k`` are V then K.
     """
     config = load_config(config_path, overrides)
+    if config.uses_higgs and not allow_higgs:
+        raise ValueError("TempoKV HIGGS generation is enabled only for Self-Forcing")
     check_deployable_cross_kv_layout(config)
     if config.use_triton:
         configure_triton_cache(triton_cache)
@@ -72,7 +75,7 @@ def load_codec(
     return TempoKVCodec(temporal, cross_kv, config)
 
 
-def load_codec_from_env(prefix: str = "TEMPOKV_") -> TempoKVCodec:
+def load_codec_from_env(prefix: str = "TEMPOKV_", *, allow_higgs: bool = False) -> TempoKVCodec:
     """Load the codec passed to a model by ``run_video_pipeline.py``."""
     required = {
         "CONFIG_PATH": os.environ.get(f"{prefix}CONFIG_PATH"),
@@ -91,4 +94,5 @@ def load_codec_from_env(prefix: str = "TEMPOKV_") -> TempoKVCodec:
         required["K_PARAMS_PATH"],
         required["V_PARAMS_PATH"],
         triton_cache=os.environ.get(f"{prefix}TRITON_CACHE"),
+        allow_higgs=allow_higgs,
     )

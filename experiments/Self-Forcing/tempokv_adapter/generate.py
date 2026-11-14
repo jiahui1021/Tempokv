@@ -254,6 +254,9 @@ def _validate_parameters(
         "k_bits": config.k_bits,
         "v_bits": config.v_bits,
         "anchor_bits": config.anchor_bits,
+        "residual_quantizer": config.residual_quantizer,
+        "higgs_group_size": config.higgs_group_size if config.uses_higgs else None,
+        "higgs_anchor": config.higgs_anchor,
         "v_history_length": codec.v_parameters.history_length,
         "v_history_mode": (
             "temporal"
@@ -844,7 +847,11 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         report["parameters"] = parameters
         report["runtime_config"] = str(paths["runtime_config"])
         requested_persistent_units = persistent_units_per_launch()
-        report["persistent_units_per_launch"] = {
+        if config.uses_higgs:
+            report["cache_decoder"] = "torch_higgs"
+        else:
+            report["cache_decoder"] = "triton" if not args.torch_decoder else "torch"
+        report["persistent_units_per_launch"] = None if config.uses_higgs else {
             "requested": requested_persistent_units,
             "k": (
                 min(requested_persistent_units, 8)
@@ -882,7 +889,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         environment["SPECTRAL_MODEL"] = str(paths["checkpoint"])
     if args.mode == "tempokv":
         runtime_payload = asdict(config)
-        if not args.allow_triton_fallback and not args.torch_decoder:
+        if not config.uses_higgs and not args.allow_triton_fallback and not args.torch_decoder:
             runtime_payload["use_triton"] = True
             runtime_payload["strict_triton"] = True
         paths["runtime_config"].write_text(
@@ -1016,8 +1023,12 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         raise RuntimeError(
             "benchmark run must generate every requested sample without skips"
         )
+    if args.mode == "tempokv" and config.uses_higgs and generated_entries:
+        if not performance["decode_routes"].get("higgs", 0):
+            raise RuntimeError("Self-Forcing did not read any HIGGS-compressed cache")
     if (
         args.mode == "tempokv"
+        and not config.uses_higgs
         and not args.allow_triton_fallback
         and not args.torch_decoder
         and generated_entries

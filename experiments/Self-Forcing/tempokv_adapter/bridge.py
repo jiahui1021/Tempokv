@@ -105,7 +105,7 @@ def install(
             # TempoKV needs the pre-RoPE frame-addressable cache; BF16 keeps the dense one.
             self._uses_pre_rope_cache = True
             self.tempokv_codec = (
-                load_codec_from_env() if codec_factory is None else codec_factory()
+                load_codec_from_env(allow_higgs=True) if codec_factory is None else codec_factory()
             )
             config = self.tempokv_codec.config
             self._tempokv_rope_precision = "complex64"

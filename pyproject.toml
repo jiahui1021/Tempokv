@@ -95,5 +95,8 @@ where = ["src", "experiments/LongCat", "experiments/Causal-Forcing"]
 include = ["tempokv*", "longcat*", "longcat_video*", "causal_forcing*"]
 namespaces = true
 
+[tool.setuptools.package-data]
+tempokv = ["higgs_grids/*.pt", "higgs_grids/*.json", "higgs_grids/LICENSE", "higgs_grids/SOURCE.md"]
+
 [tool.pytest.ini_options]
 pythonpath = ["src", "experiments/LongCat", "experiments/Causal-Forcing"]

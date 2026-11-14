@@ -48,6 +48,7 @@ dist/
 *.npz
 *.npy
 *.pt
+!/src/tempokv/higgs_grids/EDEN2-*.pt
 *.pth
 *.safetensors
 

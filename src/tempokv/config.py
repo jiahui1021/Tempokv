@@ -123,6 +123,9 @@ class CodecConfig:
     # Subtract the Jensen bias (arXiv 2605.26266) from cached attention scores.
     # Stored values are unchanged, so it stays out of format_signature().
     jensen_correction: bool = False
+    residual_quantizer: str = "scalar"
+    higgs_group_size: int = 512
+    higgs_anchor: bool = False
 
     def __post_init__(self) -> None:
         implicit_family = self.fit_mode is None
@@ -162,13 +165,15 @@ class CodecConfig:
         # JSON can spell an integer as ``4.0``; coerce so the signature matches
         # the identical integer config.
         for name in ("k_bits", "v_bits", "anchor_bits", "group_size", "stride",
-                     "v_history_length", "k_history_length"):
+                     "v_history_length", "k_history_length", "higgs_group_size"):
             value = getattr(self, name)
             if value is not None:
                 if isinstance(value, bool) or int(value) != value:
                     raise ValueError(f"{name} must be a whole number, got {value!r}")
                 object.__setattr__(self, name, int(value))
         self._validate()
+        if self.uses_higgs:
+            object.__setattr__(self, "use_triton", False)
 
     def _validate(self) -> None:
         def require(condition: bool, message: str) -> None:
@@ -188,6 +193,18 @@ class CodecConfig:
                 "k_history_length must be from 0 to 8 or null")
         require(self.residual_mode in {"symmetric", "asymmetric"},
                 "residual_mode must be symmetric or asymmetric")
+        require(self.residual_quantizer in {"scalar", "higgs"},
+                "residual_quantizer must be scalar or higgs")
+        require(isinstance(self.higgs_anchor, bool), "higgs_anchor must be a boolean")
+        if self.uses_higgs:
+            group = self.higgs_group_size
+            require(group >= 2 and group & (group - 1) == 0,
+                    "higgs_group_size must be a power of two >= 2")
+            require(not self.higgs_anchor or self.anchor_bits <= 8 or self.raw_anchor,
+                    "HIGGS anchors support 1–8 bits or 16 for an unquantized anchor")
+            require(not self.jensen_correction,
+                    "Jensen correction requires scalar quantization")
+            require(not self.strict_triton, "HIGGS uses the Torch decoder")
         require(self.scale_dtype in DTYPES and self.reconstruction_dtype in DTYPES,
                 "scale_dtype and reconstruction_dtype must be float32, float16 or bfloat16")
         require(not self.raw_anchor or self.reconstruction_dtype != "float32",
@@ -249,6 +266,10 @@ class CodecConfig:
                     "temporal V configurations must use cross_kv_weight_mode=layer_shared")
 
     @property
+    def uses_higgs(self) -> bool:
+        return self.residual_quantizer == "higgs" or (self.higgs_anchor and not self.raw_anchor)
+
+    @property
     def raw_anchor(self) -> bool:
         """Whether the anchor skips the quantizer and is stored as-is."""
         return self.anchor_bits == RAW_ANCHOR_BITS
@@ -302,6 +323,19 @@ class CodecConfig:
         # fail to load; quantized anchors keep their signatures.
         if self.raw_anchor:
             payload["anchor_mode"] = "raw"
+        if self.uses_higgs:
+            higgs_bits = []
+            if self.residual_quantizer == "higgs":
+                higgs_bits.extend((self.k_bits, self.v_bits))
+            if self.higgs_anchor and not self.raw_anchor:
+                higgs_bits.append(self.anchor_bits)
+            payload["higgs_version"] = (
+                "edenn2_v1" if all(bits in {2, 3, 4} for bits in higgs_bits)
+                else "edenn2_gaussian_scalar_v1"
+            )
+            payload["residual_quantizer"] = self.residual_quantizer
+            payload["higgs_group_size"] = self.higgs_group_size
+            payload["higgs_anchor"] = self.higgs_anchor and not self.raw_anchor
         return "tempokv-codec-v5:" + json.dumps(
             payload, sort_keys=True, separators=(",", ":")
         )

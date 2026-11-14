@@ -1,0 +1,9 @@
+{
+  "fit_mode": "native",
+  "k_bits": 4,
+  "v_bits": 4,
+  "k_history_length": 2,
+  "v_history_length": 1,
+  "residual_quantizer": "higgs",
+  "higgs_group_size": 512
+}

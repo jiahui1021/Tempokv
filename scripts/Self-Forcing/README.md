@@ -173,6 +173,35 @@ TempoKV 生成至少需要 27 个 latent 帧，约等于 105 个最终视频帧�
 都会显示 `60/60`。每个 block 内部仍执行原模型的 4 次去噪和 1 次 clean cache
 更新，进度条不会把内部 4 次去噪重复计数。
 
+### 选择 HIGGS 量化
+
+拟合与生成使用同一份 `CONFIG`。Self-Forcing 提供两种 HIGGS 配置：
+
+| `CONFIG` | 每段开头的 anchor | K/V 预测残差 |
+| --- | --- | --- |
+| `experiments/Self-Forcing/configs/tempokv_higgs.json` | HIGGS 4-bit | HIGGS 4-bit |
+| `experiments/Self-Forcing/configs/tempokv_higgs_residual.json` | 对称 INT4 | HIGGS 4-bit |
+| `configs/native.json` | 对称 INT4 | 原整数 INT4 |
+
+```bash
+export CONFIG=experiments/Self-Forcing/configs/tempokv_higgs.json
+TRACE_FILE=/data/self_forcing_trace.npz bash scripts/fit_params.sh self-forcing
+CHECKPOINT=/models/self_forcing_dmd.pt \
+WAN_MODEL_DIR=/models/Wan2.1-T2V-1.3B \
+PROMPTS=assets/moviegen128_first30.txt \
+bash scripts/Self-Forcing/run_tempokv.sh
+```
+
+HIGGS 按 512 个通道分组。K/V 残差可用 `BITS` 或分别用 `K_BITS`、`V_BITS`
+选 1–8 bit。完整 HIGGS 配置的 anchor 可用 `ANCHOR_BITS` 选 1–8 bit，设为 16
+则保留原始 BF16。2–4 bit 使用 AquaKV 的二维向量码本，1 bit 和 5–8 bit 使用
+Hadamard 变换后的高斯标量码本。拟合和生成应传入相同位宽。参数目录和生成目录会带
+`-higgs-g512` 后缀，anchor 也用 HIGGS 时再加 `-anchorhiggs`。
+
+HIGGS 使用 PyTorch 解码路径。CUDA 环境安装 `fast-hadamard-transform`
+后会使用它的 Hadamard 算子，否则使用 PyTorch 实现。HIGGS 不适用标量量化的
+`JENSEN=1` 修正。
+
 ## 4. BF16 生成
 
 ```bash

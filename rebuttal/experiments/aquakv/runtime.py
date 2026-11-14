@@ -144,7 +144,7 @@ class AquaKVCache:
                                  precision=self.rope_precision)
                 key_parts.append(rotated.to(v.dtype))
                 value_parts.append(cv[:, begin:stop])
-        query = rotate(q, grid_sizes, freqs, start_frame=start//self.frame_seqlen, precision="native").to(v.dtype)
+        query = rotate(q, grid_sizes, freqs, start_frame=start//self.frame_seqlen, precision=self.rope_precision).to(v.dtype)
         keys, values = torch.cat(key_parts, dim=1), torch.cat(value_parts, dim=1)
         result = attention(query, keys, values)
         self.next_layer = (layer+1) % self.predictor.layers

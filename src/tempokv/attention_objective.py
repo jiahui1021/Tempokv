@@ -12,7 +12,7 @@ import torch.nn.functional as F
 
 from .config import CodecConfig
 from .codec import _cuda_matmul_precision, _dtype, anchor_roundtrip
-from .quantization import roundtrip
+from .codec import residual_roundtrip as _round_trip
 
 
 EPS = 1e-12
@@ -22,18 +22,6 @@ def _reconstruction_dtype(config: CodecConfig) -> torch.dtype:
     """The dtype the codec stores reconstructions in."""
     return _dtype(config.reconstruction_dtype)
 
-
-
-def _round_trip(
-    value: torch.Tensor, *, bits: int, config: CodecConfig, symmetric: bool
-) -> torch.Tensor:
-    return roundtrip(
-        value,
-        bits=bits,
-        group_size=config.group_size,
-        scale_dtype=_dtype(config.scale_dtype),
-        symmetric=symmetric,
-    )
 
 
 def temporal_rollout(

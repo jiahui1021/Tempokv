@@ -20,7 +20,7 @@
   "use_ema": false,
   "local_attn_size": -1,
   "sink_size": 0,
-  "rope_precision": "native",
+  "rope_precision": "complex64",
   "parameter_dtype": "bfloat16",
   "reg_rate": 0.001,
   "fit_chunk_size": 4096,

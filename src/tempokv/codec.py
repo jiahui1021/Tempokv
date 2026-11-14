@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 import os
-from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, Literal
 import warnings
 
 import torch
 
+from . import higgs
 from .config import (
     RAW_ANCHOR_BITS,
     CodecConfig,
@@ -17,6 +17,7 @@ from .config import (
 from .parameters import CrossKVParameters, PreviousFrameParameters, TemporalParameters
 from .quantization import (
     code_dtype,
+    cuda_matmul_precision as _cuda_matmul_precision,
     dequantize_asymmetric,
     dequantize_symmetric,
     quantize_asymmetric,
@@ -53,6 +54,8 @@ class PackedTensor:
     # Mean-split K spans store the per-channel mean [B, H, D] subtracted
     # before prediction; decode adds it back after reconstruction.
     channel_mean: torch.Tensor | None = None
+    residual_higgs_group: int | None = None
+    anchor_higgs_group: int | None = None
 
     def step_sizes(self) -> torch.Tensor:
         """Per-token per-group quantizer step ``[B, H, S, D/g]`` for the Jensen correction.
@@ -60,6 +63,8 @@ class PackedTensor:
         This is the stored scale, except 1-bit symmetric (step ``2*scale``); a raw
         anchor reports zero.
         """
+        if self.residual_higgs_group is not None or self.anchor_higgs_group is not None:
+            raise ValueError("HIGGS does not have scalar quantization step sizes")
         batch, heads, sequence, width = self.shape
         groups = width // self.group_size
         if self.raw_anchor:
@@ -273,21 +278,6 @@ def predict_cross_kv(
     return prediction
 
 
-@contextmanager
-def _cuda_matmul_precision(device: torch.device, precision: str):
-    """Apply one explicit FP32 GEMM policy around a CrossKV projection."""
-    if device.type != "cuda":
-        yield
-        return
-    backend = torch.backends.cuda.matmul
-    previous = backend.allow_tf32
-    backend.allow_tf32 = precision == "tf32"
-    try:
-        yield
-    finally:
-        backend.allow_tf32 = previous
-
-
 def anchor_roundtrip(value: torch.Tensor, config: CodecConfig) -> torch.Tensor:
     """Replay what the encoder stores for one anchor unit.
 
@@ -296,6 +286,8 @@ def anchor_roundtrip(value: torch.Tensor, config: CodecConfig) -> torch.Tensor:
     """
     if config.raw_anchor:
         return value.to(_dtype(config.reconstruction_dtype))
+    if config.higgs_anchor:
+        return higgs.roundtrip(value, config.anchor_bits, config.higgs_group_size)
     return roundtrip(
         value,
         bits=config.anchor_bits,
@@ -305,6 +297,47 @@ def anchor_roundtrip(value: torch.Tensor, config: CodecConfig) -> torch.Tensor:
     )
 
 
+def residual_roundtrip(
+    value: torch.Tensor, *, bits: int, config: CodecConfig, symmetric: bool
+) -> torch.Tensor:
+    """Replay the residual format used by the cache on a [..., H, D] slice."""
+    if config.residual_quantizer == "higgs":
+        return higgs.roundtrip(value, bits, config.higgs_group_size)
+    return roundtrip(
+        value,
+        bits=bits,
+        group_size=config.group_size,
+        scale_dtype=_dtype(config.scale_dtype),
+        symmetric=symmetric,
+    )
+
+
+def _encode_higgs(
+    value: torch.Tensor, bits: int, group: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    # Keep the token axis in the same place as the scalar packed tensors.
+    codes, scales = higgs.encode(value.transpose(1, 2), bits, group)
+    return codes.unsqueeze(1), scales.unsqueeze(1)
+
+
+def _decode_higgs(
+    codes: torch.Tensor, scales: torch.Tensor, bits: int, group: int, heads: int, dim: int
+) -> torch.Tensor:
+    return higgs.decode(
+        codes.squeeze(1), scales.squeeze(1), bits, group, heads, dim
+    ).transpose(1, 2)
+
+
+def _residual_storage_layout(
+    heads: int, dim: int, bits: int, group_size: int,
+    higgs_group: int | None, scale_dtype: torch.dtype,
+) -> tuple[int, int, int, torch.dtype]:
+    if higgs_group is not None:
+        codes, scales = higgs.packed_widths(heads, dim, bits, higgs_group)
+        return 1, codes, scales, torch.float32
+    return heads, (dim * bits + 7) // 8, dim // group_size, scale_dtype
+
+
 def _quantize(
     value: torch.Tensor,
     *,
@@ -312,7 +345,12 @@ def _quantize(
     group_size: int,
     mode: str,
     scale_dtype: torch.dtype,
+    higgs_group: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor]:
+    if higgs_group is not None:
+        codes, scales = _encode_higgs(value, bits, higgs_group)
+        rebuilt = _decode_higgs(codes, scales, bits, higgs_group, value.shape[1], value.shape[-1])
+        return codes, scales, None, rebuilt
     if mode == "asymmetric":
         quant, scale, zero_point = quantize_asymmetric(
             value, bits, group_size, scale_dtype
@@ -361,6 +399,10 @@ def _encode(
     channel_mean: bool = False,
 ) -> tuple[PackedTensor, torch.Tensor]:
     batch, heads, sequence, width = map(int, value.shape)
+    residual_higgs_group = (
+        config.higgs_group_size if config.residual_quantizer == "higgs" else None
+    )
+    anchor_higgs_group = config.higgs_group_size if config.higgs_anchor and not config.raw_anchor else None
     stride = min(config.stride, sequence)
     scale_dtype = _dtype(config.scale_dtype)
     reconstruction_dtype = _dtype(config.reconstruction_dtype)
@@ -399,6 +441,11 @@ def _encode(
         # An empty scale keeps the field a tensor.
         anchor_scale = anchor_quant.new_empty((0,), dtype=scale_dtype)
         anchor_rebuilt = anchor_quant
+    elif anchor_higgs_group is not None:
+        anchor_quant, anchor_scale = _encode_higgs(anchor, config.anchor_bits, anchor_higgs_group)
+        anchor_rebuilt = _decode_higgs(
+            anchor_quant, anchor_scale, config.anchor_bits, anchor_higgs_group, heads, width
+        ).to(reconstruction_dtype)
     else:
         anchor_quant, anchor_scale = quantize_symmetric(
             anchor, config.anchor_bits, config.group_size, scale_dtype
@@ -438,12 +485,13 @@ def _encode(
         else None
     )
     residual_sequence = sequence - stride
-    packed_width = (width * bits + 7) // 8
-    scale_width = width // config.group_size
+    packed_heads, packed_width, scale_width, residual_scale_dtype = _residual_storage_layout(
+        heads, width, bits, config.group_size, residual_higgs_group, scale_dtype
+    )
     residual_quant = (
         torch.empty(
             batch,
-            heads,
+            packed_heads,
             residual_sequence,
             packed_width,
             device=value.device,
@@ -455,11 +503,11 @@ def _encode(
     residual_scale = (
         torch.empty(
             batch,
-            heads,
+            packed_heads,
             residual_sequence,
             scale_width,
             device=value.device,
-            dtype=scale_dtype,
+            dtype=residual_scale_dtype,
         )
         if residual_sequence
         else None
@@ -474,7 +522,11 @@ def _encode(
             # A zero point is a code, so it takes the code dtype.
             dtype=code_dtype(bits),
         )
-        if residual_sequence and config.residual_mode == "asymmetric"
+        if (
+            residual_sequence
+            and residual_higgs_group is None
+            and config.residual_mode == "asymmetric"
+        )
         else None
     )
     residual_offset = 0
@@ -516,6 +568,7 @@ def _encode(
             group_size=config.group_size,
             mode=config.residual_mode,
             scale_dtype=scale_dtype,
+            higgs_group=residual_higgs_group,
         )
         del residual_input
         rebuilt = (
@@ -573,6 +626,8 @@ def _encode(
         temporal=temporal,
         cross_kv=cross_kv,
         channel_mean=(span_mean.squeeze(2) if span_mean is not None else None),
+        residual_higgs_group=residual_higgs_group,
+        anchor_higgs_group=anchor_higgs_group,
     )
     return packed, reconstruction
 
@@ -645,12 +700,14 @@ class IncrementalTensorEncoder:
         grown_units = min(self.capacity_units, grown_units)
         batch, heads, _, width = self.packed.shape
         residual_capacity = (grown_units - 1) * self.packed.stride
-        packed_width = (width * self.packed.bits + 7) // 8
-        scale_width = width // self.packed.group_size
+        packed_heads, packed_width, scale_width, scale_dtype = _residual_storage_layout(
+            heads, width, self.packed.bits, self.packed.group_size,
+            self.packed.residual_higgs_group, self._scale_dtype,
+        )
         device = self.packed.anchor_quant.device
         quant_storage = torch.empty(
             batch,
-            heads,
+            packed_heads,
             residual_capacity,
             packed_width,
             device=device,
@@ -658,11 +715,11 @@ class IncrementalTensorEncoder:
         )
         scale_storage = torch.empty(
             batch,
-            heads,
+            packed_heads,
             residual_capacity,
             scale_width,
             device=device,
-            dtype=self._scale_dtype,
+            dtype=scale_dtype,
         )
         zero_storage = (
             torch.empty(
@@ -673,7 +730,10 @@ class IncrementalTensorEncoder:
                 device=device,
                 dtype=code_dtype(self.packed.bits),
             )
-            if self.packed.residual_mode == "asymmetric"
+            if (
+                self.packed.residual_higgs_group is None
+                and self.packed.residual_mode == "asymmetric"
+            )
             else None
         )
         used = self.packed.shape[2] - self.packed.stride
@@ -774,6 +834,7 @@ class IncrementalTensorEncoder:
                 group_size=self.packed.group_size,
                 mode=self.packed.residual_mode,
                 scale_dtype=self.packed.residual_scale.dtype,
+                higgs_group=self.packed.residual_higgs_group,
             )
             rebuilt = (
                 (prediction + residual_rebuilt).to(reconstruction_dtype)
@@ -914,7 +975,8 @@ def decode_tensor(
     effective_strict_triton = (
         strict_triton or packed.compatibility_mode == "legacy"
     )
-    if use_triton and packed.anchor_quant.is_cuda:
+    uses_higgs = packed.residual_higgs_group is not None or packed.anchor_higgs_group is not None
+    if use_triton and not uses_higgs and packed.anchor_quant.is_cuda:
         try:
             from .triton_ops import decode as decode_triton
 
@@ -940,7 +1002,7 @@ def decode_tensor(
                 stacklevel=2,
             )
 
-    _, _, sequence, width = packed.shape
+    _, heads, sequence, width = packed.shape
     anchor_length = packed.unit_lengths[0]
     if output_tensor is None:
         output = torch.empty(
@@ -952,10 +1014,15 @@ def decode_tensor(
         output = output_tensor.permute(0, 2, 1, 3)
     else:
         output = output_tensor
-    anchor = (
-        packed.anchor_quant.to(output_dtype)
-        if packed.raw_anchor
-        else dequantize_symmetric(
+    if packed.raw_anchor:
+        anchor = packed.anchor_quant.to(output_dtype)
+    elif packed.anchor_higgs_group is not None:
+        anchor = _decode_higgs(
+            packed.anchor_quant, packed.anchor_scale, packed.anchor_bits,
+            packed.anchor_higgs_group, heads, width,
+        ).to(output_dtype)
+    else:
+        anchor = dequantize_symmetric(
             packed.anchor_quant,
             packed.anchor_scale,
             packed.anchor_bits,
@@ -963,11 +1030,12 @@ def decode_tensor(
             width,
             output_dtype,
         )
-    )
     output[:, :, :anchor_length] = anchor
     if packed.residual_quant is None:
         if packed.channel_mean is not None:
             output.add_(packed.channel_mean.unsqueeze(2))
+        if packed.anchor_higgs_group is not None:
+            higgs.record_cache_read()
         return output
     history = (
         [anchor]
@@ -1020,15 +1088,17 @@ def decode_tensor(
             if packed.residual_zero_point is not None
             else None
         )
-        residual = _dequantize(
-            packed.residual_quant[:, :, residual_offset:end],
-            packed.residual_scale[:, :, residual_offset:end],
-            zero_point,
-            bits=packed.bits,
-            group_size=packed.group_size,
-            width=width,
-            mode=packed.residual_mode,
-        )
+        codes = packed.residual_quant[:, :, residual_offset:end]
+        scales = packed.residual_scale[:, :, residual_offset:end]
+        if packed.residual_higgs_group is not None:
+            residual = _decode_higgs(
+                codes, scales, packed.bits, packed.residual_higgs_group, heads, width
+            )
+        else:
+            residual = _dequantize(
+                codes, scales, zero_point, bits=packed.bits,
+                group_size=packed.group_size, width=width, mode=packed.residual_mode,
+            )
         rebuilt = (
             (prediction + residual).to(output_dtype)
             if packed.compatibility_mode == "legacy"
@@ -1057,6 +1127,8 @@ def decode_tensor(
         del prediction, zero_point, residual, rebuilt
     if packed.channel_mean is not None:
         output.add_(packed.channel_mean.unsqueeze(2))
+    if uses_higgs:
+        higgs.record_cache_read()
     return output
 
 

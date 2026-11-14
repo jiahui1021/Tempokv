@@ -207,6 +207,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                 decode_routes = route_report()
             except Exception:
                 pass
+            from tempokv.higgs import cache_reads
+
+            if count := cache_reads():
+                decode_routes["higgs"] = count
         if profile is not None:
             # A profile that fails to serialize must not lose the generation it
             # measured, so the metrics write below still runs.

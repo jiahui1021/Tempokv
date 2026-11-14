@@ -16,7 +16,12 @@ from .attention_objective import (
     phase_score,
     temporal_rollout,
 )
-from .codec import _cuda_matmul_precision, _dtype, anchor_roundtrip as _anchor_roundtrip
+from .codec import (
+    _cuda_matmul_precision,
+    _dtype,
+    anchor_roundtrip as _anchor_roundtrip,
+    residual_roundtrip as _quantization_roundtrip,
+)
 from .config import (
     FIXED_CROSS_KV_V_PREDICTOR_MODES,
     CodecConfig,
@@ -27,7 +32,6 @@ from .config import (
     is_temporal_v_predictor,
 )
 from .parameters import CrossKVParameters, TemporalParameters
-from .quantization import roundtrip
 
 
 _FIXED_TEMPORAL_DEGREES = {
@@ -1487,23 +1491,6 @@ def fit_temporal_layers(
         history_bias=torch.stack([parameters.history_bias for parameters in layer_fits]),
         stride=stride,
         layer_ids=layer_ids,
-    )
-
-
-def _quantization_roundtrip(
-    value: torch.Tensor,
-    *,
-    bits: int,
-    config: CodecConfig,
-    symmetric: bool,
-) -> torch.Tensor:
-    """Quantize/dequantize arbitrary ``[..., H, D]`` trace slices."""
-    return roundtrip(
-        value,
-        bits=bits,
-        group_size=config.group_size,
-        scale_dtype=_dtype(config.scale_dtype),
-        symmetric=symmetric,
     )
 
 

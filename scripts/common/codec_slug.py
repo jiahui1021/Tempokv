@@ -118,10 +118,18 @@ def slug(
             f"{fit_history_source!r}"
         )
     fit_label = "-fitclean" if fit_history_source == "clean" else ""
+    use_higgs_residual = config.get("residual_quantizer") == "higgs"
+    use_higgs_anchor = config.get("higgs_anchor", False) and anchor_bits_value != 16
+    quantizer_label = ""
+    if use_higgs_residual or use_higgs_anchor:
+        group = pick("", "higgs_group_size", 512)
+        quantizer_label = f"-higgs-g{group}" if use_higgs_residual else f"-anchorhiggs-g{group}"
+        if use_higgs_residual and use_higgs_anchor:
+            quantizer_label += "-anchorhiggs"
     return (
         f"{fit_mode}-{k_label}-{v_label}-{precision_label}{anchor_label}"
         f"{stride_label}{k_layout_label}-{cross_weight_mode.replace('_', '')}"
-        f"{fit_label}"
+        f"{fit_label}{quantizer_label}"
     )
 
 
