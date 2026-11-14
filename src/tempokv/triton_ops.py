@@ -6,6 +6,7 @@ import torch
 import triton
 import triton.language as tl
 
+from . import higgs
 from .quantization import MAX_BITS
 from .parameters import PreviousFrameParameters
 from .runtime import persistent_launch_plan, persistent_units_per_launch
@@ -766,6 +767,32 @@ def _advance(tensor: torch.Tensor, dim: int, offset: int) -> torch.Tensor:
     return tensor.narrow(dim, offset, tensor.shape[dim] - offset)
 
 
+def _decode_higgs_residuals(packed, source, output, route_layout):
+    from .codec import cross_projection
+    from .higgs_recurrence import launch
+
+    temporal = packed.temporal if packed.predictor_kind == "temporal" else None
+    cross = packed.cross_kv if temporal is None else None
+    if not _uniform_layout(packed):
+        _decline("higgs_unit_lengths")
+        return None
+    projection = None
+    if cross is not None:
+        if cross.layered or (cross.history_length and not cross.history_diagonal):
+            _decline("higgs_cross_kv_history_layout")
+            return None
+        projection = cross_projection(source, cross, matmul_precision=packed.cross_matmul_precision)
+    launch(packed, temporal, cross, projection, output)
+    if cross is not None:
+        route = f"{packed.predictor_kind}_persistent"
+    elif isinstance(temporal, PreviousFrameParameters):
+        route = "previous_frame_persistent"
+    else:
+        route = "temporal_persistent" if temporal.history_length else "direct_persistent"
+    _record(_route_name(route, route_layout))
+    return output.transpose(1, 2)
+
+
 def decode(
     packed: "PackedTensor",
     *,
@@ -799,12 +826,24 @@ def decode(
             output.stride()
         )
         output_sequence_dim = 2
+    higgs_kernels = None
+    for group_size in (packed.anchor_higgs_group, packed.residual_higgs_group):
+        if group_size is not None:
+            higgs_kernels = higgs.for_device(output.device, group_size)
+            if higgs_kernels is None:
+                _decline("higgs_group")
+                return None
     anchor_length = packed.unit_lengths[0]
     if packed.raw_anchor:
         # Raw anchor: copy through the logical BHSD view; the slice cast converts dtype.
-        _logical_bhsd_output(output, direct_output_layout)[
-            :, :, :anchor_length
-        ] = packed.anchor_quant
+        _logical_bhsd_output(output, direct_output_layout)[:, :, :anchor_length] = packed.anchor_quant
+    elif packed.anchor_higgs_group is not None:
+        higgs.decode_into(
+            packed.anchor_quant.squeeze(1), packed.anchor_scale.squeeze(1),
+            packed.anchor_bits, packed.anchor_higgs_group,
+            _logical_bhsd_output(output, direct_output_layout)[:, :, :anchor_length].transpose(1, 2),
+            kernels=higgs_kernels,
+        )
     else:
         anchor_packed_width = (width * packed.anchor_bits + 7) // 8
         anchor_grid = (
@@ -845,6 +884,9 @@ def decode(
             )
         )
         return _logical_bhsd_output(output, direct_output_layout)
+    if packed.residual_higgs_group is not None:
+        bshd = _logical_bhsd_output(output, direct_output_layout).transpose(1, 2)
+        return _decode_higgs_residuals(packed, source, bshd, direct_output_layout)
     assert packed.residual_scale is not None
     residual_sequence = int(packed.residual_quant.shape[2])
     residual_packed_width = (width * packed.bits + 7) // 8

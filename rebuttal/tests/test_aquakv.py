@@ -67,6 +67,33 @@ def test_higgs_decode_matches_upstream_and_counts_real_padding(dtype, layer):
     assert all(torch.isfinite(q.roundtrip(torch.zeros_like(x), layer)).flatten())
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("grid_size", [16, 64, 256])
+def test_fused_higgs_adds_predictor_with_upstream_rounding(grid_size):
+    from rebuttal.experiments.aquakv.quantizer import _cuda_kernels
+
+    if _cuda_kernels(torch.device("cuda"), 1024) is None:
+        pytest.skip("HIGGS fusion requires Triton 3")
+    quantizer = Quantizer(1536, HiggsConfig(edenn_n=grid_size))
+    generator = torch.Generator().manual_seed(22)
+    value = torch.randn((2, 4, 12, 128), generator=generator).to(torch.bfloat16)
+    value[:, 0] = 0
+    prediction = torch.randn(value.shape, generator=generator).to(value.dtype)
+    reference = quantizer.encode(value, 1)
+    expected = prediction + quantizer.decode(reference, 1)
+    reference.indices = reference.indices.cuda()
+    reference.scales = reference.scales.cuda()
+    actual = quantizer.decode(reference, 1, predictor=prediction.cuda())
+    torch.testing.assert_close(actual.cpu(), expected, rtol=0, atol=0)
+    packed = quantizer.encode(value.cuda(), 1)
+    torch.testing.assert_close(packed.scales.cpu(), reference.scales.cpu())
+    assert (packed.indices != reference.indices).float().mean().item() < 0.001
+    torch.testing.assert_close(
+        quantizer.decode(packed, 1, predictor=prediction.cuda()),
+        prediction.cuda() + quantizer.decode(packed, 1), rtol=0, atol=0,
+    )
+
+
 def test_upstream_calibration_uses_reconstructed_inputs_and_original_v_order():
     k, v = synth()
     q = Quantizer(8, HiggsConfig(**HIGGS))

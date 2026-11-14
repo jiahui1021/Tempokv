@@ -1,2 +1,3 @@
 # Install into an existing Self-Forcing environment. CPU fitting uses PyTorch.
+triton>=3.0
 fast-hadamard-transform>=1.1.0

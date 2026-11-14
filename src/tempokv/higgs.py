@@ -11,6 +11,8 @@ from pathlib import Path
 import torch
 from torch.nn.functional import pad
 
+from higgs_kernels import for_device
+
 from .quantization import _pack, _unpack, cuda_matmul_precision
 
 _ENCODE_CHUNK_SIZE = 64
@@ -65,16 +67,24 @@ def packed_widths(heads: int, dim: int, bits: int, group_size: int) -> tuple[int
 
 @torch.no_grad()
 def encode(
-    value: torch.Tensor, bits: int, group_size: int
+    value: torch.Tensor, bits: int, group_size: int, *, use_triton: bool = True
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Encode a [..., H, D] tensor. Return packed indices and FP32 scales."""
     heads, dim = value.shape[-2:]
     width, groups = packed_widths(heads, dim, bits, group_size)
+    grid, search = _grid(bits, value.device)
+    vector = bits in _VECTOR_BITS
+    kernels = for_device(value.device, group_size) if use_triton else None
+    if kernels is not None:
+        rows = value if value.ndim == 4 else value.reshape(1, -1, heads, dim)
+        codes, scales = kernels.quantize(
+            rows, grid, search, group_size=group_size,
+            code_bits=2 * bits if vector else bits, code_dim=2 if vector else 1,
+        )
+        return codes.reshape(*value.shape[:-2], width), scales.reshape(*value.shape[:-2], groups)
     rows = value.reshape(-1, heads * dim)
     codes = torch.empty((len(rows), width), device=value.device, dtype=torch.uint8)
     scales = torch.empty((len(rows), groups), device=value.device, dtype=torch.float32)
-    grid, search = _grid(bits, value.device)
-    vector = bits in _VECTOR_BITS
     with cuda_matmul_precision(value.device, "ieee"):
         for start in range(0, len(rows), _ENCODE_CHUNK_SIZE):
             stop = min(start + _ENCODE_CHUNK_SIZE, len(rows))
@@ -95,10 +105,20 @@ def encode(
 
 @torch.no_grad()
 def decode(
-    codes: torch.Tensor, scales: torch.Tensor, bits: int, group_size: int, heads: int, dim: int
+    codes: torch.Tensor, scales: torch.Tensor, bits: int, group_size: int, heads: int, dim: int,
+    *, use_triton: bool = True,
 ) -> torch.Tensor:
     """Recover [..., H, D] values from bit-packed codebook indices."""
     width, groups = packed_widths(heads, dim, bits, group_size)
+    kernels = for_device(codes.device, group_size) if use_triton else None
+    if kernels is not None:
+        batch, tokens = codes.shape[:2] if codes.ndim == 3 else (1, codes.numel() // width)
+        result = torch.empty((batch, tokens, heads, dim), device=codes.device, dtype=torch.float32)
+        decode_into(
+            codes.reshape(batch, tokens, width), scales.reshape(batch, tokens, groups),
+            bits, group_size, result, kernels=kernels,
+        )
+        return result.reshape(*codes.shape[:-1], heads, dim)
     rows = codes.reshape(-1, groups, width // groups)
     scales = scales.reshape(-1, groups)
     grid, _ = _grid(bits, codes.device)
@@ -118,6 +138,19 @@ def decode(
     return result.reshape(*codes.shape[:-1], heads, dim)
 
 
-def roundtrip(value: torch.Tensor, bits: int, group_size: int) -> torch.Tensor:
-    codes, scales = encode(value, bits, group_size)
-    return decode(codes, scales, bits, group_size, *value.shape[-2:])
+def decode_into(codes, scales, bits, group_size, output, *, kernels, predictor=None):
+    """Decode BSHD, optionally adding a FP32 prediction before the output cast."""
+    grid, _ = _grid(bits, codes.device)
+    vector = bits in _VECTOR_BITS
+    kernels.dequantize_into(
+        codes, scales, grid, output, group_size=group_size,
+        code_dim=2 if vector else 1, code_bits=2 * bits if vector else bits,
+        half_transform=vector, predictor=predictor,
+    )
+
+
+def roundtrip(
+    value: torch.Tensor, bits: int, group_size: int, *, use_triton: bool = True,
+) -> torch.Tensor:
+    codes, scales = encode(value, bits, group_size, use_triton=use_triton)
+    return decode(codes, scales, bits, group_size, *value.shape[-2:], use_triton=use_triton)

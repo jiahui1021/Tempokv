@@ -92,7 +92,7 @@ metrics = [
 
 [tool.setuptools.packages.find]
 where = ["src", "experiments/LongCat", "experiments/Causal-Forcing"]
-include = ["tempokv*", "longcat*", "longcat_video*", "causal_forcing*"]
+include = ["tempokv*", "higgs_kernels*", "longcat*", "longcat_video*", "causal_forcing*"]
 namespaces = true
 
 [tool.setuptools.package-data]

@@ -27,13 +27,13 @@ Self-Forcing 每个块执行多次去噪和一次 clean refresh。当前去噪�
 
 ## 环境
 
-CPU 校准和重放需要 `torch,numpy`。CUDA 生成使用仓库现有 Self-Forcing 环境、本地模型权重，并额外安装 HIGGS 的 CUDA Hadamard 依赖：
+CPU 校准和重放需要 `torch,numpy`。CUDA 生成使用仓库现有 Self-Forcing 环境和本地模型权重。安装 HIGGS 的 CUDA 依赖：
 
 ```bash
 python -m pip install -r rebuttal/experiments/aquakv/requirements-cuda.txt
 ```
 
-CPU 使用同公式的 Hadamard 参考计算；CUDA 使用官方 `fast-hadamard-transform`，缺失时直接报错。视频评测复用通用的 PSNR/SSIM/LPIPS 入口；LPIPS 需要对应依赖和本地权重。
+CPU 使用 Hadamard 参考实现。CUDA 使用 Triton 3.0 及以上版本做融合量化和解码，其他场景的 CUDA 参考路径使用 `fast-hadamard-transform`。视频评测复用通用的 PSNR/SSIM/LPIPS 入口。LPIPS 需要对应依赖和本地权重。
 
 ## 一个命令运行全流程
 

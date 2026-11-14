@@ -172,8 +172,6 @@ class CodecConfig:
                     raise ValueError(f"{name} must be a whole number, got {value!r}")
                 object.__setattr__(self, name, int(value))
         self._validate()
-        if self.uses_higgs:
-            object.__setattr__(self, "use_triton", False)
 
     def _validate(self) -> None:
         def require(condition: bool, message: str) -> None:
@@ -204,7 +202,6 @@ class CodecConfig:
                     "HIGGS anchors support 1–8 bits or 16 for an unquantized anchor")
             require(not self.jensen_correction,
                     "Jensen correction requires scalar quantization")
-            require(not self.strict_triton, "HIGGS uses the Torch decoder")
         require(self.scale_dtype in DTYPES and self.reconstruction_dtype in DTYPES,
                 "scale_dtype and reconstruction_dtype must be float32, float16 or bfloat16")
         require(not self.raw_anchor or self.reconstruction_dtype != "float32",

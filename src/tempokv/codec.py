@@ -287,7 +287,9 @@ def anchor_roundtrip(value: torch.Tensor, config: CodecConfig) -> torch.Tensor:
     if config.raw_anchor:
         return value.to(_dtype(config.reconstruction_dtype))
     if config.higgs_anchor:
-        return higgs.roundtrip(value, config.anchor_bits, config.higgs_group_size)
+        return higgs.roundtrip(
+            value, config.anchor_bits, config.higgs_group_size, use_triton=config.use_triton,
+        )
     return roundtrip(
         value,
         bits=config.anchor_bits,
@@ -302,7 +304,7 @@ def residual_roundtrip(
 ) -> torch.Tensor:
     """Replay the residual format used by the cache on a [..., H, D] slice."""
     if config.residual_quantizer == "higgs":
-        return higgs.roundtrip(value, bits, config.higgs_group_size)
+        return higgs.roundtrip(value, bits, config.higgs_group_size, use_triton=config.use_triton)
     return roundtrip(
         value,
         bits=bits,
@@ -313,18 +315,19 @@ def residual_roundtrip(
 
 
 def _encode_higgs(
-    value: torch.Tensor, bits: int, group: int
+    value: torch.Tensor, bits: int, group: int, *, use_triton: bool
 ) -> tuple[torch.Tensor, torch.Tensor]:
     # Keep the token axis in the same place as the scalar packed tensors.
-    codes, scales = higgs.encode(value.transpose(1, 2), bits, group)
+    codes, scales = higgs.encode(value.transpose(1, 2), bits, group, use_triton=use_triton)
     return codes.unsqueeze(1), scales.unsqueeze(1)
 
 
 def _decode_higgs(
-    codes: torch.Tensor, scales: torch.Tensor, bits: int, group: int, heads: int, dim: int
+    codes: torch.Tensor, scales: torch.Tensor, bits: int, group: int, heads: int, dim: int,
+    *, use_triton: bool,
 ) -> torch.Tensor:
     return higgs.decode(
-        codes.squeeze(1), scales.squeeze(1), bits, group, heads, dim
+        codes.squeeze(1), scales.squeeze(1), bits, group, heads, dim, use_triton=use_triton,
     ).transpose(1, 2)
 
 
@@ -346,10 +349,13 @@ def _quantize(
     mode: str,
     scale_dtype: torch.dtype,
     higgs_group: int | None = None,
+    use_triton: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor]:
     if higgs_group is not None:
-        codes, scales = _encode_higgs(value, bits, higgs_group)
-        rebuilt = _decode_higgs(codes, scales, bits, higgs_group, value.shape[1], value.shape[-1])
+        codes, scales = _encode_higgs(value, bits, higgs_group, use_triton=use_triton)
+        rebuilt = _decode_higgs(
+            codes, scales, bits, higgs_group, value.shape[1], value.shape[-1], use_triton=use_triton,
+        )
         return codes, scales, None, rebuilt
     if mode == "asymmetric":
         quant, scale, zero_point = quantize_asymmetric(
@@ -442,9 +448,12 @@ def _encode(
         anchor_scale = anchor_quant.new_empty((0,), dtype=scale_dtype)
         anchor_rebuilt = anchor_quant
     elif anchor_higgs_group is not None:
-        anchor_quant, anchor_scale = _encode_higgs(anchor, config.anchor_bits, anchor_higgs_group)
+        anchor_quant, anchor_scale = _encode_higgs(
+            anchor, config.anchor_bits, anchor_higgs_group, use_triton=config.use_triton,
+        )
         anchor_rebuilt = _decode_higgs(
-            anchor_quant, anchor_scale, config.anchor_bits, anchor_higgs_group, heads, width
+            anchor_quant, anchor_scale, config.anchor_bits, anchor_higgs_group, heads, width,
+            use_triton=config.use_triton,
         ).to(reconstruction_dtype)
     else:
         anchor_quant, anchor_scale = quantize_symmetric(
@@ -569,6 +578,7 @@ def _encode(
             mode=config.residual_mode,
             scale_dtype=scale_dtype,
             higgs_group=residual_higgs_group,
+            use_triton=config.use_triton,
         )
         del residual_input
         rebuilt = (
@@ -652,6 +662,7 @@ class IncrementalTensorEncoder:
         self.packed = packed
         self.cache_role: str | None = None
         self.capacity_units = capacity_units
+        self._use_triton = config.use_triton
         self._allocated_units = len(packed.unit_lengths)
         self._scale_dtype = (
             packed.residual_scale.dtype
@@ -835,6 +846,7 @@ class IncrementalTensorEncoder:
                 mode=self.packed.residual_mode,
                 scale_dtype=self.packed.residual_scale.dtype,
                 higgs_group=self.packed.residual_higgs_group,
+                use_triton=self._use_triton,
             )
             rebuilt = (
                 (prediction + residual_rebuilt).to(reconstruction_dtype)
@@ -972,11 +984,11 @@ def decode_tensor(
         )
     # Legacy mode picks its decode route deliberately, so a silent PyTorch
     # fallback would hide both a correctness and a throughput regression.
-    effective_strict_triton = (
-        strict_triton or packed.compatibility_mode == "legacy"
-    )
     uses_higgs = packed.residual_higgs_group is not None or packed.anchor_higgs_group is not None
-    if use_triton and not uses_higgs and packed.anchor_quant.is_cuda:
+    effective_strict_triton = strict_triton or (
+        packed.compatibility_mode == "legacy" and not uses_higgs
+    )
+    if use_triton and packed.anchor_quant.is_cuda:
         try:
             from .triton_ops import decode as decode_triton
 
@@ -990,12 +1002,15 @@ def decode_tensor(
             if accelerated is not None:
                 if packed.channel_mean is not None:
                     accelerated.add_(packed.channel_mean.unsqueeze(2))
+                if uses_higgs:
+                    higgs.record_cache_read()
                 return accelerated
             if effective_strict_triton:
                 raise RuntimeError("this packed layout is not supported by Triton")
         except Exception as error:
             if effective_strict_triton:
                 raise
+            use_triton = False
             warnings.warn(
                 f"Triton decode failed; using the PyTorch decoder: {error}",
                 RuntimeWarning,
@@ -1019,7 +1034,7 @@ def decode_tensor(
     elif packed.anchor_higgs_group is not None:
         anchor = _decode_higgs(
             packed.anchor_quant, packed.anchor_scale, packed.anchor_bits,
-            packed.anchor_higgs_group, heads, width,
+            packed.anchor_higgs_group, heads, width, use_triton=use_triton,
         ).to(output_dtype)
     else:
         anchor = dequantize_symmetric(
@@ -1054,6 +1069,11 @@ def decode_tensor(
     )
     offset = anchor_length
     residual_offset = 0
+    residual_group = packed.residual_higgs_group
+    kernels = (
+        higgs.for_device(output.device, residual_group)
+        if use_triton and residual_group is not None else None
+    )
     for unit_length in packed.unit_lengths[1:]:
         if packed.predictor_kind == "temporal":
             if isinstance(packed.temporal, PreviousFrameParameters):
@@ -1090,26 +1110,32 @@ def decode_tensor(
         )
         codes = packed.residual_quant[:, :, residual_offset:end]
         scales = packed.residual_scale[:, :, residual_offset:end]
-        if packed.residual_higgs_group is not None:
+        target = output[:, :, offset : offset + unit_length]
+        if kernels is not None:
+            higgs.decode_into(
+                codes.squeeze(1), scales.squeeze(1), packed.bits, residual_group,
+                target.transpose(1, 2), kernels=kernels, predictor=prediction.transpose(1, 2),
+            )
+        elif residual_group is not None:
             residual = _decode_higgs(
-                codes, scales, packed.bits, packed.residual_higgs_group, heads, width
+                codes, scales, packed.bits, residual_group, heads, width, use_triton=False,
             )
         else:
             residual = _dequantize(
                 codes, scales, zero_point, bits=packed.bits,
                 group_size=packed.group_size, width=width, mode=packed.residual_mode,
             )
-        rebuilt = (
-            (prediction + residual).to(output_dtype)
-            if packed.compatibility_mode == "legacy"
-            else prediction.add_(residual).to(output_dtype)
-        )
-        output[:, :, offset : offset + unit_length] = rebuilt
-        rebuilt_history = (
-            rebuilt
-            if packed.compatibility_mode == "legacy"
-            else output[:, :, offset : offset + unit_length]
-        )
+        rebuilt_history = target
+        if kernels is None:
+            rebuilt = (
+                (prediction + residual).to(output_dtype)
+                if packed.compatibility_mode == "legacy"
+                else prediction.add_(residual).to(output_dtype)
+            )
+            target.copy_(rebuilt)
+            if packed.compatibility_mode == "legacy":
+                rebuilt_history = rebuilt
+            del residual, rebuilt
         if packed.predictor_kind == "temporal":
             if packed.temporal is not None and packed.temporal.history_length:
                 history = [
@@ -1124,7 +1150,7 @@ def decode_tensor(
                 ]
         offset += unit_length
         residual_offset = end
-        del prediction, zero_point, residual, rebuilt
+        del prediction, zero_point
     if packed.channel_mean is not None:
         output.add_(packed.channel_mean.unsqueeze(2))
     if uses_higgs:

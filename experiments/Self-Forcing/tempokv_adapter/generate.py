@@ -847,11 +847,8 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         report["parameters"] = parameters
         report["runtime_config"] = str(paths["runtime_config"])
         requested_persistent_units = persistent_units_per_launch()
-        if config.uses_higgs:
-            report["cache_decoder"] = "torch_higgs"
-        else:
-            report["cache_decoder"] = "triton" if not args.torch_decoder else "torch"
-        report["persistent_units_per_launch"] = None if config.uses_higgs else {
+        report["cache_decoder"] = "triton" if config.use_triton else "torch"
+        report["persistent_units_per_launch"] = {
             "requested": requested_persistent_units,
             "k": (
                 min(requested_persistent_units, 8)
@@ -889,7 +886,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         environment["SPECTRAL_MODEL"] = str(paths["checkpoint"])
     if args.mode == "tempokv":
         runtime_payload = asdict(config)
-        if not config.uses_higgs and not args.allow_triton_fallback and not args.torch_decoder:
+        if not args.allow_triton_fallback and not args.torch_decoder:
             runtime_payload["use_triton"] = True
             runtime_payload["strict_triton"] = True
         paths["runtime_config"].write_text(
@@ -1028,7 +1025,6 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             raise RuntimeError("Self-Forcing did not read any HIGGS-compressed cache")
     if (
         args.mode == "tempokv"
-        and not config.uses_higgs
         and not args.allow_triton_fallback
         and not args.torch_decoder
         and generated_entries
@@ -1075,6 +1071,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             for name, count in performance["decode_routes"].items()
             if int(count) > 0
             and name not in required_routes
+            and name != "higgs"
             and not name.startswith("declined:")
         }
         if unexpected_routes:

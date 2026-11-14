@@ -102,8 +102,8 @@ class AquaKVCache:
             v = self.quantizer.decode(vs, layer)
         else:
             previous_k, previous_v = self.previous[index]
-            k = self.predictor.predict_key(previous_k, layer) + self.quantizer.decode(ks, layer)
-            v = self.predictor.predict_value(k, previous_v, layer) + self.quantizer.decode(vs, layer)
+            k = self.quantizer.decode(ks, layer, predictor=self.predictor.predict_key(previous_k, layer))
+            v = self.quantizer.decode(vs, layer, predictor=self.predictor.predict_value(k, previous_v, layer))
         self.previous[index] = k, v
         self.counts["decode_k"] += 1
         self.counts["decode_v"] += 1

@@ -59,10 +59,10 @@ def measure(target, prediction, rebuilt):
 def reconstruct_layer(k, v, layer, predictor, quantizer, previous=None, *, direct=False, metrics=True):
     pk = torch.zeros_like(k) if layer == 0 or direct else predictor.predict_key(previous[0], layer)
     kstate = quantizer.encode(k-pk, layer)
-    kh = pk + quantizer.decode(kstate, layer)
+    kh = quantizer.decode(kstate, layer, predictor=pk)
     pv = torch.zeros_like(v) if layer == 0 or direct else predictor.predict_value(kh, previous[1], layer)
     vstate = quantizer.encode(v-pv, layer)
-    vh = pv + quantizer.decode(vstate, layer)
+    vh = quantizer.decode(vstate, layer, predictor=pv)
     row = ({"layer_index": layer, "k": measure(k, pk, kh), "v": measure(v, pv, vh),
             "payload_bytes": kstate.storage_bytes()+vstate.storage_bytes()} if metrics else {})
     return (kh, vh), (kstate, vstate), row

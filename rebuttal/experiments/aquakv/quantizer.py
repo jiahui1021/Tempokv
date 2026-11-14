@@ -9,6 +9,16 @@ import torch
 from .upstream.quantizers import HiggsQuantizer, QuantizedTensor
 
 
+def _cuda_kernels(device, group_size):
+    if device.type != "cuda":
+        return None
+    try:
+        from higgs_kernels import for_device
+    except ImportError:
+        return None
+    return for_device(device, group_size)
+
+
 @dataclass(frozen=True)
 class HiggsConfig:
     hadamard_groupsize: int = 1024
@@ -86,21 +96,61 @@ class Quantizer:
             raise ValueError("HIGGS channel size does not match heads * head_dim")
         if layer == 0 and not self.config.quantize_first_layer:
             return HiggsState(None, value.detach().clone(), (), tuple(value.shape), value.dtype)
-        native = self._backend(layer).quantize(value.reshape(-1, self.channels))
+        backend = self._backend(layer)
+        group = backend.hadamard_groupsize
+        n = self.config.first_layer_edenn_n if layer == 0 else self.config.edenn_n
+        bits = int(math.log2(n))
+        kernels = _cuda_kernels(value.device, group)
+        if kernels is not None:
+            heads, dim = value.shape[-2:]
+            rows = value if value.ndim == 4 else value.reshape(1, -1, heads, dim)
+            indices, scales = kernels.quantize(
+                rows, backend.grid(device=value.device), backend.grid_norm(device=value.device),
+                group_size=group, code_bits=bits, code_dim=backend.edenn_d, zero_code=True,
+                check_finite=True,
+            )
+            groups, packed_width = indices.shape[-2:]
+            index_width = (group + backend.edenn_d - 1) // backend.edenn_d
+            indices = indices.reshape(-1, groups, packed_width)
+            index_shape = (indices.shape[0], groups, index_width)
+            return HiggsState(indices, scales.reshape(-1, groups), index_shape, tuple(value.shape), value.dtype)
+        native = backend.quantize(value.reshape(-1, self.channels))
         if not torch.isfinite(native.scales).all():
             raise ValueError("non-finite HIGGS scales")
-        n = self.config.first_layer_edenn_n if layer == 0 else self.config.edenn_n
-        indices = pack_indices(native.idx.to(value.device), int(math.log2(n)))
+        indices = pack_indices(native.idx.to(value.device), bits)
         return HiggsState(indices, native.scales, tuple(native.idx.shape), tuple(value.shape), value.dtype)
 
     @torch.no_grad()
-    def decode(self, state: HiggsState, layer: int):
+    def decode(self, state: HiggsState, layer: int, *, predictor: torch.Tensor | None = None):
         if state.indices is None:
-            return state.scales.clone()
+            return state.scales.clone() if predictor is None else predictor + state.scales
+        backend = self._backend(layer)
+        group = backend.hadamard_groupsize
         n = self.config.first_layer_edenn_n if layer == 0 else self.config.edenn_n
-        idx = unpack_indices(state.indices, int(math.log2(n)), state.index_shape[-1])
-        result = self._backend(layer).dequantize(QuantizedTensor(idx, state.scales))
-        return result.reshape(state.shape).to(state.dtype)
+        bits = int(math.log2(n))
+        kernels = _cuda_kernels(state.scales.device, group)
+        if kernels is not None and state.dtype in {torch.float16, torch.bfloat16, torch.float32} and (
+            predictor is None or (
+                tuple(predictor.shape) == state.shape and predictor.device == state.scales.device
+                and predictor.dtype in {torch.float16, torch.bfloat16, torch.float32}
+            )
+        ):
+            heads, dim = state.shape[-2:]
+            batch, tokens = state.shape[:2] if len(state.shape) == 4 else (1, state.index_shape[0])
+            output_dtype = state.dtype if predictor is None else torch.promote_types(state.dtype, predictor.dtype)
+            output = torch.empty((batch, tokens, heads, dim), device=state.scales.device, dtype=output_dtype)
+            kernels.dequantize_into(
+                state.indices.flatten(1).unflatten(0, (batch, tokens)),
+                state.scales.unflatten(0, (batch, tokens)),
+                backend.grid(device=state.scales.device), output,
+                group_size=group, code_bits=bits, code_dim=backend.edenn_d, half_transform=True,
+                predictor=None if predictor is None else predictor.reshape(output.shape),
+                residual_dtype=state.dtype,
+            )
+            return output.reshape(state.shape)
+        idx = unpack_indices(state.indices, bits, state.index_shape[-1])
+        result = backend.dequantize(QuantizedTensor(idx, state.scales)).reshape(state.shape).to(state.dtype)
+        return result if predictor is None else predictor + result
 
     def roundtrip(self, value, layer):
         return self.decode(self.encode(value, layer), layer)
