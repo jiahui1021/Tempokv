@@ -65,3 +65,11 @@
 - Dense 的 K/V 输出分别有 99.9837% / 100% 达到当前增益上限，因此结果限于当前约束下的实现；不据此评价无约束 Dense 的最佳能力。
 - 结果、预测参数、逐层/逐帧误差与增益诊断保存在 `rebuttal/outputs/temporal_channel_dense_self_forcing_20261107/`。只有缓存重建结果，无视频质量或生成速度结果。
 - 最终验证：166 passed, 2 CUDA skips（32.54 秒）。对角特例与生产重放一致、目标/增益控制、因果历史、无 CrossKV 调用、全部 SSE/字节数/比例和来源划分均通过核对。
+
+## 2026-11-07：AQUA-KV 移植（不覆盖 main 的 rebuttal 修复）
+
+- 本地 `rebuttal/` 压缩包基于 `0d73cc9`，比 `origin/main`（`ace2b8e`）旧。没有整包覆盖。main 上已有文件保持原样，只在 `run.py`、`experiment_matrix.json`、`README.md`、`progress.md` 上追加 AQUA-KV 入口；Self-Forcing 只增加 `aquakv` 模式和 `aquakv_bridge.py`。
+- 压缩包里的简化版（TempoKV 分组量化 + trace NMSE）改名为 `aquakv_lite`，不作为 AQUA-KV 结果。
+- 正式移植在 `experiments/aquakv/`：vendored HIGGS 与 `fit_linear_regression`（commit `e744183f2f3a4a90381f20a6975456871fd1ae29`），顺序校准，Self-Forcing pre-RoPE cache。`plan` / `generate` / 无视频的 `evaluate` 不产生质量数字。
+- 本机无 GPU，没有跑 Self-Forcing 生成，也没有填写 PSNR/SSIM/LPIPS。
+- `python3 -m pytest -q rebuttal/tests`：108 passed，1 skipped。唯一跳过项仍是 CUDA RNG。`ace2b8e` 原有用例在装上 av、opencv、matplotlib 后为 87 passed、1 skipped；新增 11 个 AQUA-KV 测试和 10 个 `aquakv_lite` 测试。原有用例全部通过。

@@ -61,7 +61,9 @@ def build_parser() -> argparse.ArgumentParser:
         description="Generate Self-Forcing videos with TempoKV or bf16 KV caches."
     )
     parser.add_argument(
-        "--mode", choices=("tempokv", "bf16", "trace", "spectral", "spectral_kv"), default="tempokv"
+        "--mode",
+        choices=("tempokv", "bf16", "trace", "spectral", "spectral_kv", "aquakv"),
+        default="tempokv",
     )
     parser.add_argument("--config", type=Path)
     parser.add_argument("--k-params", type=Path)
@@ -183,6 +185,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="require a fresh, complete generation with no skipped samples",
     )
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--aquakv-spec", type=Path, help="AQUA-KV experiment JSON (AquaSpec fields)")
+    parser.add_argument("--aquakv-predictors", type=Path, help="fitted aquakv_predictors.pt")
+    parser.add_argument(
+        "--aquakv-collect",
+        action="store_true",
+        help="BF16 rollout that writes clean pre-RoPE KV memmaps; does not quantize",
+    )
+    parser.add_argument(
+        "--aquakv-trace-dir",
+        type=Path,
+        help="directory for --aquakv-collect memmaps",
+    )
     return parser
 
 
@@ -719,6 +733,22 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         "runtime_config": args.output_dir.expanduser().resolve()
         / "runtime_config.json",
     }
+    if args.mode == "aquakv":
+        if args.sink_size != 0:
+            raise ValueError("aquakv keeps absolute frames and requires sink-size=0")
+        if args.aquakv_spec is None:
+            raise ValueError("mode=aquakv requires --aquakv-spec")
+        paths["aquakv_spec"] = args.aquakv_spec.expanduser().resolve()
+        if args.aquakv_collect:
+            if args.samples != 1:
+                raise ValueError("aquakv collection stores one video at a time; samples must be 1")
+            if args.aquakv_trace_dir is None:
+                raise ValueError("aquakv collection requires --aquakv-trace-dir")
+            paths["aquakv_trace_dir"] = args.aquakv_trace_dir.expanduser().resolve()
+        else:
+            if args.aquakv_predictors is None:
+                raise ValueError("mode=aquakv generation requires --aquakv-predictors")
+            paths["aquakv_predictors"] = args.aquakv_predictors.expanduser().resolve()
     if args.mode == "tempokv":
         missing_arguments = [
             name
@@ -747,6 +777,10 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         required_files.append("config")
         if not parameter_free_identity:
             required_files.extend(("k_params", "v_params"))
+    if args.mode == "aquakv":
+        required_files.append("aquakv_spec")
+        if not args.aquakv_collect:
+            required_files.append("aquakv_predictors")
     for name in required_files:
         if not paths[name].is_file():
             raise ValueError(f"{name} file does not exist: {paths[name]}")
@@ -921,6 +955,22 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             environment["TEMPOKV_TRITON_CACHE"] = str(
                 args.triton_cache.expanduser().resolve()
             )
+    elif args.mode == "aquakv":
+        for name in tuple(environment):
+            if name.startswith("TEMPOKV_") and name not in ("TEMPOKV_TRITON_CACHE",):
+                environment.pop(name)
+        # Same RoPE arithmetic as the BF16 reference and the TempoKV bridge.
+        environment["SELF_FORCING_CACHE_ROPE_PRECISION"] = "complex64"
+        environment["AQUAKV_SPEC"] = str(paths["aquakv_spec"])
+        environment["AQUAKV_NUM_FRAMES"] = str(latent_frames_for(args.frames))
+        environment.pop("AQUAKV_COLLECT", None)
+        environment.pop("AQUAKV_PREDICTORS", None)
+        if args.aquakv_collect:
+            environment["AQUAKV_COLLECT"] = "1"
+            environment["AQUAKV_TRACE_DIR"] = str(paths["aquakv_trace_dir"])
+            environment["AQUAKV_PROMPT_FILE"] = str(paths["prompts"])
+        else:
+            environment["AQUAKV_PREDICTORS"] = str(paths["aquakv_predictors"])
     else:
         for name in tuple(environment):
             if name.startswith("TEMPOKV_") and name not in (

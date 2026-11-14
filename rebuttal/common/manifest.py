@@ -109,6 +109,9 @@ PATH_KEYS = frozenset({
     "parameter_fit_report",
     "predictor_path",
     "previous_report",
+    "collection_dir", "scratch_dir", "predictors_path",
+    "bf16_video_dir", "tempokv_video_dir", "aquakv_video_dir",
+    "aquakv_spec", "aquakv_trace_dir",
 })
 
 

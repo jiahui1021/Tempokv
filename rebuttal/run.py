@@ -29,6 +29,8 @@ EXPERIMENTS = {
     "aquakv": "rebuttal.experiments.aquakv",
     "block_dplr": "rebuttal.experiments.block_dplr",
     "temporal_matrix": "rebuttal.experiments.temporal_matrix",
+    "aquakv_lite": "rebuttal.experiments.aquakv_lite",
+    "aquakv_official": "rebuttal.experiments.aquakv.official_workflow",
 }
 DEFAULT_CONFIGS = {name: ROOT / "rebuttal/configs" / f"{name}.json" for name in EXPERIMENTS}
 
@@ -116,7 +118,7 @@ def execute(experiment: str, config: dict, stage: str, output_dir: Path, *, resu
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--experiment", choices=[*EXPERIMENTS, "all"], required=True)
-    parser.add_argument("--stage", choices=["plan", "collect", "pipeline", "fit", "replay", "capacity", "generate", "evaluate", "quality", "convert", "summarize"], default="plan")
+    parser.add_argument("--stage", choices=["plan", "collect", "calibrate", "pipeline", "fit", "replay", "capacity", "generate", "evaluate", "quality", "convert", "summarize"], default="plan")
     parser.add_argument("--config", type=Path, help="JSON config; relative input paths resolve against repository root")
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--set", action="append", default=[], metavar="KEY=VALUE")

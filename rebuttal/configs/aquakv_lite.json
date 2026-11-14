@@ -1,0 +1,14 @@
+{
+  "experiment": "aquakv_lite",
+  "model": "self_forcing",
+  "device": "auto",
+  "codec_config": "configs/legacy.json",
+  "calibration_trace": null,
+  "evaluation_trace": null,
+  "ridge": 0.01,
+  "bias": true,
+  "fit_token_stride": 1,
+  "parameter_dtype": "bfloat16",
+  "teacher_forcing_diagnostic": true,
+  "tempokv": {"k_params": null, "v_params": null, "span_frames": null}
+}

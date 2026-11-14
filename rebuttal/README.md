@@ -83,3 +83,7 @@ python rebuttal/run.py --experiment previous_frame --config rebuttal/outputs/my_
 ## Per-channel temporal 与 Dense temporal
 
 `temporal_matrix` 单独比较 K temporal（KH2）与 V temporal-only（VH1），两种模型均不使用 CrossKV。两者采用相同数据划分、量化、head/layer 共享方式、正则目标、历史增益上限与 warm-up；详见 [temporal-only 实验说明](experiments/temporal_matrix/README.md)。
+
+## AQUA-KV 官方移植实验
+
+使用 `aquakv_official` 运行独立的官方移植工作流。早期 trace 消融使用 `aquakv_lite`。配置和命令见 [官方移植说明](experiments/aquakv/OFFICIAL.md)。
